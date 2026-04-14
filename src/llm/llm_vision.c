@@ -43,7 +43,7 @@ int llm_chat_vision(const char* prompt, const char* image_b64,
     size_t buf_size)
 {
     char model[64], api_key[128], llm_host[128];
-    llm_snapshot_config(model, sizeof(model),
+    llm_snapshot_vision_config(model, sizeof(model),
         api_key, sizeof(api_key),
         llm_host, sizeof(llm_host));
 
@@ -215,7 +215,7 @@ int llm_chat_vision_raw(const char* prompt,
     char* response_buf, size_t buf_size)
 {
     char model[64], api_key[128], llm_host[128];
-    llm_snapshot_config(model, sizeof(model),
+    llm_snapshot_vision_config(model, sizeof(model),
         api_key, sizeof(api_key),
         llm_host, sizeof(llm_host));
 

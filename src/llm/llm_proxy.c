@@ -46,6 +46,11 @@ static char s_llm_host[128] = AGENT_LLM_API_HOST;
 static char s_llm_path[128] = AGENT_LLM_API_PATH;
 static char s_llm_port[8] = "443"; /* "443" for HTTPS, "80" etc for HTTP */
 
+/* Independent vision model config — empty means fall back to main LLM */
+static char s_vision_model[64] = { 0 };
+static char s_vision_host[128] = { 0 };
+static char s_vision_api_key[128] = { 0 };
+
 static pthread_mutex_t s_llm_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Check if host uses OpenAI-compatible max_completion_tokens param */
@@ -123,6 +128,17 @@ int llm_proxy_init(void)
     memset(tmp, 0, sizeof(tmp));
     if (claw_config_get("llm_port", tmp, sizeof(tmp)) == OK && tmp[0])
         strncpy(s_llm_port, tmp, sizeof(s_llm_port) - 1);
+
+    /* Load optional vision model config — empty falls back to main LLM */
+    memset(tmp, 0, sizeof(tmp));
+    if (claw_config_get(AGENT_CFG_KEY_VISION_MODEL, tmp, sizeof(tmp)) == OK && tmp[0])
+        strncpy(s_vision_model, tmp, sizeof(s_vision_model) - 1);
+    memset(tmp, 0, sizeof(tmp));
+    if (claw_config_get(AGENT_CFG_KEY_VISION_HOST, tmp, sizeof(tmp)) == OK && tmp[0])
+        strncpy(s_vision_host, tmp, sizeof(s_vision_host) - 1);
+    memset(tmp, 0, sizeof(tmp));
+    if (claw_config_get(AGENT_CFG_KEY_VISION_API_KEY, tmp, sizeof(tmp)) == OK && tmp[0])
+        strncpy(s_vision_api_key, tmp, sizeof(s_vision_api_key) - 1);
 
     if (s_api_key[0])
         syslog(LOG_INFO, "[%s] LLM proxy initialized (model: %s, host: %s)\n", TAG,
@@ -210,6 +226,78 @@ void llm_snapshot_config(char* model, size_t model_sz,
     strncpy(host, s_llm_host, host_sz - 1);
     host[host_sz - 1] = '\0';
     pthread_mutex_unlock(&s_llm_lock);
+}
+
+/* ── Vision config snapshot ──────────────────────────────────── */
+
+void llm_snapshot_vision_config(char* model, size_t model_sz,
+    char* api_key, size_t key_sz,
+    char* host, size_t host_sz)
+{
+    pthread_mutex_lock(&s_llm_lock);
+
+    /* Use vision-specific config when set, otherwise fall back to main LLM */
+    if (s_vision_model[0])
+        strncpy(model, s_vision_model, model_sz - 1);
+    else
+        strncpy(model, s_model, model_sz - 1);
+    model[model_sz - 1] = '\0';
+
+    if (s_vision_api_key[0])
+        strncpy(api_key, s_vision_api_key, key_sz - 1);
+    else
+        strncpy(api_key, s_api_key, key_sz - 1);
+    api_key[key_sz - 1] = '\0';
+
+    if (s_vision_host[0])
+        strncpy(host, s_vision_host, host_sz - 1);
+    else
+        strncpy(host, s_llm_host, host_sz - 1);
+    host[host_sz - 1] = '\0';
+
+    pthread_mutex_unlock(&s_llm_lock);
+}
+
+/* ── Vision model setter ─────────────────────────────────────── */
+
+int llm_set_vision_model(const char* host, const char* model,
+    const char* api_key)
+{
+    pthread_mutex_lock(&s_llm_lock);
+
+    if (host && host[0]) {
+        claw_config_set(AGENT_CFG_KEY_VISION_HOST, host);
+        strncpy(s_vision_host, host, sizeof(s_vision_host) - 1);
+        s_vision_host[sizeof(s_vision_host) - 1] = '\0';
+    } else {
+        config_del(AGENT_CFG_KEY_VISION_HOST);
+        s_vision_host[0] = '\0';
+    }
+
+    if (model && model[0]) {
+        claw_config_set(AGENT_CFG_KEY_VISION_MODEL, model);
+        strncpy(s_vision_model, model, sizeof(s_vision_model) - 1);
+        s_vision_model[sizeof(s_vision_model) - 1] = '\0';
+    } else {
+        config_del(AGENT_CFG_KEY_VISION_MODEL);
+        s_vision_model[0] = '\0';
+    }
+
+    if (api_key && api_key[0]) {
+        claw_config_set(AGENT_CFG_KEY_VISION_API_KEY, api_key);
+        strncpy(s_vision_api_key, api_key, sizeof(s_vision_api_key) - 1);
+        s_vision_api_key[sizeof(s_vision_api_key) - 1] = '\0';
+    } else {
+        config_del(AGENT_CFG_KEY_VISION_API_KEY);
+        s_vision_api_key[0] = '\0';
+    }
+
+    pthread_mutex_unlock(&s_llm_lock);
+
+    syslog(LOG_INFO, "[%s] Vision LLM config updated: model=%s host=%s\n",
+        TAG, s_vision_model[0] ? s_vision_model : "(inherit)",
+        s_vision_host[0] ? s_vision_host : "(inherit)");
+    return OK;
 }
 
 /* ── HTTP helpers ─────────────────────────────────────────── */

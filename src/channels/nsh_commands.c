@@ -96,6 +96,7 @@ static void cmd_help(void)
         "  set_feishu_app <app_id> <app_secret>  - Set Feishu app credentials\n"
         "  set_feishu_user_token <token>  - Set Feishu user_access_token for doc APIs\n"
         "  set_llm <preset|host> [model] [key] - Switch LLM backend (kimi/qwen/deepseek/glm/openai)\n"
+        "  set_vision_llm <preset|host> [model] [key] - Set independent vision model\n"
         "  list_models [--free] [keyword] - List available models (openrouter)\n"
         "  memory_read          - Read MEMORY.md\n"
         "  memory_write <text>  - Write MEMORY.md (quote text)\n"
@@ -462,6 +463,9 @@ static void cmd_config_show(void)
     SHOW_CFG("Model", AGENT_CFG_KEY_MODEL, false);
     SHOW_CFG("LLM Host", AGENT_CFG_KEY_LLM_HOST, false);
     SHOW_CFG("LLM Path", AGENT_CFG_KEY_LLM_PATH, false);
+    SHOW_CFG("Vision Model", AGENT_CFG_KEY_VISION_MODEL, false);
+    SHOW_CFG("Vision Host", AGENT_CFG_KEY_VISION_HOST, false);
+    SHOW_CFG("Vision Key", AGENT_CFG_KEY_VISION_API_KEY, true);
     SHOW_CFG("Proxy Host", AGENT_CFG_KEY_PROXY_HOST, false);
     SHOW_CFG("Proxy Port", AGENT_CFG_KEY_PROXY_PORT, false);
     SHOW_CFG("SerpAPI Key", AGENT_CFG_KEY_SERP_KEY, true);
@@ -876,6 +880,8 @@ static void* cli_thread(void* arg)
             cmd_set_feishu_user_token(argc, argv);
         else if (strcmp(cmd, "set_llm") == 0)
             cmd_set_llm(argc, argv);
+        else if (strcmp(cmd, "set_vision_llm") == 0)
+            cmd_set_vision_llm(argc, argv);
         else if (strcmp(cmd, "list_models") == 0)
             cmd_list_models(argc, argv);
         else if (strcmp(cmd, "memory_read") == 0)

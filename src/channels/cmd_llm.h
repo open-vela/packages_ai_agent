@@ -17,6 +17,7 @@
 #pragma once
 
 void cmd_set_llm(int argc, char** argv);
+void cmd_set_vision_llm(int argc, char** argv);
 void cmd_list_models(int argc, char** argv);
 void cmd_router_status(void);
 void cmd_router_profile(int argc, char** argv);

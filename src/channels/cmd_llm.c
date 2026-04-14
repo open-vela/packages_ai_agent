@@ -47,7 +47,7 @@ static const router_preset_t g_router_presets[] = {
     { "glm", "open.bigmodel.cn", "/api/paas/v4/chat/completions", "glm-4-flash", 1 },
     { "openai", "api.openai.com", "/v1/chat/completions", "gpt-4o", 3 },
     { "claude", "api.anthropic.com", "/v1/messages", "claude-sonnet-4-20250514", 3 },
-    { "mimo", "api.xiaomimimo.com", "/v1/chat/completions", "MiMo-v2-Flash", 1 },
+    { "mimo", "api.xiaomimimo.com", "/v1/chat/completions", "mimo-v2-flash", 1 },
     { "openrouter", "openrouter.ai", "/api/v1/chat/completions",
         "openrouter/hunter-alpha", 2 },
     { NULL, NULL, NULL, NULL, 0 }
@@ -220,6 +220,85 @@ void cmd_set_llm(int argc, char** argv)
     if (api_key) {
         printf("API key saved.\n");
     }
+}
+
+
+/* ── cmd_set_vision_llm ──────────────────────────────────────── */
+
+void cmd_set_vision_llm(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_vision_llm <preset> [api_key]\n"
+               "       set_vision_llm <host> <model> [api_key]\n"
+               "       set_vision_llm clear\n"
+               "\n"
+               "Set an independent vision model. If not configured,\n"
+               "vision calls inherit the main LLM config.\n"
+               "\n"
+               "Presets:\n"
+               "  mimo     - api.xiaomimimo.com  (mimo-v2-omni)\n"
+               "  openai   - api.openai.com  (gpt-4o)\n"
+               "  qwen     - dashscope.aliyuncs.com  (qwen-vl-max)\n"
+               "  glm      - open.bigmodel.cn  (glm-4v-flash)\n"
+               "\n"
+               "Examples:\n"
+               "  set_vision_llm mimo <api_key>\n"
+               "  set_vision_llm clear\n");
+        return;
+    }
+
+    const char* arg1 = argv[1];
+
+    /* clear: remove vision-specific config, fall back to main LLM */
+    if (strcmp(arg1, "clear") == 0) {
+        llm_set_vision_model(NULL, NULL, NULL);
+        printf("Vision LLM config cleared (using main LLM).\n");
+        return;
+    }
+
+    const char* host = NULL;
+    const char* model = NULL;
+    const char* api_key = NULL;
+
+    /* Check if arg1 is a preset name */
+    static const struct {
+        const char* name;
+        const char* host;
+        const char* model;
+    } vision_presets[] = {
+        { "mimo", "api.xiaomimimo.com", "mimo-v2-omni" },
+        { "openai", "api.openai.com", "gpt-4o" },
+        { "qwen", "dashscope.aliyuncs.com", "qwen-vl-max" },
+        { "glm", "open.bigmodel.cn", "glm-4v-flash" },
+        { NULL, NULL, NULL }
+    };
+
+    bool found = false;
+    for (int i = 0; vision_presets[i].name; i++) {
+        if (strcmp(vision_presets[i].name, arg1) == 0) {
+            host = vision_presets[i].host;
+            model = vision_presets[i].model;
+            if (argc >= 3)
+                api_key = argv[2];
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        /* Custom: arg1 = host, arg2 = model, arg3 = api_key */
+        host = arg1;
+        if (argc >= 3)
+            model = argv[2];
+        if (argc >= 4)
+            api_key = argv[3];
+    }
+
+    llm_set_vision_model(host, model, api_key);
+
+    printf("Vision LLM: %s (model: %s)\n", host, model ? model : "(inherit)");
+    if (api_key)
+        printf("Vision API key saved.\n");
 }
 
 

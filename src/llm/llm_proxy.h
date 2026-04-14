@@ -94,6 +94,18 @@ int llm_chat_vision_raw(const char* prompt,
     const char* mime_type,
     char* response_buf, size_t buf_size);
 
+/** Vision config snapshot: returns the vision-specific model/api_key/host.
+ *  If vision model is not configured, falls back to the main LLM config. */
+void llm_snapshot_vision_config(char* model, size_t model_sz,
+    char* api_key, size_t key_sz,
+    char* host, size_t host_sz);
+
+/** Set independent vision model config.
+ *  host/model/api_key: set non-NULL/non-empty to override, NULL to clear.
+ *  Empty vision config falls back to main LLM config automatically. */
+int llm_set_vision_model(const char* host, const char* model,
+    const char* api_key);
+
 #ifdef __cplusplus
 }
 #endif
