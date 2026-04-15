@@ -23,21 +23,19 @@
 
 ### 编译
 
-```bash
-# 克隆到 openvela 工程
-git clone <your-git-repo-url>.git <openvela>/packages/ai_agent
+前提条件：下载 openvela 源码
 
-# 编译并运行 QEMU
-./build.sh vela_goldfish-arm64-v8a-ap --cmake
+```bash
+# 打开 menuconfig 启用 AI Agent
+./build.sh vendor/openvela/boards/vela/configs/goldfish-arm64-v8a-ap/ menuconfig
+# 路径：Application Configuration → Packages → Vela AI Agent，按空格启用
+
+# 编译
+./build.sh vendor/openvela/boards/vela/configs/goldfish-arm64-v8a-ap/ --cmake -j8
+
+# 运行 QEMU
 ./emulator.sh cmake_out/vela_goldfish-arm64-v8a-ap
 ```
-
-> 首次编译需在 `apps/CMakeLists.txt` 末尾 `add_subdirectory(builtin)` 之前加入：
-> ```cmake
-> if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/packages/CMakeLists.txt)
->   add_subdirectory(packages)
-> endif()
-> ```
 
 ### 基本使用
 
