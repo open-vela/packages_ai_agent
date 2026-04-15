@@ -27,7 +27,7 @@
 
 ```bash
 # 打开 menuconfig 启用 AI Agent
-./build.sh vendor/openvela/boards/vela/configs/goldfish-arm64-v8a-ap/ menuconfig
+./build.sh vendor/openvela/boards/vela/configs/goldfish-arm64-v8a-ap/ --cmake menuconfig
 # 路径：Application Configuration → Packages → Vela AI Agent，按空格启用
 
 # 编译
