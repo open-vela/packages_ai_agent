@@ -270,7 +270,7 @@ int llm_set_vision_model(const char* host, const char* model,
         strncpy(s_vision_host, host, sizeof(s_vision_host) - 1);
         s_vision_host[sizeof(s_vision_host) - 1] = '\0';
     } else {
-        config_del(AGENT_CFG_KEY_VISION_HOST);
+        claw_config_set(AGENT_CFG_KEY_VISION_HOST, "");
         s_vision_host[0] = '\0';
     }
 
@@ -279,7 +279,7 @@ int llm_set_vision_model(const char* host, const char* model,
         strncpy(s_vision_model, model, sizeof(s_vision_model) - 1);
         s_vision_model[sizeof(s_vision_model) - 1] = '\0';
     } else {
-        config_del(AGENT_CFG_KEY_VISION_MODEL);
+        claw_config_set(AGENT_CFG_KEY_VISION_MODEL, "");
         s_vision_model[0] = '\0';
     }
 
@@ -288,15 +288,15 @@ int llm_set_vision_model(const char* host, const char* model,
         strncpy(s_vision_api_key, api_key, sizeof(s_vision_api_key) - 1);
         s_vision_api_key[sizeof(s_vision_api_key) - 1] = '\0';
     } else {
-        config_del(AGENT_CFG_KEY_VISION_API_KEY);
+        claw_config_set(AGENT_CFG_KEY_VISION_API_KEY, "");
         s_vision_api_key[0] = '\0';
     }
-
-    pthread_mutex_unlock(&s_llm_lock);
 
     syslog(LOG_INFO, "[%s] Vision LLM config updated: model=%s host=%s\n",
         TAG, s_vision_model[0] ? s_vision_model : "(inherit)",
         s_vision_host[0] ? s_vision_host : "(inherit)");
+
+    pthread_mutex_unlock(&s_llm_lock);
     return OK;
 }
 
