@@ -15,12 +15,12 @@
  */
 
 #include "node/node_client.h"
-#include "core/message_bus.h"
-#include "cJSON.h"
-#include "infra/config_store.h"
-#include "tools/tool_registry.h"
 #include "agent_compat.h"
 #include "agent_config.h"
+#include "cJSON.h"
+#include "core/message_bus.h"
+#include "infra/config_store.h"
+#include "tools/tool_registry.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -59,6 +59,9 @@ typedef struct {
 
 static node_ws_t s_ws;
 static volatile bool s_running = false;
+static pthread_t s_thread;
+static bool s_thread_valid = false;
+static pthread_mutex_t s_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char s_gateway_host[128];
 static int s_gateway_port = 0;
 static char s_gateway_token[256];
@@ -73,7 +76,7 @@ static int entropy_func(void* data, unsigned char* output, size_t len)
         return 0;
     }
     syslog(LOG_ERR, "[node_client] CRITICAL: No secure entropy source available\n");
-    return -1;  /* Generic error - TLS handshake will fail safely */
+    return -1; /* Generic error - TLS handshake will fail safely */
 }
 
 /* ── Raw I/O ───────────────────────────────────────────────── */
@@ -124,9 +127,13 @@ static int read_exact(node_ws_t* ws, void* buf, size_t len)
 
 static int ws_send_text(node_ws_t* ws, const char* data, size_t len)
 {
-    if (!ws->connected)
+    pthread_mutex_lock(&s_mutex);
+    if (!ws->connected) {
+        pthread_mutex_unlock(&s_mutex);
         return -1;
+    }
 
+    int result = -1;
     uint8_t header[14];
     int hlen = 0;
     header[hlen++] = 0x81; /* FIN + text */
@@ -144,14 +151,15 @@ static int ws_send_text(node_ws_t* ws, const char* data, size_t len)
     }
 
     uint8_t mask[4];
-    entropy_func(NULL, mask, 4);
+    if (entropy_func(NULL, mask, 4) != 0)
+        goto out;
     header[hlen++] = mask[0];
     header[hlen++] = mask[1];
     header[hlen++] = mask[2];
     header[hlen++] = mask[3];
 
     if (raw_write(ws, header, hlen) < 0)
-        return -1;
+        goto out;
 
     const uint8_t* src = (const uint8_t*)data;
     uint8_t chunk[256];
@@ -162,10 +170,14 @@ static int ws_send_text(node_ws_t* ws, const char* data, size_t len)
         for (size_t i = 0; i < todo; i++)
             chunk[i] = src[off + i] ^ mask[(off + i) & 3];
         if (raw_write(ws, chunk, todo) < 0)
-            return -1;
+            goto out;
         off += todo;
     }
-    return 0;
+    result = 0;
+
+out:
+    pthread_mutex_unlock(&s_mutex);
+    return result;
 }
 
 /* ── Protocol helpers ──────────────────────────────────────── */
@@ -196,6 +208,11 @@ static int send_json_request(const char* method, cJSON* params)
         params ? params : cJSON_CreateObject());
 
     char* json = cJSON_PrintUnformatted(frame);
+    if (!json) {
+        syslog(LOG_ERR, "[%s] JSON serialization failed (OOM)\n", TAG);
+        cJSON_Delete(frame);
+        return -1;
+    }
     int ret = ws_send_text(&s_ws, json, strlen(json));
     syslog(LOG_DEBUG, "[%s] TX: %s\n", TAG, method);
     free(json);
@@ -319,7 +336,7 @@ static void handle_invoke(cJSON* payload)
 }
 
 /* ── Forward declarations ──────────────────────────────────── */
-static void do_disconnect(void);
+static void do_disconnect_locked(void); /* caller must hold s_mutex */
 
 /* ── TCP + TLS + WS handshake ──────────────────────────────── */
 static int do_connect(void)
@@ -399,7 +416,10 @@ static int do_connect(void)
 
     /* WebSocket upgrade handshake */
     uint8_t raw_key[16];
-    entropy_func(NULL, raw_key, sizeof(raw_key));
+    if (entropy_func(NULL, raw_key, sizeof(raw_key)) != 0) {
+        syslog(LOG_ERR, "[%s] Failed to generate WS key entropy\n", TAG);
+        goto fail;
+    }
     unsigned char b64_key[32] = { 0 };
     size_t b64_len = 0;
     mbedtls_base64_encode(b64_key, sizeof(b64_key) - 1, &b64_len, raw_key,
@@ -431,30 +451,87 @@ static int do_connect(void)
         goto fail;
     }
 
+    pthread_mutex_lock(&s_mutex);
     s_ws.connected = true;
+    pthread_mutex_unlock(&s_mutex);
     syslog(LOG_INFO, "[%s] WebSocket connected to %s:%d\n", TAG, s_gateway_host,
         s_gateway_port);
     return 0;
 
 fail:
-    do_disconnect();
+    pthread_mutex_lock(&s_mutex);
+    do_disconnect_locked();
+    pthread_mutex_unlock(&s_mutex);
     return -1;
 }
 
-static void do_disconnect(void)
+/* Phase 1: Close the underlying fd so any blocking recv/read returns
+ * immediately with an error.  Does NOT free TLS objects — the worker
+ * thread may still be unwinding through mbedtls_ssl_read when this
+ * runs.  Caller must hold s_mutex. */
+static void do_shutdown_fd_locked(void)
 {
+    s_ws.connected = false;
     if (s_ws.tls_init) {
-        mbedtls_ssl_close_notify(&s_ws.ssl);
-        mbedtls_ssl_free(&s_ws.ssl);
-        mbedtls_ssl_config_free(&s_ws.conf);
-        mbedtls_ctr_drbg_free(&s_ws.ctr_drbg);
-        mbedtls_net_free(&s_ws.net);
-        s_ws.tls_init = false;
+        /* Shut down the transport fd; mbedtls_ssl_read will return error */
+        if (s_ws.net.fd >= 0) {
+            shutdown(s_ws.net.fd, SHUT_RDWR);
+            close(s_ws.net.fd);
+            s_ws.net.fd = -1;
+        }
     } else if (s_ws.fd >= 0) {
+        shutdown(s_ws.fd, SHUT_RDWR);
         close(s_ws.fd);
     }
     s_ws.fd = -1;
-    s_ws.connected = false;
+}
+
+/* Phase 2: Free TLS library objects.  Only safe to call after the
+ * worker thread has exited (i.e. after pthread_join) or from the
+ * worker thread itself.  Caller must hold s_mutex. */
+static void do_free_tls_locked(void)
+{
+    if (s_ws.tls_init) {
+        mbedtls_ssl_free(&s_ws.ssl);
+        mbedtls_ssl_config_free(&s_ws.conf);
+        mbedtls_ctr_drbg_free(&s_ws.ctr_drbg);
+        /* net fd already closed in phase 1; just reset the context */
+        mbedtls_net_init(&s_ws.net);
+        s_ws.tls_init = false;
+    }
+}
+
+/* Full disconnect (both phases).  Used by the worker thread itself
+ * where there is no concurrent reader to race against. */
+static void do_disconnect_locked(void)
+{
+    do_shutdown_fd_locked();
+    do_free_tls_locked();
+}
+
+/* Thread-safe full disconnect for the worker thread's own use */
+static void do_disconnect(void)
+{
+    pthread_mutex_lock(&s_mutex);
+    do_disconnect_locked();
+    pthread_mutex_unlock(&s_mutex);
+}
+
+/* Interrupt-only disconnect for external callers (stop/start).
+ * Closes the fd to unblock the worker, but does NOT free TLS objects.
+ * Caller must pthread_join the worker, then call do_free_tls. */
+static void do_shutdown_fd(void)
+{
+    pthread_mutex_lock(&s_mutex);
+    do_shutdown_fd_locked();
+    pthread_mutex_unlock(&s_mutex);
+}
+
+static void do_free_tls(void)
+{
+    pthread_mutex_lock(&s_mutex);
+    do_free_tls_locked();
+    pthread_mutex_unlock(&s_mutex);
 }
 
 /* ── WS recv + message dispatch ────────────────────────────── */
@@ -513,7 +590,8 @@ static int ws_recv_frame(node_ws_t* ws, char* buf, size_t buf_size)
         pong_hdr[0] = 0x8A; /* FIN + pong */
         pong_hdr[1] = 0x80 | (uint8_t)read_len; /* masked, same payload */
         uint8_t pmask[4];
-        entropy_func(NULL, pmask, 4);
+        if (entropy_func(NULL, pmask, 4) != 0)
+            return -1;
         memcpy(pong_hdr + 2, pmask, 4);
         raw_write(ws, pong_hdr, 6);
         if (read_len > 0) {
@@ -657,7 +735,8 @@ static void* node_client_thread(void* arg)
                     uint8_t ping[6];
                     ping[0] = 0x89; /* FIN + ping */
                     ping[1] = 0x80; /* masked, 0 payload */
-                    entropy_func(NULL, ping + 2, 4); /* mask key */
+                    if (entropy_func(NULL, ping + 2, 4) != 0) /* mask key */
+                        break;
                     if (raw_write(&s_ws, ping, 6) < 0)
                         break;
                     last_ping = now;
@@ -697,13 +776,13 @@ int node_client_start(void)
     if (s_running) {
         syslog(LOG_INFO, "[%s] Stopping previous client...\n", TAG);
         s_running = false;
-        do_disconnect();
-        /* Give the old thread time to exit */
-        for (int i = 0; i < 20; i++) {
-            usleep(100000); /* 100ms */
-            if (!s_ws.connected)
-                break;
+        do_shutdown_fd();
+        /* Wait for old thread to actually exit */
+        if (s_thread_valid) {
+            pthread_join(s_thread, NULL);
+            s_thread_valid = false;
         }
+        do_free_tls();
     }
 
     /* Read gateway config */
@@ -720,20 +799,35 @@ int node_client_start(void)
         return OK; /* not an error — just not configured */
     }
 
+    memset(s_gateway_host, 0, sizeof(s_gateway_host));
     strncpy(s_gateway_host, host_buf, sizeof(s_gateway_host) - 1);
     s_gateway_port = port_buf[0] ? atoi(port_buf) : 8080;
+    memset(s_gateway_token, 0, sizeof(s_gateway_token));
     if (token_buf[0])
         strncpy(s_gateway_token, token_buf, sizeof(s_gateway_token) - 1);
     s_use_tls = (s_gateway_port == 443);
 
     s_running = true;
-    int ret = agent_task_create(node_client_thread, "node_client",
-        NODE_CLIENT_STACK, NULL, NODE_CLIENT_PRIO);
-    if (ret != OK) {
-        syslog(LOG_ERR, "[%s] Failed to create node client thread\n", TAG);
+
+    /* Create joinable thread (not detached) so we can synchronize on stop */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, NODE_CLIENT_STACK < 4096 ? 4096 : NODE_CLIENT_STACK);
+
+    struct sched_param sp;
+    sp.sched_priority = NODE_CLIENT_PRIO;
+    pthread_attr_setschedparam(&attr, &sp);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+
+    int ret = pthread_create(&s_thread, &attr, node_client_thread, NULL);
+    pthread_attr_destroy(&attr);
+    if (ret != 0) {
+        syslog(LOG_ERR, "[%s] Failed to create node client thread: %d\n", TAG, ret);
         s_running = false;
         return ERROR;
     }
+    s_thread_valid = true;
 
     syslog(LOG_INFO, "[%s] Node client started → %s:%d\n", TAG, s_gateway_host,
         s_gateway_port);
@@ -743,17 +837,28 @@ int node_client_start(void)
 void node_client_stop(void)
 {
     s_running = false;
-    do_disconnect();
+    /* Phase 1: close fd to unblock any blocking recv in the worker */
+    do_shutdown_fd();
+    /* Wait for worker thread to fully exit */
+    if (s_thread_valid) {
+        pthread_join(s_thread, NULL);
+        s_thread_valid = false;
+    }
+    /* Phase 2: now safe to free TLS objects — worker is gone */
+    do_free_tls();
     syslog(LOG_INFO, "[%s] Node client stopped\n", TAG);
 }
 
 int node_client_send_chat_message(const char* channel, const char* chat_id,
     const char* content)
 {
+    pthread_mutex_lock(&s_mutex);
     if (!s_ws.connected) {
+        pthread_mutex_unlock(&s_mutex);
         syslog(LOG_WARNING, "[%s] send_chat_message: not connected\n", TAG);
         return ERROR;
     }
+    pthread_mutex_unlock(&s_mutex);
 
     /* Use chat.forward — the same event name the gateway uses to push
      * messages to nodes, so the gateway already understands this payload
