@@ -21,9 +21,16 @@
 
 ## 快速开始
 
-### 编译
-
 前提条件：下载 openvela 源码
+- dev 分支：ai_agent 包可以通过 repo sync 自动获取；
+- trunk 分支：默认不包含 ai_agent，需手动引入 packages_ai_agent 仓库。
+
+对于 trunk 分支，请进入 openvela 根目录，执行以下命令，将该仓库克隆到正确路径：
+```bash
+git clone https://github.com/open-vela/packages_ai_agent.git packages/ai_agent
+```
+
+### 编译
 
 ```bash
 # 打开 menuconfig 启用 AI Agent
@@ -49,6 +56,13 @@ vela> mcp_add amap https://mcp.amap.com/mcp?key=xxx  # 接入高德地图 MCP
 vela> mcp_add didi https://mcp.didichuxing.com/mcp-servers?key=xxx  # 接入滴滴出行 MCP
 vela> mcp_discover                       # 发现远程工具
 ```
+
+### 使用 Mimo 订阅制 API（tp-）
+对于小米 Mimo 的订阅制 API（tp-），需要手动指定 Base URL 和模型名称。可以通过以下方式直接在 NSH 中配置：
+```bash
+vela> set_llm token-plan-cn.xiaomimimo.com mimo-v2-omni tp-xxxxxxxxxx   # 设置mimo-v2-omni
+```
+
 
 ## 支持的 LLM 后端
 
