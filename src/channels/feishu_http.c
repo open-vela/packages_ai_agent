@@ -17,6 +17,7 @@
 #include "channels/feishu_internal.h"
 #include "infra/config_store.h"
 #include "infra/http_proxy.h"
+#include "infra/url_parse.h"
 #include "infra/vela_tls.h"
 #include "cJSON.h"
 
@@ -373,32 +374,17 @@ int feishu_create_connection(char* ws_host, size_t host_cap,
 
     syslog(LOG_INFO, "[%s] Got WS URL: %s\n", TAG, ws_url);
 
-    /* Skip "wss://" prefix */
-    const char* p = ws_url;
-
-    if (strncmp(p, "wss://", 6) == 0) {
-        p += 6;
-    } else if (strncmp(p, "ws://", 5) == 0) {
-        p += 5;
+    parsed_url_t parsed;
+    if (url_parse(ws_url, &parsed) != 0) {
+        syslog(LOG_ERR, "[%s] Invalid WS URL: %s\n", TAG, ws_url);
+        cJSON_Delete(root);
+        return ERROR;
     }
 
-    /* Extract host and path */
-    const char* slash = strchr(p, '/');
-
-    if (slash) {
-        size_t hlen = (size_t)(slash - p);
-        if (hlen >= host_cap) {
-            hlen = host_cap - 1;
-        }
-        memcpy(ws_host, p, hlen);
-        ws_host[hlen] = '\0';
-        strncpy(ws_path, slash, path_cap - 1);
-        ws_path[path_cap - 1] = '\0';
-    } else {
-        strncpy(ws_host, p, host_cap - 1);
-        ws_host[host_cap - 1] = '\0';
-        strncpy(ws_path, "/", path_cap - 1);
-    }
+    strncpy(ws_host, parsed.host, host_cap - 1);
+    ws_host[host_cap - 1] = '\0';
+    strncpy(ws_path, parsed.path, path_cap - 1);
+    ws_path[path_cap - 1] = '\0';
 
     cJSON_Delete(root);
 

@@ -16,6 +16,7 @@
 
 #include "channels/cmd_llm.h"
 #include "infra/config_store.h"
+#include "infra/url_parse.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 #include "infra/http_proxy.h"
@@ -87,56 +88,20 @@ void cmd_set_llm(int argc, char** argv)
     const char* model = NULL;
     const char* api_key = NULL;
     int cost_tier = 1;
-    static char parsed_host[128];
 
     /* Check if arg1 is a URL (http:// or https://) */
     if (strncmp(arg1, "http://", 7) == 0 || strncmp(arg1, "https://", 8) == 0) {
-        /* Parse URL: scheme://host[:port][/path] */
-        int is_https = (strncmp(arg1, "https://", 8) == 0);
-        const char* after_scheme = arg1 + (is_https ? 8 : 7);
-        port = is_https ? "443" : "80";
-
-        /* Find host end (first '/' or ':' or end) */
-        const char* slash = strchr(after_scheme, '/');
-        const char* colon = strchr(after_scheme, ':');
-
-        if (colon && (!slash || colon < slash)) {
-            /* host:port/path */
-            size_t hlen = (size_t)(colon - after_scheme);
-            if (hlen >= sizeof(parsed_host))
-                hlen = sizeof(parsed_host) - 1;
-            memcpy(parsed_host, after_scheme, hlen);
-            parsed_host[hlen] = '\0';
-            host = parsed_host;
-
-            /* Extract port */
-            static char parsed_port[8];
-            const char* port_start = colon + 1;
-            const char* port_end = slash ? slash : port_start + strlen(port_start);
-            size_t plen = (size_t)(port_end - port_start);
-            if (plen >= sizeof(parsed_port))
-                plen = sizeof(parsed_port) - 1;
-            memcpy(parsed_port, port_start, plen);
-            parsed_port[plen] = '\0';
-            port = parsed_port;
-        } else if (slash) {
-            /* host/path (no port) */
-            size_t hlen = (size_t)(slash - after_scheme);
-            if (hlen >= sizeof(parsed_host))
-                hlen = sizeof(parsed_host) - 1;
-            memcpy(parsed_host, after_scheme, hlen);
-            parsed_host[hlen] = '\0';
-            host = parsed_host;
-        } else {
-            /* host only */
-            strncpy(parsed_host, after_scheme, sizeof(parsed_host) - 1);
-            parsed_host[sizeof(parsed_host) - 1] = '\0';
-            host = parsed_host;
+        static parsed_url_t parsed;
+        if (url_parse(arg1, &parsed) != 0) {
+            printf("Invalid URL: %s\n", arg1);
+            return;
         }
+        host = parsed.host;
+        port = parsed.port;
 
         /* Extract path from URL */
-        if (slash && slash[1]) {
-            path = slash;
+        if (parsed.path[0] && parsed.path[1]) {
+            path = parsed.path;
         } else {
             path = "/v1/chat/completions";
         }
