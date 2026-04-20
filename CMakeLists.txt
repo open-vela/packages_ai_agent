@@ -124,6 +124,22 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     )
   endif()
 
+  if(CONFIG_AI_AGENT_BLE_GATT)
+    list(APPEND AGENT_SRCS src/infra/ble_gatt.c)
+  endif()
+
+  if(CONFIG_AI_AGENT_BLE_NET)
+    list(APPEND AGENT_SRCS src/infra/ble_net.c)
+  endif()
+
+  if(CONFIG_AI_AGENT_XIAOZHI)
+    list(APPEND AGENT_SRCS
+      src/channels/xiaozhi_channel.c
+      src/channels/xiaozhi_opus.c
+      src/channels/xiaozhi_udp.c
+    )
+  endif()
+
   # cJSON from apps/netutils/cjson
   set(CJSON_INC ${NUTTX_APPS_DIR}/netutils/cjson/cJSON)
 

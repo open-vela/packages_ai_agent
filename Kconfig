@@ -192,6 +192,36 @@ config AI_AGENT_TEST_IMAGE_DIR
 		Images can be pre-pushed via adb or generated at runtime.
 		Must be on a writable filesystem.
 
+config AI_AGENT_BLE_GATT
+	bool "Enable BLE GATT data channel"
+	default n
+	depends on BLUETOOTH
+	---help---
+		Enable the BLE GATT data channel using Nordic UART Service
+		(NUS) pattern. Provides bidirectional data exchange over BLE
+		without classic Bluetooth. Suitable for iOS devices and
+		low-power BLE-only chips. Costs ~8KB code + ~2KB RAM.
+
+config AI_AGENT_BLE_NET
+	bool "Enable BLE network channel (SPP + TUN)"
+	default n
+	depends on BLUETOOTH
+	---help---
+		Enable the BLE network channel using SPP + TUN for IP
+		traffic proxy through a companion phone app. Costs ~12KB
+		code + ~4KB RAM (TUN buffer + SPP state). Requires a
+		companion app on the phone to proxy network traffic.
+
+config AI_AGENT_XIAOZHI
+	bool "Enable XiaoZhi channel"
+	default n
+	---help---
+		Enable the XiaoZhi WebSocket protocol channel. Connects
+		to XiaoZhi Server via WSS for JSON control messages and
+		binary Opus audio frames. Includes OTA config fetch,
+		auto-reconnect with exponential backoff, and MCP support.
+		Costs ~16KB code + ~12KB RAM (WS buffers + Opus codec).
+
 config AI_AGENT_NET_RPMSG
 	bool "Use RPMSG/TUN network (no Wi-Fi)"
 	default n

@@ -138,6 +138,9 @@ static void cmd_help(void)
         "  set_voice_asr <name>   - Switch ASR backend\n"
         "  set_weixin_token <tok> - Set WeChat bot token\n"
         "  weixin_login           - QR code login to WeChat\n"
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        "  set_xiaozhi <ota_url>  - Set XiaoZhi OTA endpoint URL\n"
+#endif
         "  router_status          - Show LLM router status\n"
         "  router_set <preset> <key> - Add LLM backend (deepseek/kimi/qwen/openai...)\n"
         "  router_model <idx> <model> - Change model for a backend\n"
@@ -829,6 +832,21 @@ static void cmd_skill_sync(void)
 }
 #endif
 
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+static void cmd_set_xiaozhi(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_xiaozhi <ota_url>\n"
+               "  Example: set_xiaozhi https://api.tenclass.net/xiaozhi/ota/\n");
+        return;
+    }
+
+    claw_config_set(AGENT_CFG_KEY_XIAOZHI_ENDPOINT, argv[1]);
+    printf("XiaoZhi endpoint set to: %s\n", argv[1]);
+    printf("Restart ai_agent to connect.\n");
+}
+#endif
+
 /* ── CLI thread ───────────────────────────────────────────────── */
 
 static void* cli_thread(void* arg)
@@ -969,6 +987,10 @@ static void* cli_thread(void* arg)
             cmd_set_weixin_token(argc, argv);
         else if (strcmp(cmd, "weixin_login") == 0)
             cmd_weixin_login();
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        else if (strcmp(cmd, "set_xiaozhi") == 0)
+            cmd_set_xiaozhi(argc, argv);
+#endif
         else if (strcmp(cmd, "launch_app") == 0)
             cmd_launch_app(argc, argv);
         else if (strcmp(cmd, "exit_app") == 0)

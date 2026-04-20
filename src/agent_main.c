@@ -74,6 +74,9 @@
 #ifdef CONFIG_AI_AGENT_WEIXIN
 #include "channels/weixin_channel.h"
 #endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+#include "channels/xiaozhi_channel.h"
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #include "ui/lvgl_ui_channel.h"
 #endif
@@ -123,6 +126,9 @@ static void net_state_change_cb(net_state_t state, void* arg)
 #endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
         weixin_channel_start();
+#endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        xiaozhi_channel_start();
 #endif
         g_net_services_started = true;
     } else if (state == NET_STATE_DISCONNECTED) {
@@ -176,6 +182,10 @@ static void* network_watch_task(void* arg)
         if (weixin_channel_start() != OK)
             syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
 #endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        if (xiaozhi_channel_start() != OK)
+            syslog(LOG_WARNING, "[%s] xiaozhi_channel_start failed\n", TAG);
+#endif
 
         syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
 
@@ -209,7 +219,7 @@ static time_t s_voice_cooldown_until;
 
 /**
  * Reads messages from the outbound queue and dispatches them to the
- * appropriate channel (飞书, WebSocket, CLI, etc.).
+ * appropriate channel (Feishu, WebSocket, CLI, etc.).
  */
 static void* outbound_dispatch_task(void* arg)
 {
@@ -469,6 +479,11 @@ int ai_agent_main(int argc, char* argv[])
         BOOT_LOG_RC(&t0, "P3", "weixin_channel_init", rc);
 #endif
 
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        rc = xiaozhi_channel_init();
+        BOOT_LOG_RC(&t0, "P3", "xiaozhi_channel_init", rc);
+#endif
+
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         rc = lvgl_ui_channel_init();
         BOOT_LOG_RC(&t0, "P3", "lvgl_ui_channel_init", rc);
@@ -542,6 +557,9 @@ int ai_agent_main(int argc, char* argv[])
     /* Phase 5 services (network-dependent) */
 #ifdef CONFIG_AI_AGENT_WEIXIN
     weixin_channel_stop();
+#endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+    xiaozhi_channel_stop();
 #endif
 #ifdef CONFIG_AI_AGENT_NODE
     node_client_stop();
