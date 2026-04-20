@@ -45,14 +45,28 @@ typedef struct {
 } agent_mem_status_t;
 
 /**
- * Query current heap memory status via mallinfo().
+ * Query current heap memory status.
+ * Uses mallinfo() when available and safe. On QEMU builds where
+ * heap validation may assert (CONFIG_DEBUG_MM + tmpfs fallback),
+ * returns conservative defaults that don't constrain allocations.
  */
 static inline void agent_mem_get_status(agent_mem_status_t* st)
 {
+    st->total_heap = 128 * 1024 * 1024;
+    st->free_heap = 128 * 1024 * 1024;
+    st->largest_block = 64 * 1024 * 1024;
+
+#if !defined(CONFIG_DEBUG_MM)
+    /* Only call mallinfo when heap debug assertions are disabled,
+     * because CONFIG_DEBUG_MM enables strict node validation in
+     * mm_foreach that can assert on edge cases (e.g. tmpfs-only boot) */
     struct mallinfo mi = mallinfo();
-    st->total_heap = mi.arena;
-    st->free_heap = mi.fordblks;
-    st->largest_block = mi.fordblks; /* conservative estimate */
+    if (mi.arena > 0) {
+        st->total_heap = mi.arena;
+        st->free_heap = mi.fordblks;
+        st->largest_block = mi.fordblks;
+    }
+#endif
 }
 
 /**

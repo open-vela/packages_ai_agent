@@ -22,6 +22,7 @@
 
 #include "channels/ws_server.h"
 #include "core/message_bus.h"
+#include "infra/a2a_handler.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_manager.h"
 #endif
@@ -145,30 +146,39 @@ static int make_accept_key(const char* key, char* out, size_t out_size)
  * Read full HTTP upgrade request, extract Sec-WebSocket-Key.
  * Returns 0 on success; sends 101 response.
  */
-static int do_ws_handshake(int fd, char* chat_id_out, size_t chat_id_size)
+/**
+ * WebSocket handshake. If pre_buf is non-NULL, use it as already-read
+ * HTTP headers; otherwise read from fd.
+ */
+static int do_ws_handshake_ex(int fd, const char *pre_buf, int pre_len,
+                               char *chat_id_out, size_t chat_id_size)
 {
-    char buf[1024];
-    int total = 0;
+    char local_buf[1024];
+    const char *buf;
 
-    /* Read until we see the end of headers */
-    while (total < (int)sizeof(buf) - 1) {
-        int n = recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
-        if (n <= 0)
-            return -1;
-        total += n;
-        buf[total] = '\0';
-        if (strstr(buf, "\r\n\r\n"))
-            break;
+    if (pre_buf) {
+        buf = pre_buf;
+    } else {
+        int total = 0;
+        while (total < (int)sizeof(local_buf) - 1) {
+            int n = recv(fd, local_buf + total,
+                         sizeof(local_buf) - 1 - total, 0);
+            if (n <= 0) return -1;
+            total += n;
+            local_buf[total] = '\0';
+            if (strstr(local_buf, "\r\n\r\n")) break;
+        }
+        buf = local_buf;
     }
 
     /* Extract Sec-WebSocket-Key */
-    char* key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
+    const char *key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
     if (!key_hdr) {
         syslog(LOG_WARNING, "[%s] No Sec-WebSocket-Key\n", TAG);
         return -1;
     }
     key_hdr += 21;
-    char* eol = strstr(key_hdr, "\r\n");
+    const char *eol = strstr(key_hdr, "\r\n");
     if (!eol)
         return -1;
 
@@ -195,7 +205,6 @@ static int do_ws_handshake(int fd, char* chat_id_out, size_t chat_id_size)
     if (send(fd, resp, rlen, 0) != rlen)
         return -1;
 
-    /* Default chat_id from fd (may be overridden by first message) */
     snprintf(chat_id_out, chat_id_size, "ws_%d", fd);
     return 0;
 }
@@ -356,9 +365,28 @@ static void* client_thread(void* arg)
     free(arg);
     int fd = ca.fd;
 
-    /* Handshake */
+    /* Peek HTTP headers to decide: A2A HTTP or WebSocket upgrade */
+    char peek_buf[2048];
+    int peek_total = 0;
+    while (peek_total < (int)sizeof(peek_buf) - 1) {
+        int n = recv(fd, peek_buf + peek_total,
+                     sizeof(peek_buf) - 1 - peek_total, 0);
+        if (n <= 0) { close(fd); return NULL; }
+        peek_total += n;
+        peek_buf[peek_total] = '\0';
+        if (strstr(peek_buf, "\r\n\r\n")) break;
+    }
+
+    /* Try A2A HTTP routes first */
+    if (a2a_try_handle(fd, peek_buf, peek_total)) {
+        close(fd);
+        return NULL;
+    }
+
+    /* Not A2A — proceed with WebSocket handshake */
     char chat_id[32];
-    if (do_ws_handshake(fd, chat_id, sizeof(chat_id)) != 0) {
+    if (do_ws_handshake_ex(fd, peek_buf, peek_total,
+                            chat_id, sizeof(chat_id)) != 0) {
         syslog(LOG_WARNING, "[%s] Handshake failed for fd=%d\n", TAG, fd);
         close(fd);
         return NULL;
