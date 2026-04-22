@@ -23,6 +23,7 @@
 #include "channels/ws_server.h"
 #include "core/message_bus.h"
 #include "infra/a2a_handler.h"
+#include "tools/mcp_server.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_manager.h"
 #endif
@@ -379,6 +380,12 @@ static void* client_thread(void* arg)
 
     /* Try A2A HTTP routes first */
     if (a2a_try_handle(fd, peek_buf, peek_total)) {
+        close(fd);
+        return NULL;
+    }
+
+    /* Try MCP Server (for remote MCP client integration) */
+    if (mcp_server_try_handle_http(fd, peek_buf, peek_total)) {
         close(fd);
         return NULL;
     }

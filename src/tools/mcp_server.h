@@ -138,6 +138,10 @@ void mcp_server_stop_stdio(mcp_server_t *server);
 /* Request handler */
 char *mcp_server_handle_request(mcp_server_t *server, const char *request_json);
 
+/* HTTP transport — for remote MCP client integration via ws_server.
+ * Routes POST /mcp to mcp_server_handle_request with tool_registry fallback. */
+bool mcp_server_try_handle_http(int fd, const char *buf, int buf_len);
+
 #ifdef __cplusplus
 }
 #endif

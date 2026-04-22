@@ -15,10 +15,15 @@
  */
 
 #include "tools/mcp_server.h"
+#include "tools/tool_registry.h"
+#include "agent_config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
+#include <syslog.h>
+#include <sys/socket.h>
 #include "cJSON.h"
 
 /* JSON-RPC error codes */
@@ -460,4 +465,214 @@ void mcp_server_stop_stdio(mcp_server_t *server)
     server->stdio_running = false;
     pthread_cancel(server->stdio_thread);
     pthread_join(server->stdio_thread, NULL);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  HTTP Transport — for remote MCP client integration via ws_server
+ *
+ *  Unlike stdio transport which uses mcp_server's own tool registry,
+ *  HTTP transport bridges to the main tool_registry (36+ real tools).
+ *  This lets remote clients discover and call all device tools via standard MCP.
+ *
+ *  Remote client config:
+ *    {"name":"vela-watch","url":"http://<IP>:28789/mcp","transport":"http"}
+ * ══════════════════════════════════════════════════════════════ */
+
+static const char *HTTP_TAG = "mcp_srv";
+
+static void http_respond(int fd, int status, const char *status_text,
+                         const char *body)
+{
+    int body_len = body ? (int)strlen(body) : 0;
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n",
+        status, status_text, body_len);
+    if (hlen >= (int)sizeof(hdr))
+        hlen = (int)sizeof(hdr) - 1;
+    send(fd, hdr, hlen, 0);
+    if (body && body_len > 0)
+        send(fd, body, body_len, 0);
+}
+
+static void http_jsonrpc_result(int fd, cJSON *id, cJSON *result)
+{
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) { cJSON_Delete(result); return; }
+    cJSON_AddStringToObject(resp, "jsonrpc", "2.0");
+    cJSON_AddItemToObject(resp, "id", id ? cJSON_Duplicate(id, 1)
+                                         : cJSON_CreateNull());
+    cJSON_AddItemToObject(resp, "result", result);
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (json) { http_respond(fd, 200, "OK", json); free(json); }
+}
+
+static void http_jsonrpc_error(int fd, cJSON *id, int code, const char *msg)
+{
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) return;
+    cJSON_AddStringToObject(resp, "jsonrpc", "2.0");
+    cJSON_AddItemToObject(resp, "id", id ? cJSON_Duplicate(id, 1)
+                                         : cJSON_CreateNull());
+    cJSON *err = cJSON_AddObjectToObject(resp, "error");
+    if (err) {
+        cJSON_AddNumberToObject(err, "code", code);
+        cJSON_AddStringToObject(err, "message", msg);
+    }
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (json) { http_respond(fd, 200, "OK", json); free(json); }
+}
+
+static void http_handle_initialize(int fd, cJSON *id)
+{
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "protocolVersion", "2024-11-05");
+    cJSON *caps = cJSON_AddObjectToObject(r, "capabilities");
+    if (caps) cJSON_AddObjectToObject(caps, "tools");
+    cJSON *info = cJSON_AddObjectToObject(r, "serverInfo");
+    if (info) {
+        cJSON_AddStringToObject(info, "name",
+            CONFIG_EXAMPLES_AI_AGENT_VELA_PROGNAME);
+        cJSON_AddStringToObject(info, "version", "1.0.0");
+    }
+    syslog(LOG_INFO, "[%s] initialize\n", HTTP_TAG);
+    http_jsonrpc_result(fd, id, r);
+}
+
+static void http_handle_tools_list(int fd, cJSON *id)
+{
+    char *src_json = tool_registry_get_tools_json();
+    cJSON *r = cJSON_CreateObject();
+    cJSON *arr = cJSON_CreateArray();
+
+    if (src_json) {
+        cJSON *src = cJSON_Parse(src_json);
+        if (src) {
+            cJSON *t;
+            cJSON_ArrayForEach(t, src) {
+                cJSON *n = cJSON_GetObjectItem(t, "name");
+                cJSON *d = cJSON_GetObjectItem(t, "description");
+                cJSON *s = cJSON_GetObjectItem(t, "input_schema");
+                cJSON *tool = cJSON_CreateObject();
+                if (!tool) continue;
+                if (cJSON_IsString(n))
+                    cJSON_AddStringToObject(tool, "name", n->valuestring);
+                if (cJSON_IsString(d))
+                    cJSON_AddStringToObject(tool, "description", d->valuestring);
+                cJSON_AddItemToObject(tool, "inputSchema",
+                    s ? cJSON_Duplicate(s, 1)
+                      : cJSON_Parse("{\"type\":\"object\",\"properties\":{}}"));
+                cJSON_AddItemToArray(arr, tool);
+            }
+            cJSON_Delete(src);
+        }
+        free(src_json);
+    }
+
+    cJSON_AddItemToObject(r, "tools", arr);
+    syslog(LOG_INFO, "[%s] tools/list: %d\n", HTTP_TAG, cJSON_GetArraySize(arr));
+    http_jsonrpc_result(fd, id, r);
+}
+
+static void http_handle_tools_call(int fd, cJSON *id, cJSON *params)
+{
+    cJSON *name = cJSON_GetObjectItem(params, "name");
+    cJSON *args = cJSON_GetObjectItem(params, "arguments");
+    if (!cJSON_IsString(name)) {
+        http_jsonrpc_error(fd, id, JSONRPC_INVALID_PARAMS, "missing params.name");
+        return;
+    }
+
+    char *args_str = args ? cJSON_PrintUnformatted(args) : strdup("{}");
+    if (!args_str) { http_jsonrpc_error(fd, id, JSONRPC_INTERNAL_ERROR, "OOM"); return; }
+
+    char *output = malloc(8192);
+    if (!output) { free(args_str); http_jsonrpc_error(fd, id, JSONRPC_INTERNAL_ERROR, "OOM"); return; }
+    output[0] = '\0';
+
+    syslog(LOG_INFO, "[%s] tools/call: %s\n", HTTP_TAG, name->valuestring);
+    int rc = tool_registry_execute(name->valuestring, args_str, output, 8192);
+    free(args_str);
+
+    cJSON *r = cJSON_CreateObject();
+    cJSON *content = cJSON_AddArrayToObject(r, "content");
+    if (content) {
+        cJSON *item = cJSON_CreateObject();
+        if (item) {
+            cJSON_AddStringToObject(item, "type", "text");
+            cJSON_AddStringToObject(item, "text",
+                (rc == 0 && output[0]) ? output : "tool execution failed");
+            cJSON_AddItemToArray(content, item);
+        }
+    }
+    if (rc != 0) cJSON_AddBoolToObject(r, "isError", 1);
+    free(output);
+    http_jsonrpc_result(fd, id, r);
+}
+
+static void http_dispatch(int fd, const char *body)
+{
+    cJSON *req = cJSON_Parse(body);
+    if (!req) { http_jsonrpc_error(fd, NULL, JSONRPC_PARSE_ERROR, "parse error"); return; }
+
+    cJSON *method = cJSON_GetObjectItem(req, "method");
+    cJSON *id = cJSON_GetObjectItem(req, "id");
+    cJSON *params = cJSON_GetObjectItem(req, "params");
+
+    if (!cJSON_IsString(method)) {
+        http_jsonrpc_error(fd, id, JSONRPC_INVALID_REQUEST, "missing method");
+        cJSON_Delete(req);
+        return;
+    }
+
+    const char *m = method->valuestring;
+    if (strcmp(m, "initialize") == 0)
+        http_handle_initialize(fd, id);
+    else if (strcmp(m, "notifications/initialized") == 0)
+        http_respond(fd, 200, "OK", "");
+    else if (strcmp(m, "tools/list") == 0)
+        http_handle_tools_list(fd, id);
+    else if (strcmp(m, "tools/call") == 0)
+        http_handle_tools_call(fd, id, params);
+    else
+        http_jsonrpc_error(fd, id, JSONRPC_METHOD_NOT_FOUND, "method not found");
+
+    cJSON_Delete(req);
+}
+
+bool mcp_server_try_handle_http(int fd, const char *buf, int buf_len)
+{
+    if (strncmp(buf, "POST ", 5) != 0) return false;
+    const char *pe = strchr(buf + 5, ' ');
+    if (!pe || (pe - buf - 5) != 4 || strncmp(buf + 5, "/mcp", 4) != 0)
+        return false;
+
+    const char *bs = strstr(buf, "\r\n\r\n");
+    if (!bs) { http_respond(fd, 400, "Bad Request", ""); return true; }
+    bs += 4;
+
+    int bib = buf_len - (int)(bs - buf);
+    char body[4096];
+    if (bib > 0 && bib < (int)sizeof(body))
+        memcpy(body, bs, bib);
+    else
+        bib = 0;
+
+    const char *cl = strcasestr(buf, "\r\nContent-Length: ");
+    int clen = cl ? atoi(cl + 18) : 0;
+    if (clen > (int)sizeof(body) - 1) clen = (int)sizeof(body) - 1;
+    while (bib < clen) {
+        int n = recv(fd, body + bib, clen - bib, 0);
+        if (n <= 0) break;
+        bib += n;
+    }
+    body[bib] = '\0';
+
+    http_dispatch(fd, body);
+    return true;
 }
