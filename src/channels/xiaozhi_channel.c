@@ -50,13 +50,11 @@ static const char* TAG = "xiaozhi";
 /* ── State machine ────────────────────────────────────────── */
 
 static const uint8_t s_allowed[XZ_STATE_MAX][XZ_STATE_MAX] = {
-    /* DISC CONN MQTC CHOP UDPC ASTR */
-    { 0, 1, 0, 0, 0, 0 }, /* Disconnected */
-    { 1, 0, 1, 0, 0, 0 }, /* MqttConnecting (reused as WsConnecting) */
-    { 1, 0, 0, 1, 0, 0 }, /* MqttConnected (reused as WsConnected) */
-    { 1, 0, 1, 0, 0, 0 }, /* ChannelOpened */
-    { 1, 0, 0, 1, 0, 0 }, /* UdpConnected (unused in WS mode) */
-    { 1, 0, 0, 1, 0, 0 }, /* AudioStreaming (unused in WS mode) */
+    /* DISC CONN WCON CHOP */
+    { 0, 1, 0, 0 }, /* Disconnected */
+    { 1, 0, 1, 0 }, /* Connecting */
+    { 1, 0, 0, 1 }, /* Connected */
+    { 1, 0, 1, 0 }, /* ChannelOpened */
 };
 
 static xiaozhi_state_t s_state = XZ_STATE_DISCONNECTED;
@@ -456,7 +454,7 @@ static void* ws_task(void* arg)
 
         /* Receive loop */
         {
-            char buf[8192];
+            char buf[4096];
             while (s_running) {
                 uint8_t opcode = 0;
                 int n = ws_client_recv(&s_ws, &opcode, buf, sizeof(buf) - 1);

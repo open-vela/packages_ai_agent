@@ -91,7 +91,7 @@ void cmd_set_llm(int argc, char** argv)
 
     /* Check if arg1 is a URL (http:// or https://) */
     if (strncmp(arg1, "http://", 7) == 0 || strncmp(arg1, "https://", 8) == 0) {
-        static parsed_url_t parsed;
+        parsed_url_t parsed;
         if (url_parse(arg1, &parsed) != 0) {
             printf("Invalid URL: %s\n", arg1);
             return;
@@ -107,7 +107,7 @@ void cmd_set_llm(int argc, char** argv)
         }
 
         /* Append /chat/completions if path is just /v1 */
-        static char full_path[256];
+        char full_path[256];
         if (strcmp(path, "/v1") == 0 || strcmp(path, "/v1/") == 0) {
             snprintf(full_path, sizeof(full_path), "/v1/chat/completions");
             path = full_path;

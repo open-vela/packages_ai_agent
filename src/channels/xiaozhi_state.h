@@ -26,11 +26,9 @@
 
 typedef enum {
     XZ_STATE_DISCONNECTED = 0,
-    XZ_STATE_CONNECTING,       /* was MQTT_CONNECTING, now WS connecting */
-    XZ_STATE_CONNECTED,        /* was MQTT_CONNECTED, now WS connected */
+    XZ_STATE_CONNECTING,
+    XZ_STATE_CONNECTED,
     XZ_STATE_CHANNEL_OPENED,
-    XZ_STATE_UDP_CONNECTED,    /* reserved for MQTT+UDP mode */
-    XZ_STATE_AUDIO_STREAMING,  /* reserved for MQTT+UDP mode */
     XZ_STATE_MAX
 } xiaozhi_state_t;
 
@@ -41,8 +39,6 @@ static inline const char* xiaozhi_state_name(xiaozhi_state_t s)
         "Connecting",
         "Connected",
         "ChannelOpened",
-        "UdpConnected",
-        "AudioStreaming",
     };
 
     if (s >= 0 && s < XZ_STATE_MAX) {
