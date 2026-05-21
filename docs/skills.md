@@ -9,7 +9,7 @@ Skills 是 Markdown 格式的可扩展技能，告诉 Agent 在特定场景下�
 ├── weather.md          ← 内置（首次启动自动安装）
 ├── daily-briefing.md
 ├── reminder.md
-├── ...                 ← 10 个内置 Skill
+├── ...                 ← 多个内置 Skill
 └── my-custom.md        ← 用户自定义
 
 启动流程：
@@ -38,7 +38,7 @@ agent_loop → 根据用户请求匹配 Skill → 按指引调用工具
 2. 提取每个 Skill 的标题和描述，构建摘要注入系统提示词
 3. Agent 根据用户请求自动匹配合适的 Skill 并按其指引执行
 
-## 内置 Skills（10 个）
+## 内置 Skills（示例）
 
 | Skill | 说明 |
 |-------|------|

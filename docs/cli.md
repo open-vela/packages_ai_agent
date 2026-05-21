@@ -87,6 +87,17 @@ AI Agent 通过 NuttX NSH shell 提供以下命令。启动后输入 `help` 查�
 | `node_stop` | 断开 Node 连接 |
 | `node_list` | 列出已连接 Node |
 
+## Skills 与 MCP
+
+| 命令 | 说明 |
+|------|------|
+| `install_skill <name> <url>` | 从 HTTPS URL 下载并安装 Skill Markdown 文件 |
+| `mcp_add <name> <url> [token]` | 添加远程 MCP Server |
+| `mcp_remove <name>` | 移除远程 MCP Server |
+| `mcp_discover` | 从所有已添加的 MCP Server 发现远程工具 |
+| `mcp_status` | 查看 MCP Client 连接状态 |
+| `mcp_tools` | 列出已发现的远程 MCP 工具 |
+
 ## 会话与记忆
 
 | 命令 | 说明 |
