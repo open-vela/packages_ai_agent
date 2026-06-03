@@ -29,7 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── Router presets (shared by set_llm and router_set) ─────────── */
+/* ---- Router presets (shared by set_llm and router_set) ---- */
 
 typedef struct {
     const char* name;
@@ -53,7 +53,7 @@ static const router_preset_t g_router_presets[] = {
     { NULL, NULL, NULL, NULL, 0 }
 };
 
-/* ── cmd_set_llm ──────────────────────────────────────────────── */
+/* ---- cmd_set_llm ---- */
 
 void cmd_set_llm(int argc, char** argv)
 {
@@ -153,7 +153,7 @@ void cmd_set_llm(int argc, char** argv)
         if (argc >= 4)
             api_key = argv[3];
     }
-    /* Check presets — reuse g_router_presets table */
+    /* Check presets - reuse g_router_presets table */
     else {
         const router_preset_t* preset = NULL;
         for (int i = 0; g_router_presets[i].name; i++) {
@@ -211,7 +211,10 @@ void cmd_set_llm(int argc, char** argv)
     backend.cost_tier = cost_tier;
     backend.enabled = true;
 
-    /* Write to router slot 0 and apply immediately */
+    /* Write to router slot 0 and apply immediately.
+     * llm_router_apply() -> llm_set_all() already persists
+     * llm_host/llm_path/llm_port/api_key/model to config_store,
+     * so config_show and reboot are covered without extra writes here. */
     llm_router_set_backend(0, &backend);
     llm_router_apply(0);
 
@@ -223,7 +226,7 @@ void cmd_set_llm(int argc, char** argv)
 }
 
 
-/* ── cmd_set_vision_llm ──────────────────────────────────────── */
+/* ---- cmd_set_vision_llm ---- */
 
 void cmd_set_vision_llm(int argc, char** argv)
 {
@@ -302,7 +305,7 @@ void cmd_set_vision_llm(int argc, char** argv)
 }
 
 
-/* ── list_models helpers ──────────────────────────────────────── */
+/* ---- list_models helpers ---- */
 
 #define LIST_MODELS_BUF_SIZE (256 * 1024)
 #define LIST_MODELS_PATH "/api/v1/models"
@@ -535,7 +538,7 @@ void cmd_list_models(int argc, char** argv)
 }
 
 
-/* ── Router commands ──────────────────────────────────────────── */
+/* ---- Router commands ---- */
 
 void cmd_router_status(void)
 {
