@@ -7,6 +7,7 @@ tools/*_test.py
 *.tmp
 *.log
 *.bak
+*.un~
 
 # IDE files
 .vscode/
