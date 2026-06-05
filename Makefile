@@ -155,6 +155,9 @@ endif
 # stubs
 CSRCS += src/stubs.c
 
+# local IPC client (flat-build direct call)
+CSRCS += src/sdk/velaclaw_client_local.c
+
 CSRCS += src/ui/qrcode_display.c
 
 ifeq ($(CONFIG_AI_AGENT_LVGL_UI),y)
