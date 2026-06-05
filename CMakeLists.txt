@@ -155,6 +155,16 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   # MQTT-C library
   set(MQTTC_INC ${NUTTX_APPS_DIR}/netutils/mqttc/MQTT-C/include)
 
+  # Direct ALSA capture backend (chip-specific, opt-in)
+  if(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT)
+    set(ALSA_DIRECT_INC
+      ${NUTTX_APPS_DIR}/audioutils/alsa-lib/include
+      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/hal
+      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/osal
+      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/hal/source
+    )
+  endif()
+
   # BES AEC (audio preprocessing: NS + AGC)
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
     set(BES_AEC_INC ${NUTTX_APPS_DIR}/vendor/xiaomi/miwear/bes_aec/inc)
@@ -176,6 +186,10 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
     list(APPEND AGENT_INCDIRS ${BES_AEC_INC})
+  endif()
+
+  if(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT)
+    list(APPEND AGENT_INCDIRS ${ALSA_DIRECT_INC})
   endif()
 
   nuttx_add_application(

@@ -40,6 +40,9 @@ int audio_capture_start(audio_capture_t *cap);
 int audio_capture_read(audio_capture_t *cap,
     void *buf, size_t len);
 
+/* Interrupt any in-flight blocking read without freeing the handle. */
+int audio_capture_abort(audio_capture_t* cap);
+
 /* Stop recording and release all resources. */
 void audio_capture_close(audio_capture_t *cap);
 

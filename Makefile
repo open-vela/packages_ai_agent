@@ -33,6 +33,12 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/topics/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/vibrator
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/multimedia/media/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/connectivity/bluetooth/framework/include
+ifeq ($(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT),y)
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/audioutils/alsa-lib/include
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/hal
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/osal
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos-hal/hal/source
+endif
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/mqttc/MQTT-C/include
 
 # Source files

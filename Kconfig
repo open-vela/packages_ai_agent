@@ -149,6 +149,19 @@ config AI_AGENT_AUDIO_CAPTURE_GAIN
 		- 6 = Compensate for 6-channel DMIC with 1 active mic
 		- Higher values for more amplification (may clip)
 
+config AI_AGENT_AUDIO_ALSA_DIRECT
+	bool "Use direct ALSA capture backend"
+	default n
+	---help---
+		Capture audio directly through the ALSA (aw-alsa-lib) PCM
+		interface instead of the portable media_recorder backend.
+		This requires chip-specific ALSA headers and the Allwinner
+		R528 rtos-hal include tree, so it only builds on boards that
+		ship that SDK. Leave disabled (the default) on all other
+		boards; the agent then uses the media framework recorder,
+		which works everywhere. When enabled, the agent still falls
+		back to media_recorder at runtime if ALSA capture fails.
+
 config AI_AGENT_CAMERA
 	bool "Enable camera capture tool"
 	default n
