@@ -168,6 +168,9 @@ static void cmd_help(void)
 #ifdef CONFIG_AI_AGENT_TEST
         "  claw_test [V-XX]    - Run vision integration tests\n"
 #endif
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+        "  ble_gatt_test [init|status|send|deinit] - BLE GATT test\n"
+#endif
         "  help                 - This message\n");
 }
 
@@ -503,6 +506,48 @@ static void cmd_config_reset(void)
     config_erase_all();
     printf("All runtime config cleared. Build-time defaults will be used on restart.\n");
 }
+
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+#include "infra/ble_cmd_handler.h"
+#include "infra/ble_gatt.h"
+
+static void ble_gatt_test_conn_cb(bool connected, void* user_data)
+{
+    (void)user_data;
+    printf("[ble_gatt_test] Connection %s\n",
+        connected ? "established" : "lost");
+}
+
+static void cmd_ble_gatt_test(int argc, char** argv)
+{
+    const char* sub = (argc > 1) ? argv[1] : "init";
+
+    if (strcmp(sub, "init") == 0) {
+        ble_gatt_config_t cfg = {
+            .recv_cb = ble_cmd_handler_recv,
+            .conn_cb = ble_gatt_test_conn_cb,
+            .user_data = NULL,
+        };
+        int ret = ble_gatt_init(&cfg);
+        printf("[ble_gatt_test] init: %s (%d)\n",
+            ret == 0 ? "OK" : "FAILED", ret);
+    } else if (strcmp(sub, "status") == 0) {
+        printf("[ble_gatt_test] connected=%d mtu=%u\n",
+            ble_gatt_is_connected(), ble_gatt_get_mtu());
+    } else if (strcmp(sub, "send") == 0) {
+        const char* msg = (argc > 2) ? argv[2] : "hello from AI Agent";
+        int ret = ble_gatt_send((const uint8_t*)msg, strlen(msg));
+        printf("[ble_gatt_test] send: %s (%d)\n",
+            ret > 0 ? "OK" : "FAILED", ret);
+    } else if (strcmp(sub, "deinit") == 0) {
+        int ret = ble_gatt_deinit();
+        printf("[ble_gatt_test] deinit: %s (%d)\n",
+            ret == 0 ? "OK" : "FAILED", ret);
+    } else {
+        printf("Usage: ble_gatt_test [init|status|send <msg>|deinit]\n");
+    }
+}
+#endif /* CONFIG_AI_AGENT_BLE_GATT */
 
 static void cmd_restart(void)
 {
@@ -1011,6 +1056,10 @@ static void* cli_thread(void* arg)
             cmd_router_clear(argc, argv);
         else if (strcmp(cmd, "restart") == 0)
             cmd_restart();
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+        else if (strcmp(cmd, "ble_gatt_test") == 0)
+            cmd_ble_gatt_test(argc, argv);
+#endif
         else
             printf("Unknown command: %s (type 'help')\n", cmd);
 

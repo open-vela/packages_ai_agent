@@ -77,6 +77,12 @@
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #include "ui/lvgl_ui_channel.h"
 #endif
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+#include "infra/ble_cmd_handler.h"
+#include "infra/ble_gatt.h"
+#include <bluetooth.h>
+#include <bt_adapter.h>
+#endif
 
 static const char* TAG = "agent";
 
@@ -635,6 +641,45 @@ int ai_agent_main(int argc, char* argv[])
     if (lvgl_ui_channel_start() != OK)
         syslog(LOG_WARNING, "[%s] lvgl_ui_channel_start failed\n", TAG);
     BOOT_LOG(&t0, "P5", "lvgl_ui_channel started");
+#endif
+
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+    /* BLE GATT: ensure adapter enabled, then init with retries */
+    {
+        extern void ble_cmd_handler_recv(const uint8_t* data, uint16_t len,
+            void* user_data);
+        bt_instance_t* bt_ins = bluetooth_get_instance();
+        if (bt_ins) {
+            bt_adapter_state_t state = bt_adapter_get_state(bt_ins);
+            if (state < BT_ADAPTER_STATE_BLE_ON) {
+                syslog(LOG_INFO, "[%s] BT not ready (state=%d), enabling LE...\n",
+                    TAG, (int)state);
+                bt_adapter_enable_le(bt_ins);
+                sleep(2);
+            }
+        }
+
+        ble_gatt_config_t ble_cfg = {
+            .device_name = "VelaClaw",
+            .recv_cb = ble_cmd_handler_recv,
+        };
+        int rc = -1;
+        int attempts = 0;
+        while (rc < 0 && attempts < 5) {
+            rc = ble_gatt_init(&ble_cfg);
+            if (rc < 0) {
+                syslog(LOG_WARNING, "[%s] ble_gatt_init attempt %d failed: %d\n",
+                    TAG, attempts + 1, rc);
+                sleep(3);
+            }
+            attempts++;
+        }
+        if (rc == 0) {
+            BOOT_LOG(&t0, "P5", "ble_gatt init OK");
+        } else {
+            BOOT_LOG(&t0, "P5", "ble_gatt FAILED after retries");
+        }
+    }
 #endif
 
     /* Network watcher thread: reconnect + wait + start net services */

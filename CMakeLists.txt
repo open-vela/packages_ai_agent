@@ -123,6 +123,17 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     )
   endif()
 
+  if(CONFIG_AI_AGENT_BLE_GATT)
+    list(APPEND AGENT_SRCS
+      src/infra/ble_gatt.c
+      src/infra/ble_cmd_handler.c
+    )
+  endif()
+
+  if(CONFIG_AI_AGENT_BLE_NET)
+    list(APPEND AGENT_SRCS src/infra/ble_net.c)
+  endif()
+
   # cJSON from apps/netutils/cjson
   set(CJSON_INC ${NUTTX_APPS_DIR}/netutils/cjson/cJSON)
 
@@ -137,6 +148,9 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   # Media framework
   set(MEDIA_INC ${CMAKE_SOURCE_DIR}/../frameworks/multimedia/media/include)
+
+  # Bluetooth framework
+  set(BT_INC ${CMAKE_SOURCE_DIR}/../frameworks/connectivity/bluetooth/framework/include)
 
   # MQTT-C library
   set(MQTTC_INC ${NUTTX_APPS_DIR}/netutils/mqttc/MQTT-C/include)
@@ -156,6 +170,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     ${TOPICS_INC}
     ${VIBRATOR_INC}
     ${MEDIA_INC}
+    ${BT_INC}
     ${MQTTC_INC}
   )
 

@@ -32,6 +32,7 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/crypto/mbedtls/mbedtls/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/topics/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/vibrator
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/multimedia/media/include
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/connectivity/bluetooth/framework/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/mqttc/MQTT-C/include
 
 # Source files
@@ -124,6 +125,15 @@ CSRCS += src/infra/heartbeat.c
 CSRCS += src/infra/network_manager.c
 CSRCS += src/infra/http_proxy.c
 CSRCS += src/infra/vela_tls.c
+
+ifeq ($(CONFIG_AI_AGENT_BLE_GATT),y)
+CSRCS += src/infra/ble_gatt.c
+CSRCS += src/infra/ble_cmd_handler.c
+endif
+
+ifeq ($(CONFIG_AI_AGENT_BLE_NET),y)
+CSRCS += src/infra/ble_net.c
+endif
 
 # node/ - 分布式节点
 ifeq ($(CONFIG_AI_AGENT_NODE),y)

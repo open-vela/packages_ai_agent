@@ -271,4 +271,21 @@ config AI_AGENT_TLS_CONN_POOL_SIZE
 		reuse. Each slot uses ~12KB BSS (TLS context + raw
 		buffer). Set to 1 on memory-constrained boards.
 
+config AI_AGENT_BLE_GATT
+	bool "Enable BLE GATT data channel"
+	default n
+	---help---
+		Enable BLE GATT data channel using Nordic UART Service
+		(NUS) pattern. Provides bidirectional data exchange over
+		BLE with any GATT client (iOS/Android). Works on BLE-only
+		chips without classic Bluetooth SPP support.
+
+config AI_AGENT_BLE_NET
+	bool "Enable BLE SPP network proxy"
+	default n
+	---help---
+		Enable BLE SPP + TUN based network proxy channel.
+		Provides internet access via phone companion app over
+		Bluetooth SPP. For devices without Wi-Fi.
+
 endif
