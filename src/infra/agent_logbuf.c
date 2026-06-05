@@ -1,5 +1,5 @@
 /*
- * agent_logbuf.c — Ring buffer for agent logs
+ * agent_logbuf.c - Ring buffer for agent logs
  */
 
 #include "infra/agent_logbuf.h"

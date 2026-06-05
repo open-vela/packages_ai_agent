@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-/* audio_capture.c — Audio capture via direct ALSA or media_recorder fallback.
+/* audio_capture.c - Audio capture via direct ALSA or media_recorder fallback.
  *
  * The direct ALSA backend is gated behind CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
  * because it pulls in chip-specific ALSA headers (aw-alsa-lib) that are only

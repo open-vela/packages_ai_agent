@@ -1,5 +1,5 @@
 /*
- * velaclaw_client_local.c — Flat-build local IPC client for ai_agent
+ * velaclaw_client_local.c - Flat-build local IPC client for ai_agent
  *
  * Uses direct function calls to message_bus (shared address space)
  * and mbus_tap to intercept outbound replies synchronously.

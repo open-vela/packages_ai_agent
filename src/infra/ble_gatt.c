@@ -61,7 +61,7 @@ enum {
 /* Default MTU */
 #define DEFAULT_MTU 23
 
-/* ── State ─────────────────────────────────────────────────── */
+/* -- State --------------------------------------------------- */
 
 static struct {
     bt_instance_t* bt_ins;
@@ -90,11 +90,11 @@ static struct {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
-/* ── Forward declarations ──────────────────────────────────── */
+/* -- Forward declarations ------------------------------------ */
 
 static int adv_start(void);
 
-/* ── GATTS Callbacks ───────────────────────────────────────── */
+/* -- GATTS Callbacks ----------------------------------------- */
 
 static void on_connected(gatts_handle_t srv_handle, bt_address_t* addr)
 {
@@ -114,7 +114,7 @@ static void on_connected(gatts_handle_t srv_handle, bt_address_t* addr)
 
     /* Advertising stops automatically on connection */
 
-    /* Snapshot callback before releasing — avoids TOCTOU if config
+    /* Snapshot callback before releasing - avoids TOCTOU if config
      * is modified between the check and the call. */
     ble_gatt_conn_cb_t conn_cb;
     void* user_data;
@@ -242,7 +242,7 @@ static const gatts_callbacks_t g_gatts_cbs = {
     .on_conn_param_changed = NULL,
 };
 
-/* ── Service Setup (using GATT_H_* macros like in-tree examples) ── */
+/* -- Service Setup (using GATT_H_* macros like in-tree examples) -- */
 
 static gatt_attr_db_t s_nus_attr_db[] = {
     /* NUS Service */
@@ -278,7 +278,7 @@ static int setup_nus_service(void)
     return 0;
 }
 
-/* ── BLE Advertising ────────────────────────────────────────── */
+/* -- BLE Advertising ------------------------------------------ */
 
 #define BLE_GATT_ADV_NAME "VelaClaw"
 #define BLE_GATT_ADV_INTERVAL 320 /* 200ms (320 * 0.625ms) */
@@ -392,7 +392,7 @@ static void adv_stop(void)
     }
 }
 
-/* ── Advertising Retry ──────────────────────────────────────── */
+/* -- Advertising Retry ---------------------------------------- */
 
 static void* adv_retry_thread(void* arg)
 {
@@ -439,7 +439,7 @@ static void* adv_retry_thread(void* arg)
     return NULL;
 }
 
-/* ── Public API ────────────────────────────────────────────── */
+/* -- Public API ---------------------------------------------- */
 
 int ble_gatt_init(const ble_gatt_config_t* config)
 {
@@ -502,7 +502,7 @@ int ble_gatt_init(const ble_gatt_config_t* config)
         printf("[ble_gatt] advertising started OK\n");
     }
 
-    /* Always start retry thread — even if adv_start returned 0,
+    /* Always start retry thread - even if adv_start returned 0,
      * the async on_adv_start callback may report failure later. */
     {
         pthread_t retry_thread;

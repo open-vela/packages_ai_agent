@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-/* audio_playback.c — Streaming audio playback via media_player buffer mode. */
+/* audio_playback.c - Streaming audio playback via media_player buffer mode. */
 
 #include "voice/audio_playback.h"
 #include "agent_config.h"

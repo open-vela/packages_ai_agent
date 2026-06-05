@@ -142,7 +142,7 @@ static void handle_status(void)
     send_response(resp);
 }
 
-/* ── Public API ────────────────────────────────────────────── */
+/* -- Public API ---------------------------------------------- */
 
 void ble_cmd_handler_recv(const uint8_t* data, uint16_t len, void* user_data)
 {

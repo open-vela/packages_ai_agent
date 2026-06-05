@@ -51,7 +51,7 @@ static const char* s_config_keys[] = {
 
 #define NUM_CONFIG_KEYS (sizeof(s_config_keys) / sizeof(s_config_keys[0]))
 
-/* ── HTTP helpers ─────────────────────────────────────────────── */
+/* -- HTTP helpers ----------------------------------------------- */
 
 static void send_response(int fd, int code, const char* body)
 {
@@ -89,7 +89,7 @@ static char* read_full_body(int fd, const char* buf, int buf_len)
     const char* cl = strcasestr(buf, "\r\nContent-Length: ");
     int content_len = cl ? atoi(cl + 18) : 0;
     if (content_len <= 0 || content_len > 32 * 1024) {
-        /* No Content-Length or too large — use what's already in buffer */
+        /* No Content-Length or too large - use what's already in buffer */
         int already = buf_len - (int)(hdr_end - buf);
         if (already <= 0)
             return NULL;
@@ -129,7 +129,7 @@ static char* read_full_body(int fd, const char* buf, int buf_len)
     return body;
 }
 
-/* ── Config handlers ──────────────────────────────────────────── */
+/* -- Config handlers -------------------------------------------- */
 
 /* Keys that live inside llm_backend_0 JSON (not flat config) */
 
@@ -324,7 +324,7 @@ static bool handle_config_put(int fd, const char* body)
     return true;
 }
 
-/* ── Skills handlers ──────────────────────────────────────────── */
+/* -- Skills handlers -------------------------------------------- */
 
 static void url_decode(const char* src, char* dst, size_t dst_size)
 {
@@ -526,9 +526,9 @@ static bool handle_skills_delete(int fd, const char* name)
     return true;
 }
 
-/* ── Main dispatch ────────────────────────────────────────────── */
+/* -- Main dispatch ---------------------------------------------- */
 
-/* ── Logs handler ─────────────────────────────────────────────── */
+/* -- Logs handler ----------------------------------------------- */
 
 static bool handle_logs_get(int fd)
 {
@@ -548,7 +548,7 @@ static bool handle_logs_get(int fd)
     return true;
 }
 
-/* ── Main dispatch ────────────────────────────────────────────── */
+/* -- Main dispatch ---------------------------------------------- */
 
 bool api_try_handle(int fd, const char* buf, int buf_len)
 {

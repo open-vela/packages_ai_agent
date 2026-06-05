@@ -52,7 +52,7 @@
 /* Read buffer size */
 #define READ_BUF_SIZE 2048
 
-/* ── State ─────────────────────────────────────────────────── */
+/* -- State --------------------------------------------------- */
 
 static struct {
     /* TUN */
@@ -84,7 +84,7 @@ static struct {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
-/* ── TUN Device ────────────────────────────────────────────── */
+/* -- TUN Device ---------------------------------------------- */
 
 static int tun_open(void)
 {
@@ -165,7 +165,7 @@ static void tun_set_up(bool up)
     }
 }
 
-/* ── TUN Poll (read IP packets, send via SPP) ──────────────── */
+/* -- TUN Poll (read IP packets, send via SPP) ---------------- */
 
 static void tun_poll_cb(uv_poll_t* handle, int status, int events)
 {
@@ -258,7 +258,7 @@ static void tun_poll_stop(void)
     }
 }
 
-/* ── SPP Proxy Pipe ────────────────────────────────────────── */
+/* -- SPP Proxy Pipe ------------------------------------------ */
 
 static void pipe_write_cb(euv_pipe_t* handle, uint8_t* buf, int status)
 {
@@ -279,7 +279,7 @@ static void pipe_read_cb(euv_pipe_t* handle, const uint8_t* buf, ssize_t size)
         /* Received data from phone, write to TUN */
         ble_net_receive(buf, (uint16_t)size);
     } else if (size == 0) {
-        /* EOF — peer closed the pipe */
+        /* EOF - peer closed the pipe */
         syslog(LOG_WARNING, "[%s] Pipe read EOF, disconnecting\n", TAG);
         pipe_disconnect();
         tun_set_up(false);
@@ -361,7 +361,7 @@ static void pipe_disconnect(void)
     }
 }
 
-/* ── SPP Callbacks ─────────────────────────────────────────── */
+/* -- SPP Callbacks ------------------------------------------- */
 
 static void spp_connection_state_cb(void* handle, bt_address_t* addr,
     uint16_t scn, uint16_t port,
@@ -478,7 +478,7 @@ static const spp_callbacks_t g_spp_cbs = {
     .pty_open_cb = NULL,
 };
 
-/* ── SPP Server ────────────────────────────────────────────── */
+/* -- SPP Server ---------------------------------------------- */
 
 static int spp_server_start(void)
 {
@@ -524,7 +524,7 @@ static void spp_server_stop(void)
     }
 }
 
-/* ── Public API ────────────────────────────────────────────── */
+/* -- Public API ---------------------------------------------- */
 
 int ble_net_init(void)
 {

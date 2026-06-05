@@ -404,7 +404,7 @@ static void* client_thread(void* arg)
     }
 #endif
 
-    /* Not REST API — proceed with WebSocket handshake using pre-read buffer */
+    /* Not REST API - proceed with WebSocket handshake using pre-read buffer */
     char chat_id[32];
     if (do_ws_handshake_ex(fd, peek_buf, peek_total,
             chat_id, sizeof(chat_id))

@@ -1,5 +1,5 @@
 /*
- * agent_logbuf.h — Ring buffer for agent logs (accessed by /api/logs)
+ * agent_logbuf.h - Ring buffer for agent logs (accessed by /api/logs)
  */
 
 #pragma once
