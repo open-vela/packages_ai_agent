@@ -141,6 +141,11 @@ ifeq ($(CONFIG_AI_AGENT_BLE_NET),y)
 CSRCS += src/infra/ble_net.c
 endif
 
+ifeq ($(CONFIG_AI_AGENT_REST_API),y)
+CSRCS += src/infra/api_handler.c
+CSRCS += src/infra/agent_logbuf.c
+endif
+
 # node/ - 分布式节点
 ifeq ($(CONFIG_AI_AGENT_NODE),y)
 CSRCS += src/node/node_client.c

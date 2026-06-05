@@ -134,6 +134,13 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_SRCS src/infra/ble_net.c)
   endif()
 
+  if(CONFIG_AI_AGENT_REST_API)
+    list(APPEND AGENT_SRCS
+      src/infra/api_handler.c
+      src/infra/agent_logbuf.c
+    )
+  endif()
+
   # cJSON from apps/netutils/cjson
   set(CJSON_INC ${NUTTX_APPS_DIR}/netutils/cjson/cJSON)
 

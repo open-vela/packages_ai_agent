@@ -301,4 +301,12 @@ config AI_AGENT_BLE_NET
 		Provides internet access via phone companion app over
 		Bluetooth SPP. For devices without Wi-Fi.
 
+config AI_AGENT_REST_API
+	bool "Enable REST API endpoints"
+	default n
+	---help---
+		Enable HTTP REST API endpoints accessible via WebSocket
+		server for remote configuration, skill management, and
+		log retrieval from Android companion App.
+
 endif

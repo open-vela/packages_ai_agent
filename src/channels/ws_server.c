@@ -27,6 +27,9 @@
 #endif
 #include "agent_compat.h"
 #include "agent_config.h"
+#ifdef CONFIG_AI_AGENT_REST_API
+#include "infra/api_handler.h"
+#endif
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -145,9 +148,12 @@ static int make_accept_key(const char* key, char* out, size_t out_size)
  * Read full HTTP upgrade request, extract Sec-WebSocket-Key.
  * Returns 0 on success; sends 101 response.
  */
+static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
+    char* chat_id_out, size_t chat_id_size);
+
 static int do_ws_handshake(int fd, char* chat_id_out, size_t chat_id_size)
 {
-    char buf[1024];
+    char buf[2048];
     int total = 0;
 
     /* Read until we see the end of headers */
@@ -160,6 +166,16 @@ static int do_ws_handshake(int fd, char* chat_id_out, size_t chat_id_size)
         if (strstr(buf, "\r\n\r\n"))
             break;
     }
+
+    return do_ws_handshake_ex(fd, buf, total, chat_id_out, chat_id_size);
+}
+
+/**
+ * WebSocket handshake using pre-read buffer.
+ */
+static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
+    char* chat_id_out, size_t chat_id_size)
+{
 
     /* Extract Sec-WebSocket-Key */
     char* key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
@@ -356,13 +372,49 @@ static void* client_thread(void* arg)
     free(arg);
     int fd = ca.fd;
 
-    /* Handshake */
-    char chat_id[32];
-    if (do_ws_handshake(fd, chat_id, sizeof(chat_id)) != 0) {
-        syslog(LOG_WARNING, "[%s] Handshake failed for fd=%d\n", TAG, fd);
+    /* Peek HTTP headers to decide: REST API or WebSocket */
+    char* peek_buf = malloc(2048);
+    if (!peek_buf) {
         close(fd);
         return NULL;
     }
+    int peek_total = 0;
+    while (peek_total < 2048 - 1) {
+        int n = recv(fd, peek_buf + peek_total,
+            2048 - 1 - peek_total, 0);
+        if (n <= 0) {
+            free(peek_buf);
+            close(fd);
+            return NULL;
+        }
+        peek_total += n;
+        peek_buf[peek_total] = '\0';
+        if (strstr(peek_buf, "\r\n\r\n"))
+            break;
+    }
+
+    /* Try REST API (config/skills/logs) */
+#ifdef CONFIG_AI_AGENT_REST_API
+    if (api_try_handle(fd, peek_buf, peek_total)) {
+        free(peek_buf);
+        struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        close(fd);
+        return NULL;
+    }
+#endif
+
+    /* Not REST API — proceed with WebSocket handshake using pre-read buffer */
+    char chat_id[32];
+    if (do_ws_handshake_ex(fd, peek_buf, peek_total,
+            chat_id, sizeof(chat_id))
+        != 0) {
+        syslog(LOG_WARNING, "[%s] Handshake failed for fd=%d\n", TAG, fd);
+        free(peek_buf);
+        close(fd);
+        return NULL;
+    }
+    free(peek_buf);
 
     /* Register client */
     pthread_mutex_lock(&s_clients_mtx);
