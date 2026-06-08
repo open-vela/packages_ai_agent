@@ -1,0 +1,719 @@
+# mini_memo PTT recording fix (audio capture path)
+#
+# Root-cause fixes for the "recording receives no frames / PTT hangs" issue
+# observed when running ai_agent / mini_memo on the Gemini-s1 board. The
+# ai_agent side of the fix (src/voice/voice_channel.c) is already upstream and
+# is intentionally NOT part of this patch.
+#
+# This patch spans three repositories; fix_gemini_s1.sh applies each segment
+# in the matching repo with `git apply`:
+#
+#   1. vendor/allwinnertech       - DMA stop: disable+clear this channel's IRQ
+#                                    before teardown (use-after-free guard).
+#   2. frameworks/multimedia/media - media server accept pump thread, non-block
+#                                    socket handling, format-negotiation
+#                                    wildcard, recorder open by stream name.
+#   3. external/ffmpeg/ffmpeg      - abufsink: stop constraining sample_rate /
+#                                    channel_layout so amix resamples internally.
+
+===== REPO: vendor/allwinnertech =====
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c b/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c
+index 312ea340..ade66510 100644
+--- a/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c
++++ b/chips/r528/drivers/rtos-hal/hal/source/dma/hal_dma.c
+@@ -1036,7 +1036,8 @@ hal_dma_status_t hal_dma_start(struct sunxi_dma_chan *chan)
+ 
+ hal_dma_status_t hal_dma_stop(struct sunxi_dma_chan *chan)
+ {
+-    unsigned long __cpsr;
++    unsigned long __cpsr, __ccpsr;
++    uint32_t high, irq_val;
+ 
+     if (NULL == chan)
+     {
+@@ -1052,6 +1053,19 @@ hal_dma_status_t hal_dma_stop(struct sunxi_dma_chan *chan)
+     hal_writel(CHAN_STOP, DMA_ENABLE(chan->chan_count));
+     hal_writel(CHAN_RESUME, DMA_PAUSE(chan->chan_count));
+ 
++    /* Disable and clear this channel's DMA IRQ before teardown so a
++     * hardware-latched completion interrupt cannot re-enter
++     * sunxi_dma_irq_handle() and dereference a desc/callback that
++     * sunxi_dma_free_ill() is about to free (start path re-enables it).
++     */
++    high = (chan->chan_count + START_CHAN_OFFSET >= HIGH_CHAN) ? 1 : 0;
++    __ccpsr = hal_spin_lock_irqsave(&dma_lock);
++    irq_val = hal_readl(DMA_IRQ_EN(high));
++    irq_val &= ~(SHIFT_IRQ_MASK(chan->irq_type, chan->chan_count));
++    hal_writel(irq_val, DMA_IRQ_EN(high));
++    hal_writel(SHIFT_IRQ_MASK(chan->irq_type, chan->chan_count), DMA_IRQ_STAT(high));
++    hal_spin_unlock_irqrestore(&dma_lock, __ccpsr);
++
+     if (chan->cyclic)
+     {
+         chan->cyclic = false;
+===== REPO: frameworks/multimedia/media =====
+diff --git a/client/media_graph.c b/client/media_graph.c
+index 62c701a..8b27910 100644
+--- a/client/media_graph.c
++++ b/client/media_graph.c
+@@ -30,6 +30,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/socket.h>
+ #include <sys/un.h>
+ #include <unistd.h>
+ 
+@@ -111,13 +112,19 @@ static void media_close_socket(void* handle)
+ {
+     MediaIOPriv* priv = handle;
+     int socket;
++    int socket_fd;
+ 
+-    if (atomic_load(&priv->refs) == 1 && priv->socket) {
++    if (priv->socket > 0) {
+         socket = priv->socket;
+         priv->socket = 0;
++        shutdown(socket, SHUT_RDWR);
+         close(socket);
+-        if (priv->socket_fd > 0)
+-            close(priv->socket_fd);
++    }
++
++    if (priv->socket_fd > 0) {
++        socket_fd = priv->socket_fd;
++        priv->socket_fd = 0;
++        close(socket_fd);
+     }
+ }
+ 
+@@ -221,17 +228,32 @@ static int media_prepare(void* handle, const char* url, const char* options)
+ 
+     if (fd > 0) {
+         priv->socket_fd = fd;
+-        priv->socket = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
+-        if (priv->socket < 0) {
+-            priv->socket = 0;
+-            ret = -errno;
+-        }
+     }
+ 
+ out:
+     return ret;
+ }
+ 
++static int media_accept_socket(MediaIOPriv* priv)
++{
++    if (!priv)
++        return -EINVAL;
++
++    if (priv->socket > 0)
++        return 0;
++
++    if (priv->socket_fd <= 0)
++        return -ENOTCONN;
++
++    priv->socket = accept4(priv->socket_fd, NULL, NULL, SOCK_CLOEXEC);
++    if (priv->socket < 0) {
++        priv->socket = 0;
++        return -errno;
++    }
++
++    return 0;
++}
++
+ static ssize_t media_process_data(void* handle, bool player,
+     void* data, size_t len)
+ {
+@@ -243,7 +265,8 @@ static ssize_t media_process_data(void* handle, bool player,
+ 
+     atomic_fetch_add(&priv->refs, 1);
+ 
+-    if (priv->socket <= 0)
++    ret = media_accept_socket(priv);
++    if (ret < 0)
+         goto out;
+ 
+     if (player) {
+@@ -252,7 +275,7 @@ static ssize_t media_process_data(void* handle, bool player,
+             goto out;
+         else if (ret == 0)
+             errno = ECONNRESET;
+-        else if (ret < 0 && errno == EINTR) {
++        else if (ret < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+             ret = -errno;
+             goto out;
+         }
+@@ -262,7 +285,7 @@ static ssize_t media_process_data(void* handle, bool player,
+             goto out;
+         else if (ret == 0)
+             errno = ECONNRESET;
+-        else if (ret < 0 && errno == EINTR) {
++        else if (ret < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+             ret = -errno;
+             goto out;
+         }
+@@ -403,10 +426,13 @@ int media_player_get_socket(void* handle)
+ 
+ int media_player_start(void* handle)
+ {
++    int ret;
++
+     if (!handle)
+         return -EINVAL;
+ 
+-    return media_proxy_once(handle, NULL, "start", NULL, 0, NULL, 0);
++    ret = media_proxy_once(handle, NULL, "start", NULL, 0, NULL, 0);
++    return ret;
+ }
+ 
+ int media_player_stop(void* handle)
+@@ -582,7 +608,13 @@ void media_recorder_close_socket(void* handle)
+ 
+ int media_recorder_start(void* handle)
+ {
+-    return media_proxy_once(handle, NULL, "start", NULL, 0, NULL, 0);
++    int ret;
++
++    if (!handle)
++        return -EINVAL;
++
++    ret = media_proxy_once(handle, NULL, "start", NULL, 0, NULL, 0);
++    return ret;
+ }
+ 
+ int media_recorder_pause(void* handle)
+diff --git a/server/audio_graph.c b/server/audio_graph.c
+index 09fdf00..181c8f7 100644
+--- a/server/audio_graph.c
++++ b/server/audio_graph.c
+@@ -520,6 +520,8 @@ static int audio_graph_dequeue_command(MediaGraphPriv* priv, bool process)
+ 
+         ret = avfilter_process_command(cmd->filter, cmd->cmd, cmd->arg, cmd->res, 0, 0);
+         if (ret >= 0) {
++            MEDIA_INFO("Processed %s %s on %s\n",
++                cmd->cmd, cmd->arg ? cmd->arg : "_", cmd->filter->name);
+             ret = audio_negotiation_trigger(cmd->filter);
+             if (ret < 0)
+                 MEDIA_ERR("Media graph link error after command '%s': %d:%s\n",
+@@ -700,17 +702,31 @@ static void audio_graph_dump_to_buf(AVBPrint* buf, AVFilterGraph* graph)
+ {
+     unsigned i, j, x, e;
+ 
++    if (!graph) {
++        av_bprintf(buf, "<null graph>\n");
++        return;
++    }
++
+     for (i = 0; i < graph->nb_filters; i++) {
+         AVFilterContext* filter = graph->filters[i];
+         unsigned max_src_name = 0, max_dst_name = 0;
+         unsigned max_in_name = 0, max_out_name = 0;
+         unsigned max_in_fmt = 0, max_out_fmt = 0;
+         unsigned width, height, in_indent;
+-        unsigned lname = strlen(filter->name);
+-        unsigned ltype = strlen(filter->filter->name);
++        unsigned lname;
++        unsigned ltype;
+         char filter_ext_info[256] = { 0 };
+         int ret;
+ 
++        if (!filter || !filter->name || !filter->filter ||
++            !filter->filter->name) {
++            av_bprintf(buf, "<invalid filter %u>\n", i);
++            continue;
++        }
++
++        lname = strlen(filter->name);
++        ltype = strlen(filter->filter->name);
++
+         /* Send dump command to filter to get extra info */
+         if (filter->filter->process_command) {
+             ret = avfilter_process_command(filter, "dump", NULL, filter_ext_info, sizeof(filter_ext_info), 0);
+@@ -721,14 +737,26 @@ static void audio_graph_dump_to_buf(AVBPrint* buf, AVFilterGraph* graph)
+ 
+         for (j = 0; j < filter->nb_inputs; j++) {
+             AVFilterLink* l = filter->inputs[j];
+-            unsigned ln = strlen(l->src->name) + 1 + strlen(l->srcpad->name);
++            unsigned ln;
++
++            if (!l || !l->src || !l->src->name || !l->srcpad ||
++                !l->srcpad->name || !l->dstpad || !l->dstpad->name)
++                continue;
++
++            ln = strlen(l->src->name) + 1 + strlen(l->srcpad->name);
+             max_src_name = FFMAX(max_src_name, ln);
+             max_in_name = FFMAX(max_in_name, strlen(l->dstpad->name));
+             max_in_fmt = FFMAX(max_in_fmt, audio_graph_dump_link(NULL, l, filter_ext_info));
+         }
+         for (j = 0; j < filter->nb_outputs; j++) {
+             AVFilterLink* l = filter->outputs[j];
+-            unsigned ln = strlen(l->dst->name) + 1 + strlen(l->dstpad->name);
++            unsigned ln;
++
++            if (!l || !l->dst || !l->dst->name || !l->dstpad ||
++                !l->dstpad->name || !l->srcpad || !l->srcpad->name)
++                continue;
++
++            ln = strlen(l->dst->name) + 1 + strlen(l->dstpad->name);
+             max_dst_name = FFMAX(max_dst_name, ln);
+             max_out_name = FFMAX(max_out_name, strlen(l->srcpad->name));
+             max_out_fmt = FFMAX(max_out_fmt, audio_graph_dump_link(NULL, l, filter_ext_info));
+@@ -748,13 +776,18 @@ static void audio_graph_dump_to_buf(AVBPrint* buf, AVFilterGraph* graph)
+             /* Input link */
+             if (in_no < filter->nb_inputs) {
+                 AVFilterLink* l = filter->inputs[in_no];
+-                e = buf->len + max_src_name + 2;
+-                av_bprintf(buf, "%s:%s", l->src->name, l->srcpad->name);
+-                av_bprint_chars(buf, '-', e - buf->len);
+-                e = buf->len + max_in_fmt + 2 + max_in_name - strlen(l->dstpad->name);
+-                audio_graph_dump_link(buf, l, filter_ext_info);
+-                av_bprint_chars(buf, '-', e - buf->len);
+-                av_bprintf(buf, "%s", l->dstpad->name);
++                if (l && l->src && l->src->name && l->srcpad &&
++                    l->srcpad->name && l->dstpad && l->dstpad->name) {
++                    e = buf->len + max_src_name + 2;
++                    av_bprintf(buf, "%s:%s", l->src->name, l->srcpad->name);
++                    av_bprint_chars(buf, '-', e - buf->len);
++                    e = buf->len + max_in_fmt + 2 + max_in_name - strlen(l->dstpad->name);
++                    audio_graph_dump_link(buf, l, filter_ext_info);
++                    av_bprint_chars(buf, '-', e - buf->len);
++                    av_bprintf(buf, "%s", l->dstpad->name);
++                } else {
++                    av_bprintf(buf, "<invalid input>");
++                }
+             } else {
+                 av_bprint_chars(buf, ' ', in_indent);
+             }
+@@ -776,14 +809,19 @@ static void audio_graph_dump_to_buf(AVBPrint* buf, AVFilterGraph* graph)
+             /* Output link */
+             if (out_no < filter->nb_outputs) {
+                 AVFilterLink* l = filter->outputs[out_no];
+-                unsigned ln = strlen(l->dst->name) + 1 + strlen(l->dstpad->name);
+-                e = buf->len + max_out_name + 2;
+-                av_bprintf(buf, "%s", l->srcpad->name);
+-                av_bprint_chars(buf, '-', e - buf->len);
+-                e = buf->len + max_out_fmt + 2 + max_dst_name - ln;
+-                audio_graph_dump_link(buf, l, filter_ext_info);
+-                av_bprint_chars(buf, '-', e - buf->len);
+-                av_bprintf(buf, "%s:%s", l->dst->name, l->dstpad->name);
++                if (l && l->dst && l->dst->name && l->dstpad &&
++                    l->dstpad->name && l->srcpad && l->srcpad->name) {
++                    unsigned ln = strlen(l->dst->name) + 1 + strlen(l->dstpad->name);
++                    e = buf->len + max_out_name + 2;
++                    av_bprintf(buf, "%s", l->srcpad->name);
++                    av_bprint_chars(buf, '-', e - buf->len);
++                    e = buf->len + max_out_fmt + 2 + max_dst_name - ln;
++                    audio_graph_dump_link(buf, l, filter_ext_info);
++                    av_bprint_chars(buf, '-', e - buf->len);
++                    av_bprintf(buf, "%s:%s", l->dst->name, l->dstpad->name);
++                } else {
++                    av_bprintf(buf, "<invalid output>");
++                }
+             }
+             av_bprintf(buf, "\n");
+         }
+@@ -881,10 +919,8 @@ int audio_graph_open(AVFilterContext** src, const char* stream)
+     int ret;
+ 
+     ret = media_stub_get_stream_name(stream, stream_name, sizeof(stream_name));
+-    if (ret >= 0)
++    if (ret >= 0 && stream_name[0] != '\0') {
+         stream = stream_name;
+-    else {
+-        goto fail;
+     }
+ 
+     pthread_mutex_lock(&priv->qlock);
+diff --git a/server/audio_negotiation.c b/server/audio_negotiation.c
+index b4110d6..8e2d12c 100644
+--- a/server/audio_negotiation.c
++++ b/server/audio_negotiation.c
+@@ -50,6 +50,21 @@ static bool audio_filter_is_started(AVFilterContext* ctx)
+     return state != 0;
+ }
+ 
++static void audio_get_route_map(AVFilterContext* ctx, int* map, int count)
++{
++    int i;
++
++    memset(map, 0, sizeof(int) * MAX_LINKS);
++
++    if (av_opt_get_array(ctx, "map_array", AV_OPT_SEARCH_CHILDREN,
++            0, count, AV_OPT_TYPE_INT, map)
++        >= 0)
++        return;
++
++    for (i = 0; i < count && i < MAX_LINKS; i++)
++        map[i] = ROUTE_ON;
++}
++
+ static int audio_query_formats(AVFilterContext* ctx)
+ {
+     AVFilterFormatsConfig **cfg_in_dyn = NULL, **cfg_out_dyn = NULL;
+@@ -288,15 +303,26 @@ static void audio_calculate_intersection(
+ 
+     memset(result, 0, sizeof(AVFilterFormatsConfig));
+ 
++    /* A NULL list means "accept any" (wildcard): intersection must keep the
++     * constraining (non-NULL) side instead of dropping it. Only when both
++     * sides are concrete do we compute the real intersection.
++     */
+     if (a->formats && b->formats)
+         result->formats = audio_create_merged_formats(a->formats, b->formats);
++    else if (a->formats || b->formats)
++        ff_formats_ref(a->formats ? a->formats : b->formats, &result->formats);
+ 
+     if (a->samplerates && b->samplerates)
+         result->samplerates = audio_create_merged_formats(a->samplerates, b->samplerates);
++    else if (a->samplerates || b->samplerates)
++        ff_formats_ref(a->samplerates ? a->samplerates : b->samplerates, &result->samplerates);
+ 
+     if (a->channel_layouts && b->channel_layouts)
+         result->channel_layouts = audio_create_merged_channel_layouts(
+             a->channel_layouts, b->channel_layouts);
++    else if (a->channel_layouts || b->channel_layouts)
++        ff_channel_layouts_ref(a->channel_layouts ? a->channel_layouts : b->channel_layouts,
++            &result->channel_layouts);
+ }
+ 
+ static void audio_get_max_format(AVFilterFormatsConfig* config, int* fmt)
+@@ -422,11 +448,7 @@ static int audio_negotiate_formats_init(AVFilterContext* filter)
+             for (i = 0; i < current->nb_outputs; i++) {
+                 link = current->outputs[i];
+ 
+-                memset(map, 0, sizeof(map));
+-                if (av_opt_get_array(current, "map_array", AV_OPT_SEARCH_CHILDREN,
+-                        0, current->nb_outputs, AV_OPT_TYPE_INT, map)
+-                    < 0)
+-                    MEDIA_WARN("Failed to get map array for %s\n", current->name);
++                audio_get_route_map(current, map, current->nb_outputs);
+ 
+                 if (map[i] != ROUTE_ON)
+                     continue;
+@@ -462,11 +484,7 @@ static int audio_negotiate_formats_init(AVFilterContext* filter)
+                         break;
+                 }
+ 
+-                memset(map, 0, sizeof(map));
+-                if (av_opt_get_array(link->src, "map_array", AV_OPT_SEARCH_CHILDREN,
+-                        0, link->src->nb_outputs, AV_OPT_TYPE_INT, map)
+-                    < 0)
+-                    MEDIA_WARN("Failed to get map array for %s\n", link->src->name);
++                audio_get_route_map(link->src, map, link->src->nb_outputs);
+ 
+                 if (map[j] != ROUTE_ON) {
+                     MEDIA_INFO("Skipping query for input[%d] of '%s' (src output[%d] map=OFF)\n",
+@@ -668,11 +686,8 @@ static int audio_negotiation_enabled_outputs(int enabled_count, AVFilterLink** e
+ 
+     for (i = 0; i < enabled_count; i++) {
+         if (enabled_outputs[i]->dst && enabled_outputs[i]->dst->nb_outputs > 0) {
+-            memset(dst_map, 0, sizeof(dst_map));
+-            if (av_opt_get_array(enabled_outputs[i]->dst, "map_array", AV_OPT_SEARCH_CHILDREN,
+-                    0, enabled_outputs[i]->dst->nb_outputs, AV_OPT_TYPE_INT, dst_map)
+-                < 0)
+-                MEDIA_WARN("Failed to get map array for %s.\n", enabled_outputs[i]->dst->name);
++            audio_get_route_map(enabled_outputs[i]->dst, dst_map,
++                enabled_outputs[i]->dst->nb_outputs);
+ 
+             for (j = 0; j < enabled_outputs[i]->dst->nb_outputs; j++) {
+                 if (dst_map[j] != ROUTE_ON)
+@@ -755,9 +770,8 @@ static int audio_negotiation_enabled_outputs(int enabled_count, AVFilterLink** e
+         ds_rate, ds_ch);
+ 
+     for (i = 0; i < enabled_count; i++) {
+-        memset(dst_map, 0, sizeof(dst_map));
+-        av_opt_get_array(enabled_outputs[i]->dst, "map_array", AV_OPT_SEARCH_CHILDREN,
+-            0, enabled_outputs[i]->dst->nb_outputs, AV_OPT_TYPE_INT, dst_map);
++        audio_get_route_map(enabled_outputs[i]->dst, dst_map,
++            enabled_outputs[i]->dst->nb_outputs);
+ 
+         for (j = 0; j < enabled_outputs[i]->dst->nb_outputs; j++) {
+             if (dst_map[j] != ROUTE_ON)
+@@ -833,11 +847,7 @@ static void audio_negotiate_src(AVFilterContext* filter)
+         if (!src->nb_outputs)
+             continue;
+ 
+-        memset(map, 0, sizeof(map));
+-        if (av_opt_get_array(src, "map_array", AV_OPT_SEARCH_CHILDREN,
+-                0, src->nb_outputs, AV_OPT_TYPE_INT, map)
+-            < 0)
+-            MEDIA_WARN("Failed to get map array for src %s\n", src->name);
++        audio_get_route_map(src, map, src->nb_outputs);
+ 
+         enabled_count = 0;
+         for (i = 0; i < src->nb_outputs; i++) {
+@@ -872,4 +882,4 @@ int audio_negotiation_trigger(AVFilterContext* filter)
+     audio_negotiate_src(filter);
+ 
+     return ret;
+-}
+\ No newline at end of file
++}
+diff --git a/server/media_recorder.c b/server/media_recorder.c
+index c5798f8..585949b 100644
+--- a/server/media_recorder.c
++++ b/server/media_recorder.c
+@@ -1485,7 +1485,7 @@ static int media_recorder_handler(MediadPlugin* handle, struct media_server_conn
+             }
+         }
+ 
+-        ret = media_recorder_open(ctx, arg);
++        ret = media_recorder_open(ctx, ctx->name);
+         if (ret < 0)
+             return ret;
+ 
+diff --git a/server/media_server.c b/server/media_server.c
+index fa0c9da..662f772 100644
+--- a/server/media_server.c
++++ b/server/media_server.c
+@@ -70,6 +70,8 @@ struct media_server_priv {
+ #if CONFIG_MEDIA_SERVER_PORT >= 0
+     int inet_fd;
+ #endif
++    pthread_t pump_thread;
++    bool pump_running;
+     struct media_server_conn conns[MEDIA_SERVER_MAXCONN];
+ };
+ 
+@@ -77,6 +79,8 @@ struct media_server_priv {
+  * Private Functions
+  ****************************************************************************/
+ 
++static void* media_server_pump(void* arg);
++
+ static int media_server_create_notify(struct media_server_priv* priv, media_parcel* parcel)
+ {
+     struct sockaddr_un local_addr;
+@@ -260,11 +264,15 @@ static int media_server_listen(struct media_server_priv* priv, int family)
+     int fd;
+     int len;
+ 
++    syslog(LOG_WARNING, "[media] server_listen entry, family=%d\n", family);
+     fd = socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+-    if (fd < 0)
++    if (fd < 0) {
++        syslog(LOG_WARNING, "[media] socket(%d) failed: %d\n", family, errno);
+         return -errno;
++    }
+ 
+     if (family == PF_LOCAL) {
++        memset(&local_addr, 0, sizeof(local_addr));
+         priv->local_fd = fd;
+         local_addr.sun_family = AF_LOCAL;
+         snprintf(local_addr.sun_path, UNIX_PATH_MAX,
+@@ -274,6 +282,7 @@ static int media_server_listen(struct media_server_priv* priv, int family)
+ #if CONFIG_MEDIA_SERVER_PORT >= 0
+     } else if (family == AF_INET) {
+         int opt = 1;
++        memset(&in_addr, 0, sizeof(in_addr));
+         priv->inet_fd = fd;
+         in_addr.sin_family = AF_INET;
+         in_addr.sin_addr.s_addr = INADDR_ANY;
+@@ -283,6 +292,7 @@ static int media_server_listen(struct media_server_priv* priv, int family)
+         setsockopt(priv->inet_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+ #endif
+     } else {
++        memset(&rpmsg_addr, 0, sizeof(rpmsg_addr));
+         priv->rpmsg_fd = fd;
+         rpmsg_addr.rp_family = AF_RPMSG;
+         snprintf(rpmsg_addr.rp_name, RPMSG_SOCKET_NAME_SIZE,
+@@ -292,12 +302,19 @@ static int media_server_listen(struct media_server_priv* priv, int family)
+         len = sizeof(struct sockaddr_rpmsg);
+     }
+ 
+-    if (bind(fd, addr, len) < 0)
++    if (bind(fd, addr, len) < 0) {
++        syslog(LOG_WARNING, "[media] bind failed: errno=%d family=%d\n",
++            errno, family);
+         return -errno;
++    }
+ 
+-    if (listen(fd, MEDIA_SERVER_MAXCONN) < 0)
++    if (listen(fd, MEDIA_SERVER_MAXCONN) < 0) {
++        syslog(LOG_WARNING, "[media] listen failed: errno=%d\n", errno);
+         return -errno;
++    }
+ 
++    syslog(LOG_WARNING, "[media] server listening, family=%d fd=%d\n",
++        family, fd);
+     return 0;
+ }
+ 
+@@ -308,7 +325,9 @@ static int media_server_init(MediadPlugin* ctx)
+ {
+     struct media_server_priv* priv = ctx->priv;
+     int ret1 = -1, ret2 = -1, ret3 = -1;
++    int ret;
+ 
++    syslog(LOG_WARNING, "[media] server_init called, priv=%p\n", priv);
+     ret1 = media_server_listen(priv, PF_LOCAL);
+     ret2 = media_server_listen(priv, AF_RPMSG);
+ #if CONFIG_MEDIA_SERVER_PORT >= 0
+@@ -318,6 +337,13 @@ static int media_server_init(MediadPlugin* ctx)
+     if (ret1 < 0 && ret2 < 0 && ret3 < 0)
+         return -EINVAL;
+ 
++    priv->pump_running = true;
++    ret = pthread_create(&priv->pump_thread, NULL, media_server_pump, priv);
++    if (ret == 0)
++        syslog(LOG_WARNING, "[media] server pump started\n");
++    else
++        syslog(LOG_WARNING, "[media] server pump start failed: %d\n", ret);
++
+     return 0;
+ }
+ 
+@@ -329,6 +355,11 @@ static int media_server_uinit(MediadPlugin* ctx)
+     if (priv == NULL)
+         return -EINVAL;
+ 
++    if (priv->pump_running) {
++        priv->pump_running = false;
++        pthread_join(priv->pump_thread, NULL);
++    }
++
+     SAFE_CLOSE(priv->local_fd);
+     SAFE_CLOSE(priv->rpmsg_fd);
+ #if CONFIG_MEDIA_SERVER_PORT >= 0
+@@ -400,6 +431,78 @@ static int media_server_poll_available(MediadPlugin* ctx, struct pollfd* fd, voi
+         return media_server_accept(priv, fd);
+ }
+ 
++static void media_server_try_accept(struct media_server_priv* priv, int fd)
++{
++    struct pollfd pollfd;
++    int ret;
++
++    if (fd <= 0)
++        return;
++
++    pollfd.fd = fd;
++    pollfd.events = POLLIN;
++    pollfd.revents = POLLIN;
++
++    do {
++        ret = media_server_accept(priv, &pollfd);
++        if (ret == 0)
++            syslog(LOG_WARNING, "[media] accepted connection on fd=%d\n", fd);
++    } while (ret == 0);
++}
++
++static int media_server_run_once(MediadPlugin* ctx)
++{
++    struct media_server_priv* priv = ctx->priv;
++    struct pollfd pollfd;
++    int ret;
++    int i;
++
++    if (priv == NULL)
++        return -EINVAL;
++
++    /* Accept probing is handled solely by the pump thread; this loop is the
++     * sole reader of conn sockets. Keeping accept out of here avoids two
++     * threads accept()ing the same listen fd / grabbing conn slots at once.
++     */
++    pollfd.events = POLLIN;
++    pollfd.revents = POLLIN;
++
++    for (i = 0; i < MEDIA_SERVER_MAXCONN; i++) {
++        if (priv->conns[i].tran_fd <= 0)
++            continue;
++
++        pollfd.fd = priv->conns[i].tran_fd;
++        ret = media_server_receive(priv, &pollfd, &priv->conns[i]);
++        if (ret < 0 && ret != -EAGAIN && ret != -EWOULDBLOCK &&
++            ret != -EPIPE)
++            return ret;
++    }
++
++    return 0;
++}
++
++static void* media_server_pump(void* arg)
++{
++    struct media_server_priv* priv = arg;
++
++    while (priv->pump_running) {
++        /* Only probe for pending accepts here (some NuttX listen sockets
++         * don't wake poll()). Do NOT receive on conns from this thread -
++         * the main daemon poll loop (poll_available/run_once) is the sole
++         * reader. Reading conns here too races with it and corrupts the
++         * parcel stream (misframed RPC -> garbage id -> -ENOSYS).
++         */
++        media_server_try_accept(priv, priv->local_fd);
++#if CONFIG_MEDIA_SERVER_PORT >= 0
++        media_server_try_accept(priv, priv->inet_fd);
++#endif
++
++        usleep(10000);
++    }
++
++    return NULL;
++}
++
+ int media_server_notify(void* handle, void* cookie, media_parcel* parcel)
+ {
+     struct media_server_priv* priv = handle;
+@@ -497,7 +600,7 @@ MediadPlugin media_server_plugin = {
+     .init = media_server_init,
+     .get = media_server_get_pollfds,
+     .available = media_server_poll_available,
+-    .run_once = NULL,
++    .run_once = media_server_run_once,
+     .uninit = media_server_uinit,
+ };
+ 
+===== REPO: external/ffmpeg/ffmpeg =====
+diff --git a/libavfilter/asink_abufsink.c b/libavfilter/asink_abufsink.c
+index 7fad4d2cfc..5e9895ac17 100644
+--- a/libavfilter/asink_abufsink.c
++++ b/libavfilter/asink_abufsink.c
+@@ -303,13 +303,11 @@ static int abufsink_init(AVFilterContext *ctx)
+ static int abufsink_query_formats(const AVFilterContext *ctx, AVFilterFormatsConfig **cfg_in,
+                                AVFilterFormatsConfig **cfg_out)
+ {
+-    AVFilterChannelLayouts *layouts = NULL;
+     AVFilterFormats *formats = NULL;
+     ABufSinkPriv *sink = ctx->priv;
+     int ret = AVERROR(EINVAL), i;
+ 
+     for (i = 0; i < ctx->nb_inputs; i++) {
+-        AVChannelLayout list64[] = { { 0 }, { 0 } };
+         int list[] = { 0, -1 };
+ 
+         list[0] = sink->sample_fmt;
+@@ -322,24 +320,15 @@ static int abufsink_query_formats(const AVFilterContext *ctx, AVFilterFormatsCon
+         if (ret < 0)
+             goto out;
+ 
+-        formats = NULL;
+-        list[0] = sink->sample_rate;
+-        formats = ff_make_format_list(list);
+-        if (!formats)
+-            goto out;
+-
+-        ff_formats_unref(&cfg_in[i]->samplerates);
+-        ret = ff_formats_ref(formats, &cfg_in[i]->samplerates);
+-        if (ret < 0)
+-            goto out;
+-
+-        list64[0] = sink->ch_layout;
+-        layouts = ff_make_channel_layout_list(list64);
+-        if (!layouts)
+-            goto out;
+-
+-        ff_channel_layouts_unref(&cfg_in[i]->channel_layouts);
+-        ret = ff_channel_layouts_ref(layouts, &cfg_in[i]->channel_layouts);
++        /* Do not constrain sample_rate / channel_layout on the link: the
++         * internal amix resamples any input to the recorder-requested target
++         * (set via the "link" command). Advertising the amix target here would
++         * force the upstream link format and make pass-through filters (e.g.
++         * volume) deliver frames that fail ff_filter_frame's consistency check.
++         * Leaving these NULL means "accept any", so the link inherits the
++         * source format and frames flow; amix then converts internally.
++         */
++        ret = 0;
+     }
+ 
+ out:
