@@ -145,33 +145,9 @@ static int make_accept_key(const char* key, char* out, size_t out_size)
 }
 
 /**
+ * WebSocket handshake using pre-read buffer.
  * Read full HTTP upgrade request, extract Sec-WebSocket-Key.
  * Returns 0 on success; sends 101 response.
- */
-static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
-    char* chat_id_out, size_t chat_id_size);
-
-static int do_ws_handshake(int fd, char* chat_id_out, size_t chat_id_size)
-{
-    char buf[2048];
-    int total = 0;
-
-    /* Read until we see the end of headers */
-    while (total < (int)sizeof(buf) - 1) {
-        int n = recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
-        if (n <= 0)
-            return -1;
-        total += n;
-        buf[total] = '\0';
-        if (strstr(buf, "\r\n\r\n"))
-            break;
-    }
-
-    return do_ws_handshake_ex(fd, buf, total, chat_id_out, chat_id_size);
-}
-
-/**
- * WebSocket handshake using pre-read buffer.
  */
 static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
     char* chat_id_out, size_t chat_id_size)
