@@ -562,7 +562,9 @@ int audio_capture_abort(audio_capture_t* cap)
 
     case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER:
         if (cap->handle.recorder) {
+#ifdef CONFIG_MEDIA_GRAPH
             media_recorder_close_socket(cap->handle.recorder);
+#endif
             return media_recorder_stop(cap->handle.recorder);
         }
         return 0;
