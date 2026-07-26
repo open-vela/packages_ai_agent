@@ -195,6 +195,48 @@ static const char *TAG = "skills";
     "- Add: get_current_time, then edit_file/write_file to append: - [ ] [YYYY-MM-DD] desc\n" \
     "- Complete: edit_file to change - [ ] to - [x]\n"
 
+#define BUILTIN_VISUAL_GUIDE \
+    "# Visual Guide\n\n" \
+    "Describe the camera view aloud as an informational aid. This skill does not guarantee a safe route and must not replace a mobility aid.\n\n" \
+    "## When to use\n" \
+    "When the user asks what is ahead, requests a scene description, or asks the device to read visible text aloud.\n\n" \
+    "## How to use\n" \
+    "1. Call peripheral_status. In its devices array, require the camera and audio_playback entries to have available=true.\n" \
+    "2. Call network_probe with apply=false. A failure is a warning, not a reason to skip local hardware checks.\n" \
+    "3. Call camera_capture with resolution=high and ask for observable objects, approximate relative positions, and visible text. Never state that a route is certainly safe.\n" \
+    "4. Extract analysis from the result. If it is empty, speak a short failure message.\n" \
+    "5. Call tts_speak with chunks no longer than 100 Chinese characters or 300 English characters.\n\n" \
+    "## Fallback\n" \
+    "- Camera unavailable: use tts_speak to report that the camera is not ready.\n" \
+    "- TTS unavailable: return the camera analysis as text.\n" \
+    "- Network unavailable: do not change DNS automatically; report the diagnostic result.\n"
+
+#define BUILTIN_DEVICE_SELF_CHECK \
+    "# Device Self Check\n\n" \
+    "Check the board's network and multimedia peripherals, then report a concise pass/fail summary.\n\n" \
+    "## When to use\n" \
+    "When the user asks whether the camera, microphone, speaker, display, I2S, or network is ready.\n\n" \
+    "## How to use\n" \
+    "1. Call peripheral_status.\n" \
+    "2. Call network_probe with apply=false.\n" \
+    "3. Report every missing device node and all reachable DNS servers.\n" \
+    "4. If the speaker is available and the user requested an audible result, call tts_speak with the summary.\n" \
+    "5. Never call network_probe with apply=true unless the user explicitly asks to change DNS.\n\n" \
+    "## Result\n" \
+    "Separate hardware presence from end-to-end functional verification. A present device node means registered, not that image or audio quality has been verified.\n"
+
+#define BUILTIN_MEAL_PLANNER \
+    "# Meal Planner\n\n" \
+    "Create a daily three-meal plan from the date, saved preferences, and optional activity data.\n\n" \
+    "## When to use\n" \
+    "When the user asks what to eat, requests a meal plan, or wants a daily calorie estimate.\n\n" \
+    "## How to use\n" \
+    "1. Call get_current_time and determine whether today is a weekday.\n" \
+    "2. Read " AGENT_MEMORY_DIR "/MEMORY.md for allergies, preferences, and goals. Never recommend a known allergen.\n" \
+    "3. Optionally call get_steps to estimate activity. If unavailable, use a neutral activity level.\n" \
+    "4. Provide breakfast, lunch, and dinner with approximate calories and a daily total. Label all nutrition numbers as estimates.\n" \
+    "5. For medical diets, advise confirmation with a qualified clinician.\n"
+
 /* Built-in skill registry */
 typedef struct {
     const char *filename;   /* e.g. "weather" */
@@ -212,6 +254,9 @@ static const builtin_skill_t s_builtins[] = {
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
     { "task-manager",   BUILTIN_TASK_MANAGER   },
+    { "visual-guide",   BUILTIN_VISUAL_GUIDE   },
+    { "device-self-check", BUILTIN_DEVICE_SELF_CHECK },
+    { "meal-planner",   BUILTIN_MEAL_PLANNER   },
 };
 
 #define NUM_BUILTINS (sizeof(s_builtins) / sizeof(s_builtins[0]))

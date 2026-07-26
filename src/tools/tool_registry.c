@@ -35,9 +35,12 @@
 #include "tools/tool_get_time.h"
 #include "tools/tool_health.h"
 #include "tools/tool_media.h"
+#include "tools/tool_network_probe.h"
+#include "tools/tool_peripheral.h"
 #include "tools/tool_proxyquickapp.h"
 #include "tools/tool_shell.h"
 #include "tools/tool_system.h"
+#include "tools/tool_tts.h"
 #include "tools/tool_vision.h"
 #include "tools/tool_camera.h"
 #include "tools/tool_web_search.h"
@@ -210,6 +213,15 @@ int tool_registry_init(void)
         "Get current date, time, and UNIX epoch.",
         tool_get_time_execute);
 
+    REGISTER_TOOL(
+        "network_probe",
+        "Measure DNS reachability and latency. Read-only unless apply=true.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_BOOL("apply",
+                "Apply recommended DNS servers to the configured resolver file")
+                TOOL_SCHEMA_END(),
+        tool_network_probe_execute);
+
     /* File tools */
     REGISTER_TOOL("read_file",
         "Read a file. Path must start with " AGENT_DATA_DIR "/.",
@@ -347,6 +359,12 @@ int tool_registry_init(void)
         "Check if screen is on or off.",
         tool_get_screen_state_execute);
 
+    REGISTER_TOOL_NO_PARAMS(
+        "peripheral_status",
+        "Check camera, display, I2S, audio capture, and audio playback "
+        "device-node availability.",
+        tool_peripheral_status_execute);
+
     /* Health / fitness tools */
     REGISTER_TOOL_NO_PARAMS(
         "get_heartrate",
@@ -483,6 +501,14 @@ int tool_registry_init(void)
         "Get current music playback status including state, "
         "position, duration, volume, and track URL.",
         tool_music_status_execute);
+
+    REGISTER_TOOL(
+        "tts_speak",
+        "Synthesize text and play it through the device speaker.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("text", "UTF-8 text to speak, up to 600 bytes")
+                TOOL_SCHEMA_END_REQUIRED("\"text\""),
+        tool_tts_speak_execute);
 
     /* QuickApp launch tool */
     REGISTER_TOOL("launch_quickapp",
