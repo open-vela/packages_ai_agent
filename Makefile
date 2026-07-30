@@ -67,7 +67,10 @@ CSRCS += src/tools/tool_system.c
 CSRCS += src/tools/tool_health.c
 CSRCS += src/tools/tool_control.c
 CSRCS += src/tools/tool_media.c
+CSRCS += src/tools/tool_network_probe.c
+CSRCS += src/tools/tool_peripheral.c
 CSRCS += src/tools/tool_proxyquickapp.c
+CSRCS += src/tools/tool_tts.c
 ifeq ($(CONFIG_AI_AGENT_MCP),y)
 CSRCS += src/tools/mcp_bridge.c
 CSRCS += src/tools/mcp_server.c
