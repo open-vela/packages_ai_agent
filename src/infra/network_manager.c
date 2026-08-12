@@ -704,22 +704,8 @@ int network_set_dns(const char* primary, const char* secondary)
         return -EINVAL;
     }
 
-    fp = fopen("/tmp/resolv.conf", "w");
-    if (!fp) {
-        syslog(LOG_ERR, "[%s] Cannot open /tmp/resolv.conf: %d\n",
-            TAG, errno);
-        return -errno;
-    }
-
-    fprintf(fp, "nameserver %s\n", primary);
-    if (secondary && secondary[0] != '\0') {
-        fprintf(fp, "nameserver %s\n", secondary);
-    }
-
-    fclose(fp);
-
-    /* Register with the NuttX DNS resolver. CONFIG_NETDB_RESOLVCONF is
-     * off on this board, so the resolver never reads /tmp/resolv.conf —
+    /* Register with the NuttX DNS resolver FIRST. CONFIG_NETDB_RESOLVCONF
+     * is off on this board, so the resolver never reads /tmp/resolv.conf —
      * without this the domain lookup fails with
      * MBEDTLS_ERR_NET_UNKNOWN_HOST on every HTTPS request. */
     const char* servers[2] = { primary, secondary };
@@ -738,6 +724,20 @@ int network_set_dns(const char* primary, const char* secondary)
         }
         dns_add_nameserver((FAR const struct sockaddr*)&addr,
                            sizeof(addr));
+    }
+
+    /* The file write below is best-effort: /tmp may not exist and the
+     * NuttX resolver does not read this file anyway. */
+    fp = fopen("/tmp/resolv.conf", "w");
+    if (!fp) {
+        syslog(LOG_WARNING, "[%s] Cannot open /tmp/resolv.conf: %d "
+            "(non-fatal, resolver registered directly)\n", TAG, errno);
+    } else {
+        fprintf(fp, "nameserver %s\n", primary);
+        if (secondary && secondary[0] != '\0') {
+            fprintf(fp, "nameserver %s\n", secondary);
+        }
+        fclose(fp);
     }
 
     /* Persist to config_store */
