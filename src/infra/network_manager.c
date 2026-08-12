@@ -17,6 +17,7 @@
 #include "network_manager.h"
 #include "agent_compat.h"
 
+#include <nuttx/net/dns.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
@@ -144,10 +145,130 @@ int network_wifi_reconnect(void)
     return network_wait_connected(5000);
 }
 
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
+/* ── QEMU stub: real NIC present, RPMSG state machine not needed ── */
+/* The state-machine APIs below normally live in the RPMSG/TUN branch.
+ * On QEMU the virtio-net NIC provides connectivity directly, so they
+ * return sane defaults (connected, no resource limits). */
+
+#include <errno.h>
+
+static net_state_cb_t s_qemu_listeners[NET_MAX_LISTENERS];
+static void *s_qemu_listener_args[NET_MAX_LISTENERS];
+static int s_qemu_listener_count;
+
+int network_register_listener(net_state_cb_t cb, void *arg)
+{
+    if (s_qemu_listener_count >= NET_MAX_LISTENERS)
+        return -ENOMEM;
+    s_qemu_listeners[s_qemu_listener_count] = cb;
+    s_qemu_listener_args[s_qemu_listener_count] = arg;
+    s_qemu_listener_count++;
+    return OK;
+}
+
+net_state_t network_get_state(void)
+{
+    return network_is_connected() ? NET_STATE_CONNECTED
+                                  : NET_STATE_DISCONNECTED;
+}
+
+int network_get_active_conns(void)
+{
+    return 0;
+}
+
+int network_get_iob_usage(void)
+{
+    return 0;
+}
+
+int network_rpmsg_init(void)
+{
+    return OK;
+}
+
+int network_reconnect(void)
+{
+    return network_wifi_reconnect();
+}
+
+int network_set_dns(const char *primary, const char *secondary)
+{
+    (void)primary;
+    (void)secondary;
+    return OK;
+}
+
+int network_diag(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    syslog(LOG_INFO, "[%s] QEMU: eth0 via virtio-net, state=%s\n", TAG,
+           network_is_connected() ? "connected" : "disconnected");
+    return OK;
+}
+
+int network_save_proxy_config(const char *mode, const char *cpu_name)
+{
+    (void)mode;
+    (void)cpu_name;
+    return OK;
+}
+
+int network_get_connect_timeout(void)
+{
+    return 15;
+}
+
+int network_get_read_timeout(void)
+{
+    return 30;
+}
+
+int network_get_retry_max(void)
+{
+    return 3;
+}
+
+int network_get_retry_base_sec(void)
+{
+    return 2;
+}
+
+const char *network_get_proxy_mode(void)
+{
+    return "usrsock";
+}
+
+const char *network_get_rpmsg_cpu(void)
+{
+    return "";
+}
+
+int network_acquire_resource(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return OK;
+}
+
+void network_release_resource(void)
+{
+}
+#endif /* CONFIG_AI_AGENT_NET_RPMSG */
+
 #elif defined(CONFIG_AI_AGENT_NET_RPMSG)
 /* ── RPMSG/TUN network via BLE proxy ─────────────────────────── */
 
 #include "config/config_store.h"
+
+#ifdef CONFIG_AI_AGENT_BLE_NET
+#include "ble_net.h"
+#endif
+
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+#include "ble_gatt_net.h"
+#endif
 
 #include <errno.h>
 #include <pthread.h>
@@ -417,6 +538,14 @@ static void* iface_poll_thread(void* arg)
 
     while (g_poll_running) {
         bool has_ip = check_interfaces();
+#ifdef CONFIG_AI_AGENT_BLE_NET
+        /* BLE proxy channel must have its SPP pipe up as well */
+        has_ip = has_ip && ble_net_is_connected();
+#endif
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+        /* BLE GATT proxy channel must have the phone attached */
+        has_ip = has_ip && ble_gatt_net_is_connected();
+#endif
 
         if (has_ip) {
             set_net_state(NET_STATE_CONNECTED);
@@ -589,6 +718,28 @@ int network_set_dns(const char* primary, const char* secondary)
 
     fclose(fp);
 
+    /* Register with the NuttX DNS resolver. CONFIG_NETDB_RESOLVCONF is
+     * off on this board, so the resolver never reads /tmp/resolv.conf —
+     * without this the domain lookup fails with
+     * MBEDTLS_ERR_NET_UNKNOWN_HOST on every HTTPS request. */
+    const char* servers[2] = { primary, secondary };
+    for (int i = 0; i < 2; i++) {
+        struct sockaddr_in addr;
+
+        if (!servers[i] || servers[i][0] == '\0') {
+            continue;
+        }
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        if (inet_pton(AF_INET, servers[i], &addr.sin_addr) != 1) {
+            syslog(LOG_ERR, "[%s] set_dns: invalid addr %s\n",
+                TAG, servers[i]);
+            continue;
+        }
+        dns_add_nameserver((FAR const struct sockaddr*)&addr,
+                           sizeof(addr));
+    }
+
     /* Persist to config_store */
     claw_config_set("net.dns_primary", primary);
     if (secondary && secondary[0] != '\0') {
@@ -663,6 +814,26 @@ int network_rpmsg_init(void)
 
     /* Configure DNS */
     network_set_dns(dns_primary, dns_secondary);
+
+#ifdef CONFIG_AI_AGENT_BLE_NET
+    /* Start BLE SPP + TUN proxy channel (phone companion app) */
+    ret = ble_net_init();
+    if (ret != 0) {
+        syslog(LOG_ERR, "[%s] ble_net_init failed: %d\n", TAG, ret);
+    } else {
+        syslog(LOG_INFO, "[%s] BLE SPP+TUN proxy channel started\n", TAG);
+    }
+#endif
+
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+    /* Start BLE GATT NUS + TUN proxy channel (phone companion app) */
+    ret = ble_gatt_net_init();
+    if (ret != 0) {
+        syslog(LOG_ERR, "[%s] ble_gatt_net_init failed: %d\n", TAG, ret);
+    } else {
+        syslog(LOG_INFO, "[%s] BLE GATT+TUN proxy channel started\n", TAG);
+    }
+#endif
 
     /* Start interface poll thread */
     g_poll_running = true;
