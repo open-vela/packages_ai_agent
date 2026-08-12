@@ -110,9 +110,13 @@ static void on_connected(gatts_handle_t srv_handle, bt_address_t* addr)
     memcpy(&g_gatt.peer_addr, addr, sizeof(bt_address_t));
     g_gatt.connected = true;
     g_gatt.notify_enabled = false;
+    /* Legacy advertising stops automatically on connection and the
+     * framework sends no on_adv_stopped for legacy (that event is
+     * ext-adv only): clear state here so a reconnect does not reuse
+     * a stale advertiser handle. */
+    g_gatt.advertising = false;
+    g_gatt.adv_handle = NULL;
     pthread_mutex_unlock(&g_gatt.lock);
-
-    /* Advertising stops automatically on connection */
 
     /* Snapshot callback before releasing - avoids TOCTOU if config
      * is modified between the check and the call. */
@@ -162,10 +166,16 @@ static void on_disconnected(gatts_handle_t srv_handle, bt_address_t* addr)
 static void on_mtu_changed(gatts_handle_t srv_handle, bt_address_t* addr,
     uint32_t mtu)
 {
-    syslog(LOG_INFO, "[%s] MTU changed: %u\n", TAG, (unsigned)mtu);
+    /* The framework delivers the ATT payload (MTU - 3) here, not the
+     * MTU itself. Store the real MTU so ble_gatt_send() subtracts 3
+     * exactly once (the old code stored the payload and subtracted
+     * another 3, rejecting 20-byte notifications on a default 23 MTU). */
+    uint16_t real_mtu = (uint16_t)(mtu + 3);
+
+    syslog(LOG_INFO, "[%s] MTU changed: %u\n", TAG, (unsigned)real_mtu);
 
     pthread_mutex_lock(&g_gatt.lock);
-    g_gatt.mtu = (uint16_t)mtu;
+    g_gatt.mtu = real_mtu;
     pthread_mutex_unlock(&g_gatt.lock);
 }
 
@@ -280,7 +290,7 @@ static int setup_nus_service(void)
 
 /* -- BLE Advertising ------------------------------------------ */
 
-#define BLE_GATT_ADV_NAME "VelaClaw"
+#define BLE_GATT_ADV_NAME "Agent-Watch"
 #define BLE_GATT_ADV_INTERVAL 320 /* 200ms (320 * 0.625ms) */
 #define BLE_GATT_APPEARANCE 0x00C1 /* Watch: Sports Watch */
 
@@ -294,6 +304,13 @@ static void on_adv_start(bt_advertiser_t* adv, uint8_t adv_id,
         pthread_mutex_unlock(&g_gatt.lock);
     } else {
         syslog(LOG_ERR, "[%s] Advertising start failed: %u\n", TAG, status);
+        /* On async failure (e.g. START_TIMEOUT) the framework has already
+         * destroyed the advertiser: clear the dangling handle so adv_stop()
+         * never touches freed memory. */
+        pthread_mutex_lock(&g_gatt.lock);
+        g_gatt.adv_handle = NULL;
+        g_gatt.advertising = false;
+        pthread_mutex_unlock(&g_gatt.lock);
     }
 }
 
@@ -321,28 +338,31 @@ static int adv_start(void)
     }
     pthread_mutex_unlock(&g_gatt.lock);
 
-    /* Build advertising data: flags + NUS service UUID */
+    /* Build advertising data: flags + device name in the ADV packet so
+     * the name is visible without a scan request (31-byte ADV limit:
+     * name instead of the 128-bit service UUID; UUID goes in scan_rsp). */
     advertiser_data_t* adv_data = advertiser_data_new();
     if (!adv_data) {
         return -ENOMEM;
     }
 
-    bt_uuid_t svc_uuid;
-    static const uint8_t svc_bytes[] = { NUS_SVC_UUID_BYTES };
-    bt_uuid128_create(&svc_uuid, svc_bytes);
-    advertiser_data_add_service_uuid(adv_data, &svc_uuid);
-    advertiser_data_set_appearance(adv_data, BLE_GATT_APPEARANCE);
+    advertiser_data_set_flags(adv_data, 0x06); /* LE General Discoverable */
+    advertiser_data_set_name(adv_data, BLE_GATT_ADV_NAME);
 
     uint16_t adv_len = 0;
     uint8_t* p_adv = advertiser_data_build(adv_data, &adv_len);
 
-    /* Build scan response: device name */
+    /* Build scan response: NUS service UUID + appearance */
     advertiser_data_t* scan_rsp = advertiser_data_new();
     if (!scan_rsp) {
         advertiser_data_free(adv_data);
         return -ENOMEM;
     }
-    advertiser_data_set_name(scan_rsp, BLE_GATT_ADV_NAME);
+    bt_uuid_t svc_uuid;
+    static const uint8_t svc_bytes[] = { NUS_SVC_UUID_BYTES };
+    bt_uuid128_create(&svc_uuid, svc_bytes);
+    advertiser_data_add_service_uuid(scan_rsp, &svc_uuid);
+    advertiser_data_set_appearance(scan_rsp, BLE_GATT_APPEARANCE);
 
     uint16_t rsp_len = 0;
     uint8_t* p_rsp = advertiser_data_build(scan_rsp, &rsp_len);
@@ -350,7 +370,12 @@ static int adv_start(void)
     /* Set advertising parameters */
     ble_adv_params_t params;
     memset(&params, 0, sizeof(params));
-    params.adv_type = BT_LE_ADV_IND; /* Connectable undirected */
+    params.adv_type = BT_LE_LEGACY_ADV_IND; /* Legacy connectable undirected:
+                                              * SF32LB52 LCPU firmware accepts
+                                              * ext adv (0x2039) but transmits
+                                              * nothing on air; legacy commands
+                                              * (0x2006/0x2008/0x200A) go
+                                              * through the controller directly. */
     params.own_addr_type = BT_LE_ADDR_TYPE_PUBLIC;
     params.interval = BLE_GATT_ADV_INTERVAL;
     params.channel_map = BT_LE_ADV_CHANNEL_DEFAULT;
@@ -502,8 +527,11 @@ int ble_gatt_init(const ble_gatt_config_t* config)
         printf("[ble_gatt] advertising started OK\n");
     }
 
-    /* Always start retry thread - even if adv_start returned 0,
-     * the async on_adv_start callback may report failure later. */
+    /* Retry thread disabled: re-starting advertising while the first
+     * instance is active returns BT_ADV_STATUS_START_TIMEOUT and the
+     * async on_adv_start callback may never arrive (async pipe issue),
+     * causing useless repeated retries. First successful start is kept. */
+#if 0
     {
         pthread_t retry_thread;
         pthread_attr_t attr;
@@ -513,6 +541,7 @@ int ble_gatt_init(const ble_gatt_config_t* config)
         pthread_attr_destroy(&attr);
         pthread_detach(retry_thread);
     }
+#endif
 
     /* Already marked initialized at the top; just log success */
     syslog(LOG_INFO, "[%s] BLE GATT channel ready\n", TAG);
