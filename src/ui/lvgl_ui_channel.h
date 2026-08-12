@@ -48,6 +48,12 @@ void lvgl_ui_channel_stop(void);
 void lvgl_ui_channel_show(void);
 
 /**
+ * Bring the pet stage (pet + bubble + menu) to the foreground.
+ * Used by the launcher desktop when entering the pet app.
+ */
+void lvgl_ui_enter_pet_stage(void);
+
+/**
  * 发送 Agent 回复到 UI。
  * 在 Chat View 中添加 Agent 消息气泡，并调用 voice_channel_speak() 进行 TTS 播报。
  * 首次调用时自动显示聊天界面。由 outbound_dispatch_task 调用。
@@ -56,6 +62,15 @@ void lvgl_ui_channel_show(void);
  * @return 0 成功，负值表示错误
  */
 int lvgl_ui_channel_send(const char* text);
+
+/**
+ * 发送用户消息到 UI（ASR 识别结果）。
+ * 在头顶气泡显示用户气泡并记录到历史。由语音通道（阶段 B）调用。
+ *
+ * @param text  UTF-8 文本，用户说话内容
+ * @return 0 成功，负值表示错误
+ */
+int lvgl_ui_channel_send_user(const char* text);
 
 #ifdef __cplusplus
 }

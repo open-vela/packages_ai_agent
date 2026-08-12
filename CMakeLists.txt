@@ -100,6 +100,14 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   if(CONFIG_AI_AGENT_LVGL_UI)
     list(APPEND AGENT_SRCS src/ui/lvgl_ui_channel.c)
+    list(APPEND AGENT_SRCS src/ui/pet_display.c)
+    list(APPEND AGENT_SRCS src/ui/launcher_page.c)
+    list(APPEND AGENT_SRCS src/ui/pet_page.c)
+    list(APPEND AGENT_SRCS src/ui/settings_page.c)
+    list(APPEND AGENT_SRCS src/ui/assets/ui_font_cjk_18.c)
+    list(APPEND AGENT_SRCS src/ui/assets/ui_font_cjk_12.c)
+    list(APPEND AGENT_SRCS src/ui/assets/pet_cloud_open.c)
+    list(APPEND AGENT_SRCS src/ui/assets/pet_cloud_blink.c)
   endif()
 
   if(CONFIG_AI_AGENT_CAMERA)
@@ -126,6 +134,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   if(CONFIG_AI_AGENT_BLE_GATT)
     list(APPEND AGENT_SRCS
       src/infra/ble_gatt.c
+      src/infra/ble_gatt_net.c
       src/infra/ble_cmd_handler.c
     )
   endif()
