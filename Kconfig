@@ -102,6 +102,24 @@ config AI_AGENT_LVGL_UI
 		Provides a chat-bubble interface on a round watch screen
 		with PTT (Push-to-Talk) voice input.
 
+config AI_AGENT_LCD_PATH
+	string "LVGL display device path"
+	default "/dev/lcd0"
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Framebuffer/LCD device used by the LVGL UI.
+		/dev/lcd0 on SF32LB52-DevKit-LCD, /dev/fb0 on the
+		goldfish emulator. Lets UI iterate in the emulator
+		without touching the real board.
+
+config AI_AGENT_TOUCH_PATH
+	string "LVGL touch input device path"
+	default "/dev/input0"
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Touchscreen input device used by the LVGL UI.
+		/dev/input0 on both SF32LB52 and the goldfish emulator.
+
 config AI_AGENT_FEISHU
 	bool "Enable Feishu bot channel"
 	default y

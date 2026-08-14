@@ -12,6 +12,10 @@
 #include <string.h>
 #include "settings_page.h"
 
+/* Sans-serif (Noto Sans SC) font family: full GB2312 CJK coverage.
+ * (lv_font_simsun_16_cjk is only a small subset -> missing glyphs -> 乱码) */
+extern const lv_font_t ui_font_sans_16;
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
@@ -48,7 +52,7 @@ static lv_obj_t *create_settings_row(lv_obj_t *parent, const char *label_text,
 
     lv_obj_t *label = lv_label_create(parent);
     lv_label_set_text(label, label_text);
-    lv_obj_set_style_text_font(label, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(label, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(label, lv_color_hex(0xcccccc), 0);
     lv_obj_set_pos(label, 20, y);
 
@@ -56,7 +60,7 @@ static lv_obj_t *create_settings_row(lv_obj_t *parent, const char *label_text,
 
     lv_obj_t *value = lv_label_create(parent);
     lv_label_set_text(value, value_text);
-    lv_obj_set_style_text_font(value, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(value, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(value, lv_color_hex(0x88ccff), 0);
     lv_obj_set_pos(value, 120, y);
 
@@ -81,7 +85,7 @@ lv_obj_t *settings_page_create(void)
     lv_obj_set_pos(settings_page_container, 0, 0);
     lv_obj_set_style_bg_color(settings_page_container, lv_color_hex(0x1a1a2e), 0);
     lv_obj_set_style_border_width(settings_page_container, 0, 0);
-    lv_obj_set_style_pad_all(settings_page_container, 0, 0);
+    lv_obj_set_style_pad_all(settings_page_container, 20, 0);
 
     /* Back button (enlarged for easy tapping) */
 
@@ -93,7 +97,7 @@ lv_obj_t *settings_page_create(void)
 
     lv_obj_t *back_label = lv_label_create(back_btn);
     lv_label_set_text(back_label, "< 返回");
-    lv_obj_set_style_text_font(back_label, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(back_label, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(back_label, lv_color_hex(0xffffff), 0);
     lv_obj_center(back_label);
 
@@ -103,15 +107,15 @@ lv_obj_t *settings_page_create(void)
 
     lv_obj_t *title = lv_label_create(settings_page_container);
     lv_label_set_text(title, "设置");
-    lv_obj_set_style_text_font(title, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(title, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x88ccff), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
 
     /* LLM Configuration Section */
 
     lv_obj_t *section = lv_label_create(settings_page_container);
-    lv_label_set_text(section, "── LLM 配置 ──");
-    lv_obj_set_style_text_font(section, &lv_font_simsun_16_cjk, 0);
+    lv_label_set_text(section, "— LLM 配置 —");
+    lv_obj_set_style_text_font(section, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(section, lv_color_hex(0xffaa00), 0);
     lv_obj_set_pos(section, 20, 60);
 
@@ -142,17 +146,17 @@ lv_obj_t *settings_page_create(void)
                       "格式: set_llm <host> <model> <key>\n"
                       "例: set_llm https://api.stepfun.com/v1 \\\n"
                       "      step-3.7-flash <your-key>");
-    lv_obj_set_style_text_font(info, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(info, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(info, lv_color_hex(0xaaaaaa), 0);
     lv_obj_set_pos(info, 20, 200);
     lv_obj_set_width(info, 350);
     lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
 
-    /* Note */
+    /* Note（不用 ⚠️ emoji：ui_font_sans_16 不含 U+26A0，会乱码） */
 
     lv_obj_t *note = lv_label_create(settings_page_container);
-    lv_label_set_text(note, "⚠️  当前为只读展示，实际配置请在 NSH 中输入命令");
-    lv_obj_set_style_text_font(note, &lv_font_simsun_16_cjk, 0);
+    lv_label_set_text(note, "当前为只读展示，实际配置请在 NSH 中输入命令");
+    lv_obj_set_style_text_font(note, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(note, lv_color_hex(0xffaa00), 0);
     lv_obj_align(note, LV_ALIGN_BOTTOM_MID, 0, -30);
 

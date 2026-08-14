@@ -36,9 +36,10 @@ typedef enum
 void launcher_create(void);
 
 /**
- * Get the desktop page object (for foreground management)
+ * Get the desktop page object
  *
- * @return Desktop page LVGL object
+ * Returns the launcher desktop object so callers can move it to the
+ * foreground or manage its layer.
  */
 lv_obj_t *launcher_desktop_obj(void);
 
