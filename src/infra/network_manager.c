@@ -826,12 +826,22 @@ int network_rpmsg_init(void)
 #endif
 
 #ifdef CONFIG_AI_AGENT_BLE_GATT
-    /* Start BLE GATT NUS + TUN proxy channel (phone companion app) */
-    ret = ble_gatt_net_init();
-    if (ret != 0) {
-        syslog(LOG_ERR, "[%s] ble_gatt_net_init failed: %d\n", TAG, ret);
-    } else {
-        syslog(LOG_INFO, "[%s] BLE GATT+TUN proxy channel started\n", TAG);
+    /* Start BLE GATT NUS + TUN proxy channel (phone companion app).
+     * Retry with backoff: bluetoothd may still be starting here (no BT
+     * instance yet, or gatts registration fails), and without the
+     * channel the phone can never connect. Each failed attempt cleans
+     * up after itself, so retrying is safe. */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ret = ble_gatt_net_init();
+        if (ret == 0) {
+            syslog(LOG_INFO, "[%s] BLE GATT+TUN proxy channel started\n",
+                TAG);
+            break;
+        }
+        syslog(LOG_WARNING,
+            "[%s] ble_gatt_net_init failed (%d), retry %d/5\n",
+            TAG, ret, attempt + 1);
+        sleep(3);
     }
 #endif
 
