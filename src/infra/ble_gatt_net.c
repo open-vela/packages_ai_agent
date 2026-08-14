@@ -113,6 +113,53 @@ static void tun_close(void)
     }
 }
 
+/* Default route through the phone gateway. Without it, only the
+ * 192.168.55.0/24 subnet is reachable and all internet traffic is
+ * unroutable (discovered 2026-08-14, docs_ble/03). The router field
+ * is a placeholder for TUN (no L2/ARP): the raw IP packet is written
+ * straight to the TUN fd and the phone NATs it out. */
+#define TUN_DEV_GATEWAY "192.168.55.1"
+
+static void tun_route_default(bool add)
+{
+    struct in_addr target;
+    struct in_addr netmask;
+    struct in_addr router;
+    int sockfd;
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        syslog(LOG_ERR, "[%s] route: socket failed: %d\n", TAG, errno);
+        return;
+    }
+
+    target.s_addr = INADDR_ANY;      /* 0.0.0.0/0 */
+    netmask.s_addr = INADDR_ANY;
+    router.s_addr = inet_addr(TUN_DEV_GATEWAY);
+
+    if (add) {
+        if (addroute(sockfd, &target, &netmask, &router,
+                sizeof(struct in_addr)) != 0) {
+            /* EEXIST is fine: the route is already there (reconnect). */
+            if (errno != EEXIST) {
+                syslog(LOG_ERR, "[%s] add default route failed: %d\n",
+                    TAG, errno);
+            }
+        } else {
+            syslog(LOG_INFO, "[%s] default route via %s added\n",
+                TAG, TUN_DEV_GATEWAY);
+        }
+    } else {
+        if (delroute(sockfd, &target, &netmask,
+                sizeof(struct in_addr)) != 0) {
+            syslog(LOG_ERR, "[%s] del default route failed: %d\n",
+                TAG, errno);
+        }
+    }
+
+    close(sockfd);
+}
+
 static void tun_set_up(bool up)
 {
     if (up) {
@@ -123,9 +170,11 @@ static void tun_set_up(bool up)
         addr.s_addr = inet_addr(TUN_DEV_NETMASK);
         netlib_set_ipv4netmask(TUN_DEV_NAME, &addr);
         netlib_ifup(TUN_DEV_NAME);
+        tun_route_default(true);
         syslog(LOG_INFO, "[%s] TUN %s up (%s)\n", TAG, TUN_DEV_NAME,
             TUN_DEV_IPADDR);
     } else {
+        tun_route_default(false);
         netlib_ifdown(TUN_DEV_NAME);
     }
 }
