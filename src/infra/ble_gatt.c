@@ -90,9 +90,47 @@ static struct {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
+/* -- TX fragmentation queue ---------------------------------- *
+ * BLE notifications carry at most (MTU - 3) bytes per ATT packet,
+ * but TUN frames can be up to 1518 + 2 header bytes. ble_gatt_send()
+ * splits every frame into (MTU-3)-byte chunks and paces them one at a
+ * time on the framework's on_notify_complete callback, so the ATT TX
+ * queue (CONFIG_BT_ATT_TX_COUNT) never overflows and no packet is
+ * silently rejected with -EMSGSIZE (the pre-bletest behaviour: any
+ * frame > MTU-3, i.e. every real IP packet on a default 23-byte MTU,
+ * was dropped).
+ */
+#define TX_SLOT_SIZE 1600 /* 2-byte frame header + max IP packet */
+#define TX_SLOT_COUNT 8   /* buffering: ~1s of link at 244B/30ms */
+
+typedef struct {
+    uint8_t data[TX_SLOT_SIZE];
+    uint16_t len;
+} tx_slot_t;
+
+static struct {
+    tx_slot_t slots[TX_SLOT_COUNT];
+    uint8_t head;        /* next slot to transmit */
+    uint8_t tail;        /* next free slot */
+    uint8_t count;
+    uint16_t off;        /* bytes already notified in the head slot */
+    uint16_t last_chunk; /* chunk size of the in-flight notify */
+    bool inflight;       /* a notify is awaiting its completion */
+    pthread_mutex_t lock;
+} g_txq = {
+    .head = 0,
+    .tail = 0,
+    .count = 0,
+    .off = 0,
+    .last_chunk = 0,
+    .inflight = false,
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+
 /* -- Forward declarations ------------------------------------ */
 
 static int adv_start(void);
+static void tx_pump_locked(void); /* g_txq.lock must be held */
 
 /* -- GATTS Callbacks ----------------------------------------- */
 
@@ -149,6 +187,15 @@ static void on_disconnected(gatts_handle_t srv_handle, bt_address_t* addr)
     user_data = g_gatt.config.user_data;
     pthread_mutex_unlock(&g_gatt.lock);
 
+    /* Drop all queued TX frames: the ATT link is gone, a reconnect
+     * must start from an empty queue. */
+    pthread_mutex_lock(&g_txq.lock);
+    g_txq.count = 0;
+    g_txq.head = g_txq.tail = 0;
+    g_txq.off = 0;
+    g_txq.inflight = false;
+    pthread_mutex_unlock(&g_txq.lock);
+
     if (conn_cb) {
         conn_cb(false, user_data);
     }
@@ -189,9 +236,90 @@ static void on_attr_table_added(gatts_handle_t srv_handle,
 static void on_notify_complete(gatts_handle_t srv_handle, bt_address_t* addr,
     gatt_status_t status, uint16_t attr_handle)
 {
+    pthread_mutex_lock(&g_txq.lock);
+    if (!g_txq.inflight) {
+        pthread_mutex_unlock(&g_txq.lock);
+        return;
+    }
+    g_txq.inflight = false;
+
     if (status != GATT_STATUS_SUCCESS) {
-        syslog(LOG_ERR, "[%s] Notify failed, handle=0x%04x status=%d\n",
-            TAG, attr_handle, status);
+        /* No completion would ever arrive for this chunk (the zblue
+         * stack only reports successes): drop the whole slot so the
+         * stream keeps moving. TCP recovers the lost bytes. */
+        syslog(LOG_ERR, "[%s] Notify failed, handle=0x%04x status=%d, "
+            "dropping slot\n", TAG, attr_handle, status);
+        if (g_txq.count > 0) {
+            g_txq.count--;
+            g_txq.head = (g_txq.head + 1) % TX_SLOT_COUNT;
+        }
+        g_txq.off = 0;
+    } else if (g_txq.count > 0
+        && g_txq.off >= g_txq.slots[g_txq.head].len) {
+        /* Current slot fully notified: pop it and move to the next. */
+        g_txq.count--;
+        g_txq.head = (g_txq.head + 1) % TX_SLOT_COUNT;
+        g_txq.off = 0;
+    }
+
+    tx_pump_locked();
+    pthread_mutex_unlock(&g_txq.lock);
+}
+
+/* Send the next (MTU-3)-byte chunk of the head slot, if any.
+ * Caller must hold g_txq.lock. */
+static void tx_pump_locked(void)
+{
+    uint16_t mtu, max_payload, chunk;
+    bt_status_t status;
+    bt_address_t peer;
+    gatts_handle_t srv;
+    tx_slot_t* slot;
+
+    if (g_txq.inflight || g_txq.count == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_gatt.lock);
+    if (!g_gatt.initialized || !g_gatt.connected || !g_gatt.notify_enabled) {
+        pthread_mutex_unlock(&g_gatt.lock);
+        /* Link went away while frames were queued: drop them all. */
+        g_txq.count = 0;
+        g_txq.head = g_txq.tail = 0;
+        g_txq.off = 0;
+        return;
+    }
+    srv = g_gatt.srv_handle;
+    memcpy(&peer, &g_gatt.peer_addr, sizeof(bt_address_t));
+    mtu = g_gatt.mtu;
+    pthread_mutex_unlock(&g_gatt.lock);
+
+    /* Loop so a failed submit falls through to the next slot
+     * instead of stalling the queue. */
+    while (g_txq.count > 0 && !g_txq.inflight) {
+        slot = &g_txq.slots[g_txq.head];
+        max_payload = (mtu > 3) ? (mtu - 3) : 20;
+        chunk = slot->len - g_txq.off;
+        if (chunk > max_payload) {
+            chunk = max_payload;
+        }
+
+        status = bt_gatts_notify(srv, &peer, NUS_TX_CHR_ID,
+            slot->data + g_txq.off, chunk);
+        if (status != BT_STATUS_SUCCESS) {
+            /* Service loop down / stack error: drop the slot to keep
+             * the stream moving (TCP retransmits recover). */
+            syslog(LOG_ERR, "[%s] Notify submit failed (%d), "
+                "dropping slot\n", TAG, status);
+            g_txq.count--;
+            g_txq.head = (g_txq.head + 1) % TX_SLOT_COUNT;
+            g_txq.off = 0;
+            continue;
+        }
+
+        g_txq.inflight = true;
+        g_txq.last_chunk = chunk;
+        g_txq.off += chunk;
     }
 }
 
@@ -565,6 +693,13 @@ int ble_gatt_deinit(void)
     g_gatt.notify_enabled = false;
     pthread_mutex_unlock(&g_gatt.lock);
 
+    pthread_mutex_lock(&g_txq.lock);
+    g_txq.count = 0;
+    g_txq.head = g_txq.tail = 0;
+    g_txq.off = 0;
+    g_txq.inflight = false;
+    pthread_mutex_unlock(&g_txq.lock);
+
     adv_stop();
 
     if (g_gatt.srv_handle) {
@@ -587,12 +722,16 @@ bool ble_gatt_is_connected(void)
 
 int ble_gatt_send(const uint8_t* data, uint16_t len)
 {
-    gatts_handle_t srv_handle;
-    bt_address_t peer_addr;
-    uint16_t mtu;
+    tx_slot_t* slot;
+    uint8_t next;
 
     if (!data || len == 0) {
         return -EINVAL;
+    }
+    if (len > TX_SLOT_SIZE) {
+        syslog(LOG_ERR, "[%s] Frame %u exceeds TX slot %u\n",
+            TAG, len, TX_SLOT_SIZE);
+        return -EMSGSIZE;
     }
 
     pthread_mutex_lock(&g_gatt.lock);
@@ -600,28 +739,27 @@ int ble_gatt_send(const uint8_t* data, uint16_t len)
         pthread_mutex_unlock(&g_gatt.lock);
         return -ENOTCONN;
     }
-    srv_handle = g_gatt.srv_handle;
-    memcpy(&peer_addr, &g_gatt.peer_addr, sizeof(bt_address_t));
-    mtu = g_gatt.mtu;
     pthread_mutex_unlock(&g_gatt.lock);
 
-    /* BLE ATT payload = MTU - 3 */
-    uint16_t max_payload = (mtu > 3) ? (mtu - 3) : 20;
-    if (len > max_payload) {
-        syslog(LOG_WARNING, "[%s] Data %u exceeds MTU payload %u\n",
-            TAG, len, max_payload);
-        return -EMSGSIZE;
+    pthread_mutex_lock(&g_txq.lock);
+    if (g_txq.count == TX_SLOT_COUNT) {
+        pthread_mutex_unlock(&g_txq.lock);
+        syslog(LOG_WARNING, "[%s] TX queue full, dropping frame (%u B)\n",
+            TAG, len);
+        return -EBUSY;
     }
 
-    bt_status_t status = bt_gatts_notify(srv_handle, &peer_addr,
-        NUS_TX_CHR_ID,
-        (uint8_t*)data, len);
-    if (status != BT_STATUS_SUCCESS) {
-        syslog(LOG_ERR, "[%s] Notify failed: %d\n", TAG, status);
-        return -EIO;
-    }
+    slot = &g_txq.slots[g_txq.tail];
+    memcpy(slot->data, data, len);
+    slot->len = len;
+    next = (g_txq.tail + 1) % TX_SLOT_COUNT;
+    g_txq.tail = next;
+    g_txq.count++;
 
-    return len;
+    tx_pump_locked();
+    pthread_mutex_unlock(&g_txq.lock);
+
+    return (int)len;
 }
 
 uint16_t ble_gatt_get_mtu(void)
