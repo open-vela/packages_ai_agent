@@ -112,6 +112,25 @@ static size_t decode_chunked(char* buf, size_t len)
     return (size_t)(dst - buf);
 }
 
+/* Check whether the raw accumulated body ends with the chunked
+ * terminator ("...\r\n0\r\n\r\n", or "0\r\n\r\n" for an empty body).
+ * Without this check the read loop below blocks on keep-alive
+ * connections until the server closes them (~60s idle timeout),
+ * tripping the agent's 60s LLM watchdog. */
+static int chunked_end_seen(const char* buf, size_t len)
+{
+    static const char term_empty[] = "0\r\n\r\n";
+    static const char term_last[] = "\r\n0\r\n\r\n";
+    size_t n1 = sizeof(term_empty) - 1; /* 5 */
+    size_t n2 = sizeof(term_last) - 1;  /* 7 */
+
+    if (len >= n2 && memcmp(buf + len - n2, term_last, n2) == 0)
+        return 1;
+    if (len >= n1 && memcmp(buf + len - n1, term_empty, n1) == 0)
+        return 1;
+    return 0;
+}
+
 /* ── TLS context ─────────────────────────────────────────────── */
 
 typedef struct {
@@ -613,11 +632,15 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
         while (resp_pos < resp_cap - 1) {
             if (content_length >= 0 && (long)resp_pos >= content_length)
                 break;
+            if (chunked && chunked_end_seen(resp_buf, resp_pos))
+                break;
             ret = mbedtls_ssl_read(&ctx->ssl,
                 (unsigned char*)(resp_buf + resp_pos),
                 resp_cap - 1 - resp_pos);
             if (ret > 0) {
                 resp_pos += (size_t)ret;
+                if (chunked && chunked_end_seen(resp_buf, resp_pos))
+                    break;
             } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
                 break;
             } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
