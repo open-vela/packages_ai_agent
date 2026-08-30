@@ -116,7 +116,7 @@
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
  * acts as the hard backstop that actually unblocks the read. */
-#define AGENT_LLM_TIMEOUT_SEC 60
+#define AGENT_LLM_TIMEOUT_SEC 120
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level

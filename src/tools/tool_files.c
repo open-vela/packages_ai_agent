@@ -38,6 +38,63 @@ static const char *TAG = "tool_files";
 
 #define MAX_FILE_SIZE (32 * 1024)
 
+/* VelaGuard reports/alarms live outside AGENT_DATA_DIR but on the same /data mount. */
+#define VG_DATA_ROOT "/data/velaguard"
+
+static bool path_under_resolved_root(const char *resolved, const char *logical_root)
+{
+    char root[PATH_MAX];
+    const char *base = logical_root;
+
+    if (realpath(logical_root, root) != NULL) {
+        base = root;
+    }
+
+    size_t len = strlen(base);
+    return strncmp(resolved, base, len) == 0
+        && (resolved[len] == '/' || resolved[len] == '\0');
+}
+
+static bool logical_path_allowed(const char *path)
+{
+    size_t agent_len = strlen(AGENT_DATA_DIR);
+
+    if (strncmp(path, AGENT_DATA_DIR, agent_len) == 0
+        && (path[agent_len] == '/' || path[agent_len] == '\0')) {
+        return true;
+    }
+
+    if (strncmp(path, VG_DATA_ROOT, sizeof(VG_DATA_ROOT) - 1) == 0
+        && (path[sizeof(VG_DATA_ROOT) - 1] == '/'
+            || path[sizeof(VG_DATA_ROOT) - 1] == '\0')) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool path_has_prefix(const char *path, const char *prefix)
+{
+    if (!prefix || prefix[0] == '\0') {
+        return true;
+    }
+
+    size_t plen = strlen(prefix);
+    while (plen > 0 && prefix[plen - 1] == '/') {
+        plen--;
+    }
+
+    if (strlen(path) < plen) {
+        return false;
+    }
+
+    if (strncmp(path, prefix, plen) != 0) {
+        return false;
+    }
+
+    return path[plen] == '\0' || path[plen] == '/';
+}
+
 /**
  * Validate that path resolves to a location under AGENT_DATA_DIR.
  * Uses realpath() to resolve symlinks, preventing symlink escape attacks.
@@ -49,35 +106,27 @@ static bool validate_path(const char *path)
         return false;
     }
 
-    size_t dlen = strlen(AGENT_DATA_DIR);
-
-    /* Quick reject: raw path must at least start with data dir */
-    if (strncmp(path, AGENT_DATA_DIR, dlen) != 0
-        || (path[dlen] != '/' && path[dlen] != '\0')) {
-        return false;
-    }
-
     /* Reject explicit traversal components */
     if (strstr(path, "..") != NULL) {
         return false;
     }
 
-    /* Resolve symlinks to get the real path */
+    if (!logical_path_allowed(path)) {
+        return false;
+    }
+
+    /* Resolve symlinks (/data -> /mnt/emmc/data) and verify physical path. */
     char resolved[PATH_MAX];
 
     if (realpath(path, resolved) != NULL) {
-        /* File exists — verify resolved path is still under data dir */
-        if (strncmp(resolved, AGENT_DATA_DIR, dlen) != 0
-            || (resolved[dlen] != '/' && resolved[dlen] != '\0')) {
+        if (!path_under_resolved_root(resolved, AGENT_DATA_DIR)
+            && !path_under_resolved_root(resolved, VG_DATA_ROOT)) {
             syslog(LOG_WARNING,
-                   "[%s] Path escaped data dir via symlink: %s -> %s\n",
+                   "[%s] Path escaped allowed data dirs via symlink: %s -> %s\n",
                    TAG, path, resolved);
             return false;
         }
     }
-
-    /* If realpath fails (file doesn't exist yet), the raw path checks
-     * above are sufficient — no symlink to follow. */
 
     return true;
 }
@@ -115,10 +164,18 @@ static bool is_write_protected(const char *path)
 static void ensure_parent_dirs(const char *path)
 {
     char tmp[512];
+    size_t start;
+
     snprintf(tmp, sizeof(tmp), "%s", path);
 
-    /* Walk from the first '/' after AGENT_DATA_DIR to the last '/' */
-    size_t start = strlen(AGENT_DATA_DIR);
+    if (strncmp(path, AGENT_DATA_DIR, strlen(AGENT_DATA_DIR)) == 0) {
+        start = strlen(AGENT_DATA_DIR);
+    } else if (strncmp(path, VG_DATA_ROOT, sizeof(VG_DATA_ROOT) - 1) == 0) {
+        start = sizeof(VG_DATA_ROOT) - 1;
+    } else {
+        return;
+    }
+
     for (char *p = tmp + start; *p; p++) {
         if (*p == '/') {
             *p = '\0';
@@ -141,7 +198,8 @@ int tool_read_file_execute(const char *input_json, char *output, size_t output_s
     const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(root, "path"));
     if (!validate_path(path)) {
         snprintf(output, output_size,
-                 "Error: path must start with %s/ and must not contain '..'", AGENT_DATA_DIR);
+                 "Error: path must be under %s/ or %s/ and must not contain '..'",
+                 AGENT_DATA_DIR, VG_DATA_ROOT);
         cJSON_Delete(root);
         return ERROR;
     }
@@ -180,7 +238,8 @@ int tool_write_file_execute(const char *input_json, char *output, size_t output_
 
     if (!validate_path(path)) {
         snprintf(output, output_size,
-                 "Error: path must start with %s/ and must not contain '..'", AGENT_DATA_DIR);
+                 "Error: path must be under %s/ or %s/ and must not contain '..'",
+                 AGENT_DATA_DIR, VG_DATA_ROOT);
         cJSON_Delete(root);
         return ERROR;
     }
@@ -239,7 +298,8 @@ int tool_edit_file_execute(const char *input_json, char *output, size_t output_s
 
     if (!validate_path(path)) {
         snprintf(output, output_size,
-                 "Error: path must start with %s/ and must not contain '..'", AGENT_DATA_DIR);
+                 "Error: path must be under %s/ or %s/ and must not contain '..'",
+                 AGENT_DATA_DIR, VG_DATA_ROOT);
         cJSON_Delete(root);
         return ERROR;
     }
@@ -347,7 +407,7 @@ static size_t list_dir_recursive(const char *dir_path, const char *prefix,
         char full_path[512];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
 
-        if (prefix && strncmp(full_path, prefix, strlen(prefix)) != 0) continue;
+        if (prefix && !path_has_prefix(full_path, prefix)) continue;
 
         struct stat st;
         if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {

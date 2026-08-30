@@ -61,6 +61,37 @@ bool is_openai_compat_host(const char* host)
         || strstr(host, "xiaomimimo.com");
 }
 
+bool llm_proxy_echo_reasoning(void)
+{
+    char host[128];
+
+    pthread_mutex_lock(&s_llm_lock);
+    memcpy(host, s_llm_host, sizeof(host));
+    pthread_mutex_unlock(&s_llm_lock);
+
+    return strstr(host, "moonshot") != NULL
+        || strstr(host, "kimi") != NULL;
+}
+
+/* MiMo/OpenAI-compat: null content and unknown fields break the API. */
+static void llm_sanitize_messages_for_api(cJSON* msgs)
+{
+    cJSON* msg;
+
+    cJSON_ArrayForEach(msg, msgs)
+    {
+        cJSON* content = cJSON_GetObjectItem(msg, "content");
+
+        if (content && cJSON_IsNull(content)) {
+            cJSON_DeleteItemFromObject(msg, "content");
+        }
+
+        if (!llm_proxy_echo_reasoning()) {
+            cJSON_DeleteItemFromObject(msg, "reasoning_content");
+        }
+    }
+}
+
 
 int resp_buf_init(resp_buf_t* rb, size_t initial_cap)
 {
@@ -722,6 +753,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     cJSON_AddStringToObject(sys_msg, "role", "system");
     cJSON_AddStringToObject(sys_msg, "content", system_prompt);
     cJSON_InsertItemInArray(msgs, 0, sys_msg);
+    llm_sanitize_messages_for_api(msgs);
     cJSON_AddItemToObject(body, "messages", msgs);
 
     /* Convert tools to OpenAI format */
