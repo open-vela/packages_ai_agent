@@ -40,3 +40,12 @@ int nsh_commands_init(void);
  * Call after all services are in a known state (post Phase 5).
  */
 int nsh_commands_start(void);
+
+/**
+ * Run CLI on the caller thread until the user types quit.
+ * Used when a --daemon agent is already running.
+ */
+int nsh_commands_run_interactive(void);
+
+/** When true, quit exits CLI only and leaves the daemon agent running. */
+void nsh_commands_set_detach_quit(bool detach);

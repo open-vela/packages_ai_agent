@@ -42,7 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/time.h>
+#include <time.h>
 
 #include "cJSON.h"
 
@@ -65,31 +65,33 @@ static bool llm_call_timed_out(uint32_t latency_ms);
 #define LLM_TIMEOUT_TASK_COMPLETE_MSG \
     "任务已完成，但生成确认消息超时。"
 
-/* ── Clock-safe elapsed time calculation ───────────────────── */
+/* ── Monotonic elapsed time (immune to wall-clock jumps) ───── */
 
-static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
-    const struct timeval* t1)
+static inline void mono_now(struct timespec* ts)
 {
-    int32_t sec_diff = (int32_t)(t1->tv_sec - t0->tv_sec);
-    int32_t usec_diff = (int32_t)(t1->tv_usec - t0->tv_usec);
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
 
-    /* Clock went backwards (NTP jump, manual adjustment) */
+static inline uint32_t calc_elapsed_ms(const struct timespec* t0,
+    const struct timespec* t1)
+{
+    int64_t sec_diff = (int64_t)(t1->tv_sec - t0->tv_sec);
+    int64_t nsec_diff = (int64_t)(t1->tv_nsec - t0->tv_nsec);
+
     if (sec_diff < 0) {
-        syslog(LOG_WARNING, "[%s] Clock went backwards, ignoring\n", TAG);
         return 0;
     }
 
-    /* Microsecond borrow */
-    if (usec_diff < 0) {
+    if (nsec_diff < 0) {
         sec_diff--;
-        usec_diff += 1000000;
+        nsec_diff += 1000000000L;
     }
 
     if (sec_diff < 0) {
         return 0;
     }
 
-    return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
+    return (uint32_t)sec_diff * 1000 + (uint32_t)(nsec_diff / 1000000L);
 }
 
 /* ── Memory pool (pre-allocated tool output buffers) ───────── */
@@ -105,12 +107,12 @@ static void add_assistant_message(cJSON* messages, const llm_response_t* resp)
 
     if (resp->text && resp->text_len > 0) {
         cJSON_AddStringToObject(asst_msg, "content", resp->text);
-    } else {
-        cJSON_AddNullToObject(asst_msg, "content");
     }
+    /* Omit content when empty — MiMo rejects explicit null (400 Invalid JSON). */
 
-    /* Kimi thinking mode: echo back reasoning_content or the API returns 400 */
-    if (resp->reasoning_content && resp->reasoning_content[0]) {
+    /* Kimi thinking mode only — other hosts reject unknown fields. */
+    if (resp->reasoning_content && resp->reasoning_content[0]
+        && llm_proxy_echo_reasoning()) {
         cJSON_AddStringToObject(asst_msg, "reasoning_content",
             resp->reasoning_content);
     }
@@ -819,10 +821,10 @@ static char* force_finish_reply(const char* system_prompt,
 
     llm_response_t resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    struct timespec t0, t1;
+    mono_now(&t0);
     int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
-    gettimeofday(&t1, NULL);
+    mono_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -989,10 +991,10 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
 
     llm_response_t final_resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    struct timespec t0, t1;
+    mono_now(&t0);
     int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
-    gettimeofday(&t1, NULL);
+    mono_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -1064,10 +1066,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         send_working_status(msg, iteration);
 
         llm_response_t resp;
-        struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
+        struct timespec tv_start, tv_end;
+        mono_now(&tv_start);
         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
-        gettimeofday(&tv_end, NULL);
+        mono_now(&tv_end);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
         /* Router failover: on LLM call failure, try next backend */
@@ -1083,10 +1085,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 router_idx = next_idx;
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
-                gettimeofday(&tv_start, NULL);
+                mono_now(&tv_start);
                 err = llm_chat_tools(sys_prompt, messages,
                     tools_json, &resp);
-                gettimeofday(&tv_end, NULL);
+                mono_now(&tv_end);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
             }
         }
@@ -1183,10 +1185,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     router_idx = prem_idx;
                     trace.backend_idx = prem_idx;
 
-                    gettimeofday(&tv_start, NULL);
+                    mono_now(&tv_start);
                     err = llm_chat_tools(sys_prompt, messages,
                         tools_json, &resp);
-                    gettimeofday(&tv_end, NULL);
+                    mono_now(&tv_end);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
                     /* Watchdog check on cascade retry */
@@ -1261,6 +1263,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool
          * output directly as the reply. Saves ~2s.
+         * list_dir is excluded — it is almost always a discovery step
+         * before read_file / run_shell / write_file (e.g. Skill workflows).
          * Restricted to call_count == 1: the parallel path does not
          * write into tool_output, so multi-call rounds must go through
          * the LLM to aggregate results (and tool_output would be stale
@@ -1270,8 +1274,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             for (int i = 0; i < resp.call_count; i++) {
                 if (strcmp(resp.calls[i].name, "read_file") != 0
                     && strcmp(resp.calls[i].name, "write_file") != 0
-                    && strcmp(resp.calls[i].name, "edit_file") != 0
-                    && strcmp(resp.calls[i].name, "list_dir") != 0) {
+                    && strcmp(resp.calls[i].name, "edit_file") != 0) {
                     all_local = false;
                     break;
                 }
