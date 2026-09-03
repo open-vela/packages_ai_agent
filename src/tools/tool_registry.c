@@ -36,6 +36,7 @@
 #include "tools/tool_health.h"
 #include "tools/tool_media.h"
 #include "tools/tool_proxyquickapp.h"
+#include "tools/tool_remote_agent.h"
 #include "tools/tool_shell.h"
 #include "tools/tool_system.h"
 #include "tools/tool_vision.h"
@@ -496,6 +497,29 @@ int tool_registry_init(void)
     REGISTER_TOOL_NO_PARAMS("exit_quickapp",
         "Exit current QuickApp, return to home.",
         tool_exit_quickapp_execute);
+
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+    /* Remote agent control. There is no tool for approving the remote agent's
+     * permission requests: that decision is reserved for a human on this
+     * device. The description says so, so the model reports the wait back to
+     * the user instead of retrying. */
+    REGISTER_TOOL("remote_agent_prompt",
+        "Send one instruction to the remote coding agent on the paired PC and "
+        "wait for its reply. Use for work that needs the PC's files, repo, or "
+        "shell. If the remote agent asks permission to run something, only a "
+        "human at this device can approve it: report that it is pending "
+        "instead of retrying.",
+        TOOL_SCHEMA_BEGIN() TOOL_PARAM_STR("text",
+            "The instruction to send to the remote agent")
+            TOOL_SCHEMA_END_REQUIRED("\"text\""),
+        tool_remote_agent_prompt_execute);
+
+    REGISTER_TOOL_NO_PARAMS("remote_agent_status",
+        "Check the remote coding agent's link state, current activity, "
+        "session billing, and whether it is waiting for a human permission "
+        "decision on this device.",
+        tool_remote_agent_status_execute);
+#endif
 
     build_tools_json_locked();
     syslog(LOG_INFO, "[%s] Tool registry initialized\n", TAG);

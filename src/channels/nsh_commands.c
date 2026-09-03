@@ -124,6 +124,21 @@ static void cmd_help(void)
         "  node_start          - Connect to OpenClaw Gateway as Node\n"
         "  node_stop           - Disconnect from OpenClaw Gateway\n"
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        "  set_remote <host:port> [device_id] - Set PC bridge for remote agent\n"
+        "  set_remote_auth <user> <pass> - Set bridge broker credentials\n"
+        /* One 'r' prefix for the whole family: these are typed at a console, and
+         * a set where one name is short and the rest are long is worse than
+         * either convention on its own. set_remote* keep their names because
+         * they follow the repo-wide set_<thing> pattern for configuration. */
+        "  rask <text>          - Send one instruction to the remote agent\n"
+        "  rstat                - Remote agent state, model, billing, approval\n"
+        "  rreply               - Print the remote agent's full reply\n"
+        "  rmodel [n|name]      - List remote agent models, or switch to one\n"
+        "  rusage               - Refresh remote session billing\n"
+        "  ronce                - Approve the pending request (human only)\n"
+        "  rdeny                - Deny the pending request (human only)\n"
+#endif
         "  restart              - Restart the device\n"
         "  quit                 - Exit agent\n"
         "  set_mqtt <broker> [client_id] - Set MQTT broker (host:port)\n"
@@ -480,6 +495,12 @@ static void cmd_config_show(void)
     SHOW_CFG("GW Port", AGENT_CFG_KEY_GATEWAY_PORT, false);
     SHOW_CFG("GW Token", AGENT_CFG_KEY_GATEWAY_TOKEN, true);
     SHOW_CFG("MQTT Broker", AGENT_CFG_KEY_MQTT_BROKER, false);
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+    SHOW_CFG("Remote Broker", AGENT_CFG_KEY_REMOTE_BROKER, false);
+    SHOW_CFG("Remote Device", AGENT_CFG_KEY_REMOTE_DEVICE_ID, false);
+    SHOW_CFG("Remote User", AGENT_CFG_KEY_REMOTE_USERNAME, false);
+    SHOW_CFG("Remote Pass", AGENT_CFG_KEY_REMOTE_PASSWORD, true);
+#endif
     SHOW_CFG("Volc AppKey", AGENT_CFG_KEY_VOLC_APPKEY, true);
     SHOW_CFG("Volc Token", AGENT_CFG_KEY_VOLC_TOKEN, true);
     SHOW_CFG("Volc API Key", AGENT_CFG_KEY_VOLC_API_KEY, true);
@@ -986,6 +1007,29 @@ static void* cli_thread(void* arg)
             cmd_node_start();
         else if (strcmp(cmd, "node_stop") == 0)
             cmd_node_stop();
+#endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        else if (strcmp(cmd, "set_remote") == 0)
+            cmd_set_remote(argc, argv);
+        else if (strcmp(cmd, "set_remote_auth") == 0)
+            cmd_set_remote_auth(argc, argv);
+        /* One spelling each, all 'r'-prefixed (see the help block for why).
+         * A second name for the same action would only be one more thing to
+         * remember and one more place to fall out of date. */
+        else if (strcmp(cmd, "rask") == 0)
+            cmd_remote_ask(argc, argv);
+        else if (strcmp(cmd, "rstat") == 0)
+            cmd_remote_status();
+        else if (strcmp(cmd, "rreply") == 0)
+            cmd_remote_output();
+        else if (strcmp(cmd, "rmodel") == 0)
+            cmd_remote_model(argc, argv);
+        else if (strcmp(cmd, "rusage") == 0)
+            cmd_remote_usage();
+        else if (strcmp(cmd, "ronce") == 0)
+            cmd_remote_once();
+        else if (strcmp(cmd, "rdeny") == 0)
+            cmd_remote_deny();
 #endif
         else if (strcmp(cmd, "quit") == 0) {
             cmd_quit();

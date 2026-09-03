@@ -112,6 +112,16 @@ ifeq ($(CONFIG_AI_AGENT_MQTT),y)
 CSRCS += src/channels/mqtt_channel.c
 endif
 
+# remote/ - 远程 ACP Agent 控制（设备作为客户端连接 PC 侧 bridge）
+ifeq ($(CONFIG_AI_AGENT_REMOTE_CTRL),y)
+CSRCS += src/remote/remote_link.c
+CSRCS += src/remote/remote_codec.c
+CSRCS += src/remote/remote_session.c
+CSRCS += src/remote/remote_link_mqtt.c
+CSRCS += src/channels/remote_ctrl_channel.c
+CSRCS += src/tools/tool_remote_agent.c
+endif
+
 CSRCS += src/channels/ws_server.c
 
 # voice/ - 语音管线

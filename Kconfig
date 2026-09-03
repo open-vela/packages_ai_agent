@@ -189,6 +189,30 @@ config AI_AGENT_MCP
 		tool servers. Costs ~10KB RAM (registry + client state).
 		Disable to save memory if only using builtin tools.
 
+config AI_AGENT_REMOTE_CTRL
+	bool "Enable remote agent control channel"
+	default n
+	depends on NETUTILS_MQTTC && NETUTILS_CJSON
+	---help---
+		Let this device drive a remote ACP agent (mimocode or
+		kiro-cli) running on a PC, over a bridge that speaks MQTT
+		to the device. Adds the remote_agent_prompt and
+		remote_agent_status tools, the set_remote* config commands
+		and the r* console commands (rask, rstat, rreply, rusage,
+		ronce, rdeny).
+
+		Costs ~22KB RAM (12KB thread + 2x4.6KB MQTT buffers +
+		session state). Needs its own MQTT client, separate from
+		the AI_AGENT_MQTT chat channel, because each reconnect must
+		mint a new session nonce and redo the handshake.
+
+		Permission decisions for the remote agent are reachable only
+		from the NSH commands, never as an LLM-callable tool.
+
+		Broker address and credentials are supplied at runtime
+		through the config store (remote_broker, remote_username,
+		remote_password) and are never compiled in.
+
 config AI_AGENT_TEST
 	bool "Enable integration test commands"
 	default n

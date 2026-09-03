@@ -52,6 +52,9 @@
 #ifdef CONFIG_AI_AGENT_MQTT
 #include "channels/mqtt_channel.h"
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+#include "channels/remote_ctrl_channel.h"
+#endif
 #include "infra/network_manager.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_client.h"
@@ -127,6 +130,9 @@ static void net_state_change_cb(net_state_t state, void* arg)
 #ifdef CONFIG_AI_AGENT_MQTT
         mqtt_channel_start();
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        remote_ctrl_channel_start();
+#endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
         weixin_channel_start();
 #endif
@@ -177,6 +183,10 @@ static void* network_watch_task(void* arg)
 #ifdef CONFIG_AI_AGENT_MQTT
         if (mqtt_channel_start() != OK)
             syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        if (remote_ctrl_channel_start() != OK)
+            syslog(LOG_WARNING, "[%s] remote_ctrl_channel_start failed\n", TAG);
 #endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
         if (weixin_channel_start() != OK)
@@ -585,6 +595,11 @@ int ai_agent_main(int argc, char* argv[])
         BOOT_LOG_RC(&t0, "P3", "mqtt_channel_init", rc);
 #endif
 
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        rc = remote_ctrl_channel_init();
+        BOOT_LOG_RC(&t0, "P3", "remote_ctrl_channel_init", rc);
+#endif
+
         rc = voice_channel_init();
         BOOT_LOG_RC(&t0, "P3", "voice_channel_init", rc);
 
@@ -721,6 +736,9 @@ int ai_agent_main(int argc, char* argv[])
 #endif
 #ifdef CONFIG_AI_AGENT_MQTT
     mqtt_channel_stop();
+#endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+    remote_ctrl_channel_stop();
 #endif
     ws_server_stop();
     /* feishu_bot and agent_loop have no _stop(); they will exit

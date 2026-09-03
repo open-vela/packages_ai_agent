@@ -327,6 +327,22 @@
 #define AGENT_CFG_KEY_MQTT_USERNAME "mqtt_username"
 #define AGENT_CFG_KEY_MQTT_PASSWORD "mqtt_password"
 
+/* ── Remote-control channel (drives a remote ACP agent) ─────── */
+#define AGENT_REMOTE_CTRL_STACK (12 * 1024)
+#define AGENT_REMOTE_CTRL_PRIO 45
+
+/* Default budget for one remote turn. A turn held up by a permission request
+ * cannot finish until a human answers on this device, so the tool reports what
+ * it has rather than waiting indefinitely. */
+#define AGENT_REMOTE_CTRL_TURN_TIMEOUT_MS 120000
+
+/* Credentials are read from the config store, never from a command line. */
+#define AGENT_CFG_KEY_REMOTE_BROKER "remote_broker"
+#define AGENT_CFG_KEY_REMOTE_DEVICE_ID "remote_device_id"
+#define AGENT_CFG_KEY_REMOTE_USERNAME "remote_username"
+#define AGENT_CFG_KEY_REMOTE_PASSWORD "remote_password"
+#define AGENT_CFG_KEY_REMOTE_TOPIC_PREFIX "remote_topic_prefix"
+
 /* ── Voice Channel (Doubao ASR/TTS) ─────────────────────────── */
 #define AGENT_CHAN_VOICE "voice"
 

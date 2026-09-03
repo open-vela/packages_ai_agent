@@ -123,6 +123,17 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     )
   endif()
 
+  if(CONFIG_AI_AGENT_REMOTE_CTRL)
+    list(APPEND AGENT_SRCS
+      src/remote/remote_link.c
+      src/remote/remote_codec.c
+      src/remote/remote_session.c
+      src/remote/remote_link_mqtt.c
+      src/channels/remote_ctrl_channel.c
+      src/tools/tool_remote_agent.c
+    )
+  endif()
+
   if(CONFIG_AI_AGENT_BLE_GATT)
     list(APPEND AGENT_SRCS
       src/infra/ble_gatt.c
