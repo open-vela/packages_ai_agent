@@ -31,6 +31,7 @@
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
+#include "llm/local_lm.h"
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
@@ -1092,23 +1093,39 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         }
 
         if (err != OK) {
-            /* Distinguish timeout-induced failure from other errors */
-            if (llm_call_timed_out(latency_ms)) {
+            /* Cloud is unreachable, or has no API key at all -- which is the
+             * normal state on this board.  Fall back to the on-device model
+             * before giving up: the user's message is right here, and a real
+             * answer beats an apology.  Everything downstream (session append,
+             * cache, outbound dispatch) is shared with the cloud path.
+             */
+
+            char *local_text = NULL;
+            bool timed_out = llm_call_timed_out(latency_ms);
+
+            if (timed_out) {
                 syslog(LOG_WARNING,
                     "[%s] LLM watchdog: call failed after %" PRIu32 " ms "
                     "(limit %ds)\n",
                     TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
-                agent_trace_step(&trace, iteration, NULL,
-                    latency_ms, 0);
-                llm_response_free(&resp);
-                final_text = strdup(LLM_TIMEOUT_MSG);
-                watchdog_fired = true;
-                break;
+            } else {
+                syslog(LOG_ERR, "[%s] LLM call failed (iter %d)\n",
+                    TAG, iteration);
             }
-            syslog(LOG_ERR, "[%s] LLM call failed (iter %d)\n",
-                TAG, iteration);
+
             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
             llm_response_free(&resp);
+
+            if (local_lm_available() &&
+                local_lm_reply(msg->content, &local_text) == 0) {
+                final_text = local_text;
+                break;
+            }
+
+            if (timed_out) {
+                final_text = strdup(LLM_TIMEOUT_MSG);
+                watchdog_fired = true;
+            }
             break;
         }
 
@@ -1587,12 +1604,29 @@ int agent_loop_init(void)
 
 int agent_loop_start(void)
 {
-    int ret = agent_task_create(agent_loop_task, "agent_loop",
+    static bool s_started = false;
+    int ret;
+
+    /* Called from three places now: boot phase 5, and the two network-up
+     * paths that predate it.  The loop is the only consumer of the inbound
+     * queue, so it has to run even when the link never comes up -- that is
+     * what makes the on-device model reachable offline.  Guard here rather
+     * than at the call sites so none of them can start a second thread.
+     */
+
+    if (s_started) {
+        return OK;
+    }
+
+    ret = agent_task_create(agent_loop_task, "agent_loop",
         AGENT_AI_AGENT_STACK, NULL, AGENT_AI_AGENT_PRIO);
 
     if (ret != OK) {
         syslog(LOG_ERR,
             "[%s] Failed to create agent_loop task\n", TAG);
+        return ret;
     }
-    return ret;
+
+    s_started = true;
+    return OK;
 }

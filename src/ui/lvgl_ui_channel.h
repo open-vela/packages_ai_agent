@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -71,6 +74,34 @@ int lvgl_ui_channel_send(const char* text);
  * @return 0 成功，负值表示错误
  */
 int lvgl_ui_channel_send_user(const char* text);
+
+/**
+ * 只把一条消息记入聊天历史环，不改气泡、不动桌宠表情。
+ * 给那些不以气泡形式呈现的流量用（NSH `ask` 的提问、以 "cli" 通道回来的回复），
+ * 这样历史窗口看到的是完整对话，而不只是 LVGL 通道那一部分。
+ * 线程安全：内部经 lv_async_call 转到 LVGL 线程。
+ *
+ * @param text     UTF-8 文本
+ * @param is_user  true 表示用户说的，false 表示 Agent 回的
+ * @return 0 成功，负值表示错误
+ */
+int lvgl_ui_channel_log(const char* text, bool is_user);
+
+/**
+ * 聊天历史条数（上限 20 条）。只能在 LVGL 线程上调用。
+ */
+int lvgl_ui_history_count(void);
+
+/**
+ * 取第 newest_first 条历史，0 是最新的一条。只能在 LVGL 线程上调用。
+ *
+ * @param newest_first  0 = 最新
+ * @param buf / len     输出缓冲
+ * @param is_user       可为 NULL；输出这条是谁说的
+ * @return true 取到了，false 表示下标越界
+ */
+bool lvgl_ui_history_get(int newest_first, char* buf, size_t len,
+    bool* is_user);
 
 #ifdef __cplusplus
 }

@@ -32,6 +32,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/infra/http_proxy.c
     src/infra/vela_tls.c
     src/infra/config_store.c
+    src/infra/time_sync.c
     src/infra/network_manager.c
     src/infra/cron_service.c
     src/infra/heartbeat.c
@@ -105,18 +106,20 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_SRCS src/ui/about_page.c)
     list(APPEND AGENT_SRCS src/ui/pet_page.c)
     list(APPEND AGENT_SRCS src/ui/settings_page.c)
+    if(CONFIG_INPUT_BUTTONS)
+      list(APPEND AGENT_SRCS src/ui/key_input.c)
+    endif()
+    # Only the fonts the UI actually references.  cjk_12 / sans_64 / sans_72 /
+    # sans_88 were never used (gc-sections was already dropping them) and
+    # sans_16_bold was a second full 3,879-glyph CJK face used for bold on two
+    # labels -- 279 KB of flash for a weight change.
     list(APPEND AGENT_SRCS src/ui/assets/ui_font_cjk_18.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_cjk_12.c)
     list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_16.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_16_bold.c)
     list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_24.c)
     list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_32.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_64.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_72.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_88.c)
     list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_88_bold.c)
-    list(APPEND AGENT_SRCS src/ui/assets/pet_cloud_open.c)
-    list(APPEND AGENT_SRCS src/ui/assets/pet_cloud_blink.c)
+    # pet_cloud_open / pet_cloud_blink (2 x 300x300 ARGB8888, 720 KB) are gone:
+    # the mascot is drawn with LVGL primitives now.
     list(APPEND AGENT_SRCS src/ui/assets/img_background_watch.c)
   endif()
 
@@ -218,6 +221,32 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_INCDIRS ${ALSA_DIRECT_INC})
   endif()
 
+  set(AGENT_DEPENDS mqttc)
+  set(AGENT_DEFS "")
+
+  if(CONFIG_TFLITEMICRO)
+    # On-device language model.  The sources and the model data stay in the
+    # team repo (contest rules put the work under app/ai_agent/); we reach them
+    # through the packages/demos linkfile instead of keeping a second copy.
+    # ai_lm.cxx includes "model/model_data.h" relative to its own directory, so
+    # no extra include path is needed for the model blobs.
+    set(LOCAL_LM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../demos/contest2026_181_ai_agent)
+    list(APPEND AGENT_SRCS
+      ${LOCAL_LM_DIR}/ai_lm.cxx
+      ${LOCAL_LM_DIR}/tokenizer.c
+      src/llm/local_lm.c
+    )
+    list(APPEND AGENT_INCDIRS ${LOCAL_LM_DIR})
+    list(APPEND AGENT_DEPENDS tflite_micro)
+    list(APPEND AGENT_DEFS
+      TFLITE_WITH_STABLE_ABI=0
+      TFLITE_USE_OPAQUE_DELEGATE=0
+      TFLITE_SINGLE_ROUNDING=0
+      TF_LITE_STRIP_ERROR_STRINGS
+      TF_LITE_STATIC_MEMORY
+    )
+  endif()
+
   nuttx_add_application(
     NAME
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_PROGNAME}
@@ -225,12 +254,50 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       ${AGENT_SRCS}
     INCLUDE_DIRECTORIES
       ${AGENT_INCDIRS}
+    DEFINITIONS
+      ${AGENT_DEFS}
+    COMPILE_FLAGS
+      -Wno-error
     DEPENDS
-      mqttc
+      ${AGENT_DEPENDS}
     STACKSIZE
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_STACKSIZE}
     PRIORITY
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_PRIORITY}
+  )
+
+  # "timesync" NSH builtin: force a sync now, or print the clock.
+  nuttx_add_application(
+    NAME
+      timesync
+    SRCS
+      src/channels/timesync_main.c
+    INCLUDE_DIRECTORIES
+      ${AGENT_INCDIRS}
+    COMPILE_FLAGS
+      -Wno-error
+    STACKSIZE
+      4096
+    PRIORITY
+      100
+  )
+
+  # "ask <text>" as a real NSH builtin.  The agent's own CLI has the same
+  # command, but that thread runs at priority 30 against NSH's 100 on one
+  # console fd, so NSH wins every read and the agent CLI never gets input.
+  nuttx_add_application(
+    NAME
+      ask
+    SRCS
+      src/channels/ask_main.c
+    INCLUDE_DIRECTORIES
+      ${AGENT_INCDIRS}
+    COMPILE_FLAGS
+      -Wno-error
+    STACKSIZE
+      2048
+    PRIORITY
+      100
   )
 
   # Force agent_main.c to recompile every build so that

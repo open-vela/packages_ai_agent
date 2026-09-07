@@ -87,6 +87,38 @@ static void history_add(const char *text, bool is_user)
     }
 }
 
+int lvgl_ui_history_count(void)
+{
+    return s_history.count;
+}
+
+bool lvgl_ui_history_get(int newest_first, char *buf, size_t len,
+                        bool *is_user)
+{
+    const chat_msg_t *m;
+    int idx;
+
+    /* Callers run on the LVGL thread (pet page, history page), the same
+     * thread history_add() is reached from via lv_async_call, so the ring
+     * needs no lock. */
+
+    if (!buf || len == 0 || newest_first < 0 ||
+        newest_first >= s_history.count) {
+        return false;
+    }
+
+    idx = (s_history.head - 1 - newest_first + 2 * CHAT_HISTORY_MAX)
+          % CHAT_HISTORY_MAX;
+    m = &s_history.msgs[idx];
+
+    strncpy(buf, m->text, len - 1);
+    buf[len - 1] = '\0';
+    if (is_user) {
+        *is_user = m->is_user;
+    }
+    return true;
+}
+
 /* ── State ─────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -526,6 +558,20 @@ static void ui_build(void)
     /* Launcher desktop on top: app icons → pet / settings pages */
     launcher_create();
     lv_obj_move_foreground(launcher_desktop_obj());
+
+    /* The desktop is opaque and covers the whole screen, so the pet stage
+     * below it can never be seen -- but LVGL culls invalidation only for
+     * LV_OBJ_FLAG_HIDDEN objects, never for ones merely covered by a sibling.
+     * Left visible, the pet's idle float animation invalidated its 300x300
+     * area every refresh period and dragged a full-screen repaint with it.
+     * Also hide the menu button for the same reason.
+     */
+
+    pet_display_set_stage_visible(false);
+    if (s_ui.menu_btn) {
+        lv_obj_add_flag(s_ui.menu_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
     syslog(LOG_INFO, "[%s] launcher desktop created\n", UI_TAG);
 }
 
@@ -546,6 +592,29 @@ static void *render_thread(void *arg)
 
 /* ── External interface ────────────────────────────────────────── */
 
+#define DEV_WAIT_STEP_US  50000
+#define DEV_WAIT_STEPS    60
+
+static void wait_for_device(const char *path)
+{
+    int i;
+
+    /* Both /dev/lcd0 and /dev/input0 come from the board's asynchronous
+     * LCD/touch bringup thread, which can still be running when we get here.
+     * lv_nuttx_init() probes each path exactly once and gives up on ENOENT,
+     * which used to leave the UI display-only on roughly half the boots.
+     */
+
+    for (i = 0; i < DEV_WAIT_STEPS; i++) {
+        if (access(path, F_OK) == 0) {
+            return;
+        }
+        usleep(DEV_WAIT_STEP_US);
+    }
+
+    syslog(LOG_WARNING, "[%s] %s never appeared\n", UI_TAG, path);
+}
+
 int lvgl_ui_channel_init(void)
 {
     lv_nuttx_result_t result;
@@ -556,6 +625,9 @@ int lvgl_ui_channel_init(void)
     }
 
     syslog(LOG_INFO, "[%s] init\n", UI_TAG);
+
+    wait_for_device(CONFIG_AI_AGENT_LCD_PATH);
+    wait_for_device(CONFIG_AI_AGENT_TOUCH_PATH);
 
     lv_init();
     lv_nuttx_dsc_init(&info);
@@ -699,5 +771,48 @@ int lvgl_ui_channel_send_user(const char *text)
     strncpy(payload->text, text, MSG_MAX_LEN - 1);
     payload->is_user = true;
     lv_async_call(bubble_update_async_cb, payload);
+    return 0;
+}
+
+/* Record into the chat ring without touching the bubble or the pet.
+ * Used for traffic that never renders as a bubble -- NSH `ask` questions and
+ * the replies dispatched back on the "cli" channel -- so the history window
+ * shows the whole conversation regardless of which channel carried it. */
+
+static void history_log_async_cb(void *data)
+{
+    ui_msg_t *m = (ui_msg_t *)data;
+
+    if (s_ui.initialized) {
+        history_add(m->text, m->is_user);
+        if (s_ui.history_visible) {
+            history_rebuild_list();
+        }
+        /* Replies reaching the ring through this path (NSH `ask`, the Key2
+         * demo question) still belong on the pet page text layer -- it is a
+         * no-op while that page is closed. */
+        if (!m->is_user) {
+            pet_page_update_response(m->text);
+        }
+    }
+    free(m);
+}
+
+int lvgl_ui_channel_log(const char *text, bool is_user)
+{
+    ui_msg_t *payload;
+
+    if (!text || text[0] == '\0' || !s_ui.initialized) {
+        return -EINVAL;
+    }
+
+    payload = malloc(sizeof(ui_msg_t));
+    if (!payload) {
+        return -ENOMEM;
+    }
+    memset(payload, 0, sizeof(*payload));
+    strncpy(payload->text, text, MSG_MAX_LEN - 1);
+    payload->is_user = is_user;
+    lv_async_call(history_log_async_cb, payload);
     return 0;
 }

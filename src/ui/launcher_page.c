@@ -9,22 +9,48 @@
 
 #include <lvgl/lvgl.h>
 #include <stdio.h>
+#include <string.h>
+#include <syslog.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netutils/netlib.h>
 #include "launcher_page.h"
 #include "pet_page.h"
 #include "settings_page.h"
 #include "about_page.h"
 
 /****************************************************************************
+ * Pre-processor Definitions
+ ****************************************************************************/
+
+#define LAUNCHER_TITLE_TEXT  "HerSen. Welcome back."
+
+/* Bluetooth PAN is the watch's only uplink, and the interface carries an
+ * address only once BNEP is up and DHCP has answered.
+ */
+
+#define LAUNCHER_NET_IFNAME  "bt-pan"
+#define LAUNCHER_NET_PERIOD  2000
+
+/* Polls without an address before we stop saying "connecting" and start
+ * telling the user what to actually go and do.  10 x 2 s = 20 s, comfortably
+ * longer than a healthy pair + BNEP + DHCP sequence (~8 s measured). */
+#define LAUNCHER_NET_GRACE_POLLS 10
+
+#define CLR_STATUS_OK   0xffffff
+#define CLR_STATUS_WAIT 0x9a9ab0
+#define CLR_STATUS_ERR  0xffc06a
+
+/****************************************************************************
  * Private Data
  ****************************************************************************/
 
-/* Background wallpaper (390x450 ARGB8888, generated from img_background_watch.png) */
-extern const uint32_t img_background_watch_px[];
+/* Background wallpaper (390x450 RGB565, see tools/gen_bg_rgb565.py) */
+extern const uint16_t img_background_watch_px[];
 
 /* Sans-serif (Noto Sans SC) font family: CJK + Latin, multi sizes/weights */
 extern const lv_font_t ui_font_sans_16;
-extern const lv_font_t ui_font_sans_16_bold;
 extern const lv_font_t ui_font_sans_24;
 extern const lv_font_t ui_font_sans_32;
 extern const lv_font_t ui_font_sans_64;
@@ -34,13 +60,13 @@ extern const lv_font_t ui_font_sans_88_bold;
 
 static const lv_image_dsc_t s_bg_dsc = {
     .header = { .magic = LV_IMAGE_HEADER_MAGIC,
-                .cf = LV_COLOR_FORMAT_ARGB8888,
+                .cf = LV_COLOR_FORMAT_RGB565,
                 .flags = 0,
                 .w = 390,
                 .h = 450,
-                .stride = 390 * 4,
+                .stride = 390 * 2,
                 .reserved_2 = 0 },
-    .data_size = 390 * 450 * 4,
+    .data_size = 390 * 450 * 2,
     .data = (const uint8_t *)img_background_watch_px,
     .reserved = NULL,
     .reserved_2 = NULL,
@@ -51,6 +77,13 @@ static lv_obj_t *pet_icon_btn;
 static lv_obj_t *settings_icon_btn;
 static lv_obj_t *about_icon_btn;
 static lv_obj_t *s_time_label;
+static lv_obj_t *s_date_label;
+static int s_shown_day_key = -1; /* year+yday the date label currently shows */
+static char s_shown_time[8];      /* "HH:MM" the clock label currently shows */
+static lv_obj_t *s_title_label;
+static lv_obj_t *s_status_label;  /* second line: IP, or why there is none */
+static char s_shown_status[64];   /* text the status label currently shows */
+static int s_no_ip_polls;         /* consecutive polls with no address */
 static lv_obj_t *s_current_page; /* page currently stacked above the desktop */
 
 /****************************************************************************
@@ -89,14 +122,32 @@ static void on_about_icon_clicked(lv_event_t *e)
  ****************************************************************************/
 
 /**
- * Update the desktop clock from the system RTC (HH:MM, bold).
+ * Update the desktop clock and the date stack from the system RTC.
  * Runs every second via lv_timer; also called once at build time.
+ *
+ * The date used to be the literal "WED\nAPR\n1" -- harmless while the RTC held
+ * an arbitrary value, but wrong now that time_sync.c sets a real one.  Both
+ * labels are refreshed from one localtime_r() call; the date only touches the
+ * label when the day actually changes, so a per-second timer costs nothing.
+ *
+ * Weekday and month names are spelled out here rather than taken from
+ * strftime("%a"/"%b"): those are uppercase in this design, and the build has no
+ * locale support to lean on anyway.
  */
 static void time_update_cb(lv_timer_t *timer)
 {
+    static const char *const wday[7] = {
+        "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"
+    };
+    static const char *const month[12] = {
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+    };
     time_t now;
     struct tm tmv;
     char buf[8];
+    char date[16];
+    int day_key;
 
     (void)timer;
     if (s_time_label == NULL) {
@@ -106,8 +157,111 @@ static void time_update_cb(lv_timer_t *timer)
     if (localtime_r(&now, &tmv) == NULL) {
         return;
     }
+
+    /* Only write when the minute actually rolls over.  lv_label_set_text
+     * invalidates unconditionally, and an invalidation costs a full render
+     * pass -- there is no point paying it 59 times out of every 60. */
+
     snprintf(buf, sizeof(buf), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
-    lv_label_set_text(s_time_label, buf);
+    if (strcmp(buf, s_shown_time) != 0) {
+        lv_label_set_text(s_time_label, buf);
+        strlcpy(s_shown_time, buf, sizeof(s_shown_time));
+    }
+
+    /* Key on the year too, not just the day of year: the clock jumps when
+     * time_sync.c lands, and a jump that keeps tm_yday but changes the year
+     * lands on a different weekday. */
+
+    day_key = tmv.tm_year * 1000 + tmv.tm_yday;
+    if (s_date_label != NULL && day_key != s_shown_day_key &&
+        tmv.tm_wday >= 0 && tmv.tm_wday < 7 &&
+        tmv.tm_mon >= 0 && tmv.tm_mon < 12) {
+        snprintf(date, sizeof(date), "%s\n%s\n%d",
+                 wday[tmv.tm_wday], month[tmv.tm_mon], tmv.tm_mday);
+        lv_label_set_text(s_date_label, date);
+        s_shown_day_key = day_key;
+    }
+}
+
+/****************************************************************************
+ * Network status
+ ****************************************************************************/
+
+/**
+ * Second desktop line: the bt-pan address once we have one, otherwise why we
+ * do not.
+ *
+ * Runs every LAUNCHER_NET_PERIOD ms via lv_timer, and once at build time so a
+ * board that is already online shows its address immediately.  The text is
+ * only written when it changes -- lv_label_set_text invalidates, and an
+ * invalidation costs a render pass.
+ *
+ * The three states are all we can tell apart cheaply from the LVGL thread, and
+ * that is enough to be useful: the overwhelmingly common reason for no address
+ * is that Bluetooth tethering got switched off on the phone (Android turns it
+ * off by itself after a reboot or a spell in airplane mode).  The link comes up
+ * and BNEP negotiates fine in that case -- the phone tears it down the moment
+ * DHCP starts -- so "no IP for a while" is exactly the signal to surface.
+ *
+ * This label uses ui_font_sans_16, not the 24 px title font: sans_24 is a
+ * 117-glyph subset carrying only the fixed strings already on screen, so any
+ * new Chinese would render as boxes.  sans_16 carries the full CJK subset and
+ * is already linked in for the footer.
+ */
+static void net_update_cb(lv_timer_t *timer)
+{
+    struct in_addr addr;
+    char ip[INET_ADDRSTRLEN];
+    const char *text;
+
+    (void)timer;
+    if (s_status_label == NULL) {
+        return;
+    }
+
+    ip[0] = '\0';
+    memset(&addr, 0, sizeof(addr));
+    if (netlib_get_ipv4addr(LAUNCHER_NET_IFNAME, &addr) == 0 &&
+        addr.s_addr != INADDR_ANY) {
+        if (inet_ntop(AF_INET, &addr, ip, sizeof(ip)) == NULL) {
+            ip[0] = '\0';
+        }
+    }
+
+    if (ip[0] != '\0') {
+        s_no_ip_polls = 0;
+        text = ip;
+        lv_obj_set_style_text_color(s_status_label,
+                                    lv_color_hex(CLR_STATUS_OK), 0);
+    }
+    else {
+        if (s_no_ip_polls < LAUNCHER_NET_GRACE_POLLS) {
+            s_no_ip_polls++;
+        }
+        if (s_no_ip_polls < LAUNCHER_NET_GRACE_POLLS) {
+            /* 蓝牙连接中… */
+            text = "\xe8\x93\x9d\xe7\x89\x99\xe8\xbf\x9e\xe6\x8e\xa5"
+                   "\xe4\xb8\xad\xe2\x80\xa6";
+            lv_obj_set_style_text_color(s_status_label,
+                                        lv_color_hex(CLR_STATUS_WAIT), 0);
+        }
+        else {
+            /* 蓝牙未连接，请开启手机网络共享 */
+            text = "\xe8\x93\x9d\xe7\x89\x99\xe6\x9c\xaa\xe8\xbf\x9e"
+                   "\xe6\x8e\xa5\xef\xbc\x8c\xe8\xaf\xb7\xe5\xbc\x80"
+                   "\xe5\x90\xaf\xe6\x89\x8b\xe6\x9c\xba\xe7\xbd\x91"
+                   "\xe7\xbb\x9c\xe5\x85\xb1\xe4\xba\xab";
+            lv_obj_set_style_text_color(s_status_label,
+                                        lv_color_hex(CLR_STATUS_ERR), 0);
+        }
+    }
+
+    if (strcmp(text, s_shown_status) == 0) {
+        return;
+    }
+    strlcpy(s_shown_status, text, sizeof(s_shown_status));
+    lv_label_set_text(s_status_label, text);
+    syslog(LOG_INFO, "[launcher] status: %s\n", text);
 }
 
 /****************************************************************************
@@ -201,14 +355,18 @@ void launcher_create(void)
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    /* 左侧日期 */
-    lv_obj_t *dat_label = lv_label_create(row);
-    lv_label_set_text(dat_label, "WED\nAPR\n1");
-    lv_obj_set_style_text_font(dat_label, &ui_font_sans_24, 0);
-    lv_obj_set_style_text_color(dat_label, lv_color_hex(0xffffff), 0);
+    /* 左侧日期（星期 / 月份 / 日，随 RTC 走，见 time_update_cb） */
+    s_date_label = lv_label_create(row);
+    s_shown_day_key = -1; /* new label object: repaint on the next tick */
+    lv_label_set_text(s_date_label, "---\n---\n-");
+    lv_obj_set_style_text_font(s_date_label, &ui_font_sans_24, 0);
+    lv_obj_set_style_text_color(s_date_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_align(s_date_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(s_date_label, 2, 0);
 
     /* 右侧时间（实时时钟，粗体） */
     s_time_label = lv_label_create(row);
+    s_shown_time[0] = '\0';   /* new label object: repaint on the next tick */
     lv_label_set_text(s_time_label, "--:--");
     lv_obj_set_style_text_font(s_time_label, &ui_font_sans_88_bold, 0);
     lv_obj_set_style_text_color(s_time_label, lv_color_hex(0xffffff), 0);
@@ -224,10 +382,25 @@ void launcher_create(void)
     lv_obj_set_flex_grow(mid, 1);
 
     lv_obj_t *title = lv_label_create(mid);
-    lv_label_set_text(title, "HerSen. Welcome back.");
+    lv_label_set_text(title, LAUNCHER_TITLE_TEXT);
     lv_obj_set_style_text_font(title, &ui_font_sans_24, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0); /* 在中间栏内居中 = 屏幕正中 */
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -14); /* 标题略上移，给状态行让位 */
+    s_title_label = title;
+
+    /* 状态行：有地址显示 IP，没有就说明原因。用 sans_16（含完整 CJK 子集） */
+    s_status_label = lv_label_create(mid);
+    lv_label_set_text(s_status_label, "");
+    lv_obj_set_style_text_font(s_status_label, &ui_font_sans_16, 0);
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(CLR_STATUS_WAIT), 0);
+    lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_status_label, LV_ALIGN_CENTER, 0, 16);
+
+    s_shown_status[0] = '\0';
+    s_no_ip_polls = 0;
+    net_update_cb(NULL);
+    lv_timer_create(net_update_cb, LAUNCHER_NET_PERIOD, NULL);
 
     /* ── 第三层：column 布局，占 30% ── */
     lv_obj_t *col3 = lv_obj_create(desktop_page);

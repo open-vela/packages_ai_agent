@@ -53,6 +53,23 @@ pet_emotion_t pet_display_get_emotion(void);
 void pet_display_set_layers_visible(bool visible);
 
 /**
+ * Show or hide the whole pet stage (body + emotion layers).
+ *
+ * The pet lives on the same screen as the launcher desktop, which is an
+ * opaque full-screen object stacked in front of it.  LVGL does not cull
+ * invalidation for an object that is merely covered by an opaque sibling:
+ * lv_obj_area_is_visible() checks LV_OBJ_FLAG_HIDDEN and the ancestor clip
+ * chain, never siblings.  So the pet's idle float animation kept invalidating
+ * its 300x300 area ~30 times a second, and with the display in full-refresh
+ * mode every one of those became a whole-screen repaint of a pet nobody can
+ * see.  Setting LV_OBJ_FLAG_HIDDEN makes that visibility check fail, and
+ * dropping the animations removes the per-tick style writes as well.
+ *
+ * Must be called from the LVGL thread.
+ */
+void pet_display_set_stage_visible(bool visible);
+
+/**
  * Return the pet image widget (for tap events / z-order).
  */
 lv_obj_t *pet_display_get_obj(void);

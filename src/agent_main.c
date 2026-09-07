@@ -39,6 +39,7 @@
 #include "core/message_bus_tap.h"
 #include "channels/nsh_commands.h"
 #include "infra/config_store.h"
+#include "infra/time_sync.h"
 #include "infra/cron_service.h"
 #ifdef CONFIG_AI_AGENT_FEISHU
 #include "channels/feishu_bot.h"
@@ -76,6 +77,9 @@
 #endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #include "ui/lvgl_ui_channel.h"
+#ifdef CONFIG_INPUT_BUTTONS
+#include "ui/key_input.h"
+#endif
 #endif
 #ifdef CONFIG_AI_AGENT_BLE_GATT
 #include "infra/ble_cmd_handler.h"
@@ -116,6 +120,7 @@ static void net_state_change_cb(net_state_t state, void* arg)
     (void)arg;
     if (state == NET_STATE_CONNECTED && !g_net_services_started) {
         syslog(LOG_INFO, "[%s] Network recovered, starting services\n", TAG);
+        time_sync_start();
 #ifdef CONFIG_AI_AGENT_FEISHU
         feishu_bot_start();
 #endif
@@ -154,6 +159,8 @@ static void* network_watch_task(void* arg)
 
     if (network_wait_connected(30000) == OK) {
         syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
+
+        time_sync_start();
 
 #if AGENT_SKILL_SYNC_ENABLED
         /* Sync skills from Bitable before starting agent loop */
@@ -435,6 +442,11 @@ static void* outbound_dispatch_task(void* arg)
             fflush(stdout);
             pthread_mutex_unlock(&g_stdout_lock);
             syslog(LOG_INFO, "[agent] [Agent]: %s\n", msg.content);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* Mirror into the chat ring so the pet page history window shows
+             * console conversations too; this channel renders no bubble. */
+            lvgl_ui_channel_log(msg.content, false);
+#endif
         } else {
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }
@@ -622,6 +634,16 @@ int ai_agent_main(int argc, char* argv[])
     }
     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
 
+    /* Agent loop — started here, not only from the network-up callback.  It is
+     * the only consumer of the inbound queue, so leaving it to the network
+     * meant that with no link (or no API key) nothing ever drained a query and
+     * the on-device model was unreachable.  agent_loop_start() is idempotent,
+     * so the later network-up call is a no-op. */
+    if (agent_loop_start() != OK) {
+        syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
+    }
+    BOOT_LOG(&t0, "P5", "agent loop started");
+
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
     /* Quickapp mqueue listener - receives requests from quickapp process */
     if (agent_task_create(quickapp_mq_listener_task, "qapp_mq",
@@ -641,6 +663,14 @@ int ai_agent_main(int argc, char* argv[])
     if (lvgl_ui_channel_start() != OK)
         syslog(LOG_WARNING, "[%s] lvgl_ui_channel_start failed\n", TAG);
     BOOT_LOG(&t0, "P5", "lvgl_ui_channel started");
+#ifdef CONFIG_INPUT_BUTTONS
+    /* Physical keys: Key1 opens the pet page, Key2 asks the on-device model
+     * one of the demo questions.  Started after the UI so the first press
+     * always finds the launcher built. */
+    if (key_input_start() != OK)
+        syslog(LOG_WARNING, "[%s] key_input_start failed\n", TAG);
+    BOOT_LOG(&t0, "P5", "key input started");
+#endif
 #endif
 
 #ifdef CONFIG_AI_AGENT_BLE_GATT

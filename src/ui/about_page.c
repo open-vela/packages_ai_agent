@@ -19,7 +19,6 @@ static about_back_callback_t back_callback = NULL;
 
 /* Sans-serif (Noto Sans SC) font family */
 extern const lv_font_t ui_font_sans_16;
-extern const lv_font_t ui_font_sans_16_bold;
 extern const lv_font_t ui_font_sans_32;
 
 /****************************************************************************
@@ -75,7 +74,7 @@ lv_obj_t *about_page_create(void)
     /* Title */
     lv_obj_t *title = lv_label_create(about_page_container);
     lv_label_set_text(title, "关于");
-    lv_obj_set_style_text_font(title, &ui_font_sans_16_bold, 0);
+    lv_obj_set_style_text_font(title, &ui_font_sans_16, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x88ccff), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
 

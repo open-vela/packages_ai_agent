@@ -400,6 +400,72 @@ static bool check_interfaces(void)
     return found;
 }
 
+/**
+ * Check if bt-pan specifically has a valid IPv4 address.
+ * Returns true if bt-pan is up with an IP (primary channel ready).
+ */
+static bool check_btpan_has_ip(void)
+{
+    struct ifaddrs* ifa_list = NULL;
+    bool found = false;
+
+    if (getifaddrs(&ifa_list) != 0) {
+        return false;
+    }
+
+    for (struct ifaddrs* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        if (!ifa->ifa_name || strncmp(ifa->ifa_name, "bt-pan", 6) != 0) {
+            continue;
+        }
+
+        struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+        uint32_t addr = ntohl(sin->sin_addr.s_addr);
+        if (addr != 0 && (addr >> 24) != 127) {
+            found = true;
+        }
+        break;
+    }
+
+    freeifaddrs(ifa_list);
+    return found;
+}
+
+/**
+ * Check if any non-bt-pan interface has a valid IPv4 address
+ * (for BLE GATT NUS+TUN backup channel detection).
+ */
+static bool check_backup_channel_has_ip(void)
+{
+    struct ifaddrs* ifa_list = NULL;
+    bool found = false;
+
+    if (getifaddrs(&ifa_list) != 0) {
+        return false;
+    }
+
+    for (struct ifaddrs* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        if (!ifa->ifa_name) continue;
+        /* Skip loopback and bt-pan */
+        if (strncmp(ifa->ifa_name, "lo", 2) == 0) continue;
+        if (strncmp(ifa->ifa_name, "bt-pan", 6) == 0) continue;
+
+        struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+        uint32_t addr = ntohl(sin->sin_addr.s_addr);
+        if (addr != 0 && (addr >> 24) != 127) {
+            found = true;
+        }
+    }
+
+    freeifaddrs(ifa_list);
+    return found;
+}
+
 /* ── Config loading ────────────────────────────────────────────── */
 
 static void load_net_config(void)
@@ -536,16 +602,51 @@ static void* iface_poll_thread(void* arg)
     clock_gettime(CLOCK_MONOTONIC, &start);
     bool startup_warned = false;
 
+    /* Dual-channel tracking: bt-pan (primary) vs BLE GATT (backup) */
+    const char* active_channel = "none";
+
     while (g_poll_running) {
-        bool has_ip = check_interfaces();
+        /*
+         * Dual-channel priority switching (ported from xiaozhi-sf32):
+         *   Primary:  bt-pan (BR/EDR PAN via phone Bluetooth tethering)
+         *   Backup:   BLE GATT NUS+TUN proxy (via phone companion app)
+         *
+         * bt-pan is preferred because it provides standard IP networking
+         * with DHCP. BLE GATT is a fallback when PAN is unavailable.
+         */
+        bool btpan_ready = check_btpan_has_ip();
+        bool backup_ready = false;
+        bool has_ip = false;
+
+        if (btpan_ready) {
+            /* Primary channel (bt-pan) is up — use it */
+            has_ip = true;
+            if (active_channel != "bt-pan") {
+                active_channel = "bt-pan";
+                syslog(LOG_INFO, "[%s] Active channel: bt-pan (primary)\n", TAG);
+            }
+        } else {
+            /* Primary down — check backup channels */
 #ifdef CONFIG_AI_AGENT_BLE_NET
-        /* BLE proxy channel must have its SPP pipe up as well */
-        has_ip = has_ip && ble_net_is_connected();
+            backup_ready = backup_ready || ble_net_is_connected();
 #endif
 #ifdef CONFIG_AI_AGENT_BLE_GATT
-        /* BLE GATT proxy channel must have the phone attached */
-        has_ip = has_ip && ble_gatt_net_is_connected();
+            backup_ready = backup_ready || ble_gatt_net_is_connected();
 #endif
+            if (backup_ready && check_backup_channel_has_ip()) {
+                has_ip = true;
+                if (active_channel != "ble-gatt") {
+                    active_channel = "ble-gatt";
+                    syslog(LOG_INFO, "[%s] Active channel: BLE GATT (backup)\n", TAG);
+                }
+            } else {
+                if (active_channel != "none") {
+                    syslog(LOG_WARNING, "[%s] All channels down, was: %s\n",
+                           TAG, active_channel);
+                    active_channel = "none";
+                }
+            }
+        }
 
         if (has_ip) {
             set_net_state(NET_STATE_CONNECTED);
