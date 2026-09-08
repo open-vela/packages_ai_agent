@@ -75,8 +75,8 @@ Speaker ← PCM ← TTS ← text ← message_bus (outbound)
 # 1. 设置 TTS API Key
 vela> set_volc_key <api_key>
 
-# 2. 设置 ASR 凭证
-vela> set_volc_asr <app_id> <token> <cluster>
+# 2. 设置 ASR 凭证（第三项可为 V2 cluster 或 V3 resource ID）
+vela> set_volc_asr <app_id> <token> <resource_id_or_cluster>
 
 # 3. 可选：设置 TTS 语音角色（默认 zh_male_beijingxiaoye_emo_v2_mars_bigtts）
 vela> set_volc_speaker zh_male_chunhou
@@ -85,6 +85,9 @@ vela> set_volc_speaker zh_male_chunhou
 vela> set_voice_tts volcengine
 vela> set_voice_asr volcengine
 ```
+
+火山引擎 V2 可继续使用 `volcengine_streaming_common`。使用大模型 ASR
+V3 时，将第三项设置为资源 ID，例如 `volc.bigasr.sauc.duration`。
 
 ### 测试（QEMU 文件模式）
 

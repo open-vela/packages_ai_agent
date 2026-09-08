@@ -48,13 +48,14 @@ void cmd_set_volc_speaker(int argc, char** argv)
 void cmd_set_volc_asr(int argc, char** argv)
 {
     if (argc < 4) {
-        printf("Usage: set_volc_asr <app_id> <token> <cluster>\n");
+        printf("Usage: set_volc_asr <app_id> <token> "
+               "<resource_id_or_cluster>\n");
         return;
     }
     claw_config_set(AGENT_CFG_KEY_VOLC_APPKEY, argv[1]);
     claw_config_set(AGENT_CFG_KEY_VOLC_TOKEN, argv[2]);
     claw_config_set(AGENT_CFG_KEY_VOLC_ASR_CLUSTER, argv[3]);
-    printf("ASR credentials saved (app_id=%s, cluster=%s).\n",
+    printf("ASR credentials saved (app_id=%s, resource/cluster=%s).\n",
         argv[1], argv[3]);
 }
 

@@ -339,10 +339,14 @@
 #define AGENT_DOUBAO_TTS_V3_PATH "/api/v3/tts/unidirectional"
 #define AGENT_DOUBAO_TTS_RESOURCE "volc.service_type.10029"
 
-/* Doubao streaming ASR WebSocket API (V2) */
+/* Doubao streaming ASR WebSocket API (V2 and V3 big model) */
 #define AGENT_DOUBAO_ASR_HOST "openspeech.bytedance.com"
 #define AGENT_DOUBAO_ASR_PORT "443"
-#define AGENT_DOUBAO_ASR_WS_PATH "/api/v2/asr"
+#define AGENT_DOUBAO_ASR_V2_PATH "/api/v2/asr"
+#define AGENT_DOUBAO_ASR_V3_PATH "/api/v3/sauc/bigmodel"
+
+/* Backward-compatible alias for existing V2 integrations. */
+#define AGENT_DOUBAO_ASR_WS_PATH AGENT_DOUBAO_ASR_V2_PATH
 
 /* Default ASR cluster (streaming, common Chinese) */
 #define AGENT_DOUBAO_ASR_CLUSTER "volcengine_streaming_common"

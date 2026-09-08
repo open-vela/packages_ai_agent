@@ -30,7 +30,7 @@ int volc_asr_recognize(const unsigned char *pcm_data,
                        size_t pcm_len,
                        const char *app_id,
                        const char *token,
-                       const char *cluster,
+                       const char *resource_id_or_cluster,
                        char *text_out,
                        size_t text_cap);
 
