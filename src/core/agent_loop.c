@@ -32,6 +32,9 @@
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
+#ifdef CONFIG_AI_AGENT_LOCAL_TOOL_ROUTER
+#include "tools/mooncat_local_router.h"
+#endif
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
 #include "agent_compat.h"
@@ -488,7 +491,12 @@ static char* handle_nl_fast_path(const char* text)
         }
     }
 
+#ifdef CONFIG_AI_AGENT_LOCAL_TOOL_ROUTER
+    /* Preserve all established keyword routes; NULL continues to cloud LLM. */
+    return mooncat_local_router_handle(text);
+#else
     return NULL;
+#endif
 }
 
 /* ── Handle slash commands + NL fast path (bypass LLM) ─── */
