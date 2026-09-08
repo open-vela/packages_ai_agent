@@ -74,6 +74,8 @@ CSRCS += src/tools/tool_system.c
 CSRCS += src/tools/tool_health.c
 CSRCS += src/tools/tool_control.c
 CSRCS += src/tools/tool_media.c
+CSRCS += src/tools/mooncat_coach_policy.c
+CSRCS += src/tools/tool_mooncat_coach.c
 CSRCS += src/tools/tool_proxyquickapp.c
 ifeq ($(CONFIG_AI_AGENT_MCP),y)
 CSRCS += src/tools/mcp_bridge.c
@@ -84,6 +86,21 @@ CSRCS += src/tools/mcp_client.c
 endif
 CSRCS += src/tools/skill_loader.c
 CSRCS += src/tools/tool_guard.c
+
+ifeq ($(CONFIG_AI_AGENT_LOCAL_TOOL_ROUTER),y)
+CSRCS += src/tools/mooncat_local_router.c
+CXXEXT = .cc
+CXXSRCS += src/tools/mooncat_intent_model.cc
+CXXFLAGS += ${INCDIR_PREFIX}$(CURDIR)/include
+CXXFLAGS += ${INCDIR_PREFIX}$(CURDIR)/src
+CXXFLAGS += ${INCDIR_PREFIX}$(APPDIR)/mlearning/tflite-micro/tflite-micro
+CXXFLAGS += ${INCDIR_PREFIX}$(APPDIR)/math/gemmlowp/gemmlowp
+CXXFLAGS += ${INCDIR_PREFIX}$(APPDIR)/math/kissfft/kissfft
+CXXFLAGS += ${INCDIR_PREFIX}$(APPDIR)/math/ruy/ruy
+CXXFLAGS += -DTFLITE_EMULATE_FLOAT
+CXXFLAGS += -DTF_LITE_DISABLE_X86_NEON
+CXXFLAGS += -DTF_LITE_STRIP_ERROR_STRINGS
+endif
 
 ifeq ($(CONFIG_AI_AGENT_SKILL_SYNC),y)
 CSRCS += src/tools/skill_sync.c
