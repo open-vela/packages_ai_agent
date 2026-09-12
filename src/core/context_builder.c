@@ -97,7 +97,7 @@ int context_build_system_prompt(char *buf, size_t size)
      * lookup errors (romfs doesn't have "CST-8" zoneinfo file). */
     time_t now = time(NULL);
     struct tm tm_now;
-    time_t local_epoch = now + 8 * 3600;
+    time_t local_epoch = now + AGENT_TIME_OFFSET_SEC;
     gmtime_r(&local_epoch, &tm_now);
     char time_str[64];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_now);

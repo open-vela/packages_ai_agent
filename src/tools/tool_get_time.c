@@ -170,7 +170,7 @@ int tool_get_time_execute(const char *input_json, char *output, size_t output_si
          * which fails for POSIX TZ strings like "CST-8" and spams
          * ERROR logs.  We bypass this by computing UTC+8 manually. */
         struct tm utc_tm;
-        time_t local_epoch = now + 8 * 3600;  /* UTC+8 */
+        time_t local_epoch = now + AGENT_TIME_OFFSET_SEC;
         gmtime_r(&local_epoch, &utc_tm);
 
         char time_str[64];
