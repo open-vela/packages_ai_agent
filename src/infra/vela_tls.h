@@ -87,6 +87,27 @@ int vela_https_post_json(const char *host, const char *port, const char *path,
                          char *resp_buf, size_t resp_cap);
 
 /**
+ * Streaming response callback. Invoked with decoded response-body bytes as
+ * they arrive from the socket (chunked transfer-encoding is decoded before
+ * the callback is invoked). Return 0 to keep reading, non-zero to abort the
+ * read early.
+ */
+typedef int (*vela_stream_cb_t)(const char *data, size_t len, void *ctx);
+
+/**
+ * POST JSON and stream the response body to a callback instead of buffering
+ * the whole body. Used for LLM streaming (SSE). Same request semantics as
+ * vela_https_post_json(), but always opens a fresh connection (no pooling)
+ * because a streamed response stays open for the whole generation.
+ *
+ * @return HTTP status code (200, etc.) on success, negative VELA_TLS_ERR_*
+ *         on failure.
+ */
+int vela_https_post_json_stream(const char *host, const char *port,
+    const char *path, const vela_header_t *extra_headers,
+    const char *json_body, vela_stream_cb_t cb, void *ctx);
+
+/**
  * Plain HTTP (no TLS) POST with Content-Type: application/json.
  * Used for internal/intranet endpoints that don't support HTTPS.
  */

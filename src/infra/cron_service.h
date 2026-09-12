@@ -52,6 +52,10 @@ typedef struct {
     bool delete_after_run; /* Remove job after firing (for AT jobs) */
     char action[32];       /* Tool name to execute directly (empty = send message) */
     char action_args[256]; /* JSON args for the tool action */
+    char report_channel[16]; /* If non-empty, report child confirmation to this
+                                channel after the reminder is acknowledged (e.g.
+                                "mqtt" to notify the parent). */
+    char report_chat_id[64]; /* Destination chat_id for the confirmation report */
 } cron_job_t;
 
 /**

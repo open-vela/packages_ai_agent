@@ -162,27 +162,11 @@ int tool_get_time_execute(const char *input_json, char *output, size_t output_si
 {
     syslog(LOG_INFO, "[%s] Fetching current time...\n", TAG);
 
-    /* Try local clock first — if year >= 2025, it's likely synced */
-    time_t now = time(NULL);
-    if (now > 1735689600) {  /* 2025-01-01 00:00:00 UTC */
-        /* Use gmtime + manual offset to avoid zoneinfo lookup errors.
-         * NuttX's localtime_r tries to open zoneinfo/<TZ> from romfs,
-         * which fails for POSIX TZ strings like "CST-8" and spams
-         * ERROR logs.  We bypass this by computing UTC+8 manually. */
-        struct tm utc_tm;
-        time_t local_epoch = now + 8 * 3600;  /* UTC+8 */
-        gmtime_r(&local_epoch, &utc_tm);
-
-        char time_str[64];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &utc_tm);
-        snprintf(output, output_size,
-                 "%s CST (UTC+8), UNIX epoch: %lld",
-                 time_str, (long long)now);
-        syslog(LOG_INFO, "[%s] Time (local clock): %s\n", TAG, output);
-        return OK;
-    }
-
-    /* Clock not set — fall back to HTTPS Date header */
+    /* Prefer an authoritative network sync. The on-board RTC can be stale
+     * (no coin-cell, or the system NTP daemon not running), so trusting a
+     * merely "plausible" local clock produced a ~30-day error. Fetch the
+     * HTTPS Date header first (it also settimeofday()s the clock); only
+     * fall back to the local clock if the network is unavailable. */
     int err;
     if (http_proxy_is_enabled()) {
         err = fetch_time_via_proxy(output, output_size);
@@ -192,10 +176,27 @@ int tool_get_time_execute(const char *input_json, char *output, size_t output_si
 
     if (err == OK) {
         syslog(LOG_INFO, "[%s] Time (network): %s\n", TAG, output);
-    } else {
-        snprintf(output, output_size, "Error: failed to fetch time (err=%d)", err);
-        syslog(LOG_ERR, "[%s] %s\n", TAG, output);
+        return OK;
     }
 
+    /* Network unavailable — use the local clock if it is plausible.
+     * Use gmtime + manual offset to avoid zoneinfo lookup errors. */
+    time_t now = time(NULL);
+    if (now > 1735689600) {  /* 2025-01-01 00:00:00 UTC */
+        struct tm utc_tm;
+        time_t local_epoch = now + 8 * 3600;  /* UTC+8 */
+        gmtime_r(&local_epoch, &utc_tm);
+
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &utc_tm);
+        snprintf(output, output_size,
+                 "%s CST (UTC+8), UNIX epoch: %lld",
+                 time_str, (long long)now);
+        syslog(LOG_WARNING, "[%s] Time (local clock fallback): %s\n", TAG, output);
+        return OK;
+    }
+
+    snprintf(output, output_size, "Error: failed to fetch time (err=%d)", err);
+    syslog(LOG_ERR, "[%s] %s\n", TAG, output);
     return err;
 }

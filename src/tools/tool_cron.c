@@ -92,8 +92,16 @@ static int parse_at_schedule(cJSON* root, cron_job_t* job,
     char* output, size_t output_size)
 {
     bool ok;
-    double val = get_numeric_value(
-        cJSON_GetObjectItem(root, "at_epoch"), &ok);
+
+    /* "at_epoch" is the canonical name, but some LLMs emit "target_epoch"
+     * (possibly as a quoted digit string). get_numeric_value already accepts
+     * both numbers and digit strings, so accept the alias here too. */
+    cJSON* at_item = cJSON_GetObjectItem(root, "at_epoch");
+    if (!at_item) {
+        at_item = cJSON_GetObjectItem(root, "target_epoch");
+    }
+
+    double val = get_numeric_value(at_item, &ok);
 
     if (!ok || val <= 0) {
         snprintf(output, output_size,
@@ -196,6 +204,19 @@ int tool_cron_add_execute(const char* input_json,
         strncpy(job.action_args, action_args, sizeof(job.action_args) - 1);
     }
 
+    const char* report_channel = cJSON_GetStringValue(
+        cJSON_GetObjectItem(root, "report_channel"));
+    const char* report_chat_id = cJSON_GetStringValue(
+        cJSON_GetObjectItem(root, "report_chat_id"));
+
+    if (report_channel) {
+        strncpy(job.report_channel, report_channel, sizeof(job.report_channel) - 1);
+    }
+
+    if (report_chat_id) {
+        strncpy(job.report_chat_id, report_chat_id, sizeof(job.report_chat_id) - 1);
+    }
+
     if (strcmp(job.channel, AGENT_CHAN_FEISHU) == 0
         && (job.chat_id[0] == '\0'
             || strcmp(job.chat_id, "cron") == 0)) {
@@ -259,10 +280,19 @@ int tool_cron_list_execute(const char* input_json,
 {
     (void)input_json;
 
-    cron_job_t jobs[AGENT_CRON_MAX_JOBS];
+    /* cron_job_t is ~800 bytes; 16 of them on the stack would be ~12 KB, which
+     * risks overflowing the 16 KB tool-thread stack. Allocate on the heap. */
+    cron_job_t* jobs = malloc(sizeof(cron_job_t) * AGENT_CRON_MAX_JOBS);
+
+    if (!jobs) {
+        snprintf(output, output_size, "Error: out of memory");
+        return ERROR;
+    }
+
     int count = cron_list_jobs(jobs, AGENT_CRON_MAX_JOBS);
 
     if (count == 0) {
+        free(jobs);
         snprintf(output, output_size, "No cron jobs scheduled.");
         return OK;
     }
@@ -299,6 +329,7 @@ int tool_cron_list_execute(const char* input_json,
     }
 
     syslog(LOG_INFO, "[tool_cron] cron_list: %d jobs\n", count);
+    free(jobs);
     return OK;
 }
 

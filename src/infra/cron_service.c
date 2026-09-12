@@ -96,6 +96,35 @@ static void cron_generate_id(char* id_buf)
     snprintf(id_buf, AGENT_CRON_ID_LEN, "%08x", (unsigned int)r);
 }
 
+/* Marker prefix prepended to a reminder destined for the on-device buddy when
+ * the job requests a child-confirmation report. kid_buddy.c strips it before
+ * display/TTS and uses the channel|chat_id to report back once the kid
+ * acknowledges the reminder. */
+#define KID_REPORT_TAG "[KID_REPORT:"
+
+/* Build the reminder content, prefixing a confirmation-report directive when
+ * the job asks for child-confirmation reporting back to the parent. Returns a
+ * heap string (caller frees) or NULL on OOM. */
+static char* cron_build_reminder_content(const cron_job_t* job)
+{
+    if (job->report_channel[0] == '\0' || job->report_chat_id[0] == '\0') {
+        return strdup(job->message);
+    }
+
+    size_t n = strlen(KID_REPORT_TAG) + strlen(job->report_channel) + 1
+             + strlen(job->report_chat_id) + 2
+             + strlen(job->message) + 1;
+    char* out = malloc(n);
+
+    if (!out) {
+        return NULL;
+    }
+
+    snprintf(out, n, "%s%s|%s]\n%s",
+        KID_REPORT_TAG, job->report_channel, job->report_chat_id, job->message);
+    return out;
+}
+
 /* Parse a single JSON object into a cron_job_t.
  * Returns OK on success, ERROR if the item should be skipped. */
 static int cron_parse_job_item(cJSON* item, cron_job_t* job)
@@ -159,6 +188,16 @@ static int cron_parse_job_item(cJSON* item, cron_job_t* job)
     const char* action_args = cJSON_GetStringValue(cJSON_GetObjectItem(item, "action_args"));
     if (action_args) {
         strncpy(job->action_args, action_args, sizeof(job->action_args) - 1);
+    }
+
+    const char* report_channel = cJSON_GetStringValue(cJSON_GetObjectItem(item, "report_channel"));
+    if (report_channel) {
+        strncpy(job->report_channel, report_channel, sizeof(job->report_channel) - 1);
+    }
+
+    const char* report_chat_id = cJSON_GetStringValue(cJSON_GetObjectItem(item, "report_chat_id"));
+    if (report_chat_id) {
+        strncpy(job->report_chat_id, report_chat_id, sizeof(job->report_chat_id) - 1);
     }
 
     return OK;
@@ -280,6 +319,11 @@ static int cron_save_jobs(void)
             cJSON_AddStringToObject(item, "action_args", job->action_args);
         }
 
+        if (job->report_channel[0] != '\0') {
+            cJSON_AddStringToObject(item, "report_channel", job->report_channel);
+            cJSON_AddStringToObject(item, "report_chat_id", job->report_chat_id);
+        }
+
         cJSON_AddItemToArray(jobs_arr, item);
     }
 
@@ -363,18 +407,25 @@ static void cron_fire_job(cron_job_t* job, time_t now)
             }
         }
     } else {
-        /* Plain reminder — push directly to outbound */
+        /* Plain reminder — push directly to outbound. When the job requests a
+         * confirmation report, the content carries a [KID_REPORT:...] prefix
+         * that kid_buddy strips and uses to report the kid's acknowledgment. */
         agent_msg_t msg;
         memset(&msg, 0, sizeof(msg));
         strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
         strncpy(msg.chat_id, job->chat_id, sizeof(msg.chat_id) - 1);
-        msg.content = strdup(job->message);
+        msg.content = cron_build_reminder_content(job);
 
         if (msg.content) {
+            int content_len = (int)strlen(msg.content);
             int err = message_bus_push_outbound(&msg);
             if (err != OK) {
                 syslog(LOG_WARNING, "[%s] Failed to push cron message\n", TAG);
                 free(msg.content);
+            } else {
+                syslog(LOG_INFO,
+                    "[%s] Pushed reminder outbound ch=%s:%s len=%d\n",
+                    TAG, msg.channel, msg.chat_id, content_len);
             }
         }
     }
