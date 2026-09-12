@@ -15,9 +15,10 @@
  */
 
 #include "voice/voice_tts.h"
-#include "voice/volc_tts.h"
+#include "agent_config.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
 
@@ -99,7 +100,7 @@ int voice_tts_speak(const char* text,
     return s_active->synthesize(text, pcm_out, pcm_cap, pcm_len);
 }
 
-/* ── Streaming TTS (delegates to volc_tts) ───────────────────── */
+/* ── Streaming TTS (backend-generic) ─────────────────────────── */
 
 int voice_tts_speak_stream(const char* text,
     voice_tts_chunk_cb cb,
@@ -110,6 +111,28 @@ int voice_tts_speak_stream(const char* text,
         return -ENODEV;
     }
 
-    return volc_tts_ws_synthesize_stream(text,
-        (volc_tts_chunk_cb)cb, user_data);
+    if (s_active->synthesize_stream) {
+        return s_active->synthesize_stream(text, cb, user_data);
+    }
+
+    /* Batch fallback: synthesize the whole utterance, then deliver it
+     * as a single chunk followed by the is_last notification. */
+    unsigned char* pcm = malloc(AGENT_VOICE_PCM_BUF_SIZE);
+
+    if (!pcm) {
+        syslog(LOG_ERR, "[%s] stream fallback: OOM\n", TAG);
+        return -ENOMEM;
+    }
+
+    size_t len = 0;
+    int ret = s_active->synthesize(text, pcm,
+        AGENT_VOICE_PCM_BUF_SIZE, &len);
+
+    if (ret == 0 && len > 0) {
+        cb(pcm, len, 0, user_data);
+        cb(NULL, 0, 1, user_data);
+    }
+
+    free(pcm);
+    return ret;
 }
