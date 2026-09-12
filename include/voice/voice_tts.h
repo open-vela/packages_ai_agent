@@ -25,17 +25,33 @@ extern "C" {
 /* Generic TTS backend interface. Each provider implements this struct
  * and registers via voice_tts_register(). */
 
+/* Callback invoked for each PCM chunk received from TTS.
+ * pcm_data/pcm_len: decoded PCM audio (16-bit LE, mono).
+ * is_last: 1 if this is the final chunk.
+ * user_data: opaque pointer passed to voice_tts_speak_stream(). */
+typedef void (*voice_tts_chunk_cb)(const unsigned char *pcm_data,
+                                   size_t pcm_len,
+                                   int is_last,
+                                   void *user_data);
+
 typedef struct voice_tts_ops {
     const char *name;
 
     /* Load credentials from config store. */
     int (*init)(void);
 
-    /* Synthesize UTF-8 text into raw PCM (16-bit LE, 16kHz, mono). */
+    /* Synthesize UTF-8 text into raw PCM (16-bit LE, mono). */
     int (*synthesize)(const char *text,
                       unsigned char *pcm_out,
                       size_t pcm_cap,
                       size_t *pcm_len);
+
+    /* Optional: synthesize text and stream decoded PCM chunks via cb.
+     * If NULL, voice_tts_speak_stream() falls back to synthesize() and
+     * delivers the full result as a single chunk. */
+    int (*synthesize_stream)(const char *text,
+                             voice_tts_chunk_cb cb,
+                             void *user_data);
 
     /* Release resources held by the backend. */
     void (*deinit)(void);
@@ -57,15 +73,6 @@ int voice_tts_speak(const char *text,
                     size_t *pcm_len);
 
 /* ── Streaming TTS interface ─────────────────────────────────── */
-
-/* Callback invoked for each PCM chunk received from TTS.
- * pcm_data/pcm_len: decoded PCM audio (16-bit LE, 16kHz, mono).
- * is_last: 1 if this is the final chunk.
- * user_data: opaque pointer passed to voice_tts_speak_stream(). */
-typedef void (*voice_tts_chunk_cb)(const unsigned char *pcm_data,
-                                   size_t pcm_len,
-                                   int is_last,
-                                   void *user_data);
 
 /* Synthesize text with streaming callback. Each decoded PCM chunk
  * is delivered via cb as it arrives from the TTS server.
