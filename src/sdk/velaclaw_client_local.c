@@ -28,6 +28,8 @@ struct velaclaw_client_s {
     int reply_status;
     void (*async_cb)(int, const char*, void*);
     void* async_cookie;
+    void (*notify_cb)(int, const char*, void*);
+    void* notify_cookie;
 };
 
 static struct velaclaw_client_s* g_client_instance;
@@ -42,14 +44,32 @@ static void tap_callback(const agent_msg_t* msg, void* cookie)
     pthread_mutex_lock(&c->mtx);
 
     if (c->async_cb) {
-        /* Async mode: invoke user callback directly */
+        /* Async mode: invoke user callback directly.
+         * Streaming replies arrive as a series of partial fragments
+         * (status 1) followed by one final fragment (status 0). Keep the
+         * callback registered across partial fragments so the whole stream
+         * reaches the caller; clear it only on the final fragment. */
         void (*cb)(int, const char*, void*) = c->async_cb;
         void* ck = c->async_cookie;
-        c->async_cb = NULL;
-        c->async_cookie = NULL;
+        int status = msg->partial ? 1 : 0;
+        if (!msg->partial) {
+            c->async_cb = NULL;
+            c->async_cookie = NULL;
+        }
         pthread_mutex_unlock(&c->mtx);
 
-        cb(0, msg->content, ck);
+        cb(status, msg->content, ck);
+        return;
+    }
+
+    /* No ask in flight — route to the persistent notify callback (e.g. cron
+     * reminders), mirroring async semantics but keeping notify_cb registered. */
+    if (c->notify_cb) {
+        void (*cb)(int, const char*, void*) = c->notify_cb;
+        void* ck = c->notify_cookie;
+        int status = msg->partial ? 1 : 0;
+        pthread_mutex_unlock(&c->mtx);
+        cb(status, msg->content, ck);
         return;
     }
 
@@ -120,6 +140,49 @@ void velaclaw_client_close(velaclaw_client_t* c)
     syslog(LOG_INFO, "[%s] client closed\n", TAG);
 }
 
+void velaclaw_set_notify_callback(velaclaw_client_t* c,
+    void (*cb)(int, const char*, void*), void* cookie)
+{
+    if (!c) {
+        return;
+    }
+
+    pthread_mutex_lock(&c->mtx);
+    c->notify_cb = cb;
+    c->notify_cookie = cookie;
+    pthread_mutex_unlock(&c->mtx);
+}
+
+int velaclaw_publish(velaclaw_client_t* c,
+    const char* channel, const char* chat_id, const char* text)
+{
+    (void)c; /* the bus is a shared singleton — no per-client state needed */
+
+    if (!channel || !chat_id || !text) {
+        return -EINVAL;
+    }
+
+    agent_msg_t msg = { 0 };
+    strncpy(msg.channel, channel, sizeof(msg.channel) - 1);
+    strncpy(msg.chat_id, chat_id, sizeof(msg.chat_id) - 1);
+    msg.content = strdup(text);
+
+    if (!msg.content) {
+        return -ENOMEM;
+    }
+
+    int ret = message_bus_push_outbound(&msg);
+
+    if (ret != OK) {
+        free(msg.content);
+        return -EIO;
+    }
+
+    syslog(LOG_INFO, "[%s] publish to %s:%s (%zu bytes)\n",
+        TAG, channel, chat_id, strlen(text));
+    return 0;
+}
+
 int velaclaw_ask(velaclaw_client_t* c,
     const velaclaw_ask_req_t* req,
     void (*cb)(int, const char*, void*), void* cookie)
@@ -134,10 +197,15 @@ int velaclaw_ask(velaclaw_client_t* c,
     c->async_cookie = cookie;
     pthread_mutex_unlock(&c->mtx);
 
-    /* Push message to agent inbound queue */
+    /* Push message to agent inbound queue. An explicit per-request chat_id
+     * (story/RPG session) overrides the client's app_id, which keeps that
+     * session's history isolated from free chat. */
+    const char* chat_id =
+        (req->chat_id && req->chat_id[0]) ? req->chat_id : c->app_id;
+
     agent_msg_t msg = { 0 };
     strncpy(msg.channel, CLIENT_CHANNEL, sizeof(msg.channel) - 1);
-    strncpy(msg.chat_id, c->app_id, sizeof(msg.chat_id) - 1);
+    strncpy(msg.chat_id, chat_id, sizeof(msg.chat_id) - 1);
     msg.content = strdup(req->text);
     if (!msg.content) {
         return -ENOMEM;

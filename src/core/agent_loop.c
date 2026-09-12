@@ -136,6 +136,20 @@ static void add_assistant_message(cJSON* messages, const llm_response_t* resp)
     cJSON_AddItemToArray(messages, asst_msg);
 }
 
+/* True for remote parent channels (MQTT/Feishu/WebSocket/WeChat/QuickApp).
+ * Reminders scheduled from these are meant for the child, not the sender. */
+static bool is_remote_parent_channel(const char* channel)
+{
+    return strcmp(channel, AGENT_CHAN_MQTT) == 0
+        || strcmp(channel, AGENT_CHAN_FEISHU) == 0
+        || strcmp(channel, AGENT_CHAN_WEBSOCKET) == 0
+        || strcmp(channel, AGENT_CHAN_WEIXIN) == 0
+#ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+        || strcmp(channel, AGENT_CHAN_QUICKAPP) == 0
+#endif
+        ;
+}
+
 /* Auto-inject channel/chat_id into cron_add input JSON. */
 static char* inject_cron_context(const char* tool_name,
     const char* input_json, const char* channel, const char* chat_id)
@@ -156,6 +170,23 @@ static char* inject_cron_context(const char* tool_name,
     cJSON_DeleteItemFromObject(root, "chat_id");
     cJSON_AddStringToObject(root, "channel", channel);
     cJSON_AddStringToObject(root, "chat_id", chat_id);
+
+    /* A reminder scheduled from a remote parent channel is for the child:
+     * speak it on-device (local_client), and report the child's confirmation
+     * back to the parent's own channel/chat_id. On-device requests
+     * (local_client/voice/cli) keep their original destination and do not
+     * get a confirmation report. */
+    if (is_remote_parent_channel(channel)) {
+        cJSON_DeleteItemFromObject(root, "report_channel");
+        cJSON_DeleteItemFromObject(root, "report_chat_id");
+        cJSON_AddStringToObject(root, "report_channel", channel);
+        cJSON_AddStringToObject(root, "report_chat_id", chat_id);
+
+        cJSON_DeleteItemFromObject(root, "channel");
+        cJSON_DeleteItemFromObject(root, "chat_id");
+        cJSON_AddStringToObject(root, "channel", AGENT_CHAN_LOCAL_CLIENT);
+        cJSON_AddStringToObject(root, "chat_id", "kid_buddy");
+    }
 
     char* patched = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -872,6 +903,36 @@ static void dispatch_response(const agent_msg_t* msg,
     }
 }
 
+/* ── Streaming partial dispatch (on-device GUI / local_client) ── */
+
+typedef struct {
+    char channel[16];
+    char chat_id[64];
+} stream_dispatch_ctx_t;
+
+/* on_stream callback: each cumulative text fragment is pushed as a partial
+ * outbound message so the on-device GUI can render + speak progressively.
+ * The final fragment (partial=false) is still dispatched by dispatch_response
+ * at the end of the loop, so the GUI knows when the reply is complete. */
+static void on_stream_partial(const char* partial_text, void* ctx)
+{
+    stream_dispatch_ctx_t* sc = (stream_dispatch_ctx_t*)ctx;
+    if (!sc || !partial_text || !partial_text[0]) {
+        return;
+    }
+
+    agent_msg_t out = { 0 };
+    strncpy(out.channel, sc->channel, sizeof(out.channel) - 1);
+    strncpy(out.chat_id, sc->chat_id, sizeof(out.chat_id) - 1);
+    out.content = strdup(partial_text);
+    out.partial = true;
+    if (out.content) {
+        if (message_bus_push_outbound(&out) != OK) {
+            free(out.content);
+        }
+    }
+}
+
 /* ── ReAct tool-calling loop ──────────────────────────────── */
 
 static const char* s_working_phrases[] = {
@@ -897,7 +958,8 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
         || strcmp(msg->channel, AGENT_CHAN_QUICKAPP) == 0
 #endif
-        || strcmp(msg->channel, AGENT_CHAN_WEIXIN) == 0) {
+        || strcmp(msg->channel, AGENT_CHAN_WEIXIN) == 0
+        || strcmp(msg->channel, AGENT_CHAN_LOCAL_CLIENT) == 0) {
         return;
     }
 
@@ -1030,6 +1092,24 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     int last_total_tokens = 0;
     bool watchdog_fired = false;
 
+    /* Stream partial text to the on-device GUI (local_client) so it can
+     * render + speak progressively instead of waiting for the full reply. */
+    bool use_stream = (strcmp(msg->channel, AGENT_CHAN_LOCAL_CLIENT) == 0);
+    stream_dispatch_ctx_t sctx;
+    memset(&sctx, 0, sizeof(sctx));
+    if (use_stream) {
+        strncpy(sctx.channel, msg->channel, sizeof(sctx.channel) - 1);
+        strncpy(sctx.chat_id, msg->chat_id, sizeof(sctx.chat_id) - 1);
+    }
+
+    /* The response cache is keyed on the current message only, but the
+     * on-device toy (local_client) is a stateful conversational agent — its
+     * replies depend on conversation history (RPG branching), not just the
+     * latest words. Serving a cached reply there returns a stale answer (the
+     * buddy re-tells the intro instead of branching), so skip the cache for
+     * that channel entirely. */
+    bool cacheable = (strcmp(msg->channel, AGENT_CHAN_LOCAL_CLIENT) != 0);
+
     /* Router: select and apply best backend before first LLM call.
      * Estimate complexity from the last user message. */
     llm_complexity_t complexity = LLM_COMPLEXITY_SIMPLE;
@@ -1048,7 +1128,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     trace.backend_idx = router_idx;
 
     /* Cache check: for simple queries, try cache before LLM call */
-    if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
+    if (cacheable && msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
         char* cached = llm_cache_get(msg->content, strlen(msg->content));
         if (cached) {
             syslog(LOG_INFO, "[%s] Cache hit, skipping LLM call\n", TAG);
@@ -1066,7 +1146,13 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         llm_response_t resp;
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        int err;
+        if (use_stream) {
+            err = llm_chat_tools_stream(sys_prompt, messages, tools_json,
+                &resp, on_stream_partial, &sctx);
+        } else {
+            err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        }
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
@@ -1112,22 +1198,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             break;
         }
 
-        /* Watchdog: if the LLM call took longer than the configured
-         * timeout, treat it as a timeout even if it returned OK.
-         * The socket SO_RCVTIMEO may have fired and caused a partial
-         * or error response that llm_chat_tools mapped to ERROR above,
-         * but if the call barely completed, we still flag it. */
-        if (llm_call_timed_out(latency_ms)) {
-            syslog(LOG_WARNING,
-                "[%s] LLM watchdog: call took %" PRIu32 " ms (limit %ds), "
-                "treating as timeout\n",
-                TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
-            agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
-            llm_response_free(&resp);
-            final_text = strdup(LLM_TIMEOUT_MSG);
-            watchdog_fired = true;
-            break;
-        }
+        /* The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC) is the
+         * real backstop that unblocks the read. If llm_chat_tools returned
+         * OK, the response is complete and usable regardless of how long it
+         * took, so keep the valid reply instead of discarding it as timeout. */
 
         /* Report success to router */
         if (router_idx >= 0) {
@@ -1189,8 +1263,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     gettimeofday(&tv_end, NULL);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
-                    /* Watchdog check on cascade retry */
-                    if (llm_call_timed_out(latency_ms)) {
+                    /* Watchdog check on cascade retry — only if the call
+                     * actually failed; a slow-but-valid reply is kept. */
+                    if (err != OK && llm_call_timed_out(latency_ms)) {
                         syslog(LOG_WARNING,
                             "[%s] LLM watchdog: cascade retry "
                             "took %" PRIu32 " ms\n",
@@ -1344,8 +1419,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
 
 send_reply:
-    /* Cache store: save simple query responses for future reuse */
-    if (final_text && msg->content
+    /* Cache store: save simple query responses for future reuse.
+     * Never cache a timeout/error reply — otherwise one slow LLM call
+     * would poison the cache and every subsequent identical question
+     * would return "请求超时" instantly instead of retrying. */
+    if (cacheable && !watchdog_fired && final_text && msg->content
         && complexity == LLM_COMPLEXITY_SIMPLE) {
         llm_cache_put(msg->content, strlen(msg->content), final_text);
         if (last_total_tokens > 0) {

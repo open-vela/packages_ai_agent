@@ -36,6 +36,7 @@ typedef struct {
     char  chat_id[64];   /**< chat_id (Feishu IDs are ~36 chars) */
     char *content;       /**< Heap-allocated text; receiver must free. */
     char *image_b64;     /**< Optional base64-encoded image; receiver must free. NULL if none. */
+    bool  partial;       /**< true = streaming fragment (more coming), false = final */
 } agent_msg_t;
 
 /** Free heap members (content, image_b64) of a message.

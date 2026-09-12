@@ -36,6 +36,10 @@ int llm_proxy_init(void);
 int llm_set_backend(const char* host, const char* path);
 int llm_set_port(const char* port);
 
+/** Toggle MiMo thinking/reasoning mode.  1 = disable thinking (fast,
+ *  seconds), 0 = enable (default, better quality but ~90-100s/call). */
+int llm_set_thinking(int disabled);
+
 /**
  * Atomically set all LLM proxy fields in a single lock acquisition.
  * Used by llm_router to avoid partial updates.
@@ -77,6 +81,21 @@ int llm_chat_tools(const char* system_prompt,
     cJSON* messages,
     const char* tools_json,
     llm_response_t* resp);
+
+/** Streaming delta callback: invoked with the *accumulated* assistant text
+ *  (not just the new delta) each time new content arrives. `partial_text`
+ *  is valid only for the duration of the call — copy it if kept. */
+typedef void (*llm_stream_cb_t)(const char* partial_text, void* ctx);
+
+/** Streaming variant of llm_chat_tools(). Sends "stream": true and parses
+ *  the SSE response incrementally, invoking `on_stream` (if non-NULL) with
+ *  the running text. Fills `resp` identically to llm_chat_tools() (text +
+ *  tool_calls), so callers keep the same control flow. */
+int llm_chat_tools_stream(const char* system_prompt,
+    cJSON* messages,
+    const char* tools_json,
+    llm_response_t* resp,
+    llm_stream_cb_t on_stream, void* on_stream_ctx);
 
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).

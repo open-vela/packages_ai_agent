@@ -130,8 +130,8 @@ static const char *TAG = "skills";
     "## How to use\n" \
     "1. get_current_time for current epoch\n" \
     "2. Parse user request into schedule_type and timing\n" \
-    "3. Set channel/chat_id matching the message source (feishu/system)\n" \
-    "4. cron_add to create the job\n" \
+    "3. Do NOT set channel, chat_id, report_channel or report_chat_id — the system fills them in automatically. A reminder from a remote parent channel (MQTT/Feishu/WebSocket/WeChat) is spoken on the device to the child, and the child's confirmation is reported back to the parent. An on-device voice request is spoken on the device only.\n" \
+    "4. cron_add to create the job. Do NOT set action or action_args — leave them empty; a plain reminder just sends the message at trigger time.\n" \
     "5. Confirm with trigger time\n"
 
 #define BUILTIN_NOTE_TAKER \
@@ -195,6 +195,34 @@ static const char *TAG = "skills";
     "- Add: get_current_time, then edit_file/write_file to append: - [ ] [YYYY-MM-DD] desc\n" \
     "- Complete: edit_file to change - [ ] to - [x]\n"
 
+#define BUILTIN_STORY_RPG \
+    "# Story RPG (文字冒险游戏)\n" \
+    "\n" \
+    "陪小朋友玩分支剧情的文字冒险/角色扮演游戏：讲背景故事，给2-3个选项，小朋友语音选择，剧情按选择发展并继续给选项，直到结局。\n" \
+    "\n" \
+    "## When to use\n" \
+    "当小朋友说“我们来玩冒险游戏/角色扮演/角色扮演游戏/讲故事游戏/文字RPG/编故事”，或想听故事并且自己决定剧情走向时，触发本技能。\n" \
+    "\n" \
+    "## How to use\n" \
+    "1. 进入游戏：先用一句话确认开始，讲清故事背景（2-3句，含主角、场景、目标）。\n" \
+    "2. 每轮输出：先讲一小段剧情发展（1-3句），然后用一句自然的口语把2-3个选项说清楚，例如“你想钻进树洞，还是爬上树屋，或者沿着小路走？”。千万不要用“A. B. C.”这种生硬标签，也不要写“选项1/选项2”。\n" \
+    "3. 等小朋友语音选择：他们可能说“选第一个”“第二个”“我要钻树洞”“走小路”，也可能复述选项内容，要根据意思正确对应到某个选项，不要强迫他们报字母或编号。\n" \
+    "4. 按选择推进剧情，再自然地给出下一组选项，如此循环，剧情要有悬念和变化。\n" \
+    "5. 结局：剧情自然收尾时给完整结局，并问“还想再玩一次吗？”。\n" \
+    "6. 退出：小朋友说“退出游戏/不玩了/结束”时停止游戏，回到默认角色。\n" \
+    "\n" \
+    "## Rules (重要)\n" \
+    "- 游戏期间你是“故事主持人”，可临时取代用户消息里[SYSTEM]默认角色的人设，专心讲好故事。\n" \
+    "- 全程简体中文，语气亲切，适合6-12岁孩子。\n" \
+    "- 每轮回复简短（适合语音朗读），不要一次讲太长，不要用表情符号。\n" \
+    "- 选项要用完整句子自然带出，让小朋友听一遍就懂，不要在句末堆一串字母。\n" \
+    "- 记住剧情进展：上一轮的选项与选择结果在历史消息里，续写时保持一致，不要前后矛盾。\n" \
+    "- 剧情健康、积极、无暴力恐怖。\n" \
+    "\n" \
+    "## Example\n" \
+    "小朋友：“我们来玩冒险游戏！”\n" \
+    "→ “好呀！你是一位住在魔法森林里的小探险家。今天森林里的小动物都睡着了，只有你能唤醒它们。现在你面前有一条岔路，你想走进发光的山洞，还是爬上高高的树屋，或者沿着小溪往前走呢？”\n"
+
 /* Built-in skill registry */
 typedef struct {
     const char *filename;   /* e.g. "weather" */
@@ -212,6 +240,7 @@ static const builtin_skill_t s_builtins[] = {
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
     { "task-manager",   BUILTIN_TASK_MANAGER   },
+    { "story-rpg",      BUILTIN_STORY_RPG      },
 };
 
 #define NUM_BUILTINS (sizeof(s_builtins) / sizeof(s_builtins[0]))
@@ -223,16 +252,12 @@ static void install_builtin(const builtin_skill_t *skill)
     char path[128];
     snprintf(path, sizeof(path), "%s%s.md", AGENT_SKILLS_DIR, skill->filename);
 
-    /* Check if already exists */
-    FILE *f = fopen(path, "r");
-    if (f) {
-        fclose(f);
-        syslog(LOG_DEBUG, "[%s] Skill exists: %s\n", TAG, path);
-        return;
-    }
-
-    /* Write built-in skill */
-    f = fopen(path, "w");
+    /* Built-in skills are the curated source of truth: always (re)write them
+     * so an edit to the built-in text (e.g. the story-rpg phrasing) takes
+     * effect on the next boot even though the .md already exists on disk.
+     * User-authored skills created via skill-creator live under their own
+     * filenames and are not affected. */
+    FILE *f = fopen(path, "w");
     if (!f) {
         syslog(LOG_ERR, "[%s] Cannot write skill: %s\n", TAG, path);
         return;
