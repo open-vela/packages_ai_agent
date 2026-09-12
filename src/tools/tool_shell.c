@@ -90,7 +90,10 @@ static const char *s_allowed[] = {
     "set_gateway", "set_mqtt",
     "session_list", "memory_read",
     "mcp_list", "mcp_discover",
-    
+
+    /* VelaGuard read-only bring-up tools (stage1 ai_agent) */
+    "vgmodbus", "vgstats", "vgcfg", "vgnet",
+
     NULL
 };
 #endif
@@ -157,6 +160,19 @@ static int is_blocked(const char *cmd)
     /* Strip path prefix: /bin/rm -> rm, /usr/bin/dd -> dd */
     const char *basename = strrchr(first, '/');
     const char *name = basename ? basename + 1 : first;
+
+    /* VelaGuard: point-table mutation stays off the Agent allow-list. */
+    if (strcmp(name, "vgpoint") == 0 || strcmp(name, "vgdiscover") == 0) {
+        return 1;
+    }
+    if (strcmp(name, "vgcfg") == 0) {
+        while (cmd[i] == ' ') i++;
+        if (strncmp(cmd + i, "dump", 4) != 0)
+            return 1;
+        if (cmd[i + 4] != '\0' && cmd[i + 4] != ' ')
+            return 1;
+        return 0;
+    }
 
     /* Check whitelist first */
     for (int k = 0; s_allowed[k]; k++) {
@@ -510,27 +526,31 @@ int tool_run_shell_execute(const char *input_json, char *output, size_t output_s
 
     cJSON_Delete(root);
 
-    if (ret != OK) {
-        snprintf(output, output_size, "{\"error\":\"Command failed: %s\"}", command);
+    /* Always return structured JSON so the LLM sees stdout even on non-zero exit. */
+    {
+        int exit_code = (ret == OK) ? 0 : 1;
+        cJSON *result = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(result, "exit_code", exit_code);
+        cJSON_AddStringToObject(result, "output", cmd_buf);
+        if (exit_code != 0) {
+            cJSON_AddStringToObject(result, "error", "non-zero exit");
+        }
+
+        char *json_str = cJSON_PrintUnformatted(result);
+        cJSON_Delete(result);
         free(cmd_buf);
-        return ERROR;
-    }
 
-    /* Build JSON result */
-    cJSON *result = cJSON_CreateObject();
-    cJSON_AddNumberToObject(result, "exit_code", 0);
-    cJSON_AddStringToObject(result, "output", cmd_buf);
-    free(cmd_buf);
+        if (!json_str) {
+            snprintf(output, output_size, "{\"exit_code\":1,\"output\":\"\"}");
+            return ERROR;
+        }
 
-    char *json_str = cJSON_PrintUnformatted(result);
-    cJSON_Delete(result);
-
-    if (json_str) {
         strncpy(output, json_str, output_size - 1);
         output[output_size - 1] = '\0';
-        syslog(LOG_INFO, "[%s] Result: %d bytes\n", TAG, (int)strlen(output));
         free(json_str);
+        syslog(LOG_INFO, "[%s] Result: %d bytes (exit=%d)\n",
+            TAG, (int)strlen(output), exit_code);
+        return OK;
     }
-
-    return OK;
 }

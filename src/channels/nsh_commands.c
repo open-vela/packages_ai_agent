@@ -25,6 +25,7 @@
 #include "channels/cmd_llm.h"
 #include "channels/cmd_voice.h"
 #include "core/message_bus.h"
+#include "core/agent_loop.h"
 #include "infra/config_store.h"
 #include "infra/cron_service.h"
 #include "infra/heartbeat.h"
@@ -70,6 +71,7 @@
 #endif
 
 static const char* TAG = "cli";
+static bool g_detach_quit = false;
 
 #define MAX_ARGS 8
 #define LINE_LEN 256
@@ -592,6 +594,12 @@ static void cmd_ask(int argc, char** argv)
     msg.content = strdup(content);
     if (msg.content)
         message_bus_push_inbound(&msg);
+    if (network_is_connected()) {
+        agent_loop_ensure_started();
+#ifdef CONFIG_VG_HMI
+        printf("Ask queued; agent_loop starting in background...\n");
+#endif
+    }
     printf("Sent to agent: %s\n", content);
     syslog(LOG_INFO, "[agent] ask: %s\n", content);
 }
@@ -661,7 +669,9 @@ static void cmd_quit(void)
 {
     printf("Exiting agent...\n");
     fflush(stdout);
-    agent_request_shutdown();
+    if (!g_detach_quit) {
+        agent_request_shutdown();
+    }
 }
 
 static void cmd_launch_app(int argc, char** argv)
@@ -1087,4 +1097,15 @@ int nsh_commands_init(void)
 int nsh_commands_start(void)
 {
     return agent_task_create(cli_thread, "agent_cli", AGENT_CLI_STACK, NULL, AGENT_CLI_PRIO);
+}
+
+void nsh_commands_set_detach_quit(bool detach)
+{
+    g_detach_quit = detach;
+}
+
+int nsh_commands_run_interactive(void)
+{
+    cli_thread(NULL);
+    return OK;
 }
