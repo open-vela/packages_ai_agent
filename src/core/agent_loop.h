@@ -30,6 +30,13 @@ extern "C" {
 
 int agent_loop_init(void);
 int agent_loop_start(void);
+/** Start agent_loop once; safe to call after late Wi-Fi connect. */
+int agent_loop_ensure_started(void);
+bool agent_loop_is_running(void);
+#ifdef CONFIG_VG_HMI
+void agent_loop_request_start(void);
+bool agent_loop_is_requested(void);
+#endif
 
 #ifdef __cplusplus
 }

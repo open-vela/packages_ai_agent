@@ -137,29 +137,63 @@ bool agent_shutdown_requested(void)
 
 /* ── Network watcher (async) ──────────────────────────────────── */
 
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
 static volatile bool g_net_services_started = false;
 
+static void start_network_dependent_services(void)
+{
+    if (g_net_services_started) {
+        return;
+    }
+
+    syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
+
+#if AGENT_SKILL_SYNC_ENABLED
+    if (skill_sync_from_bitable() != OK) {
+        syslog(LOG_WARNING,
+            "[%s] Bitable skill sync failed, using local skills\n", TAG);
+    }
+#endif
+
+#ifdef CONFIG_AI_AGENT_FEISHU
+    if (feishu_bot_start() != OK)
+        syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
+#endif
+#ifndef AGENT_VG_HMI_LAZY_LOOP
+    if (agent_loop_start() != OK)
+        syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
+#endif
+#ifndef AGENT_VG_HMI_SKIP_WS
+    if (ws_server_start() != OK)
+        syslog(LOG_WARNING, "[%s] ws_server_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_NODE
+    if (node_client_start() != OK)
+        syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_MQTT
+    if (mqtt_channel_start() != OK)
+        syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_WEIXIN
+    if (weixin_channel_start() != OK)
+        syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
+#endif
+
+    g_net_services_started = true;
+#ifdef AGENT_VG_HMI_LAZY_LOOP
+    syslog(LOG_INFO,
+        "[%s] HMI lazy mode: agent_loop starts on first ask\n", TAG);
+#endif
+    syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
+}
+
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
 static void net_state_change_cb(net_state_t state, void* arg)
 {
     (void)arg;
     if (state == NET_STATE_CONNECTED && !g_net_services_started) {
         syslog(LOG_INFO, "[%s] Network recovered, starting services\n", TAG);
-#ifdef CONFIG_AI_AGENT_FEISHU
-        feishu_bot_start();
-#endif
-        agent_loop_start();
-        ws_server_start();
-#ifdef CONFIG_AI_AGENT_NODE
-        node_client_start();
-#endif
-#ifdef CONFIG_AI_AGENT_MQTT
-        mqtt_channel_start();
-#endif
-#ifdef CONFIG_AI_AGENT_WEIXIN
-        weixin_channel_start();
-#endif
-        g_net_services_started = true;
+        start_network_dependent_services();
     } else if (state == NET_STATE_DISCONNECTED) {
         syslog(LOG_WARNING,
             "[%s] Network lost, services may be affected\n", TAG);
@@ -182,55 +216,41 @@ static void* network_watch_task(void* arg)
     network_wifi_reconnect();
 
     if (network_wait_connected(30000) == OK) {
-        syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
+        start_network_dependent_services();
+    } else {
+        syslog(LOG_WARNING,
+            "[%s] Network timeout — will retry until link is up.\n", TAG);
+    }
 
-#if AGENT_SKILL_SYNC_ENABLED
-        /* Sync skills from Bitable before starting agent loop */
-        if (skill_sync_from_bitable() != OK) {
-            syslog(LOG_WARNING, "[%s] Bitable skill sync failed, using local skills\n", TAG);
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
+    network_register_listener(net_state_change_cb, NULL);
+#endif
+
+    /* Wi-Fi may join after the initial 30 s window; keep polling so ask/LLM
+     * works once vgnet reports a routable address. */
+    while (!g_shutdown_requested && !g_net_services_started) {
+        sleep(2);
+        if (network_is_connected()) {
+            syslog(LOG_INFO,
+                "[%s] Network connected (late), starting services\n", TAG);
+            start_network_dependent_services();
+        }
+    }
+
+    while (!g_shutdown_requested) {
+#ifdef AGENT_VG_HMI_LAZY_LOOP
+        if (agent_loop_is_requested() && !agent_loop_is_running()) {
+            if (agent_loop_start() == OK) {
+                syslog(LOG_INFO, "[%s] agent_loop started (lazy ask)\n", TAG);
+            }
+        }
+#else
+        if (network_is_connected() && !agent_loop_is_running()) {
+            agent_loop_start();
         }
 #endif
-
-#ifdef CONFIG_AI_AGENT_FEISHU
-        if (feishu_bot_start() != OK)
-            syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
-#endif
-        if (agent_loop_start() != OK)
-            syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
-        if (ws_server_start() != OK)
-            syslog(LOG_WARNING, "[%s] ws_server_start failed\n", TAG);
-#ifdef CONFIG_AI_AGENT_NODE
-        if (node_client_start() != OK)
-            syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
-#endif
-#ifdef CONFIG_AI_AGENT_MQTT
-        if (mqtt_channel_start() != OK)
-            syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
-#endif
-#ifdef CONFIG_AI_AGENT_WEIXIN
-        if (weixin_channel_start() != OK)
-            syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
-#endif
-
-        syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
-
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
-        g_net_services_started = true;
-#endif
-    } else {
-        syslog(LOG_WARNING, "[%s] Network timeout — net services not started.\n", TAG);
-        syslog(LOG_WARNING, "[%s] Use 'config_show' / 'set_*' CLI commands to configure.\n", TAG);
-    }
-
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
-    /* Register listener for network state changes — auto-restart services on reconnect */
-    network_register_listener(net_state_change_cb, NULL);
-
-    /* Keep thread alive to handle reconnection events */
-    while (!g_shutdown_requested) {
         sleep(1);
     }
-#endif
 
     return NULL;
 }
@@ -550,12 +570,15 @@ int ai_agent_main(int argc, char* argv[])
     mkdir("/data/agent/skills", 0755);
     BOOT_LOG(&t0, "P0", "storage ready");
 
-    /* Memory info */
+#ifndef __NuttX__
+    /* mallinfo() walks every heap node; on NuttX this can assert if the heap
+     * is under pressure from large agent stacks — skip boot-time heap stats. */
     {
         struct mallinfo mi = mallinfo();
         syslog(LOG_INFO, "[%s] [boot +%ldms] heap: arena=%d free=%d used=%d\n",
             TAG, boot_ms(&t0), mi.arena, mi.fordblks, mi.uordblks);
     }
+#endif
 
     /* ── Phase 1: Core infrastructure ──────────────────────── */
     {
@@ -687,9 +710,17 @@ int ai_agent_main(int argc, char* argv[])
 #endif
 
     /* Cron + heartbeat don't need network */
+#ifndef CONFIG_VG_HMI
     cron_service_start();
     heartbeat_start();
     BOOT_LOG(&t0, "P5", "cron + heartbeat started");
+#else
+    /* VelaGuard HMI (SRAM-tight): keep the 4 KB heartbeat thread so the
+     * proactive tasks in HEARTBEAT.md (alarm interpretation, daily report)
+     * still fire; skip the cron poller. */
+    heartbeat_start();
+    BOOT_LOG(&t0, "P5", "heartbeat started, cron skipped (HMI SRAM save)");
+#endif
 
 #ifdef CONFIG_AI_AGENT_LVGL_UI
     if (lvgl_ui_channel_start() != OK)
@@ -738,7 +769,7 @@ int ai_agent_main(int argc, char* argv[])
 
     /* Network watcher thread: reconnect + wait + start net services */
     if (agent_task_create(network_watch_task, "net_watch",
-            AGENT_OUTBOUND_STACK, NULL,
+            AGENT_NET_WATCH_STACK, NULL,
             AGENT_OUTBOUND_PRIO)
         != OK) {
         syslog(LOG_WARNING, "[%s] Failed to start network_watch thread\n", TAG);

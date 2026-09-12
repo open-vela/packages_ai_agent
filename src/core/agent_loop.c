@@ -52,6 +52,15 @@ static const char* TAG = "agent";
 #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
 #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
 
+#ifdef CONFIG_VG_HMI
+#undef TOOL_OUTPUT_SIZE
+#undef TOOL_OUTPUT_SIZE_LARGE
+#undef TOOL_OUTPUT_SIZE_MIN
+#define TOOL_OUTPUT_SIZE (4 * 1024)
+#define TOOL_OUTPUT_SIZE_LARGE (8 * 1024)
+#define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+#endif
+
 /* ── Forward declarations ──────────────────────────────────── */
 
 static char* handle_slash_note(const agent_msg_t* msg);
@@ -1411,6 +1420,13 @@ static void* agent_loop_task(void* arg)
     (void)arg;
     agent_mem_status_t mem_st;
 
+#ifdef CONFIG_VG_HMI
+    /* Avoid mallinfo() at start — can assert under HMI heap pressure. */
+    size_t ctx_size = AGENT_CONTEXT_BUF_SIZE;
+    size_t hist_size = AGENT_LLM_STREAM_BUF_SIZE;
+    size_t tool_size = TOOL_OUTPUT_SIZE;
+    syslog(LOG_INFO, "[%s] Agent loop started (HMI fixed buffers)\n", TAG);
+#else
     agent_mem_get_status(&mem_st);
     syslog(LOG_INFO, "[%s] Agent loop started, free heap: %zu\n",
         TAG, mem_st.free_heap);
@@ -1421,6 +1437,7 @@ static void* agent_loop_task(void* arg)
         AGENT_LLM_STREAM_BUF_SIZE, 8 * 1024);
     size_t tool_size = agent_mem_safe_size(
         TOOL_OUTPUT_SIZE, TOOL_OUTPUT_SIZE_MIN);
+#endif
 
     char* sys_prompt = calloc(1, ctx_size);
     char* history_json = calloc(1, hist_size);
@@ -1438,8 +1455,12 @@ static void* agent_loop_task(void* arg)
         TAG, ctx_size, hist_size, tool_size);
 
     /* Initialize memory pool for parallel tool outputs */
+#ifdef CONFIG_VG_HMI
+    size_t pool_buf_size = TOOL_OUTPUT_SIZE_LARGE;
+#else
     size_t pool_buf_size = agent_mem_safe_size(
         TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
+#endif
     if (agent_pool_init(&s_tool_pool, pool_buf_size,
             AGENT_MAX_TOOL_CALLS)
         == OK) {
@@ -1473,6 +1494,7 @@ static void* agent_loop_task(void* arg)
         syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
             TAG, msg.channel, msg.chat_id);
 
+#ifndef CONFIG_VG_HMI
         /* Check memory pressure */
         agent_mem_get_status(&mem_st);
         if (mem_st.free_heap < AGENT_MEM_RESERVE_BYTES) {
@@ -1493,6 +1515,7 @@ static void* agent_loop_task(void* arg)
             free(msg.content);
             continue;
         }
+#endif
 
         /* Slash commands — fast path, bypass LLM */
         char* reply = handle_slash_command(&msg);
@@ -1582,6 +1605,68 @@ static void* agent_loop_task(void* arg)
 
 /* ── Public interface ─────────────────────────────────────── */
 
+static volatile bool s_agent_loop_started = false;
+#ifdef CONFIG_VG_HMI
+static volatile bool s_agent_loop_requested = false;
+#endif
+
+#ifdef CONFIG_VG_HMI
+/* HMI builds cannot allocate a 16 KB pthread stack from heap — use BSS. */
+static uint8_t s_agent_loop_stack[AGENT_AI_AGENT_STACK]
+    __attribute__((aligned(8)));
+
+static int agent_loop_start_static_stack(void)
+{
+    _agent_task_args_t* ta = malloc(sizeof(_agent_task_args_t));
+
+    if (!ta) {
+        return ERROR;
+    }
+
+    ta->func = agent_loop_task;
+    ta->arg = NULL;
+    ta->stack_size = AGENT_AI_AGENT_STACK;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstack(&attr, s_agent_loop_stack, sizeof(s_agent_loop_stack));
+
+    struct sched_param sp;
+    sp.sched_priority = AGENT_AI_AGENT_PRIO;
+    pthread_attr_setschedparam(&attr, &sp);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+
+    pthread_t tid;
+    int r = pthread_create(&tid, &attr, _agent_task_shim, ta);
+    pthread_attr_destroy(&attr);
+    if (r != 0) {
+        free(ta);
+        syslog(LOG_ERR, "[%s] agent_loop pthread_create failed: %d\n", TAG, r);
+        return ERROR;
+    }
+    pthread_detach(tid);
+    return OK;
+}
+#endif
+
+bool agent_loop_is_running(void)
+{
+    return s_agent_loop_started;
+}
+
+#ifdef CONFIG_VG_HMI
+void agent_loop_request_start(void)
+{
+    s_agent_loop_requested = true;
+}
+
+bool agent_loop_is_requested(void)
+{
+    return s_agent_loop_requested;
+}
+#endif
+
 int agent_loop_init(void)
 {
     syslog(LOG_INFO, "[%s] Agent loop initialized\n", TAG);
@@ -1590,12 +1675,48 @@ int agent_loop_init(void)
 
 int agent_loop_start(void)
 {
+    if (s_agent_loop_started) {
+        return OK;
+    }
+
+#ifdef CONFIG_VG_HMI
+    /* Do NOT call mallinfo() here — under HMI memory pressure it can assert. */
+    int ret = agent_loop_start_static_stack();
+#else
+    agent_mem_status_t st;
+    agent_mem_get_status(&st);
+    if (st.free_heap
+        < (size_t)AGENT_AI_AGENT_STACK + AGENT_MEM_RESERVE_BYTES) {
+        syslog(LOG_WARNING,
+            "[%s] Defer agent_loop: free heap %zu (need %u)\n",
+            TAG, st.free_heap,
+            (unsigned)(AGENT_AI_AGENT_STACK + AGENT_MEM_RESERVE_BYTES));
+        return ERROR;
+    }
+
     int ret = agent_task_create(agent_loop_task, "agent_loop",
         AGENT_AI_AGENT_STACK, NULL, AGENT_AI_AGENT_PRIO);
+#endif
 
     if (ret != OK) {
         syslog(LOG_ERR,
             "[%s] Failed to create agent_loop task\n", TAG);
+    } else {
+        s_agent_loop_started = true;
+#ifdef CONFIG_VG_HMI
+        s_agent_loop_requested = false;
+#endif
     }
     return ret;
+}
+
+int agent_loop_ensure_started(void)
+{
+#ifdef CONFIG_VG_HMI
+    /* CLI stack is tight — only request; network_watch starts the loop. */
+    agent_loop_request_start();
+    return OK;
+#else
+    return agent_loop_start();
+#endif
 }
