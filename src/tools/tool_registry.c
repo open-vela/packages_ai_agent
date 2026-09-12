@@ -251,7 +251,8 @@ int tool_registry_init(void)
         "Steps: get_current_time→compute at_epoch→call this. "
         "at_epoch must be plain integer. "
         "Recurring: schedule_type='every', interval_s=seconds. "
-        "Action: set action=tool_name, action_args=JSON.",
+        "For a plain reminder, leave action and action_args EMPTY — "
+        "the job just sends the message at trigger time.",
         TOOL_SCHEMA_BEGIN()
             TOOL_PARAM_STR("name", "Job name") "," TOOL_PARAM_ENUM("schedule_type", "Schedule type", "\"every\",\"at\"") "," TOOL_PARAM_NUM("interval_s", "Interval in seconds (for every)") "," TOOL_PARAM_NUM("at_epoch",
                 "Target UNIX timestamp as a plain integer") "," TOOL_PARAM_STR("message",

@@ -51,6 +51,17 @@ static char s_vision_model[64] = { 0 };
 static char s_vision_host[128] = { 0 };
 static char s_vision_api_key[128] = { 0 };
 
+/* MiMo thinking toggle: mimo-v2.5 is a hybrid reasoning model that "thinks"
+ * by default (~90-100s per call).  When disabled we send
+ * thinking:{"type":"disabled"} to cut latency to seconds.
+ *
+ * Default to DISABLED (fast) for the on-device kid buddy: 90-100s of
+ * reasoning exceeds AGENT_LLM_TIMEOUT_SEC (60s), so leaving thinking on
+ * makes every MiMo call time out and surface "Sorry, I encountered an
+ * error."  The field is only sent to xiaomimimo hosts (see add_thinking_param),
+ * so this default is a no-op for other LLM backends. */
+static int s_thinking_disabled = 1;
+
 static pthread_mutex_t s_llm_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Check if host uses OpenAI-compatible max_completion_tokens param */
@@ -59,6 +70,28 @@ bool is_openai_compat_host(const char* host)
     return strstr(host, "openai.com")
         || strstr(host, "openrouter.ai")
         || strstr(host, "xiaomimimo.com");
+}
+
+/* Add MiMo's "thinking" toggle to the request body.  The field is
+ * MiMo-specific, so only send it to a xiaomimimo host. */
+static void add_thinking_param(cJSON* body, const char* llm_host)
+{
+    if (!s_thinking_disabled)
+        return;
+    if (!llm_host || !strstr(llm_host, "xiaomimimo.com"))
+        return;
+
+    cJSON* thinking = cJSON_CreateObject();
+    cJSON_AddStringToObject(thinking, "type", "disabled");
+    cJSON_AddItemToObject(body, "thinking", thinking);
+}
+
+int llm_set_thinking(int disabled)
+{
+    pthread_mutex_lock(&s_llm_lock);
+    s_thinking_disabled = disabled ? 1 : 0;
+    pthread_mutex_unlock(&s_llm_lock);
+    return claw_config_set(AGENT_CFG_KEY_LLM_THINKING, disabled ? "off" : "on");
 }
 
 
@@ -139,6 +172,13 @@ int llm_proxy_init(void)
     memset(tmp, 0, sizeof(tmp));
     if (claw_config_get(AGENT_CFG_KEY_VISION_API_KEY, tmp, sizeof(tmp)) == OK && tmp[0])
         strncpy(s_vision_api_key, tmp, sizeof(s_vision_api_key) - 1);
+
+    /* MiMo thinking mode: "off"/"disabled"/"0" disables reasoning (fast). */
+    memset(tmp, 0, sizeof(tmp));
+    if (claw_config_get(AGENT_CFG_KEY_LLM_THINKING, tmp, sizeof(tmp)) == OK && tmp[0])
+        s_thinking_disabled =
+            (strcmp(tmp, "off") == 0 || strcmp(tmp, "disabled") == 0 ||
+             strcmp(tmp, "0") == 0);
 
     if (s_api_key[0])
         syslog(LOG_INFO, "[%s] LLM proxy initialized (model: %s, host: %s)\n", TAG,
@@ -608,6 +648,7 @@ int llm_chat(const char* system_prompt, const char* messages_json,
     cJSON_InsertItemInArray(messages, 0, sys_msg);
 
     cJSON_AddItemToObject(body, "messages", messages);
+    add_thinking_param(body, llm_host);
 
     char* post_data = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
@@ -723,6 +764,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     cJSON_AddStringToObject(sys_msg, "content", system_prompt);
     cJSON_InsertItemInArray(msgs, 0, sys_msg);
     cJSON_AddItemToObject(body, "messages", msgs);
+    add_thinking_param(body, llm_host);
 
     /* Convert tools to OpenAI format */
     cJSON* tools_arr = build_openai_tools_array(tools_json);
@@ -904,6 +946,334 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
         "[%s] Response: %d bytes text, %d tool calls, finish=%s\n",
         TAG, (int)resp->text_len, resp->call_count,
         resp->tool_use ? "tool_calls" : "end_turn");
+
+    return OK;
+}
+
+/* ── Streaming (SSE) response parsing ──────────────────────── */
+
+typedef struct {
+    llm_response_t* resp;
+    llm_stream_cb_t on_stream;
+    void* on_stream_ctx;
+
+    char line[8192];      /* partial current line across reads */
+    size_t line_len;
+    bool done;            /* received [DONE] */
+    bool saw_data;        /* first "data:" line seen → streaming confirmed */
+
+    char raw[65536];      /* raw body kept as non-streaming fallback */
+    size_t raw_len;
+    bool raw_overflow;
+} sse_parser_t;
+
+static void sse_append_text(sse_parser_t* sp, const char* delta)
+{
+    llm_response_t* resp = sp->resp;
+    size_t dlen = strlen(delta);
+
+    if (dlen == 0)
+        return;
+
+    size_t new_len = resp->text_len + dlen;
+    char* nt = realloc(resp->text, new_len + 1);
+    if (!nt)
+        return;
+
+    memcpy(nt + resp->text_len, delta, dlen);
+    nt[new_len] = '\0';
+    resp->text = nt;
+    resp->text_len = new_len;
+
+    if (sp->on_stream)
+        sp->on_stream(nt, sp->on_stream_ctx);
+}
+
+static void sse_append_tool_calls(sse_parser_t* sp, cJSON* tool_calls)
+{
+    llm_response_t* resp = sp->resp;
+    cJSON* tc;
+
+    cJSON_ArrayForEach(tc, tool_calls)
+    {
+        cJSON* idx = cJSON_GetObjectItem(tc, "index");
+        int i = (idx && cJSON_IsNumber(idx)) ? (int)idx->valuedouble : 0;
+        if (i < 0 || i >= AGENT_MAX_TOOL_CALLS)
+            continue;
+
+        llm_tool_call_t* call = &resp->calls[i];
+        if (resp->call_count <= i)
+            resp->call_count = i + 1;
+
+        cJSON* id_item = cJSON_GetObjectItem(tc, "id");
+        if (id_item && cJSON_IsString(id_item) && id_item->valuestring)
+            strncpy(call->id, id_item->valuestring, sizeof(call->id) - 1);
+
+        cJSON* fn = cJSON_GetObjectItem(tc, "function");
+        if (!fn)
+            continue;
+
+        cJSON* name = cJSON_GetObjectItem(fn, "name");
+        if (name && cJSON_IsString(name) && name->valuestring)
+            strncpy(call->name, name->valuestring, sizeof(call->name) - 1);
+
+        cJSON* args = cJSON_GetObjectItem(fn, "arguments");
+        if (args && cJSON_IsString(args) && args->valuestring
+            && args->valuestring[0]) {
+            size_t alen = strlen(args->valuestring);
+            char* ninput = realloc(call->input, call->input_len + alen + 1);
+            if (ninput) {
+                memcpy(ninput + call->input_len, args->valuestring, alen);
+                call->input_len += alen;
+                ninput[call->input_len] = '\0';
+                call->input = ninput;
+            }
+        }
+    }
+
+    if (resp->call_count > 0)
+        resp->tool_use = true;
+}
+
+static void sse_handle_json(sse_parser_t* sp, cJSON* j)
+{
+    cJSON* choices = cJSON_GetObjectItem(j, "choices");
+    if (!choices || !cJSON_IsArray(choices) || !choices->child)
+        return;
+
+    cJSON* delta = cJSON_GetObjectItem(choices->child, "delta");
+    if (!delta)
+        return;
+
+    cJSON* content = cJSON_GetObjectItem(delta, "content");
+    if (content && cJSON_IsString(content) && content->valuestring)
+        sse_append_text(sp, content->valuestring);
+
+    cJSON* tool_calls = cJSON_GetObjectItem(delta, "tool_calls");
+    if (tool_calls && cJSON_IsArray(tool_calls))
+        sse_append_tool_calls(sp, tool_calls);
+}
+
+static void sse_handle_line(sse_parser_t* sp)
+{
+    const char* line = sp->line;
+
+    while (*line == ' ' || *line == '\r' || *line == '\t')
+        line++;
+
+    if (strncmp(line, "data:", 5) != 0)
+        return; /* not a data line */
+
+    sp->saw_data = true;
+
+    line += 5;
+    while (*line == ' ')
+        line++;
+
+    if (strcmp(line, "[DONE]") == 0) {
+        sp->done = true;
+        return;
+    }
+
+    if (*line == '\0')
+        return;
+
+    cJSON* j = cJSON_Parse(line);
+    if (!j)
+        return; /* partial/empty data — ignore */
+
+    sse_handle_json(sp, j);
+    cJSON_Delete(j);
+}
+
+static void sse_feed(sse_parser_t* sp, const char* data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        char c = data[i];
+        if (c == '\n') {
+            /* Strip a trailing '\r' from CRLF line endings so the "[DONE]"
+             * sentinel and JSON both match exactly. */
+            if (sp->line_len > 0 && sp->line[sp->line_len - 1] == '\r')
+                sp->line_len--;
+            sp->line[sp->line_len] = '\0';
+            sse_handle_line(sp);
+            sp->line_len = 0;
+        } else if (sp->line_len < sizeof(sp->line) - 1) {
+            sp->line[sp->line_len++] = c;
+        }
+    }
+
+    /* Keep a bounded copy of the raw body for a non-streaming fallback, but
+     * only until the first "data:" line proves streaming is live — after that
+     * the SSE path owns the text and the raw copy is just wasted work. */
+    if (!sp->saw_data) {
+        size_t room = sizeof(sp->raw) - 1 - sp->raw_len;
+        size_t n = len < room ? len : room;
+        if (n > 0) {
+            memcpy(sp->raw + sp->raw_len, data, n);
+            sp->raw_len += n;
+            sp->raw[sp->raw_len] = '\0';
+        } else {
+            sp->raw_overflow = true;
+        }
+    }
+}
+
+static int llm_http_stream_cb(const char* data, size_t len, void* ctx)
+{
+    sse_feed((sse_parser_t*)ctx, data, len);
+    return 0;
+}
+
+/* Extract text + tool_calls from a non-streaming JSON object (fallback). */
+static void extract_response_from_json(cJSON* root, llm_response_t* resp)
+{
+    cJSON* choices = cJSON_GetObjectItem(root, "choices");
+    if (!choices || !cJSON_IsArray(choices) || !choices->child)
+        return;
+
+    cJSON* message = cJSON_GetObjectItem(choices->child, "message");
+    if (!message)
+        return;
+
+    cJSON* content = cJSON_GetObjectItem(message, "content");
+    if (content && cJSON_IsString(content) && content->valuestring) {
+        size_t tlen = strlen(content->valuestring);
+        resp->text = calloc(1, tlen + 1);
+        if (resp->text) {
+            memcpy(resp->text, content->valuestring, tlen);
+            resp->text_len = tlen;
+        }
+    }
+
+    extract_openai_tool_calls(message, resp);
+
+    cJSON* usage = cJSON_GetObjectItem(root, "usage");
+    if (usage) {
+        cJSON* pt = cJSON_GetObjectItem(usage, "prompt_tokens");
+        cJSON* ct = cJSON_GetObjectItem(usage, "completion_tokens");
+        cJSON* tt = cJSON_GetObjectItem(usage, "total_tokens");
+        if (pt && cJSON_IsNumber(pt))
+            resp->prompt_tokens = (int)pt->valuedouble;
+        if (ct && cJSON_IsNumber(ct))
+            resp->completion_tokens = (int)ct->valuedouble;
+        if (tt && cJSON_IsNumber(tt))
+            resp->total_tokens = (int)tt->valuedouble;
+    }
+}
+
+int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
+    const char* tools_json, llm_response_t* resp,
+    llm_stream_cb_t on_stream, void* on_stream_ctx)
+{
+    memset(resp, 0, sizeof(*resp));
+
+    /* Snapshot config under lock */
+    char model[64], api_key[128], llm_host[128], llm_path[128], llm_port[8];
+    pthread_mutex_lock(&s_llm_lock);
+    memcpy(model, s_model, sizeof(model));
+    memcpy(api_key, s_api_key, sizeof(api_key));
+    memcpy(llm_host, s_llm_host, sizeof(llm_host));
+    memcpy(llm_path, s_llm_path, sizeof(llm_path));
+    memcpy(llm_port, s_llm_port, sizeof(llm_port));
+    pthread_mutex_unlock(&s_llm_lock);
+
+    if (api_key[0] == '\0')
+        return ERROR;
+
+    int use_tls = (strcmp(llm_port, "443") == 0);
+    if (!use_tls) {
+        /* Plain-HTTP streaming is not implemented — delegate. */
+        return llm_chat_tools(system_prompt, messages, tools_json, resp);
+    }
+
+    /* Build request body with stream:true */
+    cJSON* body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "model", model_name_for_api(model, llm_host));
+
+    if (is_openai_compat_host(llm_host))
+        cJSON_AddNumberToObject(body, "max_completion_tokens",
+            AGENT_LLM_MAX_TOKENS_OPENAI);
+    else
+        cJSON_AddNumberToObject(body, "max_tokens", AGENT_LLM_MAX_TOKENS);
+
+    cJSON_AddBoolToObject(body, "stream", 1);
+    add_thinking_param(body, llm_host);
+
+    cJSON* msgs = cJSON_Duplicate(messages, 1);
+    cJSON* sys_msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys_msg, "role", "system");
+    cJSON_AddStringToObject(sys_msg, "content", system_prompt);
+    cJSON_InsertItemInArray(msgs, 0, sys_msg);
+    cJSON_AddItemToObject(body, "messages", msgs);
+
+    cJSON* tools_arr = build_openai_tools_array(tools_json);
+    if (tools_arr)
+        cJSON_AddItemToObject(body, "tools", tools_arr);
+
+    char* post_data = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!post_data)
+        return ERROR;
+
+    syslog(LOG_INFO, "[%s] OpenAI API stream (model: %s, %d bytes)\n",
+        TAG, model, (int)strlen(post_data));
+
+    /* Auth + provider headers */
+    char auth_header[256];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", api_key);
+
+    char provider[64] = { 0 };
+    const char* slash = strchr(model, '/');
+    if (slash) {
+        size_t plen = (size_t)(slash - model);
+        if (plen >= sizeof(provider))
+            plen = sizeof(provider) - 1;
+        memcpy(provider, model, plen);
+    }
+
+    vela_header_t hdrs[] = { { "Authorization", auth_header },
+        { provider[0] ? "X-Model-Provider-Id" : NULL,
+            provider[0] ? provider : NULL },
+        { NULL, NULL } };
+
+    /* Heap-allocate the parser state: it carries ~73KB of buffers (SSE line +
+     * non-streaming fallback), which would blow the 32KB agent-task stack. */
+    sse_parser_t* sp = calloc(1, sizeof(sse_parser_t));
+    if (!sp) {
+        free(post_data);
+        return ERROR;
+    }
+    sp->resp = resp;
+    sp->on_stream = on_stream;
+    sp->on_stream_ctx = on_stream_ctx;
+
+    int status = vela_https_post_json_stream(llm_host, llm_port, llm_path,
+        hdrs, post_data, llm_http_stream_cb, sp);
+    free(post_data);
+
+    if (status != 200) {
+        syslog(LOG_ERR, "[%s] stream API error %d\n", TAG, status);
+        free(sp);
+        return ERROR;
+    }
+
+    /* If no SSE chunks were parsed (endpoint ignored "stream"), fall back to
+     * parsing the buffered body as a single non-streaming JSON. */
+    if (resp->text_len == 0 && resp->call_count == 0
+        && sp->raw_len > 0 && !sp->raw_overflow) {
+        cJSON* root = cJSON_Parse(sp->raw);
+        if (root) {
+            extract_response_from_json(root, resp);
+            cJSON_Delete(root);
+        }
+    }
+
+    free(sp);
+
+    syslog(LOG_INFO,
+        "[%s] Stream response: %d bytes text, %d tool calls\n",
+        TAG, (int)resp->text_len, resp->call_count);
 
     return OK;
 }

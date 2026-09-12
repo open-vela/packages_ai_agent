@@ -38,14 +38,16 @@ static pthread_mutex_t s_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_tokens_saved;
 static uint32_t s_total_hits;
 
-/* djb2 hash over first LLM_CACHE_KEY_LEN chars */
+/* djb2 hash over the FULL string. Hash the whole message, not just a fixed
+ * prefix: kid_buddy sends "[SYSTEM]…\n[USER]\n<query>", so the meaningful
+ * part (the query) is at the END. Hashing only the first LLM_CACHE_KEY_LEN
+ * bytes made every query under one role collide on the same cached reply. */
 
 static uint32_t djb2_hash(const char* str, size_t len)
 {
     uint32_t h = 5381;
-    size_t n = len < LLM_CACHE_KEY_LEN ? len : LLM_CACHE_KEY_LEN;
 
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < len; i++) {
         h = ((h << 5) + h) + (unsigned char)str[i];
     }
     return h;
