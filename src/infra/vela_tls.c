@@ -31,6 +31,8 @@
 
 /* POSIX networking */
 #include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -44,6 +46,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <time.h>
 
 static int simple_entropy_func(void* data, unsigned char* output, size_t len)
@@ -60,6 +63,12 @@ static int simple_entropy_func(void* data, unsigned char* output, size_t len)
 }
 
 static const char* TAG = "vela_tls";
+
+/* Upper bound (seconds) on a single TLS handshake.  The socket is blocking
+ * with SO_RCVTIMEO, so a WANT_READ retry just blocks again for another full
+ * timeout; capping the handshake lets tls_ctx_connect_retry() actually recover
+ * from a half-open MiMo edge instead of stalling forever. */
+#define AGENT_TLS_HANDSHAKE_TIMEOUT_SEC 10
 
 /* ── Chunked transfer decoding ───────────────────────────────── */
 
@@ -110,6 +119,56 @@ static size_t decode_chunked(char* buf, size_t len)
     }
 
     return (size_t)(dst - buf);
+}
+
+/* Return 1 if the buffered chunked-encoded body [buf, len) has received its
+ * terminal final chunk ("0" size line), meaning the whole response body is
+ * here and no further reads are needed.  Without this, tls_read_response()
+ * keeps calling mbedtls_ssl_read() on a keep-alive connection that never
+ * closes, stalling for the server's idle timeout (or the full SO_RCVTIMEO)
+ * before the chunked body is finally decoded.  Chunk payloads are base64 here,
+ * so CR/LF bytes can only belong to chunk framing, never to payload data. */
+static int chunked_body_complete(const char* buf, size_t len)
+{
+    const char* p = buf;
+    const char* end = buf + len;
+
+    while (p < end) {
+        const char* crlf = (const char*)memmem(p, (size_t)(end - p), "\r\n", 2);
+        if (!crlf || crlf == p) {
+            return 0; /* incomplete or empty size line */
+        }
+
+        size_t slen = (size_t)(crlf - p);
+        if (slen >= 16) {
+            return 0; /* oversized size line — malformed */
+        }
+
+        char tmp[16];
+        memcpy(tmp, p, slen);
+        tmp[slen] = '\0';
+
+        char* eptr = NULL;
+        long sz = strtol(tmp, &eptr, 16);
+        while (eptr && *eptr == ' ') {
+            eptr++;
+        }
+        if (!eptr || *eptr != '\0' || sz < 0) {
+            return 0; /* malformed size line */
+        }
+
+        if (sz == 0) {
+            return 1; /* final chunk header seen — body complete */
+        }
+
+        p = crlf + 2;                 /* start of chunk payload */
+        if ((size_t)(end - p) < (size_t)sz + 2) {
+            return 0;                 /* payload / trailing CRLF not arrived */
+        }
+        p += (size_t)sz + 2;          /* skip payload + trailing CRLF */
+    }
+
+    return 0;
 }
 
 /* ── TLS context ─────────────────────────────────────────────── */
@@ -229,9 +288,73 @@ void vela_tls_pool_cleanup(void)
     pthread_mutex_unlock(&s_pool_lock);
 }
 
+/* Configure the connected socket: blocking mode + SO_RCVTIMEO (recv_timeout_sec)
+ * (+ SO_SNDTIMEO under RPMSG).  Kept separate from the connect so it can be
+ * re-applied per resolved IP.  Forces blocking instead of select()/poll(),
+ * which returns MBEDTLS_ERR_NET_POLL_FAILED (-0x0047) on NuttX/QEMU. */
+static void tls_configure_socket(tls_ctx_t* ctx, int recv_timeout_sec)
+{
+    mbedtls_net_set_block(&ctx->net);
+    if (ctx->net.fd < 0) {
+        return;
+    }
+
+    struct timeval tv = { .tv_sec = recv_timeout_sec, .tv_usec = 0 };
+    setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
+    {
+        int timeout_sec = network_get_connect_timeout();
+        struct timeval ctv = { .tv_sec = timeout_sec, .tv_usec = 0 };
+        setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
+    }
+#endif
+}
+
+/* Run the TLS handshake, bounding total elapsed time to
+ * AGENT_TLS_HANDSHAKE_TIMEOUT_SEC.  Returns 0 on success, otherwise
+ * VELA_TLS_ERR_HANDSHAKE. */
+static int tls_do_handshake(tls_ctx_t* ctx)
+{
+    int ret;
+    struct timespec hs0;
+    clock_gettime(CLOCK_MONOTONIC, &hs0);
+
+    while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+#if defined(MBEDTLS_ERROR_C)
+            char err_buf[128];
+            mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+            syslog(LOG_ERR, "[%s] ssl_handshake ret=-0x%04x: %s\n", TAG, -ret, err_buf);
+#else
+            syslog(LOG_ERR, "[%s] ssl_handshake ret=-0x%04x\n", TAG, -ret);
+#endif
+            if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
+                syslog(LOG_ERR, "[%s] Server sent fatal alert message\n", TAG);
+            }
+            return VELA_TLS_ERR_HANDSHAKE;
+        }
+
+        struct timespec hs1;
+        clock_gettime(CLOCK_MONOTONIC, &hs1);
+        if (hs1.tv_sec - hs0.tv_sec >= AGENT_TLS_HANDSHAKE_TIMEOUT_SEC) {
+            syslog(LOG_ERR, "[%s] ssl_handshake timed out (>%ds)\n",
+                TAG, AGENT_TLS_HANDSHAKE_TIMEOUT_SEC);
+            return VELA_TLS_ERR_HANDSHAKE;
+        }
+    }
+
+    return 0;
+}
+
 static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
 {
     int ret;
+
+    /* Replicate mbedtls_net_connect()'s net_prepare(): ignore SIGPIPE so a
+     * write to a peer-closed socket returns EPIPE instead of terminating us.
+     * (Our manual connect below bypasses net_prepare.) */
+    signal(SIGPIPE, SIG_IGN);
 
     mbedtls_ssl_init(&ctx->ssl);
     mbedtls_ssl_config_init(&ctx->cfg);
@@ -269,53 +392,10 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
     }
 #endif
 
-    if (http_proxy_is_enabled()) {
-        int tunnel_fd = proxy_open_tunnel(host, atoi(port), 30000);
-        if (tunnel_fd < 0) {
-            syslog(LOG_ERR, "[%s] proxy tunnel to %s:%s failed\n",
-                TAG, host, port);
-            return VELA_TLS_ERR_CONNECT;
-        }
-        ctx->net.fd = tunnel_fd;
-        syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
-            TAG, tunnel_fd, host, port);
-    } else {
-        if ((ret = mbedtls_net_connect(&ctx->net, host, port,
-                 MBEDTLS_NET_PROTO_TCP))
-            != 0) {
-            syslog(LOG_ERR, "[%s] net_connect %s:%s ret=0x%x\n",
-                TAG, host, port, -ret);
-            return VELA_TLS_ERR_CONNECT;
-        }
-    }
-
-    /* Force blocking mode and set socket-level read timeout.
-     * This avoids using select()/poll() inside mbedtls_net_recv_timeout
-     * which returns MBEDTLS_ERR_NET_POLL_FAILED (-0x0047) on NuttX/QEMU.
-     * Timeout is configured via AGENT_LLM_SOCKET_TIMEOUT_SEC in
-     * agent_config.h.  LLM APIs (especially kimi with thinking mode)
-     * can take over 60s for long responses. */
-    mbedtls_net_set_block(&ctx->net);
-    if (ctx->net.fd >= 0) {
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
-        int read_timeout_sec = network_get_read_timeout();
-        struct timeval tv = { .tv_sec = read_timeout_sec, .tv_usec = 0 };
-#else
-        struct timeval tv = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
-            .tv_usec = 0 };
-#endif
-        setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
-        {
-            int timeout_sec = network_get_connect_timeout();
-            struct timeval ctv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
-        }
-#endif
-    }
-
-    /* SSL config: client, TLS, default ciphersuites */
+    /* SSL config + setup + hostname + bio are IP-independent — do them once,
+     * before the connect loop, so we can retry the handshake across multiple
+     * resolved addresses (the MiMo edge resolves to several IPs, some of which
+     * serve an Ed25519 leaf cert this mbedtls build cannot parse). */
     if ((ret = mbedtls_ssl_config_defaults(&ctx->cfg,
              MBEDTLS_SSL_IS_CLIENT,
              MBEDTLS_SSL_TRANSPORT_STREAM,
@@ -352,11 +432,6 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
     mbedtls_ssl_conf_authmode(&ctx->cfg, MBEDTLS_SSL_VERIFY_OPTIONAL);
     mbedtls_ssl_conf_rng(&ctx->cfg, mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
 
-    /* Read timeout is handled at the socket level via SO_RCVTIMEO,
-     * not via mbedtls_ssl_conf_read_timeout + mbedtls_net_recv_timeout,
-     * because select()/poll() inside mbedtls_net_recv_timeout fails on
-     * NuttX/QEMU with MBEDTLS_ERR_NET_POLL_FAILED (-0x0047). */
-
     if ((ret = mbedtls_ssl_setup(&ctx->ssl, &ctx->cfg)) != 0) {
         syslog(LOG_ERR, "[%s] ssl_setup ret=0x%x\n", TAG, -ret);
         return VELA_TLS_ERR_HANDSHAKE;
@@ -367,33 +442,174 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         return VELA_TLS_ERR_HANDSHAKE;
     }
 
-    /* Use blocking recv — no select()/poll().  The read
-     * timeout is enforced by the SO_RCVTIMEO socket option set above. */
+    /* Use blocking recv — no select()/poll().  The read timeout is enforced by
+     * the SO_RCVTIMEO socket option set in tls_configure_socket(). */
     mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
         mbedtls_net_send, mbedtls_net_recv, NULL);
 
-    /* Handshake */
-    while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-#if defined(MBEDTLS_ERROR_C)
-            char err_buf[128];
-            mbedtls_strerror(ret, err_buf, sizeof(err_buf));
-            syslog(LOG_ERR, "[%s] ssl_handshake ret=-0x%04x: %s\n", TAG, -ret, err_buf);
-#else
-            syslog(LOG_ERR, "[%s] ssl_handshake ret=-0x%04x\n", TAG, -ret);
-#endif
-            /* Log if it was a fatal alert */
-            if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
-                syslog(LOG_ERR, "[%s] Server sent fatal alert message\n", TAG);
-            }
-            return VELA_TLS_ERR_HANDSHAKE;
+    int connected = 0;
+
+    /* TCP connect — use HTTP CONNECT proxy if configured */
+    if (http_proxy_is_enabled()) {
+        int tunnel_fd = proxy_open_tunnel(host, atoi(port), 30000);
+        if (tunnel_fd < 0) {
+            syslog(LOG_ERR, "[%s] proxy tunnel to %s:%s failed\n",
+                TAG, host, port);
+            return VELA_TLS_ERR_CONNECT;
         }
+        ctx->net.fd = tunnel_fd;
+        syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
+            TAG, tunnel_fd, host, port);
+
+        tls_configure_socket(ctx, AGENT_TLS_HANDSHAKE_TIMEOUT_SEC);
+        mbedtls_ssl_session_reset(&ctx->ssl);
+        if (tls_do_handshake(ctx) == 0) {
+            connected = 1;
+        }
+    } else {
+        /* Manual connect (instead of mbedtls_net_connect) so we can set
+         * SO_SNDTIMEO on the socket before connect().  A half-open peer
+         * (flaky MiMo edge) would otherwise block the caller for the full
+         * TCP SYN retry window, which has no timeout on this build.
+         *
+         * The endpoint resolves to multiple IPs; some intermittently serve an
+         * Ed25519 leaf cert this mbedtls build cannot parse (or send invalid
+         * TLS records).  Iterate ALL addresses and run the handshake on each
+         * until one succeeds, instead of retrying the same first IP. */
+        struct addrinfo hints;
+        struct addrinfo* addr_list = NULL;
+        struct addrinfo* cur;
+
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = 0;
+
+        if (getaddrinfo(host, port, &hints, &addr_list) != 0) {
+            syslog(LOG_ERR, "[%s] getaddrinfo %s:%s failed\n",
+                TAG, host, port);
+            return VELA_TLS_ERR_CONNECT;
+        }
+
+        for (cur = addr_list; cur != NULL && !connected; cur = cur->ai_next) {
+            int fd = (int)socket(cur->ai_family, cur->ai_socktype,
+                cur->ai_protocol);
+            if (fd < 0) {
+                continue;
+            }
+
+            struct timeval ctv = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
+                .tv_usec = 0 };
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
+
+            if (connect(fd, cur->ai_addr, cur->ai_addrlen) != 0) {
+                close(fd);
+                continue;
+            }
+
+            char ipbuf[64] = "?";
+            if (cur->ai_family == AF_INET) {
+                inet_ntop(AF_INET,
+                    &((struct sockaddr_in*)cur->ai_addr)->sin_addr,
+                    ipbuf, sizeof(ipbuf));
+            } else if (cur->ai_family == AF_INET6) {
+                inet_ntop(AF_INET6,
+                    &((struct sockaddr_in6*)cur->ai_addr)->sin6_addr,
+                    ipbuf, sizeof(ipbuf));
+            }
+
+            ctx->net.fd = fd;
+            syslog(LOG_INFO, "[%s] TCP connected to %s:%s (fd=%d, ip=%s)\n",
+                TAG, host, port, fd, ipbuf);
+
+            tls_configure_socket(ctx, AGENT_TLS_HANDSHAKE_TIMEOUT_SEC);
+            mbedtls_ssl_session_reset(&ctx->ssl);
+            if (tls_do_handshake(ctx) == 0) {
+                connected = 1;
+                break;
+            }
+
+            syslog(LOG_WARNING,
+                "[%s] handshake failed on ip=%s, trying next address\n",
+                TAG, ipbuf);
+            close(fd);
+            ctx->net.fd = -1;
+        }
+
+        freeaddrinfo(addr_list);
     }
+
+    if (!connected) {
+        syslog(LOG_ERR, "[%s] connect/handshake %s:%s failed on all addresses\n",
+            TAG, host, port);
+        return VELA_TLS_ERR_HANDSHAKE;
+    }
+
+    /* Restore the long read timeout for the response body. */
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
+    tls_configure_socket(ctx, network_get_read_timeout());
+#else
+    tls_configure_socket(ctx, AGENT_LLM_SOCKET_TIMEOUT_SEC);
+#endif
 
     syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
         mbedtls_ssl_get_ciphersuite(&ctx->ssl));
 
     return 0;
+}
+
+/* ── Connect with retry ──────────────────────────────────────── */
+
+/* The MiMo endpoint (token-plan-cn.xiaomimimo.com, a Xiaomi ALB) intermittently
+ * fails fresh handshakes during backend rotation: the server goes silent
+ * (recv timeout), serves a cert this build can't parse, or sends an invalid
+ * record — all transient, and the same host works moments later. Retry with
+ * exponential backoff so a slow rotation isn't exhausted by the fixed 200ms
+ * gap; tls_ctx_connect() already iterates every resolved IP per attempt. */
+#define TLS_CONNECT_MAX_ATTEMPTS 8
+/* Cap the backoff so a long retry run doesn't sleep for minutes between the
+ * final attempts. With 8 attempts the gaps are 500/1000/2000/4000/4000/4000/4000ms
+ * (~19.5s) plus the per-attempt handshake work — enough to ride out the MiMo
+ * ALB's ~50s+ bad windows that the old ~7.5s window (5 attempts) gave up on. */
+#define TLS_CONNECT_MAX_BACKOFF_MS 4000
+
+static int tls_ctx_connect_retry(tls_ctx_t* ctx, const char* host,
+    const char* port)
+{
+    int ret = VELA_TLS_ERR_HANDSHAKE;
+    /* Backoff in ms: 500, 1000, 2000, 4000, then capped (TLS_CONNECT_MAX_BACKOFF_MS). */
+    int backoff_ms = 500;
+
+    for (int attempt = 0; attempt < TLS_CONNECT_MAX_ATTEMPTS; attempt++) {
+        ret = tls_ctx_connect(ctx, host, port);
+
+        if (ret == 0) {
+            return 0;
+        }
+
+        /* Only transient failures (TLS handshake / TCP connect) warrant a
+         * retry; anything else (config/entropy) is fatal. */
+        if (ret != VELA_TLS_ERR_HANDSHAKE && ret != VELA_TLS_ERR_CONNECT) {
+            return ret;
+        }
+
+        if (attempt + 1 == TLS_CONNECT_MAX_ATTEMPTS) {
+            break; /* last attempt — leave ctx for the caller to free */
+        }
+
+        syslog(LOG_WARNING,
+            "[%s] connect %s:%s attempt %d/%d failed (%d), retrying in %dms\n",
+            TAG, host, port, attempt + 1, TLS_CONNECT_MAX_ATTEMPTS, ret,
+            backoff_ms);
+
+        tls_ctx_free(ctx);
+        usleep(backoff_ms * 1000);
+        if (backoff_ms < TLS_CONNECT_MAX_BACKOFF_MS) {
+            backoff_ms *= 2;
+        }
+    }
+
+    return ret;
 }
 
 /* ── HTTP/1.1 framing ────────────────────────────────────────── */
@@ -613,6 +829,12 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
         while (resp_pos < resp_cap - 1) {
             if (content_length >= 0 && (long)resp_pos >= content_length)
                 break;
+            /* A chunked body is fully received once its final chunk ("0") has
+             * arrived. Stop then rather than blocking on a keep-alive peer
+             * that leaves the connection open (MiMo TTS answers ~20s of stall
+             * per sentence waiting for the server's idle close). */
+            if (chunked && chunked_body_complete(resp_buf, resp_pos))
+                break;
             ret = mbedtls_ssl_read(&ctx->ssl,
                 (unsigned char*)(resp_buf + resp_pos),
                 resp_cap - 1 - resp_pos);
@@ -639,6 +861,197 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
         *out_body_len = resp_pos;
 
     return http_status;
+}
+
+/* ── Streaming response read ─────────────────────────────────── */
+
+/* Incremental chunked-transfer decoder.  Chunked framing is
+ *   <hex-size>\r\n<data>\r\n ... 0\r\n\r\n
+ * and the chunk headers/data may be split arbitrarily across TLS reads,
+ * so we carry incomplete bytes between calls.  Fully-received chunk
+ * payloads are emitted to cb(). */
+typedef struct {
+    char  buf[8192];
+    size_t len;
+} chunk_decoder_t;
+
+/* Feed `len` raw (still-encoded) body bytes into the decoder.
+ * Returns 1 when the final (zero-size) chunk has been consumed, 0 while
+ * more data is expected, -1 on malformed framing. */
+static int chunk_decoder_feed(chunk_decoder_t *cd, const char *data,
+    size_t len, vela_stream_cb_t cb, void *ctx)
+{
+    while (len > 0) {
+        size_t room = sizeof(cd->buf) - cd->len;
+        size_t n = len < room ? len : room;
+        memcpy(cd->buf + cd->len, data, n);
+        cd->len += n;
+        data += n;
+        len -= n;
+        if (cd->len == sizeof(cd->buf)) {
+            syslog(LOG_ERR, "[%s] chunk decoder overflow\n", TAG);
+            return -1;
+        }
+    }
+
+    for (;;) {
+        char *crlf = (char *)memmem(cd->buf, cd->len, "\r\n", 2);
+        if (!crlf)
+            break; /* incomplete size line */
+
+        char *endptr = NULL;
+        long chunk_sz = strtol(cd->buf, &endptr, 16);
+        while (endptr < crlf && *endptr == ' ')
+            endptr++;
+        if (endptr == cd->buf || endptr != crlf || chunk_sz < 0) {
+            syslog(LOG_ERR, "[%s] malformed chunk header\n", TAG);
+            return -1;
+        }
+
+        size_t hdr_len = (size_t)(crlf - cd->buf) + 2; /* size line + CRLF */
+
+        if (chunk_sz == 0) {
+            cd->len = 0; /* final chunk — done */
+            return 1;
+        }
+
+        size_t need = hdr_len + (size_t)chunk_sz + 2; /* payload + CRLF */
+        if (cd->len < need)
+            break; /* not all of this chunk has arrived yet */
+
+        if (cb(cd->buf + hdr_len, (size_t)chunk_sz, ctx) != 0)
+            return 1; /* caller aborted */
+
+        size_t consumed = hdr_len + (size_t)chunk_sz + 2;
+        memmove(cd->buf, cd->buf + consumed, cd->len - consumed);
+        cd->len -= consumed;
+    }
+
+    return 0;
+}
+
+/* Read a response, delivering decoded body bytes to cb() as they arrive.
+ * Mirrors tls_read_response() but does not buffer the whole body. */
+static int tls_read_response_stream(tls_ctx_t *ctx, vela_stream_cb_t cb,
+    void *uctx)
+{
+    char *raw = tls_raw_acquire();
+    size_t raw_len = 0;
+    int ret;
+    int result = VELA_TLS_ERR_READ;
+    chunk_decoder_t *cd = NULL;
+    char *tmp = NULL;
+
+    /* Read until full header (double CRLF). */
+    while (raw_len < TLS_RAW_BUF_SIZE - 1) {
+        ret = mbedtls_ssl_read(&ctx->ssl,
+            (unsigned char *)(raw + raw_len), TLS_RAW_BUF_SIZE - 1 - raw_len);
+        if (ret > 0) {
+            raw_len += (size_t)ret;
+            if (memmem(raw, raw_len, "\r\n\r\n", 4))
+                break;
+        } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            break;
+        } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
+            syslog(LOG_ERR, "[%s] ssl_read (header) ret=0x%x\n", TAG, -ret);
+            goto cleanup;
+        }
+    }
+    raw[raw_len] = '\0';
+
+    int http_status = 0;
+    if (sscanf(raw, "HTTP/1.%*d %d", &http_status) != 1) {
+        syslog(LOG_ERR, "[%s] Failed to parse HTTP status\n", TAG);
+        goto cleanup;
+    }
+    result = http_status;
+
+    char *body_start = (char *)memmem(raw, raw_len, "\r\n\r\n", 4);
+    if (!body_start) {
+        goto cleanup; /* no body */
+    }
+    body_start += 4;
+
+    long content_length = -1;
+    {
+        char *cl_hdr = strcasestr(raw, "Content-Length:");
+        if (cl_hdr && cl_hdr < body_start) {
+            content_length = strtol(cl_hdr + strlen("Content-Length:"), NULL, 10);
+            if (content_length < 0 || content_length > 10 * 1024 * 1024)
+                content_length = -1;
+        }
+    }
+    int chunked = 0;
+    {
+        char *te_hdr = strcasestr(raw, "Transfer-Encoding:");
+        if (te_hdr && te_hdr < body_start)
+            chunked = (strcasestr(te_hdr, "chunked") != NULL);
+    }
+
+    /* Initial fragment (bytes already read past the header). */
+    size_t initial = (size_t)(raw + raw_len - body_start);
+    long emitted = (long)initial;
+
+    /* Heap-allocate the chunk decoder + read buffer: the caller's task stack
+     * (agent loop) is only 32KB and already carries a tls_ctx_t. */
+    cd = calloc(1, sizeof(*cd));
+    tmp = malloc(4096);
+    if (!cd || !tmp) {
+        goto cleanup;
+    }
+
+    if (chunked) {
+        int r = chunk_decoder_feed(cd, body_start, initial, cb, uctx);
+        if (r < 0) {
+            result = VELA_TLS_ERR_READ;
+            goto cleanup;
+        }
+        if (r == 1) {
+            goto cleanup; /* final chunk already received */
+        }
+    } else if (initial > 0) {
+        if (cb(body_start, initial, uctx) != 0) {
+            goto cleanup;
+        }
+        if (content_length >= 0 && emitted >= content_length) {
+            goto cleanup;
+        }
+    }
+    tls_raw_release(raw);
+    raw = NULL;
+
+    /* Keep reading the body. */
+    for (;;) {
+        ret = mbedtls_ssl_read(&ctx->ssl, (unsigned char *)tmp, 4096);
+        if (ret > 0) {
+            if (chunked) {
+                int r = chunk_decoder_feed(cd, tmp, (size_t)ret, cb, uctx);
+                if (r < 0) {
+                    result = VELA_TLS_ERR_READ;
+                    break;
+                }
+                if (r == 1)
+                    break; /* final chunk — stop reading, don't wait for EOF */
+            } else {
+                if (cb(tmp, (size_t)ret, uctx) != 0)
+                    break;
+                emitted += ret;
+                if (content_length >= 0 && emitted >= content_length)
+                    break;
+            }
+        } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            break;
+        } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
+            break;
+        }
+    }
+
+cleanup:
+    free(cd);
+    free(tmp);
+    if (raw)
+        tls_raw_release(raw);
+    return result;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -708,7 +1121,7 @@ int vela_https_request(
     if (!slot) {
         /* Pool full — use a temporary ephemeral context */
         tls_ctx_t tmp_ctx;
-        if ((ret = tls_ctx_connect(&tmp_ctx, host, port)) != 0) {
+        if ((ret = tls_ctx_connect_retry(&tmp_ctx, host, port)) != 0) {
             tls_ctx_free(&tmp_ctx);
             return ret;
         }
@@ -725,7 +1138,7 @@ int vela_https_request(
     }
 
     /* Connect into the slot */
-    if ((ret = tls_ctx_connect(&slot->ctx, host, port)) != 0) {
+    if ((ret = tls_ctx_connect_retry(&slot->ctx, host, port)) != 0) {
         pool_release(slot, host, port, false);
         return ret;
     }
@@ -773,6 +1186,46 @@ int vela_https_post_json(const char* host, const char* port, const char* path,
     size_t body_len = json_body ? strlen(json_body) : 0;
     return vela_https_request(host, port, "POST", path, merged,
         json_body, body_len, resp_buf, resp_cap, NULL);
+}
+
+int vela_https_post_json_stream(const char* host, const char* port,
+    const char* path, const vela_header_t* extra_headers,
+    const char* json_body, vela_stream_cb_t cb, void* ctx)
+{
+    const int MAX_HDRS = 32;
+    vela_header_t merged[MAX_HDRS];
+    int n = 0;
+
+    merged[n++] = (vela_header_t) { "Content-Type", "application/json" };
+
+    if (extra_headers) {
+        for (const vela_header_t* h = extra_headers; h->name && n < MAX_HDRS - 1; h++) {
+            merged[n++] = *h;
+        }
+    }
+    merged[n] = (vela_header_t) { NULL, NULL };
+
+    size_t body_len = json_body ? strlen(json_body) : 0;
+    tls_ctx_t tls;
+    int ret;
+
+    /* Always use a fresh connection: a streamed response stays open for the
+     * whole generation and is not compatible with pooled keep-alive reuse. */
+    if ((ret = tls_ctx_connect_retry(&tls, host, port)) != 0) {
+        tls_ctx_free(&tls);
+        return ret;
+    }
+
+    if ((ret = tls_write_request(&tls, "POST", host, path, merged,
+             json_body, body_len)) != 0) {
+        syslog(LOG_ERR, "[%s] Write request failed: %d\n", TAG, ret);
+        tls_ctx_free(&tls);
+        return ret;
+    }
+
+    ret = tls_read_response_stream(&tls, cb, ctx);
+    tls_ctx_free(&tls);
+    return ret;
 }
 
 int vela_https_head_date(const char* host, const char* port, const char* path,
