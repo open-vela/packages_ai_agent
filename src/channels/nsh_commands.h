@@ -40,3 +40,10 @@ int nsh_commands_init(void);
  * Call after all services are in a known state (post Phase 5).
  */
 int nsh_commands_start(void);
+
+/**
+ * True once the CLI thread has exited (user typed "quit" or stdin hit EOF).
+ * Used by ai_agent_main so a CLI-only second instance can return to NSH
+ * without triggering a full agent shutdown.
+ */
+bool nsh_cli_done(void);

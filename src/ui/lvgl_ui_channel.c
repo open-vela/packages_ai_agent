@@ -547,6 +547,28 @@ void lvgl_ui_channel_show(void)
     lv_async_call(show_screen_async_cb, NULL);
 }
 
+/* Run TTS on a worker thread. voice_channel_speak() does blocking network
+ * round-trips (and several of them for a long story), so calling it inline
+ * would stall the dispatch thread and leave the UI unresponsive — frozen
+ * touch, screen not refreshing. A detached thread keeps the UI alive and
+ * relies on voice_channel_speak()'s internal abort logic to cancel an
+ * in-flight utterance when a newer one arrives. */
+static void* tts_speak_thread(void* arg)
+{
+    char* text = (char*)arg;
+
+    if (text) {
+        int ret = voice_channel_speak(text);
+        if (ret != 0) {
+            syslog(LOG_ERR, "[%s] voice_channel_speak failed (rc=%d)\n",
+                TAG, ret);
+        }
+        free(text);
+    }
+
+    return NULL;
+}
+
 int lvgl_ui_channel_send(const char* text)
 {
     int ret;
@@ -587,10 +609,26 @@ int lvgl_ui_channel_send(const char* text)
 
     lv_async_call(chat_view_add_message_async_cb, payload);
 
-    /* TTS is blocking — run after scheduling the UI update */
-    ret = voice_channel_speak(text);
+    /* TTS is blocking — run it on a worker thread after scheduling the UI
+     * update so the dispatch thread returns immediately. */
+    char* tts_text = malloc(strlen(text) + 1);
+    if (!tts_text) {
+        syslog(LOG_ERR, "[%s] TTS text alloc failed\n", TAG);
+        return 0;
+    }
+
+    strcpy(tts_text, text);
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    ret = pthread_create(&tid, &attr, tts_speak_thread, tts_text);
+    pthread_attr_destroy(&attr);
+
     if (ret != 0) {
-        syslog(LOG_ERR, "[%s] voice_channel_speak failed (rc=%d)\n", TAG, ret);
+        free(tts_text);
+        syslog(LOG_ERR, "[%s] TTS thread spawn failed (rc=%d)\n", TAG, ret);
     }
 
     return 0;
