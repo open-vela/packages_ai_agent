@@ -407,3 +407,25 @@
 #define AGENT_SHELL_SECURITY AGENT_SHELL_SECURITY_ALLOWLIST /* default \
                                                                    */
 #endif
+
+/* ── VelaGuard HMI (SRAM-tight) ──────────────────────────────── */
+#ifdef CONFIG_VG_HMI
+#undef AGENT_AI_AGENT_STACK
+#define AGENT_AI_AGENT_STACK (16 * 1024)
+#undef AGENT_CLI_STACK
+#define AGENT_CLI_STACK (12 * 1024)
+#undef AGENT_CRON_STACK
+#define AGENT_CRON_STACK (4 * 1024)
+#define AGENT_VG_HMI_SKIP_WS 1
+#define AGENT_VG_HMI_LAZY_LOOP 1
+#define AGENT_MEM_RESERVE_BYTES (8 * 1024)
+#undef AGENT_CONTEXT_BUF_SIZE
+#define AGENT_CONTEXT_BUF_SIZE (4 * 1024)
+#undef AGENT_LLM_STREAM_BUF_SIZE
+#define AGENT_LLM_STREAM_BUF_SIZE (4 * 1024)
+#undef AGENT_OUTBOUND_STACK
+#define AGENT_OUTBOUND_STACK (12 * 1024)
+#define AGENT_NET_WATCH_STACK (28 * 1024)
+#else
+#define AGENT_NET_WATCH_STACK AGENT_OUTBOUND_STACK
+#endif

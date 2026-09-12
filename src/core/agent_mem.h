@@ -61,7 +61,9 @@ static inline void agent_mem_get_status(agent_mem_status_t* st)
  * available free heap. Reserves AGENT_MEM_RESERVE_BYTES for
  * other subsystems.
  */
+#ifndef AGENT_MEM_RESERVE_BYTES
 #define AGENT_MEM_RESERVE_BYTES (32 * 1024)
+#endif
 
 static inline size_t agent_mem_safe_size(size_t requested, size_t min_size)
 {

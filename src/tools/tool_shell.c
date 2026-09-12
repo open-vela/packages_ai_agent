@@ -161,6 +161,19 @@ static int is_blocked(const char *cmd)
     const char *basename = strrchr(first, '/');
     const char *name = basename ? basename + 1 : first;
 
+    /* VelaGuard: point-table mutation stays off the Agent allow-list. */
+    if (strcmp(name, "vgpoint") == 0 || strcmp(name, "vgdiscover") == 0) {
+        return 1;
+    }
+    if (strcmp(name, "vgcfg") == 0) {
+        while (cmd[i] == ' ') i++;
+        if (strncmp(cmd + i, "dump", 4) != 0)
+            return 1;
+        if (cmd[i + 4] != '\0' && cmd[i + 4] != ' ')
+            return 1;
+        return 0;
+    }
+
     /* Check whitelist first */
     for (int k = 0; s_allowed[k]; k++) {
         if (strcmp(name, s_allowed[k]) == 0)

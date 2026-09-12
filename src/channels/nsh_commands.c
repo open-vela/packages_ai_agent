@@ -25,6 +25,7 @@
 #include "channels/cmd_llm.h"
 #include "channels/cmd_voice.h"
 #include "core/message_bus.h"
+#include "core/agent_loop.h"
 #include "infra/config_store.h"
 #include "infra/cron_service.h"
 #include "infra/heartbeat.h"
@@ -593,6 +594,12 @@ static void cmd_ask(int argc, char** argv)
     msg.content = strdup(content);
     if (msg.content)
         message_bus_push_inbound(&msg);
+    if (network_is_connected()) {
+        agent_loop_ensure_started();
+#ifdef CONFIG_VG_HMI
+        printf("Ask queued; agent_loop starting in background...\n");
+#endif
+    }
     printf("Sent to agent: %s\n", content);
     syslog(LOG_INFO, "[agent] ask: %s\n", content);
 }
