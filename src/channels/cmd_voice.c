@@ -130,3 +130,24 @@ void cmd_set_voice_asr(int argc, char** argv)
         printf("ASR backend '%s' not found.\n", argv[1]);
     }
 }
+
+void cmd_speak(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: speak <text>\n");
+        return;
+    }
+
+    /* Concatenate all arguments as the text to speak. */
+    char content[512] = { 0 };
+
+    for (int i = 1; i < argc; i++) {
+        strncat(content, argv[i], sizeof(content) - strlen(content) - 1);
+        if (i < argc - 1)
+            strncat(content, " ", sizeof(content) - strlen(content) - 1);
+    }
+
+    printf("Speaking: %s\n", content);
+    int ret = voice_channel_speak(content);
+    printf("speak done: %d\n", ret);
+}
