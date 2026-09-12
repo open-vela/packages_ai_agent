@@ -61,6 +61,23 @@ static const char* TAG = "agent";
 #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
 #endif
 
+/* Heap scan between ReAct phases: mallinfo walks the heap; with the
+ * mm_foreach corruption guard enabled (CONFIG_MM_RECORD_STACK builds)
+ * a smashed node is reported with the owning allocation's backtrace,
+ * which brackets the corrupting phase to a single step. */
+
+#ifdef CONFIG_VG_HMI
+#define VG_HEAP_SCAN(phase)                                   \
+    do {                                                      \
+        agent_mem_status_t st_;                               \
+        agent_mem_get_status(&st_);                           \
+        syslog(LOG_INFO, "[heapscan] %s free=%zu\n",          \
+            phase, st_.free_heap);                            \
+    } while (0)
+#else
+#define VG_HEAP_SCAN(phase)
+#endif
+
 /* ── Forward declarations ──────────────────────────────────── */
 
 static char* handle_slash_note(const agent_msg_t* msg);
@@ -1040,6 +1057,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     name_repeat = 0;
     int last_total_tokens = 0;
     bool watchdog_fired = false;
+    VG_HEAP_SCAN("react_enter");
 
     /* Router: select and apply best backend before first LLM call.
      * Estimate complexity from the last user message. */
@@ -1076,6 +1094,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         llm_response_t resp;
         struct timespec tv_start, tv_end;
+        VG_HEAP_SCAN("before_llm");
         mono_now(&tv_start);
         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
         mono_now(&tv_end);
@@ -1245,6 +1264,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             break;
         }
 
+        VG_HEAP_SCAN("llm_done");
         syslog(LOG_INFO, "[%s] Tool iter %d: %d calls\n",
             TAG, iteration + 1, resp.call_count);
 
@@ -1266,8 +1286,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         }
 
         add_assistant_message(messages, &resp);
+        VG_HEAP_SCAN("asst_added");
         add_tool_result_messages(messages, &resp, tool_output,
             tool_size, msg->channel, msg->chat_id);
+        VG_HEAP_SCAN("tools_done");
 
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool
@@ -1426,6 +1448,7 @@ static void* agent_loop_task(void* arg)
     size_t hist_size = AGENT_LLM_STREAM_BUF_SIZE;
     size_t tool_size = TOOL_OUTPUT_SIZE;
     syslog(LOG_INFO, "[%s] Agent loop started (HMI fixed buffers)\n", TAG);
+    VG_HEAP_SCAN("task_enter");
 #else
     agent_mem_get_status(&mem_st);
     syslog(LOG_INFO, "[%s] Agent loop started, free heap: %zu\n",
@@ -1476,6 +1499,7 @@ static void* agent_loop_task(void* arg)
 
     syslog(LOG_INFO, "[%s] Tools JSON loaded: %d bytes\n",
         TAG, tools_json ? (int)strlen(tools_json) : 0);
+    VG_HEAP_SCAN("loop_started");
 
     while (!agent_shutdown_requested()) {
         agent_msg_t msg;
@@ -1558,9 +1582,11 @@ static void* agent_loop_task(void* arg)
             skill_loader_refresh();
         }
 
+        VG_HEAP_SCAN("ctx_pre");
         context_build_system_prompt(sys_prompt, ctx_size);
         inject_session_context(sys_prompt, ctx_size,
             msg.channel, msg.chat_id);
+        VG_HEAP_SCAN("ctx_done");
 
         /* Refresh tools JSON — Node tools are dynamic */
         free(tools_json);

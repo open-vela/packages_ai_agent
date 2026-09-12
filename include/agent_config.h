@@ -101,6 +101,15 @@
 #define AGENT_FEISHU_POLL_PRIO 50
 #define AGENT_FEISHU_MAX_MSG_LEN 4000 /* Feishu text message limit */
 
+/* ── Time ───────────────────────────────────────────────────── */
+/* Offset applied by get_current_time / context header on top of the
+ * system clock. 0 when the clock already runs local wall time. */
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA_TIME_OFFSET_SEC
+#define AGENT_TIME_OFFSET_SEC CONFIG_EXAMPLES_AI_AGENT_VELA_TIME_OFFSET_SEC
+#else
+#define AGENT_TIME_OFFSET_SEC (8 * 3600)
+#endif
+
 /* ── Agent Loop ─────────────────────────────────────────────── */
 #define AGENT_AI_AGENT_STACK (32 * 1024)
 #define AGENT_AI_AGENT_PRIO 60
@@ -410,8 +419,14 @@
 
 /* ── VelaGuard HMI (SRAM-tight) ──────────────────────────────── */
 #ifdef CONFIG_VG_HMI
+/* The agent loop thread runs the whole ReAct round on one stack:
+ * mbedTLS handshake (~14KB), 15KB tools-JSON request build/parse, and
+ * tool dispatch. 16KB overflowed into heap-adjacent memory and
+ * corrupted free-node metadata (HARDFAULT in mallinfo/mm_foreach on
+ * VelaGuard H750B-DK, deterministic with any tool-calling round).
+ * 32KB matches the non-HMI default; SRAM budget on H750B-DK allows it. */
 #undef AGENT_AI_AGENT_STACK
-#define AGENT_AI_AGENT_STACK (16 * 1024)
+#define AGENT_AI_AGENT_STACK (32 * 1024)
 #undef AGENT_CLI_STACK
 #define AGENT_CLI_STACK (12 * 1024)
 #undef AGENT_CRON_STACK
