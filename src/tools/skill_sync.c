@@ -22,7 +22,7 @@
  *   2. GET bitable records (enabled=true, paginated)
  *   3. Filter by target_device
  *   4. Compare version with local .versions.json
- *   5. Write changed skills to /data/agent/skills/
+ *   5. Write changed skills to /data/ai_agent/skills/
  *   6. Optionally clean orphaned local skills (full mode)
  */
 

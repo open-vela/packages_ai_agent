@@ -117,8 +117,8 @@ static const char *TAG = "skills";
     "When user asks about system status, health check, or running state.\n\n" \
     "## How to use\n" \
     "1. get_current_time to get current time\n" \
-    "2. list_dir to list /data/agent/ files\n" \
-    "3. read_file /data/agent/config/config.json to check config\n" \
+    "2. list_dir to list " AGENT_DATA_DIR "/ files\n" \
+    "3. read_file " AGENT_CONFIG_FILE " to check config\n" \
     "4. cron_list to check scheduled tasks\n" \
     "5. Summarize: time, file count, config status, cron jobs\n"
 
