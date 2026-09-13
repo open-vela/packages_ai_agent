@@ -187,6 +187,10 @@
 #define AGENT_CRON_PRIO 40
 #define AGENT_HEARTBEAT_FILE AGENT_DATA_DIR "/HEARTBEAT.md"
 #define AGENT_HEARTBEAT_INTERVAL_MS (30 * 60 * 1000)
+/* Touch this file to run a heartbeat check immediately (consumed+unlinked
+ * by the heartbeat thread); used for on-demand tasks e.g. daily report. */
+#define AGENT_HEARTBEAT_POKE_FILE AGENT_DATA_DIR "/HEARTBEAT.poke"
+#define AGENT_HEARTBEAT_POLL_SLICE_S 5
 
 /* ── Skills ─────────────────────────────────────────────────── */
 #define AGENT_SKILLS_DIR AGENT_DATA_DIR "/skills/"

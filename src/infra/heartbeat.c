@@ -30,6 +30,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <errno.h>
+#include <unistd.h>
 
 static const char *TAG = "heartbeat";
 
@@ -127,13 +129,46 @@ static bool heartbeat_send(void)
 }
 
 
+/* ── Poke file ────────────────────────────────────────────────── */
+
+/* AGENT_HEARTBEAT_POKE_FILE present -> run a check right away. External
+ * tasks (e.g. on-demand daily report) touch it instead of calling into
+ * the agent process, which may not have initialized its message bus yet. */
+static bool heartbeat_poke_consumed(void)
+{
+    if (access(AGENT_HEARTBEAT_POKE_FILE, F_OK) != 0) {
+        return false;
+    }
+
+    if (unlink(AGENT_HEARTBEAT_POKE_FILE) != 0 && errno != ENOENT) {
+        syslog(LOG_WARNING, "[%s] Failed to unlink poke file: %s\n", TAG,
+               strerror(errno));
+    }
+    return true;
+}
+
 static void *heartbeat_thread(void *arg)
 {
     (void)arg;
 
     while (s_heartbeat_running) {
-        /* Sleep for the heartbeat interval (use sleep() to avoid usleep overflow) */
-        sleep(AGENT_HEARTBEAT_INTERVAL_MS / 1000);
+        /* Slice the interval sleep so a poke file triggers an immediate
+         * check; also makes heartbeat_stop() responsive. */
+        int interval_s = AGENT_HEARTBEAT_INTERVAL_MS / 1000;
+        int waited = 0;
+
+        while (s_heartbeat_running && waited < interval_s) {
+            sleep(AGENT_HEARTBEAT_POLL_SLICE_S);
+            waited += AGENT_HEARTBEAT_POLL_SLICE_S;
+            if (heartbeat_poke_consumed()) {
+                break;
+            }
+        }
+
+        if (!s_heartbeat_running) {
+            break;
+        }
+
         heartbeat_send();
     }
 
