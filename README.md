@@ -85,7 +85,7 @@ vela> router_status                      # 查看路由状态
 | 分类 | 工具 | 说明 |
 |------|------|------|
 | 🔍 搜索 | `web_search` `news_search` `fetch_url` | Tavily/SerpAPI/Exa/NewsAPI |
-| 📁 文件 | `read_file` `write_file` `edit_file` `list_dir` | 限制在 /data/agent/ |
+| 📁 文件 | `read_file` `write_file` `edit_file` `list_dir` | 限制在 /data/ai_agent/ |
 | ⏰ 定时 | `cron_add` `cron_list` `cron_remove` | 定时任务调度 |
 | 🖼️ 视觉 | `analyze_image` `camera_capture` | Vision LLM 图片识别/OCR/截屏分析，V4L2 拍照 |
 | 🐚 Shell | `run_shell` | NuttX 命令（三级安全策略） |
@@ -131,7 +131,7 @@ vela> router_status                      # 查看路由状态
 
 ```bash
 vela> ask 帮我创建一个翻译技能    # 对话创建
-# 或手动放 .md 文件到 /data/agent/skills/
+# 或手动放 .md 文件到 /data/ai_agent/skills/
 ```
 
 ## 配置
@@ -158,7 +158,7 @@ vela> ask 帮我创建一个翻译技能    # 对话创建
 
 ### 配置文件
 
-配置文件位于 `/data/agent/config/`：
+配置文件位于 `/data/ai_agent/config/`：
 
 | 文件 | 说明 |
 |------|------|

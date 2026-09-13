@@ -19,4 +19,4 @@ User (voice, Chinese): "这个多少钱？"
 Agent (voice, English): "How much is this?"
 
 ## Tip
-Read /data/agent/config/USER.md for user's preferred languages.
+Read /data/ai_agent/config/USER.md for user's preferred languages.

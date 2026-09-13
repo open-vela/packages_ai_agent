@@ -1,6 +1,6 @@
 # AI Agent Skills
 
-AI Agent 内置 Skill 的 Markdown 源文件。设备启动时自动安装到 `/data/agent/skills/`。
+AI Agent 内置 Skill 的 Markdown 源文件。设备启动时自动安装到 `/data/ai_agent/skills/`。
 
 ## 目录
 
@@ -51,4 +51,4 @@ AI Agent 内置 Skill 的 Markdown 源文件。设备启动时自动安装到 `/
 vela> ask 帮我创建一个翻译技能
 ```
 
-或手动放 `.md` 文件到 `/data/agent/skills/` 目录。
+或手动放 `.md` 文件到 `/data/ai_agent/skills/` 目录。

@@ -13,7 +13,7 @@ When the user asks to create a new skill, teach the bot something, or add a new 
    - `## When to use` — trigger conditions
    - `## How to use` — step-by-step instructions
    - `## Example` — concrete example (optional but helpful)
-3. Save to `/data/agent/skills/<name>.md` using write_file
+3. Save to `/data/ai_agent/skills/<name>.md` using write_file
 4. The skill will be automatically available after the next conversation
 
 ## Best practices

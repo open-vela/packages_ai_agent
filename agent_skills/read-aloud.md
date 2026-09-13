@@ -21,7 +21,7 @@ For longer content, break into multiple turns.
 
 ## Example
 User: "帮我朗读记忆文件"
-→ read_file /data/agent/memory/MEMORY.md
+→ read_file /data/ai_agent/memory/MEMORY.md
 → Clean text, split into paragraphs
 → "你的记忆文件内容：用户偏好中文回复，常用嵌入式开发功能..."
 (TTS will read the response aloud)

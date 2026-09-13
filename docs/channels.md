@@ -93,10 +93,10 @@ QEMU 环境下无真实音频硬件，使用文件模式测试：
 ```bash
 # TTS：文本合成为 PCM 文件
 vela> voice_test_tts 你好世界
-# TTS OK: 32000 bytes -> /data/agent/tts_out.pcm
+# TTS OK: 32000 bytes -> /data/ai_agent/tts_out.pcm
 
 # ASR：PCM 文件识别为文本，自动发送给 Agent
-vela> voice_test_asr /data/agent/tts_out.pcm
+vela> voice_test_asr /data/ai_agent/tts_out.pcm
 # ASR result: 你好世界
 # Sent to agent.
 ```

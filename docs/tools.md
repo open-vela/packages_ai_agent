@@ -44,7 +44,7 @@ AI Agent 内置 35+ 种工具，Agent 通过 ReAct 循环自动调用。
 | `launch_quickapp` | 按包名启动快应用 |
 | `exit_quickapp` | 退出当前快应用回到主屏 |
 
-文件操作限制在 `/data/agent/` 目录内。
+文件操作限制在 `/data/ai_agent/` 目录内。
 
 ## Shell 安全策略
 

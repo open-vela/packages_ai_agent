@@ -5,7 +5,7 @@ Skills 是 Markdown 格式的可扩展技能，告诉 Agent 在特定场景下�
 ## 架构
 
 ```
-/data/agent/skills/
+/data/ai_agent/skills/
 ├── weather.md          ← 内置（首次启动自动安装）
 ├── daily-briefing.md
 ├── reminder.md
@@ -20,7 +20,7 @@ skill_loader_init()
     ▼
 skill_loader_build_summary()
     │
-    ├─ 扫描 /data/agent/skills/*.md
+    ├─ 扫描 /data/ai_agent/skills/*.md
     ├─ 提取每个文件的 # 标题 + 描述段落
     │
     ▼
@@ -34,7 +34,7 @@ agent_loop → 根据用户请求匹配 Skill → 按指引调用工具
 
 ## 工作原理
 
-1. Agent 启动时扫描 `/data/agent/skills/` 目录下所有 `.md` 文件
+1. Agent 启动时扫描 `/data/ai_agent/skills/` 目录下所有 `.md` 文件
 2. 提取每个 Skill 的标题和描述，构建摘要注入系统提示词
 3. Agent 根据用户请求自动匹配合适的 Skill 并按其指引执行
 
@@ -64,7 +64,7 @@ vela> ask 帮我创建一个翻译技能
 ### 方式二：手动创建
 
 ```bash
-adb push my-skill.md /data/agent/skills/
+adb push my-skill.md /data/ai_agent/skills/
 ```
 
 ### 文件格式

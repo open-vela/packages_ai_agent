@@ -10,7 +10,7 @@ or wants to send/receive MQTT messages.
 AI Agent connects to MQTT broker and listens on agent/in topic.
 Outbound messages go to agent/out topic.
 
-1. Check MQTT config: read_file /data/agent/config/config.json
+1. Check MQTT config: read_file /data/ai_agent/config/config.json
    Look for mqtt_broker, mqtt_topic_in, mqtt_topic_out
 2. If not configured: tell user to run set_mqtt <host:port>
 3. To send a command to IoT device:

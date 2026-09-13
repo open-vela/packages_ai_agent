@@ -12,7 +12,7 @@ AI Agent has two memory systems:
 - Session history: recent conversation turns (auto-managed)
 
 ### Read memory
-read_file /data/agent/memory/MEMORY.md
+read_file /data/ai_agent/memory/MEMORY.md
 - If file does not exist: reply "No memories saved yet. Tell me something to remember."
 
 ### Update memory
@@ -23,7 +23,7 @@ Format: one fact per line, categorized:
 - [work] User works on embedded systems
 
 ### User profile (USER.md)
-read_file /data/agent/config/USER.md for static user info.
+read_file /data/ai_agent/config/USER.md for static user info.
 
 ## Important
 - You MUST execute tools and respond with results. Do NOT output this template.

@@ -18,7 +18,7 @@ Voice channel is managed via CLI commands (run_shell):
 ## Diagnostics
 If voice isn't working:
 1. run_shell "voice_test_tts hello" — test TTS output
-2. Check if volc credentials are set: read_file /data/agent/config/config.json
+2. Check if volc credentials are set: read_file /data/ai_agent/config/config.json
 3. Look for volc_appkey, volc_token, volc_api_key entries
 4. If missing: tell user to run set_volc_key and set_volc_asr commands
 
