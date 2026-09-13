@@ -40,6 +40,7 @@
 #include "core/message_bus.h"
 #include "cJSON.h"
 #include "infra/config_store.h"
+#include "infra/url_parse.h"
 #include "infra/vela_tls.h"
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -675,15 +676,15 @@ int weixin_channel_poll_login(const char* qrcode_id)
 
         if (cJSON_IsString(base_j) && base_j->valuestring[0]) {
             /* Parse host from baseurl (https://host) */
-            const char* url = base_j->valuestring;
-            if (strncmp(url, "https://", 8) == 0)
-                url += 8;
-            strncpy(s_host, url, sizeof(s_host) - 1);
-            s_host[sizeof(s_host) - 1] = '\0';
-            /* Remove trailing slash */
-            size_t len = strlen(s_host);
-            if (len > 0 && s_host[len - 1] == '/')
-                s_host[len - 1] = '\0';
+            parsed_url_t parsed;
+            if (url_parse(base_j->valuestring, &parsed) == 0) {
+                strncpy(s_host, parsed.host, sizeof(s_host) - 1);
+                s_host[sizeof(s_host) - 1] = '\0';
+            } else {
+                /* Fallback: use raw value */
+                strncpy(s_host, base_j->valuestring, sizeof(s_host) - 1);
+                s_host[sizeof(s_host) - 1] = '\0';
+            }
             claw_config_set("weixin.host", s_host);
         }
 

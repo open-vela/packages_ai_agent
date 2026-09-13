@@ -26,66 +26,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "infra/url_parse.h"
+
 static const char* TAG = "mcp_client";
-
-/* ── URL parsing helper ─────────────────────────────────── */
-
-typedef struct {
-    char host[128];
-    char port[8];
-    char path[128];
-    bool use_tls;
-} parsed_url_t;
-
-static int parse_url(const char* url, parsed_url_t* out)
-{
-    memset(out, 0, sizeof(*out));
-
-    if (strncmp(url, "https://", 8) == 0) {
-        out->use_tls = true;
-        url += 8;
-        strncpy(out->port, "443", sizeof(out->port) - 1);
-    } else if (strncmp(url, "http://", 7) == 0) {
-        out->use_tls = false;
-        url += 7;
-        strncpy(out->port, "80", sizeof(out->port) - 1);
-    } else {
-        return -1;
-    }
-
-    const char* slash = strchr(url, '/');
-    const char* colon = strchr(url, ':');
-
-    if (colon && (!slash || colon < slash)) {
-        size_t hlen = colon - url;
-        if (hlen >= sizeof(out->host))
-            hlen = sizeof(out->host) - 1;
-        memcpy(out->host, url, hlen);
-        out->host[hlen] = '\0';
-
-        colon++;
-        const char* pend = slash ? slash : colon + strlen(colon);
-        size_t plen = pend - colon;
-        if (plen >= sizeof(out->port))
-            plen = sizeof(out->port) - 1;
-        memcpy(out->port, colon, plen);
-        out->port[plen] = '\0';
-    } else {
-        size_t hlen = slash ? (size_t)(slash - url) : strlen(url);
-        if (hlen >= sizeof(out->host))
-            hlen = sizeof(out->host) - 1;
-        memcpy(out->host, url, hlen);
-        out->host[hlen] = '\0';
-    }
-
-    if (slash) {
-        strncpy(out->path, slash, sizeof(out->path) - 1);
-    } else {
-        strncpy(out->path, "/", sizeof(out->path) - 1);
-    }
-
-    return 0;
-}
 
 /* ── Data structures ────────────────────────────────────── */
 
@@ -481,7 +424,7 @@ int mcp_client_add_server(const char* name, const char* url,
         strncpy(srv->token, token, sizeof(srv->token) - 1);
     }
 
-    if (parse_url(url, &srv->parsed) != 0) {
+    if (url_parse(url, &srv->parsed) != 0) {
         syslog(LOG_ERR, "[%s] Invalid URL: %s\n", TAG, url);
         pthread_mutex_unlock(&s_mtx);
         return ERROR;

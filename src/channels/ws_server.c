@@ -22,6 +22,8 @@
 
 #include "channels/ws_server.h"
 #include "core/message_bus.h"
+#include "infra/a2a_handler.h"
+#include "tools/mcp_server.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_manager.h"
 #endif
@@ -154,13 +156,13 @@ static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
 {
 
     /* Extract Sec-WebSocket-Key */
-    char* key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
+    const char *key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
     if (!key_hdr) {
         syslog(LOG_WARNING, "[%s] No Sec-WebSocket-Key\n", TAG);
         return -1;
     }
     key_hdr += 21;
-    char* eol = strstr(key_hdr, "\r\n");
+    const char *eol = strstr(key_hdr, "\r\n");
     if (!eol)
         return -1;
 
@@ -187,7 +189,6 @@ static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
     if (send(fd, resp, rlen, 0) != rlen)
         return -1;
 
-    /* Default chat_id from fd (may be overridden by first message) */
     snprintf(chat_id_out, chat_id_size, "ws_%d", fd);
     return 0;
 }

@@ -225,7 +225,7 @@
 #define AGENT_WS_MAX_CLIENTS 8
 
 /* ── WS client thread stack ──────────────────────────────────── */
-#define AGENT_WS_CLIENT_STACK (12 * 1024)
+#define AGENT_WS_CLIENT_STACK (16 * 1024)
 
 /* ── Serial CLI ─────────────────────────────────────────────── */
 #define AGENT_CLI_STACK (16 * 1024)
@@ -255,6 +255,9 @@
 #define AGENT_CFG_KEY_GATEWAY_HOST "gateway_host"
 #define AGENT_CFG_KEY_GATEWAY_PORT "gateway_port"
 #define AGENT_CFG_KEY_GATEWAY_TOKEN "gateway_token"
+#define AGENT_CFG_KEY_XIAOZHI_ENDPOINT "xiaozhi_endpoint"
+#define AGENT_CFG_KEY_XIAOZHI_CLIENT_ID "xiaozhi_client_id"
+#define AGENT_CFG_KEY_XIAOZHI_DEVICE_ID "xiaozhi_device_id"
 
 /* ── Vision / Multimodal ─────────────────────────────────────── */
 #define AGENT_VISION_MAX_IMAGE_SIZE \
