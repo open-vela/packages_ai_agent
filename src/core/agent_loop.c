@@ -43,6 +43,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <nuttx/clock.h>
 
 #include "cJSON.h"
 
@@ -65,31 +66,16 @@ static bool llm_call_timed_out(uint32_t latency_ms);
 #define LLM_TIMEOUT_TASK_COMPLETE_MSG \
     "任务已完成，但生成确认消息超时。"
 
-/* ── Clock-safe elapsed time calculation ───────────────────── */
+/* ── Clock-safe elapsed time calculation ─────────────────────
+ * Uses clock_systime_ticks() (NuttX uptime ticks) instead of
+ * gettimeofday() which may return garbage on platforms without
+ * CONFIG_SYSTEM_TIME64 or where the RTC is not yet initialized.
+ * clock_systime_ticks() is always monotonic and reliable. */
 
-static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
-    const struct timeval* t1)
+static inline uint32_t calc_elapsed_ms(clock_t t0, clock_t t1)
 {
-    int32_t sec_diff = (int32_t)(t1->tv_sec - t0->tv_sec);
-    int32_t usec_diff = (int32_t)(t1->tv_usec - t0->tv_usec);
-
-    /* Clock went backwards (NTP jump, manual adjustment) */
-    if (sec_diff < 0) {
-        syslog(LOG_WARNING, "[%s] Clock went backwards, ignoring\n", TAG);
-        return 0;
-    }
-
-    /* Microsecond borrow */
-    if (usec_diff < 0) {
-        sec_diff--;
-        usec_diff += 1000000;
-    }
-
-    if (sec_diff < 0) {
-        return 0;
-    }
-
-    return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
+    clock_t diff = t1 - t0;
+    return (uint32_t)(diff * 1000 / CONFIG_USEC_PER_TICK);
 }
 
 /* ── Memory pool (pre-allocated tool output buffers) ───────── */
@@ -819,11 +805,10 @@ static char* force_finish_reply(const char* system_prompt,
 
     llm_response_t resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    clock_t t0 = clock_systime_ticks();
     int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
-    gettimeofday(&t1, NULL);
-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
+    clock_t t1 = clock_systime_ticks();
+    uint32_t ms = calc_elapsed_ms(t0, t1);
     bool timed_out = llm_call_timed_out(ms);
 
     if (err == OK && !timed_out && resp.text && resp.text_len > 0) {
@@ -989,11 +974,10 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
 
     llm_response_t final_resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    clock_t t0 = clock_systime_ticks();
     int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
-    gettimeofday(&t1, NULL);
-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
+    clock_t t1 = clock_systime_ticks();
+    uint32_t ms = calc_elapsed_ms(t0, t1);
     bool timed_out = llm_call_timed_out(ms);
 
     if (err == OK && !timed_out
@@ -1064,11 +1048,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         send_working_status(msg, iteration);
 
         llm_response_t resp;
-        struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
+        clock_t tick_start, tick_end;
+        tick_start = clock_systime_ticks();
         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
-        gettimeofday(&tv_end, NULL);
-        uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+        tick_end = clock_systime_ticks();
+        uint32_t latency_ms = calc_elapsed_ms(tick_start, tick_end);
 
         /* Router failover: on LLM call failure, try next backend */
         if (err != OK && router_idx >= 0) {
@@ -1083,11 +1067,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 router_idx = next_idx;
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
-                gettimeofday(&tv_start, NULL);
+                tick_start = clock_systime_ticks();
                 err = llm_chat_tools(sys_prompt, messages,
                     tools_json, &resp);
-                gettimeofday(&tv_end, NULL);
-                latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+                tick_end = clock_systime_ticks();
+                latency_ms = calc_elapsed_ms(tick_start, tick_end);
             }
         }
 
@@ -1183,11 +1167,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     router_idx = prem_idx;
                     trace.backend_idx = prem_idx;
 
-                    gettimeofday(&tv_start, NULL);
+                    tick_start = clock_systime_ticks();
                     err = llm_chat_tools(sys_prompt, messages,
                         tools_json, &resp);
-                    gettimeofday(&tv_end, NULL);
-                    latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+                    tick_end = clock_systime_ticks();
+                    latency_ms = calc_elapsed_ms(tick_start, tick_end);
 
                     /* Watchdog check on cascade retry */
                     if (llm_call_timed_out(latency_ms)) {
