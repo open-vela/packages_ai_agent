@@ -32,6 +32,13 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/crypto/mbedtls/mbedtls/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/topics/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/vibrator
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/multimedia/media/include
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/connectivity/bluetooth/framework/include
+ifeq ($(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT),y)
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/audioutils/alsa-lib/include
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/hal
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/osal
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos-hal/hal/source
+endif
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/mqttc/MQTT-C/include
 
 # Source files
@@ -125,6 +132,20 @@ CSRCS += src/infra/network_manager.c
 CSRCS += src/infra/http_proxy.c
 CSRCS += src/infra/vela_tls.c
 
+ifeq ($(CONFIG_AI_AGENT_BLE_GATT),y)
+CSRCS += src/infra/ble_gatt.c
+CSRCS += src/infra/ble_cmd_handler.c
+endif
+
+ifeq ($(CONFIG_AI_AGENT_BLE_NET),y)
+CSRCS += src/infra/ble_net.c
+endif
+
+ifeq ($(CONFIG_AI_AGENT_REST_API),y)
+CSRCS += src/infra/api_handler.c
+CSRCS += src/infra/agent_logbuf.c
+endif
+
 # node/ - 分布式节点
 ifeq ($(CONFIG_AI_AGENT_NODE),y)
 CSRCS += src/node/node_client.c
@@ -133,6 +154,9 @@ endif
 
 # stubs
 CSRCS += src/stubs.c
+
+# local IPC client (flat-build direct call)
+CSRCS += src/sdk/velaclaw_client_local.c
 
 CSRCS += src/ui/qrcode_display.c
 

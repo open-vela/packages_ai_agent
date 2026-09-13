@@ -29,6 +29,9 @@
 #endif
 #include "agent_compat.h"
 #include "agent_config.h"
+#ifdef CONFIG_AI_AGENT_REST_API
+#include "infra/api_handler.h"
+#endif
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -144,33 +147,13 @@ static int make_accept_key(const char* key, char* out, size_t out_size)
 }
 
 /**
+ * WebSocket handshake using pre-read buffer.
  * Read full HTTP upgrade request, extract Sec-WebSocket-Key.
  * Returns 0 on success; sends 101 response.
  */
-/**
- * WebSocket handshake. If pre_buf is non-NULL, use it as already-read
- * HTTP headers; otherwise read from fd.
- */
-static int do_ws_handshake_ex(int fd, const char *pre_buf, int pre_len,
-                               char *chat_id_out, size_t chat_id_size)
+static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
+    char* chat_id_out, size_t chat_id_size)
 {
-    char local_buf[1024];
-    const char *buf;
-
-    if (pre_buf) {
-        buf = pre_buf;
-    } else {
-        int total = 0;
-        while (total < (int)sizeof(local_buf) - 1) {
-            int n = recv(fd, local_buf + total,
-                         sizeof(local_buf) - 1 - total, 0);
-            if (n <= 0) return -1;
-            total += n;
-            local_buf[total] = '\0';
-            if (strstr(local_buf, "\r\n\r\n")) break;
-        }
-        buf = local_buf;
-    }
 
     /* Extract Sec-WebSocket-Key */
     const char *key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
@@ -366,38 +349,49 @@ static void* client_thread(void* arg)
     free(arg);
     int fd = ca.fd;
 
-    /* Peek HTTP headers to decide: A2A HTTP or WebSocket upgrade */
-    char peek_buf[2048];
+    /* Peek HTTP headers to decide: REST API or WebSocket */
+    char* peek_buf = malloc(2048);
+    if (!peek_buf) {
+        close(fd);
+        return NULL;
+    }
     int peek_total = 0;
-    while (peek_total < (int)sizeof(peek_buf) - 1) {
+    while (peek_total < 2048 - 1) {
         int n = recv(fd, peek_buf + peek_total,
-                     sizeof(peek_buf) - 1 - peek_total, 0);
-        if (n <= 0) { close(fd); return NULL; }
+            2048 - 1 - peek_total, 0);
+        if (n <= 0) {
+            free(peek_buf);
+            close(fd);
+            return NULL;
+        }
         peek_total += n;
         peek_buf[peek_total] = '\0';
-        if (strstr(peek_buf, "\r\n\r\n")) break;
+        if (strstr(peek_buf, "\r\n\r\n"))
+            break;
     }
 
-    /* Try A2A HTTP routes first */
-    if (a2a_try_handle(fd, peek_buf, peek_total)) {
+    /* Try REST API (config/skills/logs) */
+#ifdef CONFIG_AI_AGENT_REST_API
+    if (api_try_handle(fd, peek_buf, peek_total)) {
+        free(peek_buf);
+        struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         close(fd);
         return NULL;
     }
+#endif
 
-    /* Try MCP Server (for remote MCP client integration) */
-    if (mcp_server_try_handle_http(fd, peek_buf, peek_total)) {
-        close(fd);
-        return NULL;
-    }
-
-    /* Not A2A — proceed with WebSocket handshake */
+    /* Not REST API - proceed with WebSocket handshake using pre-read buffer */
     char chat_id[32];
     if (do_ws_handshake_ex(fd, peek_buf, peek_total,
-                            chat_id, sizeof(chat_id)) != 0) {
+            chat_id, sizeof(chat_id))
+        != 0) {
         syslog(LOG_WARNING, "[%s] Handshake failed for fd=%d\n", TAG, fd);
+        free(peek_buf);
         close(fd);
         return NULL;
     }
+    free(peek_buf);
 
     /* Register client */
     pthread_mutex_lock(&s_clients_mtx);

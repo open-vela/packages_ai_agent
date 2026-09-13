@@ -149,6 +149,19 @@ config AI_AGENT_AUDIO_CAPTURE_GAIN
 		- 6 = Compensate for 6-channel DMIC with 1 active mic
 		- Higher values for more amplification (may clip)
 
+config AI_AGENT_AUDIO_ALSA_DIRECT
+	bool "Use direct ALSA capture backend"
+	default n
+	---help---
+		Capture audio directly through the ALSA (aw-alsa-lib) PCM
+		interface instead of the portable media_recorder backend.
+		This requires chip-specific ALSA headers and the Allwinner
+		R528 rtos-hal include tree, so it only builds on boards that
+		ship that SDK. Leave disabled (the default) on all other
+		boards; the agent then uses the media framework recorder,
+		which works everywhere. When enabled, the agent still falls
+		back to media_recorder at runtime if ALSA capture fails.
+
 config AI_AGENT_CAMERA
 	bool "Enable camera capture tool"
 	default n
@@ -300,5 +313,30 @@ config AI_AGENT_TLS_CONN_POOL_SIZE
 		Number of persistent TLS connections kept alive for
 		reuse. Each slot uses ~12KB BSS (TLS context + raw
 		buffer). Set to 1 on memory-constrained boards.
+
+config AI_AGENT_BLE_GATT
+	bool "Enable BLE GATT data channel"
+	default n
+	---help---
+		Enable BLE GATT data channel using Nordic UART Service
+		(NUS) pattern. Provides bidirectional data exchange over
+		BLE with any GATT client (iOS/Android). Works on BLE-only
+		chips without classic Bluetooth SPP support.
+
+config AI_AGENT_BLE_NET
+	bool "Enable BLE SPP network proxy"
+	default n
+	---help---
+		Enable BLE SPP + TUN based network proxy channel.
+		Provides internet access via phone companion app over
+		Bluetooth SPP. For devices without Wi-Fi.
+
+config AI_AGENT_REST_API
+	bool "Enable REST API endpoints"
+	default n
+	---help---
+		Enable HTTP REST API endpoints accessible via WebSocket
+		server for remote configuration, skill management, and
+		log retrieval from Android companion App.
 
 endif

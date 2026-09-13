@@ -432,6 +432,14 @@ static void* recording_thread(void* arg)
         int n = audio_capture_read(s_voice.cap,
             chunk, sizeof(chunk));
 
+        if (n == -EAGAIN || n == -EWOULDBLOCK) {
+            /* Non-blocking capture socket has no data yet (common right
+             * after start before the first frames arrive). Retry instead
+             * of treating it as a fatal error. */
+            usleep(10000);
+            continue;
+        }
+
         if (n <= 0) {
             syslog(LOG_WARNING,
                 "[%s] capture read returned %d, stopping\n", TAG, n);
@@ -732,6 +740,7 @@ int voice_channel_start(void)
             s_voice.asr_stream = NULL;
         }
         pthread_mutex_unlock(&s_voice.lock);
+        audio_capture_abort(s_voice.cap);
         pthread_join(s_voice.rec_thread, NULL);
         audio_capture_close(s_voice.cap);
         s_voice.cap = NULL;
@@ -752,6 +761,8 @@ int voice_channel_stop(void)
     }
     s_voice.state = VOICE_STOPPING;
     pthread_mutex_unlock(&s_voice.lock);
+
+    audio_capture_abort(s_voice.cap);
 
     /* Wait for recording thread to finish */
     pthread_join(s_voice.rec_thread, NULL);
@@ -862,6 +873,8 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     }
     s_voice.state = VOICE_STOPPING;
     pthread_mutex_unlock(&s_voice.lock);
+
+    audio_capture_abort(s_voice.cap);
 
     /* Wait for recording thread to finish */
     pthread_join(s_voice.rec_thread, NULL);
@@ -1210,4 +1223,9 @@ int voice_channel_test_asr(const char* pcm_path)
 
     printf("ASR test started (background thread).\n");
     return 0;
+}
+
+void voice_channel_cleanup(void)
+{
+    voice_channel_stop();
 }

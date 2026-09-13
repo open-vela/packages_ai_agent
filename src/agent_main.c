@@ -80,6 +80,12 @@
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #include "ui/lvgl_ui_channel.h"
 #endif
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+#include "infra/ble_cmd_handler.h"
+#include "infra/ble_gatt.h"
+#include <bluetooth.h>
+#include <bt_adapter.h>
+#endif
 
 static const char* TAG = "agent";
 
@@ -210,6 +216,120 @@ static void* network_watch_task(void* arg)
     return NULL;
 }
 
+#ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+/* -- Quickapp mqueue IPC (cross-process bridge) --------------- */
+
+#include <mqueue.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#define VELACLAW_MQ_QAPP_IN   "/velaclaw_qapp_in"
+#define VELACLAW_MQ_QAPP_OUT  "/velaclaw_qapp_out"
+#define VELACLAW_MQ_MSG_SIZE  4096
+#define VELACLAW_MQ_MAX_MSGS  4
+
+/**
+ * Reads requests from the quickapp process via POSIX mqueue and feeds
+ * them into the local message_bus inbound queue.
+ */
+static void *quickapp_mq_listener_task(void *arg)
+{
+    (void)arg;
+    syslog(LOG_INFO, "[%s] Quickapp mqueue listener started\n", TAG);
+
+    struct mq_attr attr = {
+        .mq_maxmsg  = VELACLAW_MQ_MAX_MSGS,
+        .mq_msgsize = VELACLAW_MQ_MSG_SIZE,
+    };
+    mqd_t mq = mq_open(VELACLAW_MQ_QAPP_IN, O_RDONLY | O_CREAT, 0666, &attr);
+    if (mq == (mqd_t)-1) {
+        syslog(LOG_ERR, "[%s] Failed to open quickapp inbound mqueue: %d\n", TAG, errno);
+        return NULL;
+    }
+
+    char *buf = (char *)malloc(VELACLAW_MQ_MSG_SIZE);
+    if (!buf) {
+        syslog(LOG_ERR, "[%s] Failed to allocate mqueue recv buffer\n", TAG);
+        mq_close(mq);
+        return NULL;
+    }
+
+    while (1) {
+        ssize_t n = mq_receive(mq, buf, VELACLAW_MQ_MSG_SIZE, NULL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            syslog(LOG_ERR, "[%s] mq_receive failed: %d\n", TAG, errno);
+            break;
+        }
+        if (n >= (ssize_t)VELACLAW_MQ_MSG_SIZE) {
+            n = VELACLAW_MQ_MSG_SIZE - 1;
+        }
+        buf[n] = '\0';
+
+        /* Message format: "chat_id\nquery" */
+        char *sep = strchr(buf, '\n');
+        if (!sep) {
+            syslog(LOG_WARNING, "[%s] Malformed quickapp message\n", TAG);
+            continue;
+        }
+        *sep = '\0';
+        const char *chat_id = buf;
+        const char *query = sep + 1;
+
+        syslog(LOG_INFO, "[%s] Quickapp request: chat_id=%s query=%.40s\n",
+               TAG, chat_id, query);
+
+        agent_msg_t msg = {0};
+        strncpy(msg.channel, AGENT_CHAN_QUICKAPP, sizeof(msg.channel) - 1);
+        strncpy(msg.chat_id, chat_id, sizeof(msg.chat_id) - 1);
+        msg.content = strdup(query);
+        if (msg.content) {
+            message_bus_push_inbound(&msg);
+        }
+    }
+
+    free(buf);
+    mq_close(mq);
+    return NULL;
+}
+
+/**
+ * Send a reply to the quickapp process via the outbound mqueue.
+ * Called from the outbound dispatch thread in the agent process.
+ */
+static void quickapp_mq_dispatch(const char *chat_id, const char *content)
+{
+    struct mq_attr attr = {
+        .mq_maxmsg  = VELACLAW_MQ_MAX_MSGS,
+        .mq_msgsize = VELACLAW_MQ_MSG_SIZE,
+    };
+    mqd_t mq = mq_open(VELACLAW_MQ_QAPP_OUT, O_WRONLY | O_CREAT, 0666, &attr);
+    if (mq == (mqd_t)-1) {
+        syslog(LOG_ERR, "[%s] quickapp dispatch: mq_open failed: %d\n", TAG, errno);
+        return;
+    }
+
+    char *buf = (char *)malloc(VELACLAW_MQ_MSG_SIZE);
+    if (!buf) {
+        mq_close(mq);
+        return;
+    }
+    int len = snprintf(buf, VELACLAW_MQ_MSG_SIZE, "%s\n%s", chat_id, content);
+    if (len >= (int)VELACLAW_MQ_MSG_SIZE) {
+        len = VELACLAW_MQ_MSG_SIZE - 1;
+        buf[len] = '\0';
+    }
+
+    if (mq_send(mq, buf, len + 1, 0) != 0) {
+        syslog(LOG_ERR, "[%s] quickapp dispatch: mq_send failed: %d\n", TAG, errno);
+    } else {
+        syslog(LOG_INFO, "[%s] quickapp dispatch: reply sent chat_id=%s\n", TAG, chat_id);
+    }
+    free(buf);
+    mq_close(mq);
+}
+#endif /* CONFIG_FEATURE_SYSTEM_VELACLAW */
+
 /* ── Outbound dispatch ────────────────────────────────────────── */
 
 /* ── Voice failure cooldown — prevent error-message cascade ──── */
@@ -219,7 +339,7 @@ static time_t s_voice_cooldown_until;
 
 /**
  * Reads messages from the outbound queue and dispatches them to the
- * appropriate channel (Feishu, WebSocket, CLI, etc.).
+ * appropriate channel (FeiShu, WebSocket, CLI, etc.).
  */
 static void* outbound_dispatch_task(void* arg)
 {
@@ -315,6 +435,10 @@ static void* outbound_dispatch_task(void* arg)
 #endif
         } else if (strcmp(msg.channel, AGENT_CHAN_SYSTEM) == 0) {
             syslog(LOG_INFO, "[%s] System message [%s]: %.128s\n", TAG, msg.chat_id, msg.content);
+#ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+        } else if (strcmp(msg.channel, AGENT_CHAN_QUICKAPP) == 0) {
+            quickapp_mq_dispatch(msg.chat_id, msg.content);
+#endif
         } else if (strcmp(msg.channel, "cli") == 0) {
             pthread_mutex_lock(&g_stdout_lock);
             printf("\n[Agent]: %s\nvela> ", msg.content);
@@ -513,6 +637,16 @@ int ai_agent_main(int argc, char* argv[])
     }
     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
 
+#ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+    /* Quickapp mqueue listener - receives requests from quickapp process */
+    if (agent_task_create(quickapp_mq_listener_task, "qapp_mq",
+                         AGENT_OUTBOUND_STACK, NULL,
+                         AGENT_OUTBOUND_PRIO) != OK) {
+        syslog(LOG_WARNING, "[%s] Failed to start quickapp mqueue listener\n", TAG);
+    }
+    BOOT_LOG(&t0, "P5", "quickapp mqueue listener started");
+#endif
+
     /* Cron + heartbeat don't need network */
     cron_service_start();
     heartbeat_start();
@@ -522,6 +656,45 @@ int ai_agent_main(int argc, char* argv[])
     if (lvgl_ui_channel_start() != OK)
         syslog(LOG_WARNING, "[%s] lvgl_ui_channel_start failed\n", TAG);
     BOOT_LOG(&t0, "P5", "lvgl_ui_channel started");
+#endif
+
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+    /* BLE GATT: ensure adapter enabled, then init with retries */
+    {
+        extern void ble_cmd_handler_recv(const uint8_t* data, uint16_t len,
+            void* user_data);
+        bt_instance_t* bt_ins = bluetooth_get_instance();
+        if (bt_ins) {
+            bt_adapter_state_t state = bt_adapter_get_state(bt_ins);
+            if (state < BT_ADAPTER_STATE_BLE_ON) {
+                syslog(LOG_INFO, "[%s] BT not ready (state=%d), enabling LE...\n",
+                    TAG, (int)state);
+                bt_adapter_enable_le(bt_ins);
+                sleep(2);
+            }
+        }
+
+        ble_gatt_config_t ble_cfg = {
+            .device_name = "VelaClaw",
+            .recv_cb = ble_cmd_handler_recv,
+        };
+        int rc = -1;
+        int attempts = 0;
+        while (rc < 0 && attempts < 5) {
+            rc = ble_gatt_init(&ble_cfg);
+            if (rc < 0) {
+                syslog(LOG_WARNING, "[%s] ble_gatt_init attempt %d failed: %d\n",
+                    TAG, attempts + 1, rc);
+                sleep(3);
+            }
+            attempts++;
+        }
+        if (rc == 0) {
+            BOOT_LOG(&t0, "P5", "ble_gatt init OK");
+        } else {
+            BOOT_LOG(&t0, "P5", "ble_gatt FAILED after retries");
+        }
+    }
 #endif
 
     /* Network watcher thread: reconnect + wait + start net services */

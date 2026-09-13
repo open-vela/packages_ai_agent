@@ -296,6 +296,9 @@
 #define AGENT_CHAN_FEISHU "feishu"
 #define AGENT_CHAN_MQTT "mqtt"
 #define AGENT_CHAN_WEIXIN "weixin"
+#ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
+#define AGENT_CHAN_QUICKAPP "quickapp"
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #define AGENT_CHAN_LVGL_UI "lvgl_ui"
 #endif

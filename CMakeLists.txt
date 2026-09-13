@@ -126,18 +126,20 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   endif()
 
   if(CONFIG_AI_AGENT_BLE_GATT)
-    list(APPEND AGENT_SRCS src/infra/ble_gatt.c)
+    list(APPEND AGENT_SRCS
+      src/infra/ble_gatt.c
+      src/infra/ble_cmd_handler.c
+    )
   endif()
 
   if(CONFIG_AI_AGENT_BLE_NET)
     list(APPEND AGENT_SRCS src/infra/ble_net.c)
   endif()
 
-  if(CONFIG_AI_AGENT_XIAOZHI)
+  if(CONFIG_AI_AGENT_REST_API)
     list(APPEND AGENT_SRCS
-      src/channels/xiaozhi_channel.c
-      src/channels/xiaozhi_opus.c
-      src/channels/xiaozhi_udp.c
+      src/infra/api_handler.c
+      src/infra/agent_logbuf.c
     )
   endif()
 
@@ -156,8 +158,21 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   # Media framework
   set(MEDIA_INC ${CMAKE_SOURCE_DIR}/../frameworks/multimedia/media/include)
 
+  # Bluetooth framework
+  set(BT_INC ${CMAKE_SOURCE_DIR}/../frameworks/connectivity/bluetooth/framework/include)
+
   # MQTT-C library
   set(MQTTC_INC ${NUTTX_APPS_DIR}/netutils/mqttc/MQTT-C/include)
+
+  # Direct ALSA capture backend (chip-specific, opt-in)
+  if(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT)
+    set(ALSA_DIRECT_INC
+      ${NUTTX_APPS_DIR}/audioutils/alsa-lib/include
+      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/hal
+      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/osal
+      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/hal/source
+    )
+  endif()
 
   # BES AEC (audio preprocessing: NS + AGC)
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
@@ -174,11 +189,16 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     ${TOPICS_INC}
     ${VIBRATOR_INC}
     ${MEDIA_INC}
+    ${BT_INC}
     ${MQTTC_INC}
   )
 
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
     list(APPEND AGENT_INCDIRS ${BES_AEC_INC})
+  endif()
+
+  if(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT)
+    list(APPEND AGENT_INCDIRS ${ALSA_DIRECT_INC})
   endif()
 
   nuttx_add_application(
