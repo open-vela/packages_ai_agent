@@ -447,6 +447,13 @@ static void* outbound_dispatch_task(void* arg)
              * console conversations too; this channel renders no bubble. */
             lvgl_ui_channel_log(msg.content, false);
 #endif
+        } else if (strcmp(msg.channel, "care") == 0) {
+            /* pet_care L2 follow-up: rendered as a second bubble on the pet
+             * stage (L1 template already went out first). */
+            syslog(LOG_INFO, "[agent] [Care]: %s\n", msg.content);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            lvgl_ui_channel_send(msg.content);
+#endif
         } else {
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }

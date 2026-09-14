@@ -102,6 +102,9 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   if(CONFIG_AI_AGENT_LVGL_UI)
     list(APPEND AGENT_SRCS src/ui/lvgl_ui_channel.c)
     list(APPEND AGENT_SRCS src/ui/pet_display.c)
+    # pet_care: proactive companion scheduler (idle care / alarm / hr alert);
+    # tick runs on the render thread, L2 goes through the message bus.
+    list(APPEND AGENT_SRCS src/ui/pet_care.c)
     list(APPEND AGENT_SRCS src/ui/launcher_page.c)
     list(APPEND AGENT_SRCS src/ui/about_page.c)
     list(APPEND AGENT_SRCS src/ui/pet_page.c)

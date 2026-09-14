@@ -34,6 +34,7 @@
 #include "pet_page.h"
 #include "lvgl_ui_channel.h"
 #include "core/message_bus.h"
+#include "pet_care.h"
 
 #define TAG "key"
 
@@ -251,6 +252,10 @@ static void *key_monitor_thread(void *arg)
             continue;
         }
         last_event_ms = key_now_ms();
+
+        /* 任何按键都算用户活动：复位空闲关怀计时（闹钟 pending 时
+         * note_activity 内部按唤醒确认处理） */
+        pet_care_note_activity();
 
         if (pressed & KEY_BIT_KEY1) {
             key_action_open_pet();

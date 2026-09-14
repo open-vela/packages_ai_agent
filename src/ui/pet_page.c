@@ -31,6 +31,7 @@
 #include <time.h>
 #include "pet_page.h"
 #include "lvgl_ui_channel.h"
+#include "pet_care.h"
 
 /****************************************************************************
  * Private Data
@@ -314,6 +315,9 @@ static void on_cloud_clicked(lv_event_t *e)
     (void)e;
     printf("[PetPage] Cloud tapped\n");
 
+    /* 触摸活动：复位空闲关怀计时（闹钟 pending 时视为唤醒确认） */
+    pet_care_note_activity();
+
     /* Playful reply in the AI text layer, restore greeting after 3s */
     if (ai_text_label != NULL)
     {
@@ -341,6 +345,7 @@ static void on_back_clicked(lv_event_t *e)
 {
     (void)e;
     printf("[PetPage] Back button clicked\n");
+    pet_care_note_activity();
     if (back_callback != NULL)
     {
         back_callback();
