@@ -49,6 +49,7 @@ config EXAMPLES_AI_AGENT_VELA_TIME_OFFSET_SEC
 		get_current_time and the system prompt header compute local
 		time as clock + this offset. Set 0 when the system clock already
 		runs local wall time (e.g. VelaGuard HMI syncs Beijing time).
+		Typical values are 0 or 28800 (UTC+8).
 
 config EXAMPLES_AI_AGENT_VELA_DATA_DIR
 	string "Persistent data directory"
