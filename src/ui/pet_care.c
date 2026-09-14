@@ -23,6 +23,7 @@
 #include "lvgl_ui_channel.h"
 #include "pet_display.h"
 #include "core/message_bus.h"
+#include "health/hr_monitor.h"
 
 #define TAG "pet_care"
 
@@ -287,6 +288,7 @@ void pet_care_tick(void)
     /* 1Hz 逻辑 */
     care_alarm_check();
     care_idle_check();
+    hr_monitor_tick();   /* 场景③：模拟心率步进 + 阈值判定 */
 }
 
 void pet_care_note_activity(void)

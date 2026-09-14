@@ -22,6 +22,10 @@
 #ifndef AI_AGENT_PET_CARE_H
 #define AI_AGENT_PET_CARE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* 常量（编译期兜底；做成 Kconfig int 项属于后续调优，不阻塞交付） */
 #define PET_CARE_IDLE_MIN_DEFAULT     5    /* 空闲多少分钟后主动开口 */
 #define PET_CARE_COOLDOWN_MIN_DEFAULT 10   /* 两次关怀之间的最短间隔 */
@@ -59,5 +63,9 @@ void pet_care_alarm_cancel(void);
 
 /* 场景③心率（Task 1.3 由 health/hr_monitor.c 超阈值时调用） */
 void pet_care_hr_report(int bpm);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AI_AGENT_PET_CARE_H */

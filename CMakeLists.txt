@@ -105,6 +105,9 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     # pet_care: proactive companion scheduler (idle care / alarm / hr alert);
     # tick runs on the render thread, L2 goes through the message bus.
     list(APPEND AGENT_SRCS src/ui/pet_care.c)
+    # hr_monitor: simulated heart-rate walk (scenario 3); threshold routes
+    # back into pet_care_hr_report.
+    list(APPEND AGENT_SRCS src/health/hr_monitor.c)
     list(APPEND AGENT_SRCS src/ui/launcher_page.c)
     list(APPEND AGENT_SRCS src/ui/about_page.c)
     list(APPEND AGENT_SRCS src/ui/pet_page.c)
@@ -293,6 +296,23 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       ask
     SRCS
       src/channels/ask_main.c
+    INCLUDE_DIRECTORIES
+      ${AGENT_INCDIRS}
+    COMPILE_FLAGS
+      -Wno-error
+    STACKSIZE
+      2048
+    PRIORITY
+      100
+  )
+
+  # "hr_set" NSH builtin: drive the simulated heart-rate monitor
+  # (scenario 3 demo entry point: set baseline / inject spike event).
+  nuttx_add_application(
+    NAME
+      hr_set
+    SRCS
+      src/health/hr_cmd.c
     INCLUDE_DIRECTORIES
       ${AGENT_INCDIRS}
     COMPILE_FLAGS
