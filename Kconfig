@@ -117,8 +117,38 @@ config AI_AGENT_TOUCH_PATH
 	default "/dev/input0"
 	depends on AI_AGENT_LVGL_UI
 	---help---
-		Touchscreen input device used by the LVGL UI.
+		Framebuffer/LCD device used by the LVGL UI.
 		/dev/input0 on both SF32LB52 and the goldfish emulator.
+
+config AI_AGENT_CARE_IDLE_MIN
+	int "Idle minutes before proactive care"
+	default 5
+	range 1 120
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_COOLDOWN_MIN
+	int "Minimum minutes between proactive care messages"
+	default 10
+	range 1 240
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_QUIET_START
+	int "Quiet hours start (local hour)"
+	default 22
+	range 0 23
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_QUIET_END
+	int "Quiet hours end (local hour)"
+	default 7
+	range 0 23
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_HR_HIGH
+	int "Simulated heart-rate reminder threshold (bpm)"
+	default 120
+	range 90 180
+	depends on AI_AGENT_LVGL_UI
 
 config AI_AGENT_FEISHU
 	bool "Enable Feishu bot channel"

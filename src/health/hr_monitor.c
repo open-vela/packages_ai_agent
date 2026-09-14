@@ -8,8 +8,10 @@
  * Team 181 - Contest 2026
  */
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <syslog.h>
+#include <time.h>
 
 #include "hr_monitor.h"
 #include "ui/pet_care.h"
@@ -20,6 +22,8 @@
  * Private Data
  ****************************************************************************/
 
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int s_rand_state = 1; /* 模块私有 PRNG */
 static int  s_base = 78;          /* 模拟基线（hr_set 可改） */
 static int  s_current = 78;       /* 当前值 */
 static bool s_event_active;        /* 注入事件进行中 */
@@ -38,11 +42,19 @@ static int clampi(int v, int lo, int hi)
 
 void hr_monitor_tick(void)
 {
-  int next = s_current;
+  int alert_bpm = 0;
+  int next;
   int peak = 0;
 
+  pthread_mutex_lock(&s_lock);
+  next = s_current;
+  if (s_rand_state == 1)
+    {
+      s_rand_state = (unsigned int)time(NULL) ^ (unsigned int)clock();
+    }
+
   /* 随机游走一步：±1 bpm */
-  next += (rand() % 3) - 1;
+  next += (int)(rand_r(&s_rand_state) % 3) - 1;
 
   if (s_event_active)
     {
@@ -52,8 +64,9 @@ void hr_monitor_tick(void)
         {
           /* 上升段：向峰值线性爬升 + 扰动 */
           peak = HR_MONITOR_EVENT_PEAK_MIN +
-                 rand() % (HR_MONITOR_EVENT_PEAK_MAX -
-                           HR_MONITOR_EVENT_PEAK_MIN + 1);
+                 (int)(rand_r(&s_rand_state) %
+                       (HR_MONITOR_EVENT_PEAK_MAX -
+                        HR_MONITOR_EVENT_PEAK_MIN + 1));
           next = s_current + (peak - s_current + 2) / 3;  /* 每秒收 1/3 差距 */
         }
       else if (s_event_elapsed <= HR_MONITOR_EVENT_RISE_S +
@@ -90,7 +103,7 @@ void hr_monitor_tick(void)
       if (!s_alerted_this_event)
         {
           s_alerted_this_event = true;
-          pet_care_hr_report(s_current);
+          alert_bpm = s_current;
         }
     }
   else if (s_current < HR_MONITOR_HIGH_DEFAULT - 15)
@@ -98,25 +111,46 @@ void hr_monitor_tick(void)
       /* 回到安全区间足够深才重置告警标志，避免在阈值附近抖动重报 */
       s_alerted_this_event = false;
     }
+  pthread_mutex_unlock(&s_lock);
+
+  /* 回调可能排 UI 消息并获取 pet_care 锁，必须在 hr 锁外执行。 */
+  if (alert_bpm > 0)
+    {
+      pet_care_hr_report(alert_bpm);
+    }
 }
 
 int hr_monitor_set(int base_bpm)
 {
+  int actual;
+
+  pthread_mutex_lock(&s_lock);
   s_base = clampi(base_bpm, HR_MONITOR_BASE_MIN, HR_MONITOR_BASE_MAX);
-  syslog(LOG_INFO, "[%s] baseline set to %d bpm\n", TAG, s_base);
-  return s_base;
+  actual = s_base;
+  pthread_mutex_unlock(&s_lock);
+
+  syslog(LOG_INFO, "[%s] baseline set to %d bpm\n", TAG, actual);
+  return actual;
 }
 
 void hr_monitor_inject_event(void)
 {
+  pthread_mutex_lock(&s_lock);
   s_event_active = true;
   s_event_elapsed = 0;
   s_alerted_this_event = false;
+  pthread_mutex_unlock(&s_lock);
+
   syslog(LOG_INFO, "[%s] event injected (peak in %ds)\n",
          TAG, HR_MONITOR_EVENT_RISE_S);
 }
 
 int hr_monitor_current(void)
 {
-  return s_current;
+  int current;
+
+  pthread_mutex_lock(&s_lock);
+  current = s_current;
+  pthread_mutex_unlock(&s_lock);
+  return current;
 }

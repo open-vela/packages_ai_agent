@@ -22,15 +22,33 @@
 #ifndef AI_AGENT_PET_CARE_H
 #define AI_AGENT_PET_CARE_H
 
+#include <nuttx/config.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* 常量（编译期兜底；做成 Kconfig int 项属于后续调优，不阻塞交付） */
-#define PET_CARE_IDLE_MIN_DEFAULT     5    /* 空闲多少分钟后主动开口 */
-#define PET_CARE_COOLDOWN_MIN_DEFAULT 10   /* 两次关怀之间的最短间隔 */
-#define PET_CARE_QUIET_START_DEFAULT   22   /* 静默期开始（时，含） */
-#define PET_CARE_QUIET_END_DEFAULT      7   /* 静默期结束（时，不含） */
+#ifdef CONFIG_AI_AGENT_CARE_IDLE_MIN
+#  define PET_CARE_IDLE_MIN_DEFAULT CONFIG_AI_AGENT_CARE_IDLE_MIN
+#else
+#  define PET_CARE_IDLE_MIN_DEFAULT 5
+#endif
+#ifdef CONFIG_AI_AGENT_CARE_COOLDOWN_MIN
+#  define PET_CARE_COOLDOWN_MIN_DEFAULT CONFIG_AI_AGENT_CARE_COOLDOWN_MIN
+#else
+#  define PET_CARE_COOLDOWN_MIN_DEFAULT 10
+#endif
+#ifdef CONFIG_AI_AGENT_CARE_QUIET_START
+#  define PET_CARE_QUIET_START_DEFAULT CONFIG_AI_AGENT_CARE_QUIET_START
+#else
+#  define PET_CARE_QUIET_START_DEFAULT 22
+#endif
+#ifdef CONFIG_AI_AGENT_CARE_QUIET_END
+#  define PET_CARE_QUIET_END_DEFAULT CONFIG_AI_AGENT_CARE_QUIET_END
+#else
+#  define PET_CARE_QUIET_END_DEFAULT 7
+#endif
 #define PET_CARE_ALARM_ESC_SEC       120   /* 闹钟到点后无响应的升级窗口 */
 
 /* 情绪场景，决定模板库取哪一组 */

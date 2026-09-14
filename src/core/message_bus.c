@@ -217,6 +217,15 @@ int message_bus_push_inbound(const agent_msg_t *msg)
     return msg_queue_push(&g_inbound_queue, msg, AGENT_BUS_PUSH_TIMEOUT_MS);
 }
 
+int message_bus_try_push_inbound(const agent_msg_t *msg)
+{
+    if (msg == NULL) {
+        return ERROR;
+    }
+
+    return msg_queue_push(&g_inbound_queue, msg, 0);
+}
+
 int message_bus_pop_inbound(agent_msg_t *msg, uint32_t timeout_ms)
 {
     if (msg == NULL) {

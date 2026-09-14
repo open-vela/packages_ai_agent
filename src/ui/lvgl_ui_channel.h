@@ -19,6 +19,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "pet_display.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -65,6 +67,12 @@ void lvgl_ui_enter_pet_stage(void);
  * @return 0 成功，负值表示错误
  */
 int lvgl_ui_channel_send(const char* text);
+
+/**
+ * 发送 Agent 气泡但不触发 TTS。供 render 线程内的主动关怀使用，
+ * 避免在 LVGL render loop 中同步等待语音播放。
+ */
+int lvgl_ui_channel_send_silent(const char* text, pet_emotion_t emotion);
 
 /**
  * 发送用户消息到 UI（ASR 识别结果）。

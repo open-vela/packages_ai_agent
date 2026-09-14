@@ -56,6 +56,10 @@ void message_bus_wakeup(void);
  *  On failure (queue full / timeout) the caller still owns them. */
 int message_bus_push_inbound(const agent_msg_t *msg);
 
+/** Try to push inbound without waiting.  On success the bus owns heap members;
+ *  on failure the caller retains ownership.  Use from render/UI threads. */
+int message_bus_try_push_inbound(const agent_msg_t *msg);
+
 /** Block until an inbound message is available (or timeout expires).
  *  Caller must free msg->content / msg->image_b64 when done. */
 int message_bus_pop_inbound(agent_msg_t *msg, uint32_t timeout_ms);

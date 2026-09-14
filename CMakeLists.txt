@@ -306,22 +306,23 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       100
   )
 
-  # "hr_set" NSH builtin: drive the simulated heart-rate monitor
-  # (scenario 3 demo entry point: set baseline / inject spike event).
-  nuttx_add_application(
-    NAME
-      hr_set
-    SRCS
-      src/health/hr_cmd.c
-    INCLUDE_DIRECTORIES
-      ${AGENT_INCDIRS}
-    COMPILE_FLAGS
-      -Wno-error
-    STACKSIZE
-      2048
-    PRIORITY
-      100
-  )
+  # "hr_set" exists only with the UI/care scheduler that owns hr_monitor.
+  if(CONFIG_AI_AGENT_LVGL_UI)
+    nuttx_add_application(
+      NAME
+        hr_set
+      SRCS
+        src/health/hr_cmd.c
+      INCLUDE_DIRECTORIES
+        ${AGENT_INCDIRS}
+      COMPILE_FLAGS
+        -Wno-error
+      STACKSIZE
+        2048
+      PRIORITY
+        100
+    )
+  endif()
 
   # Force agent_main.c to recompile every build so that
   # AGENT_BUILD_VERSION (__DATE__ " " __TIME__) stays fresh.

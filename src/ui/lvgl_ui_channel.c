@@ -719,10 +719,11 @@ void lvgl_ui_enter_pet_stage(void)
     }
 }
 
-int lvgl_ui_channel_send(const char *text)
+/* Common first half of normal/silent sends.  One call queues one bubble and
+ * one history entry; callers independently choose visual/TTS behavior. */
+static int queue_agent_bubble(const char *text)
 {
     ui_msg_t *payload;
-    pet_emotion_t emotion;
 
     if (!text || text[0] == '\0') {
         return -EINVAL;
@@ -732,7 +733,6 @@ int lvgl_ui_channel_send(const char *text)
         return -EINVAL;
     }
 
-    /* schedule the bubble update on the LVGL thread */
     payload = malloc(sizeof(ui_msg_t));
     if (!payload) {
         return -ENOMEM;
@@ -741,6 +741,31 @@ int lvgl_ui_channel_send(const char *text)
     strncpy(payload->text, text, MSG_MAX_LEN - 1);
     payload->is_user = false;
     lv_async_call(bubble_update_async_cb, payload);
+    return 0;
+}
+
+int lvgl_ui_channel_send_silent(const char *text, pet_emotion_t emotion)
+{
+    int ret = queue_agent_bubble(text);
+
+    if (ret != 0) {
+        return ret;
+    }
+    /* Silent means no TTS, not no expression. */
+    pet_display_set_emotion(emotion);
+    pet_back_idle_after(1500);
+    return 0;
+}
+
+int lvgl_ui_channel_send(const char *text)
+{
+    pet_emotion_t emotion;
+    int ret;
+
+    ret = queue_agent_bubble(text);
+    if (ret != 0) {
+        return ret;
+    }
 
     /* emotion follows the reply content */
     emotion = emotion_from_text(text);

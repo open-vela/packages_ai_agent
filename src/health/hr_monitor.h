@@ -18,13 +18,19 @@
 #ifndef AI_AGENT_HR_MONITOR_H
 #define AI_AGENT_HR_MONITOR_H
 
+#include <nuttx/config.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* 阈值（bpm）：超过即触发 pet_care_hr_report。
  * Kconfig 项 AI_AGENT_HR_HIGH 的编译期兜底。 */
-#define HR_MONITOR_HIGH_DEFAULT  120
+#ifdef CONFIG_AI_AGENT_HR_HIGH
+#  define HR_MONITOR_HIGH_DEFAULT CONFIG_AI_AGENT_HR_HIGH
+#else
+#  define HR_MONITOR_HIGH_DEFAULT 120
+#endif
 
 /* 模拟基线范围 */
 #define HR_MONITOR_BASE_MIN      65
