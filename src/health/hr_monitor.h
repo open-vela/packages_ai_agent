@@ -49,7 +49,7 @@ int  hr_monitor_set(int base_bpm);
 /* 注入一次心率飙升事件（同刻已在事件中则刷新为新的 60s 窗口）。 */
 void hr_monitor_inject_event(void);
 
-/* 当前值（只读，供诊断命令打印） */
+/* 当前值（只读，供 hr_set 状态打印） */
 int  hr_monitor_current(void);
 
 #ifdef __cplusplus
