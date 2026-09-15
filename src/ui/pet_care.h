@@ -50,6 +50,13 @@ extern "C" {
 #  define PET_CARE_QUIET_END_DEFAULT 7
 #endif
 #define PET_CARE_ALARM_ESC_SEC       120   /* 闹钟到点后无响应的升级窗口 */
+/* 心率告警冷却独立于关怀冷却：演示中连续注入两次事件很常见，
+ * 10 分钟窗口会把第二次演示全部吞掉。60 秒足以防连环轰炸。 */
+#ifdef CONFIG_AI_AGENT_HR_ALERT_COOLDOWN_S
+#  define PET_CARE_HR_ALERT_COOLDOWN_S CONFIG_AI_AGENT_HR_ALERT_COOLDOWN_S
+#else
+#  define PET_CARE_HR_ALERT_COOLDOWN_S 60
+#endif
 
 /* 情绪场景，决定模板库取哪一组 */
 typedef enum

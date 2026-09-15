@@ -403,10 +403,11 @@ void pet_care_hr_report(int bpm)
 
     pet_care_init();
     pthread_mutex_lock(&s_lock);
-    /* 首次告警不应用冷却；之后持续高值十分钟内只提醒一次。 */
+    /* 首次告警不应用冷却；之后 PET_CARE_HR_ALERT_COOLDOWN_S 秒内的
+     * 持续高值只提醒一次。60s 窗口对演示友好（连续注入两次事件
+     * 都能看到），也足够防单事件内的连环轰炸。 */
     if (s_last_hr_alert_s == 0 ||
-        now - s_last_hr_alert_s >=
-            (time_t)PET_CARE_COOLDOWN_MIN_DEFAULT * 60) {
+        now - s_last_hr_alert_s >= (time_t)PET_CARE_HR_ALERT_COOLDOWN_S) {
         s_last_hr_alert_s = now;
         s_last_care_s = now;
         text = care_pick(g_hr_alert_templates, 2);

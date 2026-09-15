@@ -150,6 +150,17 @@ config AI_AGENT_HR_HIGH
 	range 90 180
 	depends on AI_AGENT_LVGL_UI
 
+config AI_AGENT_HR_ALERT_COOLDOWN_S
+	int "Heart-rate alert cooldown (seconds)"
+	default 60
+	range 10 3600
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Seconds between two heart-rate reminders during sustained
+		high readings. Kept short (60s) so back-to-back demo
+		injections are not swallowed; a single injected event still
+		only alerts once thanks to the per-event latch in hr_monitor.
+
 config AI_AGENT_FEISHU
 	bool "Enable Feishu bot channel"
 	default y
