@@ -382,11 +382,11 @@ int ai_agent_main(int argc, char* argv[])
     }
 
     /* Ensure directory structure exists (No more manual mkdir needed!) */
-    mkdir("/data/agent", 0755);
-    mkdir("/data/agent/config", 0755);
-    mkdir("/data/agent/memory", 0755);
-    mkdir("/data/agent/sessions", 0755);
-    mkdir("/data/agent/skills", 0755);
+    mkdir(AGENT_DATA_DIR, 0755);
+    mkdir(AGENT_CONFIG_DIR, 0755);
+    mkdir(AGENT_MEMORY_DIR, 0755);
+    mkdir(AGENT_SESSION_DIR, 0755);
+    mkdir(AGENT_SKILLS_DIR, 0755);
     BOOT_LOG(&t0, "P0", "storage ready");
 
     /* Memory info */

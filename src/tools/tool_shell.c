@@ -278,7 +278,7 @@ static int builtin_uname(char *output, size_t output_size)
 
 /* Allowed path prefixes for file access (symlink escape protection) */
 static const char *s_allowed_prefixes[] = {
-    "/proc/", "/data/agent/", "/tmp/", NULL
+    "/proc/", AGENT_DATA_DIR "/", "/tmp/", NULL
 };
 
 static bool is_path_allowed(const char *path)
@@ -372,7 +372,7 @@ static int builtin_ls(const char *path, char *output, size_t output_size)
 {
     /* Strip trailing slash for display, but keep for opendir */
     char dir_buf[PATH_MAX];
-    const char *dir = (path && path[0]) ? path : "/data/agent";
+    const char *dir = (path && path[0]) ? path : AGENT_DATA_DIR;
 
     /* Normalise: remove trailing slash (except root "/") so path check works */
     strncpy(dir_buf, dir, sizeof(dir_buf) - 1);

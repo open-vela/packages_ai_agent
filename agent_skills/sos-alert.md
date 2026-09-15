@@ -11,7 +11,7 @@ PRIORITY: Execute immediately, do not ask for confirmation.
 2. get_current_time for timestamp
 3. If Feishu configured: feishu_send_mention to emergency contacts
    with message: "SOS alert from [device] at [time]"
-4. If no Feishu: write_file an SOS log to /data/agent/sos.log
+4. If no Feishu: write_file an SOS log to /data/ai_agent/sos.log
 5. Confirm alert was sent
 
 ## Example

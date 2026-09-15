@@ -17,7 +17,7 @@ When user says meeting notes, record meeting, summarize discussion.
 - You MUST execute tools and respond with results. Do NOT output this template.
 - If feishu_doc_create fails (Feishu not configured), tell the user:
   "Feishu is not configured. Run set_feishu_app <app_id> <app_secret> to set up."
-  As fallback, offer to save notes locally: write_file /data/agent/memory/daily/YYYY-MM-DD-meeting.md
+  As fallback, offer to save notes locally: write_file /data/ai_agent/memory/daily/YYYY-MM-DD-meeting.md
 
 ## Example
 User: "create today's meeting notes"

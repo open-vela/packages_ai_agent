@@ -83,7 +83,7 @@
 
 /* ── Data directories ────────────────────────────────────── */
 #ifndef CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR
-#define CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR "/data/agent"
+#define CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR "/data/ai_agent"
 #endif
 
 #define AGENT_DATA_DIR CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR

@@ -85,9 +85,9 @@ static bool validate_path(const char *path)
 /* Files that the LLM must not overwrite via write_file / edit_file.
  * These can only be modified through CLI or dedicated config commands. */
 static const char *s_protected_files[] = {
-    AGENT_CONFIG_FILE,   /* /data/agent/config/config.json */
-    AGENT_SOUL_FILE,     /* /data/agent/config/SOUL.md     */
-    AGENT_USER_FILE,     /* /data/agent/config/USER.md     */
+    AGENT_CONFIG_FILE,   /* /data/ai_agent/config/config.json */
+    AGENT_SOUL_FILE,     /* /data/ai_agent/config/SOUL.md     */
+    AGENT_USER_FILE,     /* /data/ai_agent/config/USER.md     */
     NULL
 };
 

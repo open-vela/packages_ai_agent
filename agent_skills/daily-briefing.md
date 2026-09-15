@@ -8,7 +8,7 @@ Also useful as a heartbeat/cron task.
 
 ## How to use
 1. Use get_current_time for today's date and time
-2. Try to read /data/agent/memory/MEMORY.md for user preferences and context
+2. Try to read /data/ai_agent/memory/MEMORY.md for user preferences and context
    - If the file does not exist or is empty, skip this step and use general interests (tech, AI, weather)
 3. Try to read today's daily note if it exists
    - If no daily note exists, skip this step

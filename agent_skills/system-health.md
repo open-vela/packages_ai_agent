@@ -7,8 +7,8 @@ When user asks about system status, health check, or running state.
 
 ## How to use
 1. get_current_time to get current time
-2. list_dir to list /data/agent/ files
-3. read_file /data/agent/config/config.json to check config
+2. list_dir to list /data/ai_agent/ files
+3. read_file /data/ai_agent/config/config.json to check config
 4. cron_list to check scheduled tasks
 5. Summarize: time, file count, config status, cron jobs
 
