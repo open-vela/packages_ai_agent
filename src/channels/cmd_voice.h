@@ -25,3 +25,4 @@ void cmd_voice_test_tts(int argc, char** argv);
 void cmd_voice_test_asr(int argc, char** argv);
 void cmd_set_voice_tts(int argc, char** argv);
 void cmd_set_voice_asr(int argc, char** argv);
+void cmd_speak(int argc, char** argv);

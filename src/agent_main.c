@@ -92,9 +92,21 @@ static const char* TAG = "agent";
 pthread_mutex_t g_stdout_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ── Global shutdown flag ─────────────────────────────────────── */
-/* Set by cmd_quit via agent_request_shutdown(); checked by main loop
- * to trigger graceful teardown instead of calling exit(). */
+/* Set via agent_request_shutdown() (e.g. by the app framework when the
+ * quickapp is killed); checked by the main loop to trigger graceful
+ * teardown instead of calling exit(). The interactive CLI's "quit" no
+ * longer sets this — it uses nsh_cli_done() so a config-only instance
+ * does not tear down the boot-time agent. */
 static volatile bool g_shutdown_requested = false;
+
+/* ── Double-start guard ──────────────────────────────────────── */
+/* In a FLAT build every spawn of "ai_agent" shares these statics, so this
+ * detects the boot-time "ai_agent --no-cli &" instance. A second foreground
+ * "ai_agent" (typed manually to reach the set_wifi/set_llm CLI) must NOT
+ * re-run init — that would spawn a second outbound dispatcher + agent loop
+ * fighting over the shared message bus. The second instance only attaches
+ * the interactive CLI and returns without tearing anything down. */
+static bool s_agent_started = false;
 
 void agent_request_shutdown(void)
 {
@@ -466,8 +478,35 @@ static inline long boot_ms(struct timespec* t0)
 
 int ai_agent_main(int argc, char* argv[])
 {
-    (void)argc;
-    (void)argv;
+    /* Parse args: --no-cli / --daemon disables the interactive CLI thread,
+     * used when auto-started in background so it does not compete with NSH
+     * for stdin. NOTE: must be a LOCAL (stack) variable, not static — in a
+     * FLAT build a static would be shared across every spawn of this app, so
+     * the boot-time "ai_agent --no-cli &" would permanently disable the CLI
+     * for any later foreground "ai_agent". */
+    bool cli_enabled = true;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-cli") == 0 ||
+            strcmp(argv[i], "--daemon") == 0) {
+            cli_enabled = false;
+        }
+    }
+
+    /* Already running (the boot-time background instance)? Attach the CLI
+     * only and block until the user quits — do NOT re-init, and do NOT run
+     * teardown (the original instance owns every service). */
+    if (s_agent_started) {
+        syslog(LOG_INFO, "[%s] ai_agent already running — %s\n", TAG,
+            cli_enabled ? "attaching CLI only" : "ignoring duplicate start");
+        if (cli_enabled) {
+            nsh_commands_start();
+            while (!nsh_cli_done()) {
+                sleep(1);
+            }
+        }
+        return 0;
+    }
+    s_agent_started = true;
 
     g_shutdown_requested = false;
 
@@ -503,12 +542,14 @@ int ai_agent_main(int argc, char* argv[])
     mkdir("/data/agent/skills", 0755);
     BOOT_LOG(&t0, "P0", "storage ready");
 
-    /* Memory info */
+    /* Memory info — disabled: mallinfo() may crash on fragmented heap */
+#if 0
     {
         struct mallinfo mi = mallinfo();
         syslog(LOG_INFO, "[%s] [boot +%ldms] heap: arena=%d free=%d used=%d\n",
             TAG, boot_ms(&t0), mi.arena, mi.fordblks, mi.uordblks);
     }
+#endif
 
     /* ── Phase 1: Core infrastructure ──────────────────────── */
     {
@@ -692,16 +733,25 @@ int ai_agent_main(int argc, char* argv[])
     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
 
     /* ── Phase 6: CLI thread — all services now in known state ── */
-    {
+    if (cli_enabled) {
         int rc = nsh_commands_start();
         BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
+    } else {
+        syslog(LOG_INFO, "[%s] daemon mode (--no-cli): interactive CLI disabled\n",
+            TAG);
     }
 
     syslog(LOG_INFO, "[%s] [boot +%ldms] AI Agent ready. Type 'help' in NSH for commands.\n",
         TAG, boot_ms(&t0));
 
-    /* Block main thread until shutdown is requested */
+    /* Block main thread until shutdown is requested, or — in interactive
+     * (CLI) mode — until the user types "quit". The "quit" path only ends
+     * the CLI, it does not set g_shutdown_requested, so a config-only
+     * second instance can leave the boot-time agent untouched. */
     while (!g_shutdown_requested) {
+        if (cli_enabled && nsh_cli_done()) {
+            break;
+        }
         sleep(1);
     }
 

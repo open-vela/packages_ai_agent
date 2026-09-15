@@ -249,6 +249,7 @@
 #define AGENT_CFG_KEY_FEISHU_USER_TOKEN "feishu_user_token"
 #define AGENT_CFG_KEY_LLM_HOST "llm_host"
 #define AGENT_CFG_KEY_LLM_PATH "llm_path"
+#define AGENT_CFG_KEY_LLM_THINKING "llm_thinking"
 #define AGENT_CFG_KEY_VISION_MODEL "vision_model"
 #define AGENT_CFG_KEY_VISION_HOST "vision_host"
 #define AGENT_CFG_KEY_VISION_API_KEY "vision_api_key"
@@ -293,6 +294,7 @@
 #define AGENT_CHAN_FEISHU "feishu"
 #define AGENT_CHAN_MQTT "mqtt"
 #define AGENT_CHAN_WEIXIN "weixin"
+#define AGENT_CHAN_LOCAL_CLIENT "local_client"
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
 #define AGENT_CHAN_QUICKAPP "quickapp"
 #endif

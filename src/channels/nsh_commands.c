@@ -74,6 +74,17 @@ static const char* TAG = "cli";
 #define MAX_ARGS 8
 #define LINE_LEN 256
 
+/* Set by "quit" (or stdin EOF) so ai_agent_main can detect the CLI has
+ * finished. Deliberately separate from g_shutdown_requested: quitting the
+ * interactive CLI of a second (config-only) instance must NOT tear down the
+ * boot-time background agent. */
+static volatile bool s_cli_done = false;
+
+bool nsh_cli_done(void)
+{
+    return s_cli_done;
+}
+
 /* ── Helpers ──────────────────────────────────────────────────── */
 
 static int tokenise(char* line, char** argv, int max_argc)
@@ -96,6 +107,7 @@ static void cmd_help(void)
         "  set_feishu_app <app_id> <app_secret>  - Set Feishu app credentials\n"
         "  set_feishu_user_token <token>  - Set Feishu user_access_token for doc APIs\n"
         "  set_llm <preset|host> [model] [key] - Switch LLM backend (kimi/qwen/deepseek/glm/openai)\n"
+        "  thinking <on|off>      - Toggle MiMo thinking mode (off = faster replies)\n"
         "  set_vision_llm <preset|host> [model] [key] - Set independent vision model\n"
         "  list_models [--free] [keyword] - List available models (openrouter)\n"
         "  memory_read          - Read MEMORY.md\n"
@@ -136,6 +148,7 @@ static void cmd_help(void)
         "  voice_test_asr <file>  - Test ASR recognition\n"
         "  set_voice_tts <name>   - Switch TTS backend\n"
         "  set_voice_asr <name>   - Switch ASR backend\n"
+        "  speak <text>           - Read text aloud through the speaker\n"
         "  set_weixin_token <tok> - Set WeChat bot token\n"
         "  weixin_login           - QR code login to WeChat\n"
         "  router_status          - Show LLM router status\n"
@@ -307,9 +320,8 @@ static void cmd_session_clear_all(void)
 
 static void cmd_heap_info(void)
 {
-    struct mallinfo mi = mallinfo();
-    printf("Heap: arena=%d fordblks(free)=%d uordblks(used)=%d\n",
-        mi.arena, mi.fordblks, mi.uordblks);
+    /* mallinfo() is unsafe on this board — skip */
+    printf("Heap info: not available (mallinfo disabled)\n");
 }
 
 static void cmd_set_proxy(int argc, char** argv)
@@ -466,6 +478,7 @@ static void cmd_config_show(void)
     SHOW_CFG("Model", AGENT_CFG_KEY_MODEL, false);
     SHOW_CFG("LLM Host", AGENT_CFG_KEY_LLM_HOST, false);
     SHOW_CFG("LLM Path", AGENT_CFG_KEY_LLM_PATH, false);
+    SHOW_CFG("Thinking", AGENT_CFG_KEY_LLM_THINKING, false);
     SHOW_CFG("Vision Model", AGENT_CFG_KEY_VISION_MODEL, false);
     SHOW_CFG("Vision Host", AGENT_CFG_KEY_VISION_HOST, false);
     SHOW_CFG("Vision Key", AGENT_CFG_KEY_VISION_API_KEY, true);
@@ -505,6 +518,33 @@ static void cmd_config_reset(void)
 {
     config_erase_all();
     printf("All runtime config cleared. Build-time defaults will be used on restart.\n");
+}
+
+static void cmd_thinking(int argc, char** argv)
+{
+    if (argc < 2) {
+        char val[16] = { 0 };
+        if (claw_config_get(AGENT_CFG_KEY_LLM_THINKING, val, sizeof(val)) == OK && val[0])
+            printf("LLM thinking: %s\n", val);
+        else
+            printf("LLM thinking: on (default)\n");
+        return;
+    }
+
+    int disabled;
+    if (strcmp(argv[1], "off") == 0 || strcmp(argv[1], "disabled") == 0 ||
+        strcmp(argv[1], "0") == 0)
+        disabled = 1;
+    else if (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "enabled") == 0 ||
+        strcmp(argv[1], "1") == 0)
+        disabled = 0;
+    else {
+        printf("Usage: thinking <on|off>\n");
+        return;
+    }
+
+    llm_set_thinking(disabled);
+    printf("LLM thinking %s\n", disabled ? "OFF (fast)" : "ON (default)");
 }
 
 #ifdef CONFIG_AI_AGENT_BLE_GATT
@@ -659,9 +699,11 @@ static void cmd_claw_test(int argc, char** argv)
 
 static void cmd_quit(void)
 {
-    printf("Exiting agent...\n");
+    printf("Exiting CLI...\n");
     fflush(stdout);
-    agent_request_shutdown();
+    /* Signal the CLI is done. This only ends the interactive CLI loop; the
+     * boot-time background agent keeps running (see nsh_cli_done). */
+    s_cli_done = true;
 }
 
 static void cmd_launch_app(int argc, char** argv)
@@ -882,6 +924,8 @@ static void* cli_thread(void* arg)
     char line[LINE_LEN];
     char* argv[MAX_ARGS];
 
+    s_cli_done = false;
+
     syslog(LOG_INFO, "[%s] NSH CLI started. Type 'help' for commands.\n", TAG);
     pthread_mutex_lock(&g_stdout_lock);
     printf("vela> ");
@@ -925,6 +969,8 @@ static void* cli_thread(void* arg)
             cmd_set_feishu_user_token(argc, argv);
         else if (strcmp(cmd, "set_llm") == 0)
             cmd_set_llm(argc, argv);
+        else if (strcmp(cmd, "thinking") == 0)
+            cmd_thinking(argc, argv);
         else if (strcmp(cmd, "set_vision_llm") == 0)
             cmd_set_vision_llm(argc, argv);
         else if (strcmp(cmd, "list_models") == 0)
@@ -1010,6 +1056,8 @@ static void* cli_thread(void* arg)
             cmd_set_voice_tts(argc, argv);
         else if (strcmp(cmd, "set_voice_asr") == 0)
             cmd_set_voice_asr(argc, argv);
+        else if (strcmp(cmd, "speak") == 0)
+            cmd_speak(argc, argv);
         else if (strcmp(cmd, "set_weixin_token") == 0)
             cmd_set_weixin_token(argc, argv);
         else if (strcmp(cmd, "weixin_login") == 0)
@@ -1069,6 +1117,7 @@ static void* cli_thread(void* arg)
         pthread_mutex_unlock(&g_stdout_lock);
     }
 
+    s_cli_done = true;
     syslog(LOG_INFO, "[%s] CLI thread exiting\n", TAG);
     return NULL;
 }
@@ -1086,5 +1135,9 @@ int nsh_commands_init(void)
 
 int nsh_commands_start(void)
 {
+    /* Reset synchronously (before the thread runs) so a caller that polls
+     * nsh_cli_done() right after start doesn't observe a stale "true" from
+     * a previous CLI session and bail out early. */
+    s_cli_done = false;
     return agent_task_create(cli_thread, "agent_cli", AGENT_CLI_STACK, NULL, AGENT_CLI_PRIO);
 }
