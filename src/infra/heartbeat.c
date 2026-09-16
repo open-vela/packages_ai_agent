@@ -36,13 +36,18 @@
 static const char *TAG = "heartbeat";
 
 #define HEARTBEAT_PROMPT \
-    "Read " AGENT_HEARTBEAT_FILE " and follow any instructions or tasks listed there. " \
-    "If nothing needs attention, reply with just: HEARTBEAT_OK"
+    "Do not read HEARTBEAT.md or skill files. " \
+    "Do not write /data/velaguard/reports/runtime-report.md " \
+    "(firmware already wrote the screen report). " \
+    "If read_file /data/velaguard/pending_alarm.txt succeeds, " \
+    "write last_alarm.md using vgstats/vgmodbus/vgcfg dump. " \
+    "Never list_dir, ls, or cat. If no pending alarm, reply HEARTBEAT_OK."
 
 static volatile bool s_heartbeat_running = false;
 
 /* ── Content check ────────────────────────────────────────────── */
 
+#ifndef CONFIG_VG_HMI
 /**
  * Check if HEARTBEAT.md has actionable content.
  * Returns true if any line is NOT:
@@ -93,14 +98,29 @@ static bool heartbeat_has_tasks(void)
     fclose(f);
     return found_task;
 }
+#endif
 
 /* ── Send heartbeat to agent ──────────────────────────────────── */
 
-static bool heartbeat_send(void)
+#ifndef VG_PENDING_ALARM_PATH
+#define VG_PENDING_ALARM_PATH "/data/velaguard/pending_alarm.txt"
+#endif
+
+static bool heartbeat_send(bool force)
 {
-    if (!heartbeat_has_tasks()) {
+#ifdef CONFIG_VG_HMI
+    /* HMI must not start ReAct from the timer, leftover HEARTBEAT.poke,
+     * report-page poke, or NSH heartbeat_trigger. 2026-09-14 15:19:
+     * system prompt built (3489 B) then mm_forcefree IMPRECISERR in
+     * ai_agent and NSH died. Screen report is firmware-local. */
+    (void)force;
+    syslog(LOG_INFO, "[%s] skip LLM (HMI, no ReAct from heartbeat/poke)\n", TAG);
+    return false;
+#else
+    if (!force && !heartbeat_has_tasks()) {
         return false;
     }
+#endif
 
     agent_msg_t msg;
     memset(&msg, 0, sizeof(msg));
@@ -156,11 +176,13 @@ static void *heartbeat_thread(void *arg)
          * check; also makes heartbeat_stop() responsive. */
         int interval_s = AGENT_HEARTBEAT_INTERVAL_MS / 1000;
         int waited = 0;
+        bool poked = false;
 
         while (s_heartbeat_running && waited < interval_s) {
             sleep(AGENT_HEARTBEAT_POLL_SLICE_S);
             waited += AGENT_HEARTBEAT_POLL_SLICE_S;
             if (heartbeat_poke_consumed()) {
+                poked = true;
                 break;
             }
         }
@@ -169,7 +191,7 @@ static void *heartbeat_thread(void *arg)
             break;
         }
 
-        heartbeat_send();
+        heartbeat_send(poked);
     }
 
     return NULL;
@@ -221,5 +243,5 @@ void heartbeat_stop(void)
 
 bool heartbeat_trigger(void)
 {
-    return heartbeat_send();
+    return heartbeat_send(true);
 }

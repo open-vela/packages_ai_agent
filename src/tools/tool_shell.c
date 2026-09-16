@@ -92,7 +92,7 @@ static const char *s_allowed[] = {
     "mcp_list", "mcp_discover",
 
     /* VelaGuard read-only bring-up tools (stage1 ai_agent) */
-    "vgmodbus", "vgstats", "vgcfg", "vgnet",
+    "vgmodbus", "vgstats", "vgruntime", "vgcfg", "vgnet",
 
     NULL
 };
@@ -294,7 +294,7 @@ static int builtin_uname(char *output, size_t output_size)
 
 /* Allowed path prefixes for file access (symlink escape protection) */
 static const char *s_allowed_prefixes[] = {
-    "/proc/", "/data/agent/", "/tmp/", NULL
+    "/proc/", "/data/agent/", "/data/velaguard/", "/tmp/", NULL
 };
 
 static bool is_path_allowed(const char *path)
@@ -369,13 +369,17 @@ static int builtin_popen_cmd(const char *cmd, char *output, size_t output_size)
     size_t n = fread(output, 1, output_size - 1, fp);
     output[n] = '\0';
     int status = pclose(fp);
-    if (status != 0 && n == 0) {
+    /* NuttX pclose often returns -1 for NSH builtins even with stdout. */
+    if (n > 0) {
+        return OK;
+    }
+    if (status != 0) {
         snprintf(output, output_size,
                  "Command failed with exit code %d", WEXITSTATUS(status));
         return ERROR;
     }
 
-    return (status == 0) ? OK : ERROR;
+    return OK;
 #else
     (void)cmd;
     snprintf(output, output_size, "popen not available (enable CONFIG_SYSTEM_POPEN)");
@@ -500,10 +504,17 @@ int tool_run_shell_execute(const char *input_json, char *output, size_t output_s
             size_t n = fread(cmd_buf, 1, SHELL_OUTPUT_MAX - 1, fp);
             cmd_buf[n] = '\0';
             int status = pclose(fp);
-            ret = (status == 0) ? OK : ERROR;
-            if (ret != OK && n == 0) {
+            /* NuttX popen/waitpid often returns -1 for NSH builtins even
+             * when stdout is valid; treat captured output as success. */
+            if (n > 0) {
+                ret = OK;
+            } else {
+                ret = (status == 0) ? OK : ERROR;
+            }
+            if (ret != OK) {
                 snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                         "Command failed with exit code %d", WEXITSTATUS(status));
+                         "Command failed with exit code %d",
+                         WEXITSTATUS(status));
             }
             syslog(LOG_INFO, "[%s] popen(%s) exit=%d, %zu bytes\n",
                    TAG, command, status, n);
