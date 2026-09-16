@@ -78,6 +78,8 @@ int llm_chat_tools(const char* system_prompt,
     const char* tools_json,
     llm_response_t* resp);
 
+bool llm_proxy_echo_reasoning(void);
+
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).
  *  mime_type: "image/jpeg", "image/png", etc. NULL defaults to "image/jpeg". */

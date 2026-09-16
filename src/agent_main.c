@@ -86,6 +86,35 @@
 
 static const char* TAG = "agent";
 
+/* Daemon autostart (--daemon): cron/heartbeat/network, no stdin CLI. */
+static volatile bool g_daemon_running = false;
+
+static bool argv_has_flag(int argc, char* argv[], const char* flag)
+{
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] != NULL && strcmp(argv[i], flag) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* NuttX boards without RTC boot at epoch; TLS may jump the clock mid-call.
+ * Set a sane wall clock once at agent start, before any HTTPS traffic. */
+static void ensure_wall_clock_for_tls(void)
+{
+    time_t now = time(NULL);
+
+    if (now >= 1704067200) { /* Jan 1 2024 UTC */
+        return;
+    }
+
+    struct timespec ts = { .tv_sec = 1772275200, .tv_nsec = 0 }; /* 2026-02-28 */
+    clock_settime(CLOCK_REALTIME, &ts);
+    syslog(LOG_WARNING, "[%s] Wall clock was stale (%ld), set for TLS\n",
+        TAG, (long)now);
+}
+
 /* ── stdout mutex — shared with nsh_commands.c ──────────────── */
 /* Prevents concurrent printf from outbound_dispatch_task and cli_thread
  * which causes adbd shell_service_uv assert (wait_ack != 0). */
@@ -466,8 +495,25 @@ static inline long boot_ms(struct timespec* t0)
 
 int ai_agent_main(int argc, char* argv[])
 {
-    (void)argc;
-    (void)argv;
+    const bool daemon_mode = argv_has_flag(argc, argv, "--daemon");
+    const bool skip_cli = daemon_mode;
+
+    if (daemon_mode) {
+        if (g_daemon_running) {
+            return 0;
+        }
+    } else if (g_daemon_running) {
+        /* Background daemon is up; attach an interactive CLI on NSH stdin. */
+        syslog(LOG_INFO, "[%s] Attaching CLI to daemon agent\n", TAG);
+        nsh_commands_set_detach_quit(true);
+        nsh_commands_run_interactive();
+        nsh_commands_set_detach_quit(false);
+        return 0;
+    }
+
+    if (daemon_mode) {
+        g_daemon_running = true;
+    }
 
     g_shutdown_requested = false;
 
@@ -485,6 +531,7 @@ int ai_agent_main(int argc, char* argv[])
 #ifdef CONFIG_LIBC_LOCALTIME
     tzset();
 #endif
+    ensure_wall_clock_for_tls();
     BOOT_LOG(&t0, "P0", "timezone set");
 
     /* ── Phase 0: Storage Bootstrapping (Auto-mount & Mkdir) ── */
@@ -518,8 +565,12 @@ int ai_agent_main(int argc, char* argv[])
 
         rc = message_bus_init();
         BOOT_LOG_RC(&t0, "P1", "message_bus_init", rc);
-        if (rc != OK)
+        if (rc != OK) {
+            if (daemon_mode) {
+                g_daemon_running = false;
+            }
             return -1;
+        }
 
         rc = memory_store_init();
         BOOT_LOG_RC(&t0, "P1", "memory_store_init", rc);
@@ -618,6 +669,9 @@ int ai_agent_main(int argc, char* argv[])
             AGENT_OUTBOUND_PRIO)
         != OK) {
         syslog(LOG_ERR, "[%s] Failed to start outbound dispatch thread\n", TAG);
+        if (daemon_mode) {
+            g_daemon_running = false;
+        }
         return -1;
     }
     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
@@ -692,9 +746,11 @@ int ai_agent_main(int argc, char* argv[])
     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
 
     /* ── Phase 6: CLI thread — all services now in known state ── */
-    {
+    if (!skip_cli) {
         int rc = nsh_commands_start();
         BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
+    } else {
+        BOOT_LOG(&t0, "P6", "nsh_commands skipped (daemon mode)");
     }
 
     syslog(LOG_INFO, "[%s] [boot +%ldms] AI Agent ready. Type 'help' in NSH for commands.\n",
@@ -752,5 +808,8 @@ int ai_agent_main(int argc, char* argv[])
 
     syslog(LOG_INFO, "[%s] Shutdown complete.\n", TAG);
 
+    if (daemon_mode) {
+        g_daemon_running = false;
+    }
     return 0;
 }
