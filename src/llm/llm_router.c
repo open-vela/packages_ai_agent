@@ -401,7 +401,20 @@ static int router_select_internal(llm_complexity_t complexity,
             syslog(LOG_INFO, "[%s] All backends backed off, using fallback %d\n",
                 TAG, best_idx);
         } else {
-            syslog(LOG_WARNING, "[%s] No available backend\n", TAG);
+            /* fail_count>=3 skips without backoff; a single-backend board
+             * would otherwise return -1 for RECOVERY_INTERVAL_SEC. */
+            for (int i = 0; i < LLM_ROUTER_MAX_BACKENDS; i++) {
+                if (s_backends[i].host[0] != '\0') {
+                    best_idx = i;
+                    syslog(LOG_WARNING,
+                           "[%s] No healthy backend, retrying host %d anyway\n",
+                           TAG, i);
+                    break;
+                }
+            }
+            if (best_idx < 0) {
+                syslog(LOG_WARNING, "[%s] No available backend\n", TAG);
+            }
         }
     }
 

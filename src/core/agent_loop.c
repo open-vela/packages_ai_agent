@@ -67,13 +67,8 @@ static const char* TAG = "agent";
  * which brackets the corrupting phase to a single step. */
 
 #ifdef CONFIG_VG_HMI
-#define VG_HEAP_SCAN(phase)                                   \
-    do {                                                      \
-        agent_mem_status_t st_;                               \
-        agent_mem_get_status(&st_);                           \
-        syslog(LOG_INFO, "[heapscan] %s free=%zu\n",          \
-            phase, st_.free_heap);                            \
-    } while (0)
+/* Heap walk itself HARDFAULTs after a smashed free-node; do not scan. */
+#define VG_HEAP_SCAN(phase) ((void)(phase))
 #else
 #define VG_HEAP_SCAN(phase)
 #endif
@@ -282,7 +277,14 @@ static void add_tool_result_messages(cJSON* messages,
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
+#ifdef CONFIG_VG_HMI
+        /* Tool workers share the tight HMI heap; 16 KiB was the same
+         * class of overflow that corrupted mm freelist on the loop
+         * stack before AGENT_AI_AGENT_STACK was raised to 32 KiB. */
+        pthread_attr_setstacksize(&attr, 24 * 1024);
+#else
         pthread_attr_setstacksize(&attr, 16 * 1024);
+#endif
         if (pthread_create(&threads[i], &attr,
                 tool_exec_thread, &tasks[i])
             != 0) {
@@ -1076,8 +1078,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     agent_trace_begin(&trace, msg->chat_id, msg->channel);
     trace.backend_idx = router_idx;
 
-    /* Cache check: for simple queries, try cache before LLM call */
-    if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
+    /* Cache check: for simple queries, try cache before LLM call.
+     * HEARTBEAT/system prompts are identical every cycle; a hit would
+     * replay the previous reply and skip tools (no report rewrite). */
+    if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE
+        && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
         char* cached = llm_cache_get(msg->content, strlen(msg->content));
         if (cached) {
             syslog(LOG_INFO, "[%s] Cache hit, skipping LLM call\n", TAG);
@@ -1311,27 +1316,32 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 }
             }
             if (all_local && tool_output[0]) {
-                /* Don't shortcut if the tool read a skill file
-                 * from AGENT_SKILLS_DIR — the LLM needs to process
-                 * the skill content and generate a proper user-facing
-                 * response instead of dumping raw markdown to the user. */
-                bool is_skill_read = false;
-                if (strcmp(resp.calls[0].name, "read_file") == 0
+                /* Don't shortcut instruction files: skills, HEARTBEAT, or
+                 * any system-channel task. Dumping the file as the reply
+                 * skips the rest of the ReAct workflow (report rewrite). */
+                bool is_instruction_read = false;
+                if (strcmp(msg->channel, AGENT_CHAN_SYSTEM) == 0) {
+                    is_instruction_read = true;
+                }
+                else if (strcmp(resp.calls[0].name, "read_file") == 0
                     && resp.calls[0].input != NULL) {
                     cJSON *input_obj = cJSON_Parse(resp.calls[0].input);
                     if (input_obj) {
                         cJSON *path_obj = cJSON_GetObjectItem(input_obj, "path");
                         if (path_obj && cJSON_IsString(path_obj)
-                            && strncmp(path_obj->valuestring,
-                                AGENT_SKILLS_DIR,
-                                strlen(AGENT_SKILLS_DIR)) == 0) {
-                            is_skill_read = true;
+                            && path_obj->valuestring) {
+                            const char *p = path_obj->valuestring;
+                            if (strncmp(p, AGENT_SKILLS_DIR,
+                                    strlen(AGENT_SKILLS_DIR)) == 0
+                                || strcmp(p, AGENT_HEARTBEAT_FILE) == 0) {
+                                is_instruction_read = true;
+                            }
                         }
                         cJSON_Delete(input_obj);
                     }
                 }
 
-                if (!is_skill_read) {
+                if (!is_instruction_read) {
                     syslog(LOG_INFO,
                         "[%s] Local tool shortcut: skip LLM round\n",
                         TAG);
@@ -1341,7 +1351,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 }
 
                 syslog(LOG_INFO,
-                    "[%s] Skill file read — no shortcut, LLM will process\n",
+                    "[%s] Instruction file read — no shortcut, LLM will process\n",
                     TAG);
             }
         }
@@ -1380,7 +1390,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 send_reply:
     /* Cache store: save simple query responses for future reuse */
     if (final_text && msg->content
-        && complexity == LLM_COMPLEXITY_SIMPLE) {
+        && complexity == LLM_COMPLEXITY_SIMPLE
+        && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
         llm_cache_put(msg->content, strlen(msg->content), final_text);
         if (last_total_tokens > 0) {
             llm_cache_put_tokens(msg->content, strlen(msg->content),
@@ -1440,7 +1451,9 @@ static void inject_session_context(char* sys_prompt, size_t size,
 static void* agent_loop_task(void* arg)
 {
     (void)arg;
+#ifndef CONFIG_VG_HMI
     agent_mem_status_t mem_st;
+#endif
 
 #ifdef CONFIG_VG_HMI
     /* Avoid mallinfo() at start — can assert under HMI heap pressure. */
@@ -1517,6 +1530,11 @@ static void* agent_loop_task(void* arg)
 
         syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
             TAG, msg.channel, msg.chat_id);
+
+        if (strcmp(msg.channel, AGENT_CHAN_SYSTEM) == 0
+            && strcmp(msg.chat_id, "heartbeat") == 0) {
+            session_clear(msg.chat_id);
+        }
 
 #ifndef CONFIG_VG_HMI
         /* Check memory pressure */
