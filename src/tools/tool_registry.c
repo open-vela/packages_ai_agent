@@ -215,9 +215,11 @@ int tool_registry_init(void)
     /* Watch alarm: the device previews one minute ahead, wakes the user at
      * the set time, and escalates if nobody reacts. */
     REGISTER_TOOL("set_alarm",
-        "Arm the watch alarm to wake/remind the user after N minutes. "
-        "The watch previews 1 minute before, then calls at the set time "
-        "and escalates until the user touches the device.",
+        "Remind the user ON THE WATCH after N minutes. PREFER THIS over "
+        "cron_add whenever the request came from the watch or the user "
+        "should be alerted on the device: the watch previews 1 minute "
+        "before, speaks up at the set time and escalates until the user "
+        "touches it. cron_add only appends a silent line to the history.",
         TOOL_SCHEMA_BEGIN()
             TOOL_PARAM_NUM("minutes", "Whole minutes from now, 1-1440")
                 TOOL_SCHEMA_END_REQUIRED("\"minutes\""),

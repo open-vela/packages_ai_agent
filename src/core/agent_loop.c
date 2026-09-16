@@ -1352,6 +1352,15 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
         final_text = force_finish_reply(sys_prompt, messages);
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
+    } else if (!final_text && trace.total_tool_calls > 0) {
+        /* Tools ran but the model closed with no text (observed with
+         * StepFun right after a successful set_alarm). The action already
+         * happened on the device, so confirm it instead of apologising. */
+        final_text = strdup("好的，已经为你安排好了。");
+        syslog(LOG_INFO,
+            "[%s] Empty closing text after %d tool call(s); confirming\n",
+            TAG, trace.total_tool_calls);
+        agent_trace_end(&trace, AGENT_TRACE_OK);
     } else if (watchdog_fired) {
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
     } else if (final_text) {

@@ -132,16 +132,22 @@ static const char *TAG = "skills";
     "2. Parse user request into schedule_type and timing\n" \
     "3. Set channel/chat_id matching the message source (feishu/system)\n" \
     "4. cron_add to create the job\n" \
-    "5. Confirm with trigger time\n"
+    "5. Confirm with trigger time\n\n" \
+    "## Exception: reminders that must reach the user on the watch\n" \
+    "If the request came from the watch itself (nsh ask / key press / voice), use the\n" \
+    "关怀叫醒 (care-reminder) skill instead: it calls set_alarm, so the device\n" \
+    "previews one minute ahead, speaks up on time and escalates if nobody reacts.\n" \
+    "cron_add only drops a silent line into the chat history and will not wake anyone.\n"
 
 #define BUILTIN_CARE_ALARM \
     "# 关怀叫醒\n\n" \
-    "把手表设成主动叫醒：到点前会先预告，到点主动开口叫醒，没人理会会再催一次。\n\n" \
-    "## 何时使用\n" \
-    "用户说「X 分钟后提醒我 / 叫我 / 喊我起床」，或指定了某个钟点。\n" \
-    "要区分：只想要一条静默的定时通知，用 reminder 技能；想让手表主动把人叫醒，用本技能。\n\n" \
+    "手表上的提醒/叫醒一律用本技能（优先于 reminder/cron）：到点前先预告，到点主动开口叫醒，没人理会会再催一次。\n\n" \
+    "## 何时使用（优先于 reminder）\n" \
+    "用户说「X 分钟后提醒我 / 叫我 / 喊我起床」，或指定了某个钟点——**凡是希望用户在手表前被提醒到的，都用本技能**。\n" \
+    "不要用 cron_add / reminder 处理这类请求：cron 通知只在消息历史里静默出现，\n" \
+    "而 set_alarm 会让设备端主动开口（预告 + 叫醒 + 催促），这才是本产品的核心能力。\n\n" \
     "## 怎么用\n" \
-    "1. 先算分钟数：用户给了时长（如 10 分钟）直接用；给了钟点先用 get_current_time 取当前时间再换算\n" \
+    "1. 先算分钟数：用户给了时长（如 25 分钟）直接用；给了钟点先用 get_current_time 取当前时间再换算\n" \
     "2. 调 set_alarm，参数 minutes，范围 1-1440\n" \
     "3. 用用户的语言简短确认，并说明设备行为：到点前 1 分钟先预告、到点叫醒、没反应会再催\n" \
     "4. 用户要取消时调 cancel_alarm\n" \
