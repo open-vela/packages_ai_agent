@@ -75,6 +75,16 @@ int lvgl_ui_channel_send(const char* text);
 int lvgl_ui_channel_send_silent(const char* text, pet_emotion_t emotion);
 
 /**
+ * 线程安全地向 LVGL 投递一次异步回调。
+ * LVGL 以 LV_OS_NONE 构建（无内部锁），任何非 render 线程直接调
+ * lv_async_call / lv_timer_* 都会与 lv_timer_handler 竞态并损坏定时器
+ * 链表（Round 27：ask 回复后 render 线程睡死）。此函数只做加锁入队，
+ * 由 render 线程每圈统一落地。回调在 LVGL 线程执行，语义与
+ * lv_async_call 相同。
+ */
+int lvgl_ui_post(lv_async_cb_t cb, void* data);
+
+/**
  * 发送用户消息到 UI（ASR 识别结果）。
  * 在头顶气泡显示用户气泡并记录到历史。由语音通道（阶段 B）调用。
  *

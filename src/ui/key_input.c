@@ -139,7 +139,8 @@ static void key_ask_shown_cb(void *arg)
 static void key_action_open_pet(void)
 {
     syslog(LOG_INFO, "[%s] KEY1: open pet page\n", TAG);
-    lv_async_call(key_open_pet_cb, NULL);
+    /* key monitor thread -> LVGL: post queue, not lv_async_call (Round 27) */
+    lvgl_ui_post(key_open_pet_cb, NULL);
 }
 
 static void key_action_ask_model(void)
@@ -166,7 +167,7 @@ static void key_action_ask_model(void)
 
     shown = strdup(question);
     if (shown != NULL) {
-        lv_async_call(key_ask_shown_cb, shown);
+        lvgl_ui_post(key_ask_shown_cb, shown);
     }
 
     strncpy(msg.channel, "cli", sizeof(msg.channel) - 1);

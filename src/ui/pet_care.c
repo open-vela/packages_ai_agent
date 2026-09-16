@@ -8,7 +8,7 @@
  * 第二条气泡。L1 已经保底，L2 失败完全静默。
  *
  * 为什么不用独立线程：SRAM 余量紧张（docs_ble/24），且 agent_loop、
- * render 线程都在 —— tick 挂 render 线程 1Hz 分频零额外成本。
+ * render 线程都在 —— tick 挂 render 线程、墙钟秒门控，零额外成本。
  *
  * Team 181 - Contest 2026
  ****************************************************************************/
@@ -28,8 +28,10 @@
 
 #define TAG "pet_care"
 
-/* render 线程 5ms 一拍，200 拍 = 1 秒 */
-#define TICKS_PER_SEC   200   /* render 5ms 一拍，200 拍 = 1s */
+/* 1Hz 逻辑用『墙钟秒』门控，而不是数 tick：render 每圈实际耗时
+ * 取决于 lv_timer_handler（实测约 25ms，不是标称的 5ms），数 tick 会
+ * 让『1 秒逻辑』退化成 5 秒一次。改用 care_now_s() 的秒变化做门，
+ * 与循环速率解耦。 */
 
 /* "care" 通道名（outbound dispatch 需识别同名字符串） */
 #define CARE_CHANNEL     "care"
@@ -123,7 +125,7 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int s_rand_state = 1; /* 模块私有 PRNG，避免并发 rand() */
 static time_t s_last_activity_s;      /* 最近一次触摸/按键 */
 static time_t s_last_care_s;          /* 最近一次主动开口（含告警） */
-static int    s_tick_div;             /* 5ms → 1s 分频计数 */
+static time_t s_last_1hz_s;           /* 上次跑 1Hz 逻辑的墙钟秒 */
 static bool   s_inited;
 static int    s_alarm_minutes;        /* 设定的分钟数 */
 static time_t s_alarm_at;             /* 闹钟到点时刻（MONOTONIC 秒） */
@@ -161,6 +163,10 @@ static void care_fire(const char *text, pet_emotion_t emotion, bool quiet)
     if (text == NULL) {
         return;
     }
+
+    /* 验收/现场排障都靠串口日志：触发动作必须留痕（气泡本身不打印）。 */
+    syslog(LOG_INFO, "[%s] fire emo=%d quiet=%d text=%s\n",
+           TAG, (int)emotion, (int)quiet, text);
 
     if (!quiet) {
         /* render 线程内只排气泡，不做同步 TTS；bubble 回调本身会记历史。 */
@@ -281,7 +287,7 @@ int pet_care_init(void)
 
     s_last_activity_s = care_now_s();   /* 开机视为一次活动，从满 idle 窗起算 */
     s_last_care_s = 0;
-    s_tick_div = 0;
+    s_last_1hz_s = 0;
     s_alarm_stage = ALARM_OFF;
     s_alarm_minutes = 0;
     s_last_hr_alert_s = 0;
@@ -302,8 +308,10 @@ void pet_care_tick(void)
     bool run_1hz = false;
 
     pthread_mutex_lock(&s_lock);
-    if (s_inited && ++s_tick_div >= TICKS_PER_SEC) {
-        s_tick_div = 0;
+    /* 墙钟秒门控：render 每圈实际耗时随 LVGL 负载变化（实测 ~25ms），
+     * 数 tick 会让 1Hz 逻辑退化成几秒一次。 */
+    if (s_inited && care_now_s() != s_last_1hz_s) {
+        s_last_1hz_s = care_now_s();
         run_1hz = true;
         care_alarm_decide(&action);
         if (action.text == NULL) {

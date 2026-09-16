@@ -25,6 +25,8 @@
 #include <lvgl/lvgl.h>
 #include <lvgl/src/drivers/nuttx/lv_nuttx_entry.h>
 
+#include <pthread.h>
+
 #include "voice/voice_channel.h"
 #include "pet_display.h"
 #include "pet_page.h"
@@ -157,9 +159,32 @@ static void pet_back_idle_timer_cb(lv_timer_t *timer)
     pet_display_set_emotion(PET_EMOTION_IDLE);
 }
 
+typedef struct {
+    uint32_t ms;
+} pet_idle_req_t;
+
+static void pet_back_idle_post_cb(void *data)
+{
+    pet_idle_req_t *req = data;
+    lv_timer_t *t = lv_timer_create(pet_back_idle_timer_cb, req->ms, NULL);
+    if (t != NULL) {
+        lv_timer_set_auto_delete(t, true);
+    }
+    free(req);
+}
+
+/* Thread-safe wrapper: lvgl_ui_channel_send() runs on the agent
+ * (outbound dispatch) thread, so the lv_timer_create must be posted. */
 static void pet_back_idle_after(uint32_t ms)
 {
-    lv_timer_create(pet_back_idle_timer_cb, ms, NULL);
+    pet_idle_req_t *req = malloc(sizeof(*req));
+    if (req == NULL) {
+        return;
+    }
+    req->ms = ms;
+    if (lvgl_ui_post(pet_back_idle_post_cb, req) != 0) {
+        free(req);
+    }
 }
 
 /* ── Async message passing (agent threads -> LVGL thread) ──────── */
@@ -168,6 +193,86 @@ typedef struct {
     char text[MSG_MAX_LEN];
     bool is_user;
 } ui_msg_t;
+
+/* ── Cross-thread LVGL posting ────────────────────────────────────
+ * LVGL is built with LV_OS_NONE here: no internal locking. Calling
+ * lv_async_call() (which mutates the timer list) from agent/key/NSH
+ * threads races with lv_timer_handler() on the render thread and can
+ * corrupt the timer list -- observed as the render thread never waking
+ * from usleep() again after an `ask` reply (Round 27 dumpstack).
+ *
+ * All non-render threads therefore enqueue {cb, data} under a mutex;
+ * the render thread drains the queue each cycle and performs the
+ * lv_async_call() itself. malloc/queue ops never touch LVGL state. */
+
+typedef struct ui_post_node_s {
+    lv_async_cb_t cb;
+    void *data;
+    struct ui_post_node_s *next;
+} ui_post_node_t;
+
+static pthread_mutex_t s_post_lock = PTHREAD_MUTEX_INITIALIZER;
+static ui_post_node_t *s_post_head;
+static ui_post_node_t *s_post_tail;
+/* recycled nodes so a busy console does not churn the heap */
+static ui_post_node_t *s_post_free;
+
+int lvgl_ui_post(lv_async_cb_t cb, void *data)
+{
+    ui_post_node_t *n;
+
+    if (cb == NULL) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&s_post_lock);
+    n = s_post_free;
+    if (n != NULL) {
+        s_post_free = n->next;
+    } else {
+        n = malloc(sizeof(*n));
+    }
+    if (n == NULL) {
+        pthread_mutex_unlock(&s_post_lock);
+        return -1;
+    }
+    n->cb = cb;
+    n->data = data;
+    n->next = NULL;
+    if (s_post_tail != NULL) {
+        s_post_tail->next = n;
+    } else {
+        s_post_head = n;
+    }
+    s_post_tail = n;
+    pthread_mutex_unlock(&s_post_lock);
+    return 0;
+}
+
+/* Render thread only: drain pending posts. Runs before this cycle's
+ * lv_timer_handler() so posted work lands in the same cycle it was
+ * queued for whenever possible. */
+static void ui_post_flush(void)
+{
+    ui_post_node_t *list;
+
+    pthread_mutex_lock(&s_post_lock);
+    list = s_post_head;
+    s_post_head = NULL;
+    s_post_tail = NULL;
+    pthread_mutex_unlock(&s_post_lock);
+
+    while (list != NULL) {
+        ui_post_node_t *n = list;
+        list = list->next;
+        lv_async_call(n->cb, n->data);
+
+        pthread_mutex_lock(&s_post_lock);
+        n->next = s_post_free;
+        s_post_free = n;
+        pthread_mutex_unlock(&s_post_lock);
+    }
+}
 
 /* Set the bubble text, truncated so the bubble stays short enough to
  * fully fit below the screen top edge. */
@@ -584,10 +689,11 @@ static void *render_thread(void *arg)
 
     ui_build();
 
-    /* 关怀调度器挂 render 线程：内部 1Hz 分频，零常驻线程成本 */
+    /* 关怀调度器挂 render 线程：内部按墙钟秒做 1Hz 门控 */
     pet_care_init();
 
     while (s_ui.running) {
+        ui_post_flush();     /* 跨线程投递的 LVGL 操作统一在此线程落地 */
         lv_timer_handler();
         pet_care_tick();
         usleep(RENDER_PERIOD_US);
@@ -740,7 +846,7 @@ static int queue_agent_bubble(const char *text)
     memset(payload, 0, sizeof(*payload));
     strncpy(payload->text, text, MSG_MAX_LEN - 1);
     payload->is_user = false;
-    lv_async_call(bubble_update_async_cb, payload);
+    lvgl_ui_post(bubble_update_async_cb, payload);
     return 0;
 }
 
@@ -800,7 +906,7 @@ int lvgl_ui_channel_send_user(const char *text)
     memset(payload, 0, sizeof(*payload));
     strncpy(payload->text, text, MSG_MAX_LEN - 1);
     payload->is_user = true;
-    lv_async_call(bubble_update_async_cb, payload);
+    lvgl_ui_post(bubble_update_async_cb, payload);
     return 0;
 }
 
@@ -843,6 +949,6 @@ int lvgl_ui_channel_log(const char *text, bool is_user)
     memset(payload, 0, sizeof(*payload));
     strncpy(payload->text, text, MSG_MAX_LEN - 1);
     payload->is_user = is_user;
-    lv_async_call(history_log_async_cb, payload);
+    lvgl_ui_post(history_log_async_cb, payload);
     return 0;
 }
