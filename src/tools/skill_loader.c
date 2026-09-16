@@ -245,12 +245,23 @@ static void install_builtin(const builtin_skill_t *skill)
     char path[128];
     snprintf(path, sizeof(path), "%s%s.md", AGENT_SKILLS_DIR, skill->filename);
 
-    /* Check if already exists */
+    /* Compare the installed copy with the built-in text: only installing
+     * when the file is missing meant wording fixes never reached a board
+     * whose /data already had the file from an earlier firmware. Skipping
+     * identical content keeps this cheap at every boot. */
     FILE *f = fopen(path, "r");
     if (f) {
+        static char cur[2048];
+        size_t n = fread(cur, 1, sizeof(cur) - 1, f);
+        cur[n] = '\0';
         fclose(f);
-        syslog(LOG_DEBUG, "[%s] Skill exists: %s\n", TAG, path);
-        return;
+
+        size_t want = strlen(skill->content);
+        if (n == want && memcmp(cur, skill->content, want) == 0) {
+            syslog(LOG_DEBUG, "[%s] Skill up to date: %s\n", TAG, path);
+            return;
+        }
+        syslog(LOG_INFO, "[%s] Updating built-in skill: %s\n", TAG, path);
     }
 
     /* Write built-in skill */

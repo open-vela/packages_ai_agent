@@ -49,7 +49,10 @@ static pthread_mutex_t s_router_lock = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_CONSECUTIVE_FAILURES 3
 
 /* Auto-recovery: disabled backends retry after this many seconds */
-#define RECOVERY_INTERVAL_SEC 300
+/* Transient phone-tethering flaps used to cost a full 5 minutes of
+ * silent local-model fallback; one minute is enough to stop hammering
+ * a genuinely dead backend. */
+#define RECOVERY_INTERVAL_SEC 60
 
 /* Backoff: ignore rapid failures within this window (seconds) */
 #define BACKOFF_DEBOUNCE_SEC 5
