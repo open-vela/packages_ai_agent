@@ -86,6 +86,35 @@
 
 static const char* TAG = "agent";
 
+/* Daemon autostart (--daemon): cron/heartbeat/network, no stdin CLI. */
+static volatile bool g_daemon_running = false;
+
+static bool argv_has_flag(int argc, char* argv[], const char* flag)
+{
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] != NULL && strcmp(argv[i], flag) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* NuttX boards without RTC boot at epoch; TLS may jump the clock mid-call.
+ * Set a sane wall clock once at agent start, before any HTTPS traffic. */
+static void ensure_wall_clock_for_tls(void)
+{
+    time_t now = time(NULL);
+
+    if (now >= 1704067200) { /* Jan 1 2024 UTC */
+        return;
+    }
+
+    struct timespec ts = { .tv_sec = 1772275200, .tv_nsec = 0 }; /* 2026-02-28 */
+    clock_settime(CLOCK_REALTIME, &ts);
+    syslog(LOG_WARNING, "[%s] Wall clock was stale (%ld), set for TLS\n",
+        TAG, (long)now);
+}
+
 /* ── stdout mutex — shared with nsh_commands.c ──────────────── */
 /* Prevents concurrent printf from outbound_dispatch_task and cli_thread
  * which causes adbd shell_service_uv assert (wait_ack != 0). */
@@ -108,29 +137,63 @@ bool agent_shutdown_requested(void)
 
 /* ── Network watcher (async) ──────────────────────────────────── */
 
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
 static volatile bool g_net_services_started = false;
 
+static void start_network_dependent_services(void)
+{
+    if (g_net_services_started) {
+        return;
+    }
+
+    syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
+
+#if AGENT_SKILL_SYNC_ENABLED
+    if (skill_sync_from_bitable() != OK) {
+        syslog(LOG_WARNING,
+            "[%s] Bitable skill sync failed, using local skills\n", TAG);
+    }
+#endif
+
+#ifdef CONFIG_AI_AGENT_FEISHU
+    if (feishu_bot_start() != OK)
+        syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
+#endif
+#ifndef AGENT_VG_HMI_LAZY_LOOP
+    if (agent_loop_start() != OK)
+        syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
+#endif
+#ifndef AGENT_VG_HMI_SKIP_WS
+    if (ws_server_start() != OK)
+        syslog(LOG_WARNING, "[%s] ws_server_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_NODE
+    if (node_client_start() != OK)
+        syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_MQTT
+    if (mqtt_channel_start() != OK)
+        syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_WEIXIN
+    if (weixin_channel_start() != OK)
+        syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
+#endif
+
+    g_net_services_started = true;
+#ifdef AGENT_VG_HMI_LAZY_LOOP
+    syslog(LOG_INFO,
+        "[%s] HMI lazy mode: agent_loop starts on first ask\n", TAG);
+#endif
+    syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
+}
+
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
 static void net_state_change_cb(net_state_t state, void* arg)
 {
     (void)arg;
     if (state == NET_STATE_CONNECTED && !g_net_services_started) {
         syslog(LOG_INFO, "[%s] Network recovered, starting services\n", TAG);
-#ifdef CONFIG_AI_AGENT_FEISHU
-        feishu_bot_start();
-#endif
-        agent_loop_start();
-        ws_server_start();
-#ifdef CONFIG_AI_AGENT_NODE
-        node_client_start();
-#endif
-#ifdef CONFIG_AI_AGENT_MQTT
-        mqtt_channel_start();
-#endif
-#ifdef CONFIG_AI_AGENT_WEIXIN
-        weixin_channel_start();
-#endif
-        g_net_services_started = true;
+        start_network_dependent_services();
     } else if (state == NET_STATE_DISCONNECTED) {
         syslog(LOG_WARNING,
             "[%s] Network lost, services may be affected\n", TAG);
@@ -153,55 +216,41 @@ static void* network_watch_task(void* arg)
     network_wifi_reconnect();
 
     if (network_wait_connected(30000) == OK) {
-        syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
+        start_network_dependent_services();
+    } else {
+        syslog(LOG_WARNING,
+            "[%s] Network timeout — will retry until link is up.\n", TAG);
+    }
 
-#if AGENT_SKILL_SYNC_ENABLED
-        /* Sync skills from Bitable before starting agent loop */
-        if (skill_sync_from_bitable() != OK) {
-            syslog(LOG_WARNING, "[%s] Bitable skill sync failed, using local skills\n", TAG);
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
+    network_register_listener(net_state_change_cb, NULL);
+#endif
+
+    /* Wi-Fi may join after the initial 30 s window; keep polling so ask/LLM
+     * works once vgnet reports a routable address. */
+    while (!g_shutdown_requested && !g_net_services_started) {
+        sleep(2);
+        if (network_is_connected()) {
+            syslog(LOG_INFO,
+                "[%s] Network connected (late), starting services\n", TAG);
+            start_network_dependent_services();
+        }
+    }
+
+    while (!g_shutdown_requested) {
+#ifdef AGENT_VG_HMI_LAZY_LOOP
+        if (agent_loop_is_requested() && !agent_loop_is_running()) {
+            if (agent_loop_start() == OK) {
+                syslog(LOG_INFO, "[%s] agent_loop started (lazy ask)\n", TAG);
+            }
+        }
+#else
+        if (network_is_connected() && !agent_loop_is_running()) {
+            agent_loop_start();
         }
 #endif
-
-#ifdef CONFIG_AI_AGENT_FEISHU
-        if (feishu_bot_start() != OK)
-            syslog(LOG_WARNING, "[%s] feishu_bot_start failed\n", TAG);
-#endif
-        if (agent_loop_start() != OK)
-            syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
-        if (ws_server_start() != OK)
-            syslog(LOG_WARNING, "[%s] ws_server_start failed\n", TAG);
-#ifdef CONFIG_AI_AGENT_NODE
-        if (node_client_start() != OK)
-            syslog(LOG_WARNING, "[%s] node_client_start failed\n", TAG);
-#endif
-#ifdef CONFIG_AI_AGENT_MQTT
-        if (mqtt_channel_start() != OK)
-            syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
-#endif
-#ifdef CONFIG_AI_AGENT_WEIXIN
-        if (weixin_channel_start() != OK)
-            syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
-#endif
-
-        syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
-
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
-        g_net_services_started = true;
-#endif
-    } else {
-        syslog(LOG_WARNING, "[%s] Network timeout — net services not started.\n", TAG);
-        syslog(LOG_WARNING, "[%s] Use 'config_show' / 'set_*' CLI commands to configure.\n", TAG);
-    }
-
-#ifdef CONFIG_AI_AGENT_NET_RPMSG
-    /* Register listener for network state changes — auto-restart services on reconnect */
-    network_register_listener(net_state_change_cb, NULL);
-
-    /* Keep thread alive to handle reconnection events */
-    while (!g_shutdown_requested) {
         sleep(1);
     }
-#endif
 
     return NULL;
 }
@@ -466,8 +515,25 @@ static inline long boot_ms(struct timespec* t0)
 
 int ai_agent_main(int argc, char* argv[])
 {
-    (void)argc;
-    (void)argv;
+    const bool daemon_mode = argv_has_flag(argc, argv, "--daemon");
+    const bool skip_cli = daemon_mode;
+
+    if (daemon_mode) {
+        if (g_daemon_running) {
+            return 0;
+        }
+    } else if (g_daemon_running) {
+        /* Background daemon is up; attach an interactive CLI on NSH stdin. */
+        syslog(LOG_INFO, "[%s] Attaching CLI to daemon agent\n", TAG);
+        nsh_commands_set_detach_quit(true);
+        nsh_commands_run_interactive();
+        nsh_commands_set_detach_quit(false);
+        return 0;
+    }
+
+    if (daemon_mode) {
+        g_daemon_running = true;
+    }
 
     g_shutdown_requested = false;
 
@@ -485,6 +551,7 @@ int ai_agent_main(int argc, char* argv[])
 #ifdef CONFIG_LIBC_LOCALTIME
     tzset();
 #endif
+    ensure_wall_clock_for_tls();
     BOOT_LOG(&t0, "P0", "timezone set");
 
     /* ── Phase 0: Storage Bootstrapping (Auto-mount & Mkdir) ── */
@@ -503,12 +570,15 @@ int ai_agent_main(int argc, char* argv[])
     mkdir("/data/agent/skills", 0755);
     BOOT_LOG(&t0, "P0", "storage ready");
 
-    /* Memory info */
+#ifndef __NuttX__
+    /* mallinfo() walks every heap node; on NuttX this can assert if the heap
+     * is under pressure from large agent stacks — skip boot-time heap stats. */
     {
         struct mallinfo mi = mallinfo();
         syslog(LOG_INFO, "[%s] [boot +%ldms] heap: arena=%d free=%d used=%d\n",
             TAG, boot_ms(&t0), mi.arena, mi.fordblks, mi.uordblks);
     }
+#endif
 
     /* ── Phase 1: Core infrastructure ──────────────────────── */
     {
@@ -518,8 +588,12 @@ int ai_agent_main(int argc, char* argv[])
 
         rc = message_bus_init();
         BOOT_LOG_RC(&t0, "P1", "message_bus_init", rc);
-        if (rc != OK)
+        if (rc != OK) {
+            if (daemon_mode) {
+                g_daemon_running = false;
+            }
             return -1;
+        }
 
         rc = memory_store_init();
         BOOT_LOG_RC(&t0, "P1", "memory_store_init", rc);
@@ -618,6 +692,9 @@ int ai_agent_main(int argc, char* argv[])
             AGENT_OUTBOUND_PRIO)
         != OK) {
         syslog(LOG_ERR, "[%s] Failed to start outbound dispatch thread\n", TAG);
+        if (daemon_mode) {
+            g_daemon_running = false;
+        }
         return -1;
     }
     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
@@ -633,9 +710,17 @@ int ai_agent_main(int argc, char* argv[])
 #endif
 
     /* Cron + heartbeat don't need network */
+#ifndef CONFIG_VG_HMI
     cron_service_start();
     heartbeat_start();
     BOOT_LOG(&t0, "P5", "cron + heartbeat started");
+#else
+    /* VelaGuard HMI (SRAM-tight): keep the 4 KB heartbeat thread so the
+     * proactive tasks in HEARTBEAT.md (alarm interpretation, daily report)
+     * still fire; skip the cron poller. */
+    heartbeat_start();
+    BOOT_LOG(&t0, "P5", "heartbeat started, cron skipped (HMI SRAM save)");
+#endif
 
 #ifdef CONFIG_AI_AGENT_LVGL_UI
     if (lvgl_ui_channel_start() != OK)
@@ -684,7 +769,7 @@ int ai_agent_main(int argc, char* argv[])
 
     /* Network watcher thread: reconnect + wait + start net services */
     if (agent_task_create(network_watch_task, "net_watch",
-            AGENT_OUTBOUND_STACK, NULL,
+            AGENT_NET_WATCH_STACK, NULL,
             AGENT_OUTBOUND_PRIO)
         != OK) {
         syslog(LOG_WARNING, "[%s] Failed to start network_watch thread\n", TAG);
@@ -692,9 +777,11 @@ int ai_agent_main(int argc, char* argv[])
     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
 
     /* ── Phase 6: CLI thread — all services now in known state ── */
-    {
+    if (!skip_cli) {
         int rc = nsh_commands_start();
         BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
+    } else {
+        BOOT_LOG(&t0, "P6", "nsh_commands skipped (daemon mode)");
     }
 
     syslog(LOG_INFO, "[%s] [boot +%ldms] AI Agent ready. Type 'help' in NSH for commands.\n",
@@ -752,5 +839,8 @@ int ai_agent_main(int argc, char* argv[])
 
     syslog(LOG_INFO, "[%s] Shutdown complete.\n", TAG);
 
+    if (daemon_mode) {
+        g_daemon_running = false;
+    }
     return 0;
 }

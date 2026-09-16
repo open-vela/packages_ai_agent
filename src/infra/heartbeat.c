@@ -22,6 +22,7 @@
 
 #include "infra/heartbeat.h"
 #include "agent_config.h"
+#include "core/agent_loop.h"
 #include "core/message_bus.h"
 
 #include <stdio.h>
@@ -118,6 +119,10 @@ static bool heartbeat_send(void)
     }
 
     syslog(LOG_INFO, "[%s] Triggered agent check\n", TAG);
+
+    /* Lazy-loop builds (VelaGuard HMI) only start agent_loop on demand;
+     * make sure the queued heartbeat prompt actually gets consumed. */
+    agent_loop_ensure_started();
     return true;
 }
 
