@@ -325,17 +325,26 @@ size_t skill_loader_build_summary(char *buf, size_t size)
      * on the skills directory and iterate over .md files.
      * (Original version used flat namespace readdir from mount root.)
      */
+
+    /* size == 0 时一个字节都不能写，下面的 buf[0] / buf[off] 都依赖它。 */
+    if (size == 0) {
+        return 0;
+    }
+
+    /* 提前置空，覆盖 opendir 失败与循环一次都没跑两种情况。 */
+    buf[0] = '\0';
+
     DIR *dir = opendir(AGENT_SKILLS_DIR);
     if (!dir) {
         syslog(LOG_WARNING, "[%s] Cannot open skills directory for enumeration: %s\n", TAG, AGENT_SKILLS_DIR);
-        buf[0] = '\0';
         return 0;
     }
 
     size_t off = 0;
+    bool truncated = false;
     struct dirent *ent;
 
-    while ((ent = readdir(dir)) != NULL && off < size - 1) {
+    while ((ent = readdir(dir)) != NULL) {
         const char *name = ent->d_name;
         size_t name_len = strlen(name);
 
@@ -345,6 +354,13 @@ size_t skill_loader_build_summary(char *buf, size_t size)
 
         /* Skip hidden files */
         if (name[0] == '.') continue;
+
+        /* 剩余空间放不下下一条目时整条丢弃。此处 off <= size - 1，
+         * 下面的 size - off 不会下溢。 */
+        if (off >= size - 1) {
+            truncated = true;
+            break;
+        }
 
         /* Build full path */
         char full_path[256];
@@ -368,15 +384,33 @@ size_t skill_loader_build_summary(char *buf, size_t size)
         extract_description(f, desc, sizeof(desc));
         fclose(f);
 
-        /* Append to summary */
-        off += snprintf(buf + off, size - off,
+        /* Append to summary.
+         * snprintf 返回的是本该写入的长度，不是截断后的实际长度。直接累加
+         * 会让 off 越过 size，收尾的 buf[off] = '\0' 随即写到界外（本次故障
+         * 中它落在调用者 agent_loop_task 的栈帧里，写坏了 tools_json）。
+         * 放不下的条目整条丢弃：半行会把 read_file <半截路径> 这种错误指令
+         * 写进提示词，模型下一步就会去读一个不存在的文件。 */
+        int n = snprintf(buf + off, size - off,
             "- **%s**: %s (read with: read_file %s)\n",
             title, desc, full_path);
+        if (n < 0 || (size_t)n >= size - off) {
+            truncated = true;
+            break;
+        }
+        off += (size_t)n;
     }
 
     closedir(dir);
 
-    buf[off] = '\0';
+    buf[off] = '\0';      /* off <= size - 1，恒在界内 */
+
+    if (truncated) {
+        syslog(LOG_WARNING,
+            "[%s] Skills summary truncated at %d/%d bytes; "
+            "some skills omitted from the prompt\n",
+            TAG, (int)off, (int)size);
+    }
+
     syslog(LOG_INFO, "[%s] Skills summary: %d bytes\n", TAG, (int)off);
     return off;
 }
