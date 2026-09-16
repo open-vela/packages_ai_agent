@@ -134,6 +134,21 @@ static const char *TAG = "skills";
     "4. cron_add to create the job\n" \
     "5. Confirm with trigger time\n"
 
+#define BUILTIN_CARE_ALARM \
+    "# 关怀叫醒\n\n" \
+    "把手表设成主动叫醒：到点前会先预告，到点主动开口叫醒，没人理会会再催一次。\n\n" \
+    "## 何时使用\n" \
+    "用户说「X 分钟后提醒我 / 叫我 / 喊我起床」，或指定了某个钟点。\n" \
+    "要区分：只想要一条静默的定时通知，用 reminder 技能；想让手表主动把人叫醒，用本技能。\n\n" \
+    "## 怎么用\n" \
+    "1. 先算分钟数：用户给了时长（如 10 分钟）直接用；给了钟点先用 get_current_time 取当前时间再换算\n" \
+    "2. 调 set_alarm，参数 minutes，范围 1-1440\n" \
+    "3. 用用户的语言简短确认，并说明设备行为：到点前 1 分钟先预告、到点叫醒、没反应会再催\n" \
+    "4. 用户要取消时调 cancel_alarm\n" \
+    "5. 同一次请求只调一次 set_alarm，不要重复调用\n\n" \
+    "## 语气\n" \
+    "像同伴而不是闹钟：简短、带一点关心，不要长篇大论。\n"
+
 #define BUILTIN_NOTE_TAKER \
     "# Note Taker\n\n" \
     "Quick notes saved to daily diary files.\n\n" \
@@ -208,6 +223,7 @@ static const builtin_skill_t s_builtins[] = {
     { "system-health",  BUILTIN_SYSTEM_HEALTH  },
     { "reminder",       BUILTIN_REMINDER       },
     { "note-taker",     BUILTIN_NOTE_TAKER     },
+    { "care-reminder",  BUILTIN_CARE_ALARM     },
     { "translate",      BUILTIN_TRANSLATE      },
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },

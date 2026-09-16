@@ -46,6 +46,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_get_time.c
     src/tools/tool_web_search.c
     src/tools/tool_cron.c
+    src/tools/tool_alarm.c
     src/tools/tool_fetch_url.c
     src/tools/tool_feishu_doc.c
     src/tools/tool_feishu_chat.c

@@ -27,6 +27,7 @@
 #endif
 #include "tools/tool_guard.h"
 #include "tools/tool_control.h"
+#include "tools/tool_alarm.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_feishu_chat.h"
 #include "tools/tool_feishu_doc.h"
@@ -209,6 +210,23 @@ int tool_registry_init(void)
         "get_current_time",
         "Get current date, time, and UNIX epoch.",
         tool_get_time_execute);
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    /* Watch alarm: the device previews one minute ahead, wakes the user at
+     * the set time, and escalates if nobody reacts. */
+    REGISTER_TOOL("set_alarm",
+        "Arm the watch alarm to wake/remind the user after N minutes. "
+        "The watch previews 1 minute before, then calls at the set time "
+        "and escalates until the user touches the device.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_NUM("minutes", "Whole minutes from now, 1-1440")
+                TOOL_SCHEMA_END_REQUIRED("\"minutes\""),
+        tool_set_alarm_execute);
+
+    REGISTER_TOOL_NO_PARAMS("cancel_alarm",
+        "Cancel the currently armed watch alarm.",
+        tool_cancel_alarm_execute);
+#endif
 
     /* File tools */
     REGISTER_TOOL("read_file",
