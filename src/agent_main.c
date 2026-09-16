@@ -84,9 +84,9 @@
 #ifdef CONFIG_AI_AGENT_BLE_GATT
 #include "infra/ble_cmd_handler.h"
 #include "infra/ble_gatt.h"
+#endif
 #include <bluetooth.h>
 #include <bt_adapter.h>
-#endif
 
 static const char* TAG = "agent";
 
@@ -145,6 +145,61 @@ static void net_state_change_cb(net_state_t state, void* arg)
     }
 }
 #endif
+
+/* ── Classic-BT local name override ──────────────────────────────
+ * The PAN service names the adapter "<prefix>-<MAC>" on every adapter-on
+ * event (panu_service.c: pan_set_local_name_with_mac), which shows up in
+ * the phone's pairing list as a long pseudo-address. Override it app-side
+ * with a product name: wait for the adapter to reach ON, give the PAN
+ * handler a moment to finish, then write our name and read it back.
+ * One-shot task - it exits once done, so there is no resident cost.
+ * If BT is restarted, PAN re-applies its name; re-running this task
+ * (or a reboot) restores ours. */
+#define AGENT_BT_LOCAL_NAME  "小云手表"
+
+static void* bt_name_task(void* arg)
+{
+    bt_instance_t* ins;
+    char cur[64] = { 0 };
+    int i;
+
+    (void)arg;
+
+    ins = bluetooth_get_instance();
+    if (ins == NULL)
+    {
+        syslog(LOG_WARNING, "[%s] bt_name: no bt instance, skipped\n", TAG);
+        return NULL;
+    }
+
+    for (i = 0; i < 60; i++)
+    {
+        if (bt_adapter_get_state(ins) == BT_ADAPTER_STATE_ON)
+        {
+            break;
+        }
+        sleep(1);
+    }
+    if (i >= 60)
+    {
+        syslog(LOG_WARNING, "[%s] bt_name: adapter never reached ON\n", TAG);
+        return NULL;
+    }
+
+    /* Let PAN's own adapter-on handler land first, otherwise it would
+     * overwrite us a moment later. */
+    sleep(3);
+
+    if (bt_adapter_set_name(ins, AGENT_BT_LOCAL_NAME) != BT_STATUS_SUCCESS)
+    {
+        syslog(LOG_WARNING, "[%s] bt_name: set_name failed\n", TAG);
+        return NULL;
+    }
+
+    bt_adapter_get_name(ins, cur, sizeof(cur));
+    syslog(LOG_INFO, "[%s] bt_name: local name now \"%s\"\n", TAG, cur);
+    return NULL;
+}
 
 /**
  * Runs in a background thread: waits for network, then starts all
@@ -706,6 +761,13 @@ int ai_agent_main(int argc, char* argv[])
         syslog(LOG_WARNING, "[%s] Failed to start network_watch thread\n", TAG);
     }
     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
+
+    /* One-shot: rename the adapter once BT is up (see bt_name_task). */
+    if (agent_task_create(bt_name_task, "bt_name", 4096, NULL,
+            AGENT_OUTBOUND_PRIO)
+        != OK) {
+        syslog(LOG_WARNING, "[%s] Failed to start bt_name thread\n", TAG);
+    }
 
     /* ── Phase 6: CLI thread — all services now in known state ── */
     {
