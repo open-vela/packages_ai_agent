@@ -833,18 +833,18 @@ static char* strip_tool_call_markup(char* text)
 /* ── Extracted: force finish when iteration limit reached ─── */
 
 static char* force_finish_reply(const char* system_prompt,
-    cJSON* messages)
+    cJSON* messages, const char* reason)
 {
     syslog(LOG_WARNING,
-        "[%s] Tool iteration limit (%d) reached, forcing finish\n",
-        TAG, AGENT_AI_AGENT_MAX_TOOL_ITER);
+        "[%s] %s (max %d iters), forcing finish\n",
+        TAG, reason, AGENT_AI_AGENT_MAX_TOOL_ITER);
 
     cJSON* hint = cJSON_CreateObject();
     cJSON_AddStringToObject(hint, "role", "system");
     cJSON_AddStringToObject(hint, "content",
-        "You have used all available tool iterations. "
-        "Do NOT call any more tools. Summarize what you have "
-        "learned so far and reply to the user in plain text now.");
+        "Stop calling tools now. Summarize what you have learned "
+        "from the tool results above and reply to the user in "
+        "plain text.");
     cJSON_AddItemToArray(messages, hint);
 
     llm_response_t resp;
@@ -1059,6 +1059,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     name_repeat = 0;
     int last_total_tokens = 0;
     bool watchdog_fired = false;
+    bool tool_break = false;
     VG_HEAP_SCAN("react_enter");
 
     /* Router: select and apply best backend before first LLM call.
@@ -1287,6 +1288,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             add_tool_result_messages(messages, &resp, tool_output,
                 tool_size, msg->channel, msg->chat_id);
             llm_response_free(&resp);
+            tool_break = true;
             break;
         }
 
@@ -1377,8 +1379,19 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
     /* Iteration limit reached — force a summary reply */
     if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
-        final_text = force_finish_reply(sys_prompt, messages);
+        final_text = force_finish_reply(sys_prompt, messages,
+            "Tool iteration limit reached");
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
+    } else if (!final_text && tool_break) {
+        /* The duplicate / tool-repeat guard cut the loop short.  The tools
+         * it did run already returned data, so ask for a summary instead of
+         * reporting failure: an error reply here throws away a round that
+         * mostly worked, which is exactly what a slightly chatty model used
+         * to produce on every multi-shell skill. */
+        final_text = force_finish_reply(sys_prompt, messages,
+            "Tool repeat guard tripped");
+        agent_trace_end(&trace, final_text ? AGENT_TRACE_OK
+                                           : AGENT_TRACE_FAIL);
     } else if (watchdog_fired) {
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
     } else if (final_text) {

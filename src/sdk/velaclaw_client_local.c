@@ -14,6 +14,7 @@
 #include <string.h>
 #include <syslog.h>
 
+#include "core/agent_loop.h"
 #include "core/message_bus.h"
 #include "core/message_bus_tap.h"
 
@@ -118,6 +119,23 @@ void velaclaw_client_close(velaclaw_client_t* c)
 
     free(c);
     syslog(LOG_INFO, "[%s] client closed\n", TAG);
+}
+
+int velaclaw_ask_async(velaclaw_client_t* c,
+    const velaclaw_ask_req_t* req,
+    void (*cb)(int, const char*, void*), void* cookie)
+{
+    if (!c || !req || !req->text) {
+        return -EINVAL;
+    }
+
+    /* Under CONFIG_VG_HMI this only raises the start request; the network
+     * watcher spins the loop up within about a second.  Other builds start
+     * it outright.  Either way, ask before the message is queued so the
+     * consumer exists by the time it lands. */
+    agent_loop_ensure_started();
+
+    return velaclaw_ask(c, req, cb, cookie);
 }
 
 int velaclaw_ask(velaclaw_client_t* c,
