@@ -46,12 +46,73 @@
 
 #include "cJSON.h"
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 static const char* TAG = "tools";
 
 #define MAX_TOOLS 48
 #define MAX_PROVIDERS 4
+
+/* ── Persistent tool-call audit ─────────────────────────────── */
+
+/* Every tool call lands here, redacted and bounded.  AGENTS.md V5 asks for
+ * the read-only boundary and the call trail to live in C rather than in the
+ * prompt, and syslog alone is gone after a reboot, so a reviewer cannot see
+ * what the agent actually ran.  A failure to write must never fail the call. */
+
+#define VG_TOOL_AUDIT_PATH      "/data/velaguard/logs/agent_tools.log"
+#define VG_TOOL_AUDIT_DIR       "/data/velaguard/logs"
+#define VG_TOOL_AUDIT_ARG_MAX   96
+#define VG_TOOL_AUDIT_MAX_BYTES (64 * 1024)
+
+/* rc column: 0 ok, the tool's own return otherwise, plus these two so a
+ * refusal can be told apart from a tool that ran and failed. */
+
+#define VG_TOOL_AUDIT_BLOCKED   (-2)
+#define VG_TOOL_AUDIT_UNKNOWN   (-3)
+
+static void audit_tool_call(const char* name, const char* input_json, int rc)
+{
+    char safe[VG_TOOL_AUDIT_ARG_MAX];
+    struct timespec ts;
+    struct stat st;
+    FILE* fp;
+
+    if (name == NULL) {
+        return;
+    }
+
+    tool_guard_sanitize_log(input_json, safe, sizeof(safe));
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+    }
+
+    mkdir(VG_TOOL_AUDIT_DIR, 0755);
+
+    /* Rotate once so a chatty skill cannot fill the eMMC partition. */
+
+    if (stat(VG_TOOL_AUDIT_PATH, &st) == 0
+        && st.st_size > VG_TOOL_AUDIT_MAX_BYTES) {
+        (void)rename(VG_TOOL_AUDIT_PATH, VG_TOOL_AUDIT_PATH ".1");
+    }
+
+    fp = fopen(VG_TOOL_AUDIT_PATH, "a");
+    if (fp == NULL) {
+        return;
+    }
+
+    fprintf(fp, "%lu.%03lu tool=%s rc=%d args=%s\n",
+        (unsigned long)ts.tv_sec,
+        (unsigned long)(ts.tv_nsec / 1000000),
+        name, rc, safe);
+
+    fclose(fp);
+}
 
 /* ── External tool provider registry ───────────────────────── */
 
@@ -559,6 +620,7 @@ int tool_registry_execute(const char *name, const char *input_json,
         snprintf(output, output_size,
                  "Error: tool '%s' blocked — %s",
                  name ? name : "(null)", reason);
+        audit_tool_call(name, input_json, VG_TOOL_AUDIT_BLOCKED);
         return ERROR;
     }
 
@@ -570,6 +632,7 @@ int tool_registry_execute(const char *name, const char *input_json,
             if (ret == OK) {
                 tool_guard_record_call(name);
             }
+            audit_tool_call(name, input_json, ret);
             return ret;
         }
     }
@@ -579,6 +642,7 @@ int tool_registry_execute(const char *name, const char *input_json,
     if (mcp_bridge_execute(name, input_json, output, output_size) == OK) {
         syslog(LOG_INFO, "[%s] Executed MCP tool: %s\n", TAG, name);
         tool_guard_record_call(name);
+        audit_tool_call(name, input_json, OK);
         return OK;
     }
 #endif
@@ -593,11 +657,13 @@ int tool_registry_execute(const char *name, const char *input_json,
             syslog(LOG_INFO, "[%s] Executed %s tool: %s\n",
                    TAG, s_providers[p].name, name);
             tool_guard_record_call(name);
+            audit_tool_call(name, input_json, OK);
             return OK;
         }
     }
 
     syslog(LOG_WARNING, "[%s] Unknown tool: %s\n", TAG, name);
     snprintf(output, output_size, "Error: unknown tool '%s'", name);
+    audit_tool_call(name, input_json, VG_TOOL_AUDIT_UNKNOWN);
     return ERROR;
 }

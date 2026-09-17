@@ -137,6 +137,12 @@ static const char *s_protected_files[] = {
     AGENT_CONFIG_FILE,   /* /data/agent/config/config.json */
     AGENT_SOUL_FILE,     /* /data/agent/config/SOUL.md     */
     AGENT_USER_FILE,     /* /data/agent/config/USER.md     */
+    /* VelaGuard: the firmware writes this from its own frame counters and
+     * the report page falls back to it whenever the agent's daily report is
+     * missing or fails validation.  Keeping it out of write_file's reach is
+     * what makes that fallback trustworthy, so the rule lives here and not
+     * only in the skill wording. */
+    "/data/velaguard/reports/runtime-report.md",
     NULL
 };
 

@@ -91,10 +91,36 @@ static const char *s_allowed[] = {
     "session_list", "memory_read",
     "mcp_list", "mcp_discover",
 
-    /* VelaGuard read-only bring-up tools (stage1 ai_agent) */
+    /* VelaGuard read-only bring-up tools (stage1 ai_agent).  Being listed
+     * here means "reachable at all"; s_vg_readonly below narrows each one to
+     * the subcommands that cannot change board state. */
     "vgmodbus", "vgstats", "vgruntime", "vgcfg", "vgnet",
 
     NULL
+};
+
+/* Per-command gate for the VelaGuard tools.  This has to live in C rather
+ * than in the skill text: these commands are reachable through the generic
+ * run_shell tool, and vgstats inject/reset mutate frame counters, vgnet
+ * inject/wifi rewrite network policy, and vgruntime report <path> writes an
+ * arbitrary file.
+ *
+ *   subcmd == NULL  read-only by construction, the whole command is fine
+ *   subcmd == ""    no subcommand is permitted at all
+ *   otherwise       the first token after the command must equal subcmd   */
+
+static const struct {
+    const char *name;
+    const char *subcmd;
+} s_vg_readonly[] = {
+    { "vgmodbus",   NULL     },
+    { "vgstats",    "dump"   },
+    { "vgruntime",  "dump"   },
+    { "vgcfg",      "dump"   },
+    { "vgnet",      "status" },
+    { "vgpoint",    ""       },
+    { "vgdiscover", ""       },
+    { NULL, NULL }
 };
 #endif
 
@@ -161,16 +187,25 @@ static int is_blocked(const char *cmd)
     const char *basename = strrchr(first, '/');
     const char *name = basename ? basename + 1 : first;
 
-    /* VelaGuard: point-table mutation stays off the Agent allow-list. */
-    if (strcmp(name, "vgpoint") == 0 || strcmp(name, "vgdiscover") == 0) {
-        return 1;
-    }
-    if (strcmp(name, "vgcfg") == 0) {
+    /* VelaGuard: the agent may read board state, never change it. */
+    for (int k = 0; s_vg_readonly[k].name; k++) {
+        if (strcmp(name, s_vg_readonly[k].name) != 0)
+            continue;
+
+        const char *want = s_vg_readonly[k].subcmd;
+
+        if (want == NULL)
+            return 0;           /* read-only by construction */
+
+        if (want[0] == '\0')
+            return 1;           /* nothing permitted, including bare name */
+
         while (cmd[i] == ' ') i++;
-        if (strncmp(cmd + i, "dump", 4) != 0)
+        size_t wlen = strlen(want);
+        if (strncmp(cmd + i, want, wlen) != 0)
             return 1;
-        if (cmd[i + 4] != '\0' && cmd[i + 4] != ' ')
-            return 1;
+        if (cmd[i + wlen] != '\0' && cmd[i + wlen] != ' ')
+            return 1;           /* "dumpsters" must not pass as "dump" */
         return 0;
     }
 
