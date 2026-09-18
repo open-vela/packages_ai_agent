@@ -152,6 +152,15 @@
 #define AGENT_LLM_MAX_RESP_SIZE \
     (512 * 1024) /* hard cap for growable resp buffer */
 
+/* Response cap for the direct (non-proxy) HTTPS path, which hands its buffer
+ * straight to vela_tls instead of growing it.  vela_tls stops reading at
+ * resp_cap-1, so this has to clear the largest real reply: a tool-calling
+ * round carries the model's entire tool_arguments inline, and the document the
+ * advice round asks for is written through that argument.  The 4 KiB VG_HMI
+ * stream buffer cut an advice reply off mid-JSON on 2026-09-17, which reached
+ * the log as "Failed to parse API JSON". */
+#define AGENT_LLM_DIRECT_RESP_CAP (64 * 1024)
+
 /* ── Qwen (Alibaba DashScope) backend constants ─────────────── */
 #define AGENT_LLM_QWEN_HOST "dashscope.aliyuncs.com"
 #define AGENT_LLM_QWEN_PATH "/compatible-mode/v1/chat/completions"
