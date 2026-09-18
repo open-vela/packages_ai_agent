@@ -102,7 +102,7 @@
 #define AGENT_FEISHU_MAX_MSG_LEN 4000 /* Feishu text message limit */
 
 /* ── Agent Loop ─────────────────────────────────────────────── */
-#define AGENT_AI_AGENT_STACK (32 * 1024)
+#define AGENT_AI_AGENT_STACK (64 * 1024)
 #define AGENT_AI_AGENT_PRIO 60
 #define AGENT_AI_AGENT_CORE 0
 #define AGENT_AI_AGENT_MAX_HISTORY 10
@@ -161,7 +161,7 @@
 /* ── Message Bus ────────────────────────────────────────────── */
 #define AGENT_BUS_QUEUE_LEN 16
 #define AGENT_BUS_PUSH_TIMEOUT_MS 5000
-#define AGENT_OUTBOUND_STACK (16 * 1024)
+#define AGENT_OUTBOUND_STACK (48 * 1024)
 #define AGENT_OUTBOUND_PRIO 50
 #define AGENT_OUTBOUND_CORE 0
 
@@ -228,7 +228,7 @@
 #define AGENT_WS_CLIENT_STACK (12 * 1024)
 
 /* ── Serial CLI ─────────────────────────────────────────────── */
-#define AGENT_CLI_STACK (16 * 1024)
+#define AGENT_CLI_STACK (48 * 1024)
 #define AGENT_CLI_PRIO 30
 #define AGENT_CLI_CORE 0
 
@@ -300,14 +300,35 @@
 #define AGENT_CHAN_LVGL_UI "lvgl_ui"
 #endif
 
+/* ── Notify Service (Gerrit/Jira background polling → toast popup) ── */
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+#define AGENT_CHAN_LVGL_NOTIFY "lvgl_notify"
+#endif
+
 /* ── WeChat Channel ─────────────────────────────────────────── */
 #define AGENT_WEIXIN_STACK (12 * 1024)
 #define AGENT_WEIXIN_PRIO 45
 
 /* ── LVGL UI Channel ───────────────────────────────────────── */
 #ifdef CONFIG_AI_AGENT_LVGL_UI
-#define AGENT_LVGL_UI_STACK (16 * 1024)
+#define AGENT_LVGL_UI_STACK (64 * 1024)
 #define AGENT_LVGL_UI_PRIO 45
+#endif
+
+/* ── Notify Service (Gerrit/Jira polling → LVGL toast) ────── */
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+#define AGENT_NOTIFY_STACK (8 * 1024)   /* mcp_client sync HTTP needs deeper stack */
+#define AGENT_NOTIFY_PRIO 35            /* below agent_loop (60) + outbound (50) */
+#ifndef CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC
+#define CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC 60
+#endif
+#define AGENT_NOTIFY_INTERVAL_SEC CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC
+/* JSON buffer for one poll response (Gerrit/Jira ~4-8KB) */
+#define AGENT_NOTIFY_JSON_BUF_SIZE 8192
+#define AGENT_NOTIFY_MAX_NEW 16          /* cap new records per poll */
+#define AGENT_NOTIFY_TOAST_MS 4000       /* toast auto-dismiss */
+#define AGENT_NOTIFY_GERRIT_COLOR 0x2196f3 /* blue */
+#define AGENT_NOTIFY_JIRA_COLOR   0xff9800 /* orange (== LVGL_UI_CARD_COLOR_JIRA) */
 #endif
 
 /* ── MQTT Channel ───────────────────────────────────────────── */
@@ -327,25 +348,45 @@
 #define AGENT_CFG_KEY_MQTT_USERNAME "mqtt_username"
 #define AGENT_CFG_KEY_MQTT_PASSWORD "mqtt_password"
 
+/* ── Remote-control channel (drives a remote ACP agent) ─────── */
+#define AGENT_REMOTE_CTRL_STACK (12 * 1024)
+#define AGENT_REMOTE_CTRL_PRIO 45
+
+/* Default budget for one remote turn. A turn held up by a permission request
+ * cannot finish until a human answers on this device, so the tool reports what
+ * it has rather than waiting indefinitely. */
+#define AGENT_REMOTE_CTRL_TURN_TIMEOUT_MS 120000
+
+/* Credentials are read from the config store, never from a command line. */
+#define AGENT_CFG_KEY_REMOTE_BROKER "remote_broker"
+#define AGENT_CFG_KEY_REMOTE_DEVICE_ID "remote_device_id"
+#define AGENT_CFG_KEY_REMOTE_USERNAME "remote_username"
+#define AGENT_CFG_KEY_REMOTE_PASSWORD "remote_password"
+#define AGENT_CFG_KEY_REMOTE_TOPIC_PREFIX "remote_topic_prefix"
+
 /* ── Voice Channel (Doubao ASR/TTS) ─────────────────────────── */
 #define AGENT_CHAN_VOICE "voice"
 
-#define AGENT_VOICE_STACK (16 * 1024)
+#define AGENT_VOICE_STACK (48 * 1024)
 #define AGENT_VOICE_PRIO 50
 
-/* Doubao TTS V3 API endpoint (HTTP Chunked, x-api-key auth) */
+/* Doubao TTS V3 API endpoint (HTTP Chunked, x-api-key auth).
+ * Resource id must match the speaker model generation (account grants
+ * seed-tts-2.0 only): *_uranus_bigtts / saturn_* -> seed-tts-2.0,
+ * *_mars_bigtts / *_moon_bigtts / ICL_* -> seed-tts-1.0. */
 #define AGENT_DOUBAO_TTS_HOST "openspeech.bytedance.com"
 #define AGENT_DOUBAO_TTS_PORT "443"
 #define AGENT_DOUBAO_TTS_V3_PATH "/api/v3/tts/unidirectional"
-#define AGENT_DOUBAO_TTS_RESOURCE "volc.service_type.10029"
+#define AGENT_DOUBAO_TTS_RESOURCE "seed-tts-2.0"
 
-/* Doubao streaming ASR WebSocket API (V2) */
+/* Doubao streaming ASR WebSocket API (V3 bigmodel, API-key auth).
+ * Auth: X-Api-Key header (from set_volc_key). Resource id fixed per app. */
 #define AGENT_DOUBAO_ASR_HOST "openspeech.bytedance.com"
 #define AGENT_DOUBAO_ASR_PORT "443"
-#define AGENT_DOUBAO_ASR_WS_PATH "/api/v2/asr"
+#define AGENT_DOUBAO_ASR_WS_PATH "/api/v3/sauc/bigmodel_async"
 
-/* Default ASR cluster (streaming, common Chinese) */
-#define AGENT_DOUBAO_ASR_CLUSTER "volcengine_streaming_common"
+/* Default ASR resource (豆包流式语音识别大模型 2.0 小时版) */
+#define AGENT_DOUBAO_ASR_RESOURCE "volc.seedasr.sauc.duration"
 
 /* Audio device paths (platform-specific) */
 #ifndef AGENT_AUDIO_CAPTURE_DEV
@@ -380,8 +421,8 @@
 #define AGENT_CFG_KEY_VOLC_CLUSTER "volc_cluster"
 #define AGENT_CFG_KEY_VOLC_ASR_CLUSTER "volc_asr_cluster"
 
-/* Default TTS speaker and cluster */
-#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
+/* Default TTS speaker and cluster (seed-tts-2.0 voice: *_uranus_bigtts) */
+#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_m191_uranus_bigtts"
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
 
 /* WebSocket TTS output sample rate (big-model voices output 24kHz) */

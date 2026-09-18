@@ -28,6 +28,9 @@
 #include "infra/config_store.h"
 #include "infra/cron_service.h"
 #include "infra/heartbeat.h"
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+#include "infra/notify_service.h"
+#endif
 #include "llm/llm_proxy.h"
 #ifdef CONFIG_AI_AGENT_MCP
 #include "tools/mcp_client.h"
@@ -124,6 +127,21 @@ static void cmd_help(void)
         "  node_start          - Connect to OpenClaw Gateway as Node\n"
         "  node_stop           - Disconnect from OpenClaw Gateway\n"
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        "  set_remote <host:port> [device_id] - Set PC bridge for remote agent\n"
+        "  set_remote_auth <user> <pass> - Set bridge broker credentials\n"
+        /* One 'r' prefix for the whole family: these are typed at a console, and
+         * a set where one name is short and the rest are long is worse than
+         * either convention on its own. set_remote* keep their names because
+         * they follow the repo-wide set_<thing> pattern for configuration. */
+        "  rask <text>          - Send one instruction to the remote agent\n"
+        "  rstat                - Remote agent state, model, billing, approval\n"
+        "  rreply               - Print the remote agent's full reply\n"
+        "  rmodel [n|name]      - List remote agent models, or switch to one\n"
+        "  rusage               - Refresh remote session billing\n"
+        "  ronce                - Approve the pending request (human only)\n"
+        "  rdeny                - Deny the pending request (human only)\n"
+#endif
         "  restart              - Restart the device\n"
         "  quit                 - Exit agent\n"
         "  set_mqtt <broker> [client_id] - Set MQTT broker (host:port)\n"
@@ -134,6 +152,8 @@ static void cmd_help(void)
         "  voice_stop             - Stop voice channel\n"
         "  voice_test_tts <text> [out.pcm] - Test TTS synthesis\n"
         "  voice_test_asr <file>  - Test ASR recognition\n"
+        "  voice_test_beep [freq] [ms] - Test beep tone (default 1000Hz 200ms)\n"
+        "  voice_test_speak <text> - Test speak end-to-end (beep + TTS + playback)\n"
         "  set_voice_tts <name>   - Switch TTS backend\n"
         "  set_voice_asr <name>   - Switch ASR backend\n"
         "  set_weixin_token <tok> - Set WeChat bot token\n"
@@ -155,6 +175,12 @@ static void cmd_help(void)
         "  mcp_discover          - Discover tools from remote servers\n"
         "  mcp_status            - Show MCP client status\n"
         "  mcp_tools             - List remote MCP tools\n"
+#endif
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+        "  notify_start          - Start Gerrit/Jira background polling\n"
+        "  notify_status         - Show notify service status (cursor/new)\n"
+        "  notify_stop           - Stop background polling\n"
+        "  notify_inject <g|j> <key> <text> - Pop a test toast (gerrit/jira)\n"
 #endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         "  show_chat            - Show chat UI on screen\n"
@@ -480,6 +506,12 @@ static void cmd_config_show(void)
     SHOW_CFG("GW Port", AGENT_CFG_KEY_GATEWAY_PORT, false);
     SHOW_CFG("GW Token", AGENT_CFG_KEY_GATEWAY_TOKEN, true);
     SHOW_CFG("MQTT Broker", AGENT_CFG_KEY_MQTT_BROKER, false);
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+    SHOW_CFG("Remote Broker", AGENT_CFG_KEY_REMOTE_BROKER, false);
+    SHOW_CFG("Remote Device", AGENT_CFG_KEY_REMOTE_DEVICE_ID, false);
+    SHOW_CFG("Remote User", AGENT_CFG_KEY_REMOTE_USERNAME, false);
+    SHOW_CFG("Remote Pass", AGENT_CFG_KEY_REMOTE_PASSWORD, true);
+#endif
     SHOW_CFG("Volc AppKey", AGENT_CFG_KEY_VOLC_APPKEY, true);
     SHOW_CFG("Volc Token", AGENT_CFG_KEY_VOLC_TOKEN, true);
     SHOW_CFG("Volc API Key", AGENT_CFG_KEY_VOLC_API_KEY, true);
@@ -696,18 +728,44 @@ static void cmd_exit_app(void)
 #ifdef CONFIG_AI_AGENT_MCP
 static void cmd_mcp_add(int argc, char** argv)
 {
+    /* Two forms:
+     *   mcp_add <name> <url> [token]                          (generic / Gerrit)
+     *   mcp_add <name> <url> <jira_url> <username> <pat>      (Jira MCP)
+     * The Jira form is selected when the URL targets acc.pt.miui.com; the
+     * Jira MCP (mcp-atlassian) authenticates via three X-Atlassian-* headers
+     * instead of a single bearer token. */
+    bool is_jira = (argc >= 3) && (strstr(argv[2], "acc.pt.miui.com") != NULL);
+
     if (argc < 3) {
-        printf("Usage: mcp_add <name> <url> [token]\n"
-               "  name:  server name (e.g. amap)\n"
-               "  url:   MCP endpoint (e.g. http://host:port/mcp)\n"
-               "  token: optional bearer token\n");
+        printf("Usage:\n"
+               "  mcp_add <name> <url> [token]\n"
+               "  mcp_add <name> <url> <jira_url> <username> <pat>   (Jira)\n"
+               "    name:     server name (e.g. gerrit, jira)\n"
+               "    url:      MCP endpoint\n"
+               "    token:    optional bearer token (generic / onedev gateway)\n"
+               "    jira_url: Jira base URL (e.g. https://jira-phone.mioffice.cn)\n"
+               "    username: Jira username (email prefix)\n"
+               "    pat:      Jira personal access token\n");
         return;
     }
 
-    const char* token = (argc >= 4) ? argv[3] : NULL;
-    int ret = mcp_client_add_server(argv[1], argv[2], token);
+    int ret;
+    if (is_jira) {
+        if (argc < 6) {
+            printf("Jira MCP needs: mcp_add <name> <url> <jira_url> <username> <pat>\n");
+            return;
+        }
+        ret = mcp_client_add_server(argv[1], argv[2], NULL,
+            argv[3], argv[4], argv[5]);
+    } else {
+        const char* token = (argc >= 4) ? argv[3] : NULL;
+        ret = mcp_client_add_server(argv[1], argv[2], token,
+            NULL, NULL, NULL);
+    }
     if (ret == OK) {
         printf("Added MCP server: %s → %s\n", argv[1], argv[2]);
+        /* Persist so the server is auto-restored after reboot. */
+        mcp_client_persist_save();
     } else {
         printf("Failed to add MCP server\n");
     }
@@ -725,6 +783,8 @@ static void cmd_mcp_remove(int argc, char** argv)
     int ret = mcp_client_remove_server(argv[1]);
     if (ret == OK) {
         printf("Removed MCP server: %s\n", argv[1]);
+        /* Update persisted list so a removed server doesn't reappear. */
+        mcp_client_persist_save();
     } else {
         printf("Server not found: %s\n", argv[1]);
     }
@@ -771,6 +831,72 @@ static void cmd_mcp_tools(void)
     }
 }
 #endif /* CONFIG_AI_AGENT_MCP */
+
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+/* ── notify_start / status / stop / inject ──────────────────── */
+
+static void cmd_notify_start(void)
+{
+    if (notify_service_start() == OK) {
+        printf("Notify service started (polling Gerrit/Jira).\n");
+    } else {
+        printf("Notify service already running or failed to start.\n");
+    }
+}
+
+static void cmd_notify_status(void)
+{
+    char* json = notify_service_status_json();
+    if (json) {
+        printf("%s\n", json);
+        free(json);
+    } else {
+        printf("No notify service data\n");
+    }
+}
+
+static void cmd_notify_stop(void)
+{
+    notify_service_stop();
+    printf("Notify service stopped.\n");
+}
+
+static void cmd_notify_inject(int argc, char** argv)
+{
+    /* notify_inject <gerrit|jira> <key> <summary...>
+     * Bypasses polling — pops a toast immediately.  Used to verify the
+     * toast widget + outbound path without a live MCP server. */
+    if (argc < 4) {
+        printf("Usage: notify_inject <gerrit|jira> <key> <summary...>\n"
+               "  e.g. notify_inject gerrit 9688768 \"CI failed: audio.c build error\"\n");
+        return;
+    }
+
+    notify_source_t src;
+    if (strcmp(argv[1], "gerrit") == 0) {
+        src = NOTIFY_SRC_GERRIT;
+    } else if (strcmp(argv[1], "jira") == 0) {
+        src = NOTIFY_SRC_JIRA;
+    } else {
+        printf("Source must be 'gerrit' or 'jira'\n");
+        return;
+    }
+
+    /* Rejoin argv[3..] as the summary text. */
+    char summary[192];
+    summary[0] = '\0';
+    for (int i = 3; i < argc; i++) {
+        if (i > 3) strlcat(summary, " ", sizeof(summary));
+        strlcat(summary, argv[i], sizeof(summary));
+    }
+
+    if (notify_service_inject(src, argv[2], summary) == OK) {
+        printf("Injected %s notification: %s\n", argv[1], argv[2]);
+    } else {
+        printf("Inject failed (bad source/key?)\n");
+    }
+}
+#endif /* CONFIG_AI_AGENT_NOTIFY_SERVICE */
 
 /* ── install_skill: install a skill from URL ──────────────── */
 
@@ -987,6 +1113,29 @@ static void* cli_thread(void* arg)
         else if (strcmp(cmd, "node_stop") == 0)
             cmd_node_stop();
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        else if (strcmp(cmd, "set_remote") == 0)
+            cmd_set_remote(argc, argv);
+        else if (strcmp(cmd, "set_remote_auth") == 0)
+            cmd_set_remote_auth(argc, argv);
+        /* One spelling each, all 'r'-prefixed (see the help block for why).
+         * A second name for the same action would only be one more thing to
+         * remember and one more place to fall out of date. */
+        else if (strcmp(cmd, "rask") == 0)
+            cmd_remote_ask(argc, argv);
+        else if (strcmp(cmd, "rstat") == 0)
+            cmd_remote_status();
+        else if (strcmp(cmd, "rreply") == 0)
+            cmd_remote_output();
+        else if (strcmp(cmd, "rmodel") == 0)
+            cmd_remote_model(argc, argv);
+        else if (strcmp(cmd, "rusage") == 0)
+            cmd_remote_usage();
+        else if (strcmp(cmd, "ronce") == 0)
+            cmd_remote_once();
+        else if (strcmp(cmd, "rdeny") == 0)
+            cmd_remote_deny();
+#endif
         else if (strcmp(cmd, "quit") == 0) {
             cmd_quit();
             break;
@@ -1006,6 +1155,10 @@ static void* cli_thread(void* arg)
             cmd_voice_test_tts(argc, argv);
         else if (strcmp(cmd, "voice_test_asr") == 0)
             cmd_voice_test_asr(argc, argv);
+        else if (strcmp(cmd, "voice_test_beep") == 0)
+            cmd_voice_test_beep(argc, argv);
+        else if (strcmp(cmd, "voice_test_speak") == 0)
+            cmd_voice_test_speak(argc, argv);
         else if (strcmp(cmd, "set_voice_tts") == 0)
             cmd_set_voice_tts(argc, argv);
         else if (strcmp(cmd, "set_voice_asr") == 0)
@@ -1035,6 +1188,16 @@ static void* cli_thread(void* arg)
             cmd_mcp_status();
         else if (strcmp(cmd, "mcp_tools") == 0)
             cmd_mcp_tools();
+#endif
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+        else if (strcmp(cmd, "notify_start") == 0)
+            cmd_notify_start();
+        else if (strcmp(cmd, "notify_status") == 0)
+            cmd_notify_status();
+        else if (strcmp(cmd, "notify_stop") == 0)
+            cmd_notify_stop();
+        else if (strcmp(cmd, "notify_inject") == 0)
+            cmd_notify_inject(argc, argv);
 #endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         else if (strcmp(cmd, "show_chat") == 0)

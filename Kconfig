@@ -139,15 +139,21 @@ config AI_AGENT_AUDIO_PREPROCESS
 config AI_AGENT_AUDIO_CAPTURE_GAIN
 	int "Audio capture gain multiplier"
 	default 6
-	range 1 16
+	range 1 256
 	---help---
 		Gain multiplier applied to captured audio samples.
-		When board configures multiple DMIC channels but only
-		one has a physical microphone, the mono downmix dilutes
-		the signal. Set gain to compensate:
-		- 1 = No gain (single-channel or balanced multi-mic)
-		- 6 = Compensate for 6-channel DMIC with 1 active mic
-		- Higher values for more amplification (may clip)
+		Two use cases:
+		- Multi-mic downmix: when the board configures several DMIC
+		  channels but only one has a physical mic, the mono downmix
+		  dilutes the signal (e.g. 6 = compensate 6-channel DMIC with
+		  1 active mic).
+		- QEMU/goldfish: the host mic level depends on which
+		  PulseAudio source the virtio-snd capture binds to.  A
+		  Bluetooth HFP headset source is already 16kHz mono s16le at
+		  normal mic level, so no gain is needed (1 = passthrough).
+		  Only raise this if a specific host source is measurably too
+		  quiet.
+		- 1 = No gain; higher values amplify more (may clip; saturated).
 
 config AI_AGENT_AUDIO_ALSA_DIRECT
 	bool "Use direct ALSA capture backend"
@@ -161,6 +167,19 @@ config AI_AGENT_AUDIO_ALSA_DIRECT
 		boards; the agent then uses the media framework recorder,
 		which works everywhere. When enabled, the agent still falls
 		back to media_recorder at runtime if ALSA capture fails.
+
+config AI_AGENT_AUDIO_NUTTX_DIRECT
+	bool "Use direct NuttX audio backend (pcm0c capture + pcm0p playback)"
+	default n
+	depends on AUDIO
+	---help---
+		Use the NuttX audio framework devices directly instead of the
+		portable media_recorder / media_player backends: capture via
+		/dev/audio/pcm0c (open/ioctl/read) and playback via
+		/dev/audio/pcm0p (open/ioctl/enqueue). Use this on boards that
+		register NuttX audio lower-halves (e.g. BK7258 /dev/audio/pcm0c
+		and /dev/audio/pcm0p). When enabled, the agent still falls back
+		to the media framework at runtime if the device open fails.
 
 config AI_AGENT_CAMERA
 	bool "Enable camera capture tool"
@@ -188,6 +207,30 @@ config AI_AGENT_MCP
 		Enable the Model Context Protocol bridge for remote
 		tool servers. Costs ~10KB RAM (registry + client state).
 		Disable to save memory if only using builtin tools.
+
+config AI_AGENT_REMOTE_CTRL
+	bool "Enable remote agent control channel"
+	default n
+	depends on NETUTILS_MQTTC && NETUTILS_CJSON
+	---help---
+		Let this device drive a remote ACP agent (mimocode or
+		kiro-cli) running on a PC, over a bridge that speaks MQTT
+		to the device. Adds the remote_agent_prompt and
+		remote_agent_status tools, the set_remote* config commands
+		and the r* console commands (rask, rstat, rreply, rusage,
+		ronce, rdeny).
+
+		Costs ~22KB RAM (12KB thread + 2x4.6KB MQTT buffers +
+		session state). Needs its own MQTT client, separate from
+		the AI_AGENT_MQTT chat channel, because each reconnect must
+		mint a new session nonce and redo the handshake.
+
+		Permission decisions for the remote agent are reachable only
+		from the NSH commands, never as an LLM-callable tool.
+
+		Broker address and credentials are supplied at runtime
+		through the config store (remote_broker, remote_username,
+		remote_password) and are never compiled in.
 
 config AI_AGENT_TEST
 	bool "Enable integration test commands"
@@ -260,7 +303,7 @@ config AI_AGENT_MCP_MAX_SERVERS
 	int "Max MCP remote servers"
 	default 4
 	range 1 8
-	depends on AGENT_MCP
+	depends on AI_AGENT_MCP
 	---help---
 		Maximum number of remote MCP servers. Each server slot
 		uses ~456 bytes BSS. Reduce on memory-constrained boards.
@@ -269,7 +312,7 @@ config AI_AGENT_MCP_MAX_TOOLS
 	int "Max MCP remote tools"
 	default 16
 	range 4 64
-	depends on AGENT_MCP
+	depends on AI_AGENT_MCP
 	---help---
 		Maximum cached remote tools across all MCP servers.
 		Each tool slot uses ~452 bytes BSS. Reduce on
@@ -283,6 +326,39 @@ config AI_AGENT_TLS_CONN_POOL_SIZE
 		Number of persistent TLS connections kept alive for
 		reuse. Each slot uses ~12KB BSS (TLS context + raw
 		buffer). Set to 1 on memory-constrained boards.
+
+config AI_AGENT_NOTIFY_SERVICE
+	bool "Enable Gerrit/Jira notify polling → LVGL toast"
+	default n
+	depends on AI_AGENT_LVGL_UI
+	depends on AI_AGENT_MCP
+	---help---
+		Background polling service that periodically queries
+		connected Gerrit/Jira MCP servers for new changes,
+		deduplicates against a persisted cursor, and pops a
+		top-of-screen LVGL toast for each new item (does NOT
+		enter chat history). Requires LVGL UI + MCP client.
+
+config AI_AGENT_NOTIFY_INTERVAL_SEC
+	int "Notify polling interval (seconds)"
+	default 60
+	range 30 3600
+	depends on AI_AGENT_NOTIFY_SERVICE
+	---help---
+		Base polling interval in seconds. Each source (gerrit/
+		jira) keeps its own next-due timestamp staggered off
+		this base. Too low hammers internal MCP gateways; too
+		-high misses fresh CI failures. 60 is a sane default.
+
+config AI_AGENT_NOTIFY_LLM_SUMMARY
+	bool "Summarize new items via LLM (off = template text)"
+	default n
+	depends on AI_AGENT_NOTIFY_SERVICE
+	---help---
+		If on, new Gerrit/Jira items are pushed as a prompt to
+		agent_loop so the LLM summarizes them before showing the
+		toast. Costs tokens + ~2-5s latency per batch. Off (default)
+		uses a fast snprintf template ("Gerrit #N: subject").
 
 config AI_AGENT_BLE_GATT
 	bool "Enable BLE GATT data channel"

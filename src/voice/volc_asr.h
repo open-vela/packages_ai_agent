@@ -28,9 +28,8 @@ int volc_asr_register(void);
 /* Legacy direct-call API (kept for backward compatibility). */
 int volc_asr_recognize(const unsigned char *pcm_data,
                        size_t pcm_len,
-                       const char *app_id,
-                       const char *token,
-                       const char *cluster,
+                       const char *api_key,
+                       const char *resource,
                        char *text_out,
                        size_t text_cap);
 

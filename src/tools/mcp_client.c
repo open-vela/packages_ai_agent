@@ -18,6 +18,7 @@
 #include "tools/tool_registry.h"
 #include "cJSON.h"
 #include "infra/vela_tls.h"
+#include "infra/config_store.h"
 #include "agent_compat.h"
 
 #include <pthread.h>
@@ -103,6 +104,16 @@ typedef struct {
     parsed_url_t parsed;
     bool initialized; /* MCP initialize handshake done */
     char session_id[128]; /* Mcp-Session header from server */
+
+    /* Jira MCP (sooperset/mcp-atlassian, fronted by acc.pt.miui.com) authenticates
+     * via three X-Atlassian-* headers instead of x-user-token: the Jira base URL,
+     * the username, and a Jira personal access token. They must outlive the post
+     * call (vela_header_t holds const char*), so they live here on the server
+     * struct rather than on mcp_http_post's stack. Unused (empty) for non-Jira
+     * servers; mcp_http_post only reads them when host == MCP_JIRA_HOST. */
+    char jira_url[128];
+    char jira_user[64];
+    char jira_pat[128];
 } mcp_remote_server_t;
 
 static mcp_remote_server_t s_servers[MCP_CLIENT_MAX_SERVERS];
@@ -115,8 +126,34 @@ static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
 static bool s_inited = false;
 static atomic_int s_req_id = 1;
 
-/* Response buffer size for MCP HTTP calls */
-#define MCP_RESP_BUF_SIZE 8192
+/* Response buffer size for MCP HTTP calls.
+ * Must hold full SSE-wrapped JSON-RPC responses; e.g. the onedev Gerrit
+ * gateway's tools/list is ~14KB. 64KB leaves headroom for large tools/call
+ * results (query_changes listings, diffs, etc.). Buffer is heap-allocated
+ * per call and freed immediately after, so the size costs nothing at rest. */
+#define MCP_RESP_BUF_SIZE 65536
+
+/* The onedev MCP unified gateway fronts several Gerrit instances and routes
+ * a tools/call to the right one via a pair of headers: one declares a named
+ * "host segment" carrying the Gerrit base URL, the other selects that segment
+ * by name. Without them tools/list works but tools/call is rejected with
+ * "Missing required header: at least one 'x-gerrit-host-*' must be configured".
+ * The segment name ("default") is a placeholder shared by both headers; the
+ * Gerrit URL must be a *.mioffice.cn address the gateway can resolve. These
+ * are only attached for the onedev gateway host, so other MCP servers are
+ * unaffected. */
+#define MCP_GW_HOST      "onedev.pt.miui.com"
+#define MCP_GERRIT_URL   "https://gerrit.pt.mioffice.cn"
+#define MCP_GERRIT_SEG   "default"
+
+/* The internal Jira MCP service (sooperset/mcp-atlassian, deployed by the
+ * xiaoai client team) is fronted by acc.pt.miui.com and authenticates via
+ * three X-Atlassian-* headers carried on every request (initialize through
+ * tools/call alike). Unlike the onedev Gerrit gateway, Jira needs no separate
+ * tools/call routing header — the Jira base URL itself is the routing hint.
+ * These headers are attached only for this host, so non-Jira servers are
+ * unaffected. */
+#define MCP_JIRA_HOST    "acc.pt.miui.com"
 
 /* ── JSON-RPC request builder ───────────────────────────── */
 
@@ -149,8 +186,18 @@ static char* build_jsonrpc_request(const char* method, cJSON* params)
 static int mcp_http_post(mcp_remote_server_t* srv, const char* body,
     char* resp_buf, size_t resp_cap)
 {
-    vela_header_t headers[5];
+    /* Worst case: Accept, Connection, Mcp-Session, x-user-token,
+     * x-gerrit-host-<seg>, x-gerrit-<seg>, X-Atlassian-Jira-Url,
+     * X-Atlassian-Username, X-Atlassian-Jira-Personal-Token, plus NULL. */
+    vela_header_t headers[10];
     int h = 0;
+
+    /* Header names for the Gerrit segment, built once: "x-gerrit-host-default"
+     * and "x-gerrit-default". Sized to fit any reasonable segment name. */
+    char host_hdr[32];
+    char sel_hdr[32];
+    snprintf(host_hdr, sizeof(host_hdr), "x-gerrit-host-%s", MCP_GERRIT_SEG);
+    snprintf(sel_hdr, sizeof(sel_hdr), "x-gerrit-%s", MCP_GERRIT_SEG);
 
     headers[h].name = "Accept";
     headers[h].value = "application/json, text/event-stream";
@@ -170,31 +217,55 @@ static int mcp_http_post(mcp_remote_server_t* srv, const char* body,
     }
 
     if (srv->token[0]) {
-        /* Build "Bearer <token>" — use heap to avoid static buffer race */
-        char* auth_buf = malloc(192);
-        if (!auth_buf)
-            return -1;
-        snprintf(auth_buf, 192, "Bearer %s", srv->token);
-        headers[h].name = "Authorization";
-        headers[h].value = auth_buf;
+        /* Auth via the MCP unified gateway's custom header.
+         * The gateway (onedev.pt.miui.com/mcp-gw) expects the raw token in
+         * "x-user-token", NOT a standard "************** ****** <token>".
+         * srv->token outlives the post call (caller holds the lock or a
+         * stack copy of the server struct), so no heap buffer is needed. */
+        headers[h].name = "x-user-token";
+        headers[h].value = srv->token;
         h++;
+    }
 
-        headers[h].name = NULL;
-        headers[h].value = NULL;
+    /* Gerrit host routing for the onedev gateway. The gateway fronts multiple
+     * Gerrit instances; tools/call needs a host-segment header (declaring a
+     * named Gerrit base URL) plus a selector header (picking that segment by
+     * name) to know which Gerrit to query. tools/list works without these, so
+     * mcp_discover succeeds regardless — this only matters for tools/call.
+     * Gated on the gateway host so non-Gerrit MCP servers are unaffected. */
+    if (strcmp(srv->parsed.host, MCP_GW_HOST) == 0) {
+        headers[h].name = host_hdr;        /* "x-gerrit-host-default" */
+        headers[h].value = MCP_GERRIT_URL; /* https://gerrit.pt.mioffice.cn */
+        h++;
+        headers[h].name = sel_hdr;         /* "x-gerrit-default" */
+        headers[h].value = MCP_GERRIT_SEG; /* "default" */
+        h++;
+    }
 
-        int status;
-        if (srv->parsed.use_tls) {
-            status = vela_https_post_json(
-                srv->parsed.host, srv->parsed.port, srv->parsed.path,
-                headers, body, resp_buf, resp_cap);
-        } else {
-            status = vela_http_post_json(
-                srv->parsed.host, srv->parsed.port, srv->parsed.path,
-                headers, body, resp_buf, resp_cap);
+    /* Jira MCP auth via three X-Atlassian-* headers. The Jira service
+     * (acc.pt.miui.com, backed by mcp-atlassian) requires these on every
+     * request — initialize through tools/call — to know which Jira instance
+     * to talk to and to authenticate as the user. Values come from the server
+     * struct (set via mcp_client_add_server) so they outlive this call.
+     * Gated on the Jira host; if a server is added without credentials the
+     * empty fields are simply skipped, letting the server reject with 401
+     * rather than sending a malformed header. */
+    if (strcmp(srv->parsed.host, MCP_JIRA_HOST) == 0) {
+        if (srv->jira_url[0]) {
+            headers[h].name = "X-Atlassian-Jira-Url";
+            headers[h].value = srv->jira_url;
+            h++;
         }
-
-        free(auth_buf);
-        return status;
+        if (srv->jira_user[0]) {
+            headers[h].name = "X-Atlassian-Username";
+            headers[h].value = srv->jira_user;
+            h++;
+        }
+        if (srv->jira_pat[0]) {
+            headers[h].name = "X-Atlassian-Jira-Personal-Token";
+            headers[h].value = srv->jira_pat;
+            h++;
+        }
     }
 
     headers[h].name = NULL;
@@ -216,9 +287,89 @@ static int mcp_http_post(mcp_remote_server_t* srv, const char* body,
 
 /* ── Parse JSON-RPC response ────────────────────────────── */
 
+/*
+ * Streamable HTTP MCP servers (e.g. the onedev unified gateway) may return
+ * responses as Server-Sent Events: a "text/event-stream" body where the
+ * JSON-RPC payload sits in one or more "data:" lines:
+ *
+ *   event: message
+ *   data: {"jsonrpc":"2.0","id":1,"result":{...}}
+ *
+ * cJSON cannot parse that directly. This helper extracts and concatenates
+ * the "data:" line payloads into a heap buffer (caller must free) and
+ * returns it; if the response is already plain JSON (no "data:" lines),
+ * it returns a strdup of the original. Returns NULL on allocation failure.
+ */
+static char* extract_mcp_payload(const char* resp)
+{
+    /* Detect SSE: look for a line starting with "data:" */
+    const char* p = resp;
+    bool has_data_line = false;
+    while (p && *p) {
+        if (strncmp(p, "data:", 5) == 0) {
+            has_data_line = true;
+            break;
+        }
+        p = strchr(p, '\n');
+        if (p)
+            p++;
+    }
+
+    if (!has_data_line) {
+        /* Plain JSON response — return a copy */
+        return strdup(resp);
+    }
+
+    /* Concatenate every "data:" line's payload (SSE spec joins multi-line
+     * data with '\n' between them). Most MCP servers send a single line. */
+    size_t cap = strlen(resp) + 1;
+    char* out = malloc(cap);
+    if (!out)
+        return NULL;
+    out[0] = '\0';
+    size_t len = 0;
+
+    p = resp;
+    while (p && *p) {
+        if (strncmp(p, "data:", 5) == 0) {
+            const char* line = p + 5;
+            /* skip one optional leading space */
+            if (*line == ' ')
+                line++;
+            const char* eol = strchr(line, '\n');
+            size_t seg = eol ? (size_t)(eol - line) : strlen(line);
+            /* strip a trailing \r if present */
+            while (seg > 0 && (line[seg - 1] == '\r' || line[seg - 1] == '\n'))
+                seg--;
+            if (len + seg + 1 >= cap) {
+                cap = (len + seg + 1) * 2;
+                char* tmp = realloc(out, cap);
+                if (!tmp) {
+                    free(out);
+                    return NULL;
+                }
+                out = tmp;
+            }
+            memcpy(out + len, line, seg);
+            len += seg;
+            out[len] = '\0';
+        }
+        p = strchr(p, '\n');
+        if (p)
+            p++;
+    }
+
+    return out;
+}
+
 static cJSON* parse_jsonrpc_result(const char* resp_json)
 {
-    cJSON* root = cJSON_Parse(resp_json);
+    char* payload = extract_mcp_payload(resp_json);
+    if (!payload)
+        return NULL;
+
+    cJSON* root = cJSON_Parse(payload);
+    free(payload);
     if (!root)
         return NULL;
 
@@ -426,6 +577,106 @@ static int discover_server_tools(mcp_remote_server_t* srv,
 
 /* ── Public API ─────────────────────────────────────────── */
 
+/* ── Server persistence (config_store) ──────────────────────────
+ *
+ * Flat KV layout:
+ *   ai.mcp.servers.count = N
+ *   ai.mcp.server.0.name / .url / .token / .jira_url / .jira_user / .jira_pat
+ *   ai.mcp.server.1...
+ *
+ * Only the connection params (the 6 args of mcp_client_add_server) are
+ * persisted; parsed_url/session_id/initialized are re-derived by
+ * add_server + discover.  Tokens are stored as-is — config_store already
+ * lives on the device's persistent partition and is not exported. */
+
+static const char* persist_key(int idx, const char* field)
+{
+    static char buf[64];
+    snprintf(buf, sizeof(buf), "ai.mcp.server.%d.%s", idx, field);
+    return buf;
+}
+
+int mcp_client_persist_save(void)
+{
+    /* Snapshot server list under the lock so we don't hold it during I/O. */
+    int n;
+    mcp_remote_server_t snap[MCP_CLIENT_MAX_SERVERS];
+    pthread_mutex_lock(&s_mtx);
+    n = s_server_count;
+    if (n > MCP_CLIENT_MAX_SERVERS) n = MCP_CLIENT_MAX_SERVERS;
+    memcpy(snap, s_servers, n * sizeof(snap[0]));
+    pthread_mutex_unlock(&s_mtx);
+
+    char cstr[16];
+    snprintf(cstr, sizeof(cstr), "%d", n);
+    claw_config_set("ai.mcp.servers.count", cstr);
+
+    for (int i = 0; i < n; i++) {
+        claw_config_set(persist_key(i, "name"), snap[i].name);
+        claw_config_set(persist_key(i, "url"), snap[i].url);
+        claw_config_set(persist_key(i, "token"), snap[i].token);
+        claw_config_set(persist_key(i, "jira_url"), snap[i].jira_url);
+        claw_config_set(persist_key(i, "jira_user"), snap[i].jira_user);
+        claw_config_set(persist_key(i, "jira_pat"), snap[i].jira_pat);
+    }
+    /* Clear stale entries beyond n (in case count shrank). */
+    for (int i = n; i < MCP_CLIENT_MAX_SERVERS; i++) {
+        config_del(persist_key(i, "name"));
+        config_del(persist_key(i, "url"));
+        config_del(persist_key(i, "token"));
+        config_del(persist_key(i, "jira_url"));
+        config_del(persist_key(i, "jira_user"));
+        config_del(persist_key(i, "jira_pat"));
+    }
+
+    syslog(LOG_INFO, "[%s] persisted %d server(s)\n", TAG, n);
+    return OK;
+}
+
+int mcp_client_persist_load(void)
+{
+    char cstr[8];
+    if (claw_config_get("ai.mcp.servers.count", cstr, sizeof(cstr)) != OK
+        || !cstr[0]) {
+        return OK;  /* nothing persisted yet */
+    }
+    int n = atoi(cstr);
+    if (n < 0) n = 0;
+    if (n > MCP_CLIENT_MAX_SERVERS) n = MCP_CLIENT_MAX_SERVERS;
+
+    int added = 0;
+    for (int i = 0; i < n; i++) {
+        char name[64], url[256], token[128];
+        char jira_url[128], jira_user[64], jira_pat[128];
+        name[0] = url[0] = token[0] = '\0';
+        jira_url[0] = jira_user[0] = jira_pat[0] = '\0';
+
+        claw_config_get(persist_key(i, "name"), name, sizeof(name));
+        claw_config_get(persist_key(i, "url"), url, sizeof(url));
+        claw_config_get(persist_key(i, "token"), token, sizeof(token));
+        claw_config_get(persist_key(i, "jira_url"), jira_url, sizeof(jira_url));
+        claw_config_get(persist_key(i, "jira_user"), jira_user, sizeof(jira_user));
+        claw_config_get(persist_key(i, "jira_pat"), jira_pat, sizeof(jira_pat));
+
+        if (!name[0] || !url[0]) continue;
+
+        if (mcp_client_add_server(name, url,
+                                  token[0] ? token : NULL,
+                                  jira_url[0] ? jira_url : NULL,
+                                  jira_user[0] ? jira_user : NULL,
+                                  jira_pat[0] ? jira_pat : NULL) == OK) {
+            added++;
+        }
+    }
+
+    if (added > 0) {
+        syslog(LOG_INFO, "[%s] restored %d server(s), discovering...\n",
+               TAG, added);
+        mcp_client_discover();
+    }
+    return OK;
+}
+
 int mcp_client_init(void)
 {
     pthread_mutex_lock(&s_mtx);
@@ -444,12 +695,18 @@ int mcp_client_init(void)
                                     mcp_client_get_tools_json,
                                     mcp_client_execute);
 
+    /* Auto-restore persisted servers so MCP works right after boot
+     * without a manual mcp_add. discover() is called inside persist_load
+     * once servers are re-added. */
+    mcp_client_persist_load();
+
     syslog(LOG_INFO, "[%s] MCP client initialized\n", TAG);
     return OK;
 }
 
 int mcp_client_add_server(const char* name, const char* url,
-    const char* token)
+    const char* token, const char* jira_url, const char* jira_user,
+    const char* jira_pat)
 {
     if (!name || !url)
         return ERROR;
@@ -479,6 +736,17 @@ int mcp_client_add_server(const char* name, const char* url,
     strncpy(srv->url, url, sizeof(srv->url) - 1);
     if (token) {
         strncpy(srv->token, token, sizeof(srv->token) - 1);
+    }
+    /* Jira credentials (X-Atlassian-* header values). Only meaningful for
+     * MCP_JIRA_HOST; NULL/empty otherwise. */
+    if (jira_url) {
+        strncpy(srv->jira_url, jira_url, sizeof(srv->jira_url) - 1);
+    }
+    if (jira_user) {
+        strncpy(srv->jira_user, jira_user, sizeof(srv->jira_user) - 1);
+    }
+    if (jira_pat) {
+        strncpy(srv->jira_pat, jira_pat, sizeof(srv->jira_pat) - 1);
     }
 
     if (parse_url(url, &srv->parsed) != 0) {

@@ -40,6 +40,10 @@ int voice_channel_stop_with_text(char *text_out, size_t text_cap);
 /* Synthesize text and play back (called from outbound dispatcher). */
 int voice_channel_speak(const char *text);
 
+/* Play a short sine-wave beep (attention cue). freq_hz 0 → default 1000Hz,
+ * duration_ms 0 → default 200ms. Returns 0 on success, negative errno. */
+int voice_channel_beep(unsigned int freq_hz, unsigned int duration_ms);
+
 /* Test TTS: synthesize text, save PCM to file. */
 int voice_channel_test_tts(const char *text, const char *out_path);
 

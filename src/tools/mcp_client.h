@@ -46,7 +46,8 @@ extern "C" {
  * @return OK on success, ERROR on failure
  */
 int mcp_client_add_server(const char* name, const char* url,
-    const char* token);
+    const char* token, const char* jira_url, const char* jira_user,
+    const char* jira_pat);
 
 /**
  * Remove a remote MCP server by name.
@@ -101,6 +102,19 @@ char* mcp_client_status_json(void);
  * Cleanup all remote connections and cached data.
  */
 void mcp_client_cleanup(void);
+
+/**
+ * Persist current server list to config_store and reload from it.
+ *
+ * persist_save() writes every registered server's connection params
+ * (name/url/token/jira_url/jira_user/jira_pat) so they survive reboot.
+ * persist_load() reads them back, re-adds each server, and re-discovers
+ * tools — call once at the end of mcp_client_init() for auto-reconnect.
+ *
+ * Both are no-ops (return OK) if CONFIG_AI_AGENT_MCP_SERVER_PERSIST is off.
+ */
+int mcp_client_persist_save(void);
+int mcp_client_persist_load(void);
 
 #ifdef __cplusplus
 }

@@ -258,7 +258,7 @@ static int volc_tts_synthesize(const char* text,
  * chunked HTTP reception would be needed (future work).
  * Net saving vs batch: 80KB (b64 96KB→16KB). */
 #define VOLC_TTS_STREAM_RESP_SIZE (512 * 1024)
-#define VOLC_TTS_STREAM_B64_SIZE (16 * 1024)
+#define VOLC_TTS_STREAM_B64_SIZE (64 * 1024)
 
 int volc_tts_synthesize_stream(const char* text,
     volc_tts_chunk_cb cb,
@@ -379,13 +379,27 @@ int volc_tts_synthesize_stream(const char* text,
             size_t b64_len = strlen(b64);
             size_t decoded_len;
 
-            mbedtls_base64_decode(
+            int b64rc = mbedtls_base64_decode(
                 pcm_tmp, VOLC_TTS_STREAM_B64_SIZE,
                 &decoded_len,
                 (const unsigned char*)b64, b64_len);
 
-            cb(pcm_tmp, decoded_len, 0, user_data);
-            chunks++;
+            /* Guard: on BUFFER_TOO_SMALL (or any error) mbedtls does NOT
+             * write pcm_tmp but sets decoded_len to the required size.
+             * Using that stale/oversized length would read past the
+             * buffer -> heap out-of-bounds -> recursive assert. Skip the
+             * chunk instead. */
+            if (b64rc == 0 && decoded_len > 0
+                && decoded_len <= VOLC_TTS_STREAM_B64_SIZE) {
+                cb(pcm_tmp, decoded_len, 0, user_data);
+                chunks++;
+            } else {
+                syslog(LOG_WARNING,
+                    "[%s] stream: base64 decode rc=%d need=%zu cap=%d, "
+                    "skipping chunk\n",
+                    TAG, b64rc, decoded_len,
+                    (int)VOLC_TTS_STREAM_B64_SIZE);
+            }
         }
 
         cJSON_Delete(obj);

@@ -23,6 +23,7 @@
 #include "voice/voice_tts.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void cmd_set_volc_key(int argc, char** argv)
@@ -89,6 +90,35 @@ void cmd_voice_test_asr(int argc, char** argv)
         return;
     }
     voice_channel_test_asr(argv[1]);
+}
+
+void cmd_voice_test_beep(int argc, char** argv)
+{
+    unsigned int freq = 1000;
+    unsigned int ms = 200;
+
+    if (argc >= 2) {
+        freq = (unsigned int)strtoul(argv[1], NULL, 10);
+    }
+    if (argc >= 3) {
+        ms = (unsigned int)strtoul(argv[2], NULL, 10);
+    }
+
+    printf("Beep: %uHz for %ums ...\n", freq, ms);
+    int ret = voice_channel_beep(freq, ms);
+    printf("Beep done: %d\n", ret);
+}
+
+void cmd_voice_test_speak(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: voice_test_speak <text>\n");
+        return;
+    }
+
+    printf("Speak: \"%s\" ...\n", argv[1]);
+    int ret = voice_channel_speak(argv[1]);
+    printf("Speak done: %d\n", ret);
 }
 
 void cmd_set_voice_tts(int argc, char** argv)

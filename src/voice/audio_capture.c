@@ -28,6 +28,11 @@
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
 #include <aw-alsa-lib/pcm.h>
 #endif
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <nuttx/audio/audio.h>
+#endif
 #include <errno.h>
 #include <media_recorder.h>
 #include <stdint.h>
@@ -52,6 +57,7 @@ static const char* TAG = "audio_cap";
 
 enum audio_capture_backend {
     AUDIO_CAPTURE_BACKEND_NONE = 0,
+    AUDIO_CAPTURE_BACKEND_NUTTX,
     AUDIO_CAPTURE_BACKEND_ALSA,
     AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER,
 };
@@ -63,6 +69,9 @@ struct audio_capture {
         snd_pcm_t* pcm;
 #endif
         void* recorder;
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+        int fd;
+#endif
     } handle;
     unsigned int bits_per_sample;
     unsigned int requested_channels;
@@ -332,6 +341,67 @@ static int open_alsa_capture(audio_capture_t* cap, const char* dev_path,
 
 #endif /* CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT */
 
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+static int open_nuttx_capture(audio_capture_t* cap, const char* dev_path,
+    unsigned int sample_rate, unsigned int channels,
+    unsigned int bits_per_sample)
+{
+    struct audio_caps_desc_s desc;
+    int fd;
+    int ret;
+
+    /* The BK7258 capture device is a single analog MIC at 16-bit mono. */
+    if (channels != 1 || bits_per_sample != 16) {
+        syslog(LOG_WARNING,
+            "[%s] NuttX audio capture requires 16-bit mono\n", TAG);
+        return -ENOTSUP;
+    }
+
+    fd = open(dev_path, O_RDONLY);
+    if (fd < 0) {
+        syslog(LOG_ERR, "[%s] open(%s) failed, errno=%d\n",
+            TAG, dev_path, errno);
+        return -errno;
+    }
+
+    ret = ioctl(fd, AUDIOIOC_RESERVE, 0);
+    if (ret < 0) {
+        syslog(LOG_ERR, "[%s] AUDIOIOC_RESERVE failed: %d\n", TAG, ret);
+        close(fd);
+        return ret;
+    }
+
+    memset(&desc, 0, sizeof(desc));
+    desc.caps.ac_len            = sizeof(desc.caps);
+    desc.caps.ac_type           = AUDIO_TYPE_INPUT;
+    desc.caps.ac_subtype        = AUDIO_FMT_PCM;
+    desc.caps.ac_channels       = (uint8_t)channels;
+    desc.caps.ac_controls.hw[0] = (uint16_t)(sample_rate & 0xFFFFu);
+    desc.caps.ac_controls.b[3]  = (uint8_t)(sample_rate >> 16);
+    desc.caps.ac_controls.b[2]  = (uint8_t)bits_per_sample;
+
+    ret = ioctl(fd, AUDIOIOC_CONFIGURE, &desc);
+    if (ret < 0) {
+        syslog(LOG_ERR, "[%s] AUDIOIOC_CONFIGURE failed: %d\n", TAG, ret);
+        close(fd);
+        return ret;
+    }
+
+    cap->backend = AUDIO_CAPTURE_BACKEND_NUTTX;
+    cap->handle.fd = fd;
+    cap->bits_per_sample = bits_per_sample;
+    cap->requested_channels = channels;
+    cap->hw_channels = channels;
+    cap->out_frame_bytes = (bits_per_sample / 8) * channels;
+    cap->hw_frame_bytes = cap->out_frame_bytes;
+
+    syslog(LOG_INFO,
+        "[%s] opened NuttX audio capture (%s, %uHz, %uch, %ubit)\n",
+        TAG, dev_path, sample_rate, channels, bits_per_sample);
+    return 0;
+}
+#endif /* CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT */
+
 static int open_media_recorder_capture(audio_capture_t* cap,
     unsigned int sample_rate, unsigned int channels,
     unsigned int bits_per_sample)
@@ -387,25 +457,49 @@ audio_capture_t* audio_capture_open(const char* dev_path,
     }
 
     int ret = -ENOTSUP;
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-    ret = open_alsa_capture(cap, dev_path, sample_rate, channels,
+
+    /* Try the portable media_recorder backend FIRST.  On openvela targets
+     * with a media server (e.g. the goldfish emulator) the media framework
+     * correctly drives the virtio-snd capture device through the full
+     * NuttX audio buffer dance.  On devices without a media server (e.g.
+     * BK7258) media_recorder_open() resolves to a weak stub returning NULL
+     * immediately, so we fall through to the direct backends below. */
+    ret = open_media_recorder_capture(cap, sample_rate, channels,
         bits_per_sample);
     if (ret < 0) {
         syslog(LOG_WARNING,
-            "[%s] direct ALSA capture unavailable (%d), falling back to media recorder\n",
+            "[%s] media recorder unavailable (%d), trying next backend\n",
             TAG, ret);
+    }
+
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+    if (ret < 0) {
+        ret = open_nuttx_capture(cap, dev_path, sample_rate, channels,
+            bits_per_sample);
+        if (ret < 0) {
+            syslog(LOG_WARNING,
+                "[%s] NuttX audio capture unavailable (%d), trying next backend\n",
+                TAG, ret);
+        }
     }
 #else
     (void)dev_path;
 #endif
 
+#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
     if (ret < 0) {
-        ret = open_media_recorder_capture(cap, sample_rate, channels,
+        ret = open_alsa_capture(cap, dev_path, sample_rate, channels,
             bits_per_sample);
         if (ret < 0) {
-            free(cap);
-            return NULL;
+            syslog(LOG_WARNING,
+                "[%s] direct ALSA capture unavailable (%d)\n", TAG, ret);
         }
+    }
+#endif
+
+    if (ret < 0) {
+        free(cap);
+        return NULL;
     }
 
     s_active_capture = cap;
@@ -419,6 +513,29 @@ int audio_capture_start(audio_capture_t* cap)
     }
 
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NUTTX:
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+        if (cap->handle.fd < 0) {
+            return -EINVAL;
+        }
+
+        if (cap->started) {
+            return 0;
+        }
+
+        if (ioctl(cap->handle.fd, AUDIOIOC_START, 0) < 0) {
+            syslog(LOG_ERR, "[%s] AUDIOIOC_START failed: %d\n",
+                TAG, errno);
+            return -errno;
+        }
+
+        cap->started = 1;
+        syslog(LOG_INFO, "[%s] NuttX audio capture started\n", TAG);
+        return 0;
+#else
+        return -ENOTSUP;
+#endif
+
     case AUDIO_CAPTURE_BACKEND_ALSA:
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         if (!cap->handle.pcm) {
@@ -470,6 +587,29 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
     }
 
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NUTTX: {
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+        ssize_t n;
+
+        if (cap->handle.fd < 0) {
+            return -EINVAL;
+        }
+
+        n = read(cap->handle.fd, buf, len);
+        if (n < 0) {
+            return -errno;
+        }
+
+        if (n > 0 && cap->bits_per_sample == 16) {
+            apply_capture_gain(buf, (size_t)n);
+        }
+
+        return (int)n;
+#else
+        return -ENOTSUP;
+#endif
+    }
+
     case AUDIO_CAPTURE_BACKEND_ALSA: {
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         snd_pcm_uframes_t frames;
@@ -548,6 +688,20 @@ int audio_capture_abort(audio_capture_t* cap)
     }
 
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NUTTX:
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+        if (cap->handle.fd >= 0 && cap->started) {
+            int ret = ioctl(cap->handle.fd, AUDIOIOC_STOP, 0);
+            cap->started = 0;
+            if (ret < 0) {
+                return ret;
+            }
+        }
+        return 0;
+#else
+        return -ENOTSUP;
+#endif
+
     case AUDIO_CAPTURE_BACKEND_ALSA:
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         if (cap->handle.pcm && cap->started) {
@@ -581,6 +735,19 @@ void audio_capture_close(audio_capture_t* cap)
     }
 
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NUTTX:
+#ifdef CONFIG_AI_AGENT_AUDIO_NUTTX_DIRECT
+        if (cap->handle.fd >= 0) {
+            if (cap->started) {
+                ioctl(cap->handle.fd, AUDIOIOC_STOP, 0);
+                cap->started = 0;
+            }
+            close(cap->handle.fd);
+            cap->handle.fd = -1;
+        }
+#endif
+        break;
+
     case AUDIO_CAPTURE_BACKEND_ALSA:
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         if (cap->handle.pcm) {

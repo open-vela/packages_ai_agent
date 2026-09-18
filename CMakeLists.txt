@@ -100,6 +100,16 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   if(CONFIG_AI_AGENT_LVGL_UI)
     list(APPEND AGENT_SRCS src/ui/lvgl_ui_channel.c)
+    list(APPEND AGENT_SRCS src/ui/lvgl_toast.c)
+    # Pre-rasterized MiSans 16 CJK font (lv_font_conv, 3755 GB2312-1 chars).
+    # App-owned like xiaozhi_gui's font_awesome_*.c: LV_FONT_DECLARE in code,
+    # no patching of apps_graphics_lvgl. The file header carries the exact
+    # regeneration command.
+    list(APPEND AGENT_SRCS src/ui/lv_font_misans_16_cjk.c)
+  endif()
+
+  if(CONFIG_AI_AGENT_NOTIFY_SERVICE)
+    list(APPEND AGENT_SRCS src/infra/notify_service.c)
   endif()
 
   if(CONFIG_AI_AGENT_CAMERA)
@@ -120,6 +130,17 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       src/tools/mcp_tool_registry.c
       src/tools/mcp_builtin_tools.c
       src/tools/mcp_client.c
+    )
+  endif()
+
+  if(CONFIG_AI_AGENT_REMOTE_CTRL)
+    list(APPEND AGENT_SRCS
+      src/remote/remote_link.c
+      src/remote/remote_codec.c
+      src/remote/remote_session.c
+      src/remote/remote_link_mqtt.c
+      src/channels/remote_ctrl_channel.c
+      src/tools/tool_remote_agent.c
     )
   endif()
 

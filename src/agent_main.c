@@ -52,6 +52,9 @@
 #ifdef CONFIG_AI_AGENT_MQTT
 #include "channels/mqtt_channel.h"
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+#include "channels/remote_ctrl_channel.h"
+#endif
 #include "infra/network_manager.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_client.h"
@@ -76,6 +79,12 @@
 #endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #include "ui/lvgl_ui_channel.h"
+#endif
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+#include "infra/notify_service.h"
+#endif
+#ifdef CONFIG_AI_AGENT_MCP
+#include "tools/mcp_client.h"
 #endif
 #ifdef CONFIG_AI_AGENT_BLE_GATT
 #include "infra/ble_cmd_handler.h"
@@ -126,6 +135,9 @@ static void net_state_change_cb(net_state_t state, void* arg)
 #endif
 #ifdef CONFIG_AI_AGENT_MQTT
         mqtt_channel_start();
+#endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        remote_ctrl_channel_start();
 #endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
         weixin_channel_start();
@@ -178,9 +190,25 @@ static void* network_watch_task(void* arg)
         if (mqtt_channel_start() != OK)
             syslog(LOG_WARNING, "[%s] mqtt_channel_start failed\n", TAG);
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        if (remote_ctrl_channel_start() != OK)
+            syslog(LOG_WARNING, "[%s] remote_ctrl_channel_start failed\n", TAG);
+#endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
         if (weixin_channel_start() != OK)
             syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
+#endif
+
+        /* MCP servers were restored from config_store during mcp_client_init
+         * (before the link was up), so the initial discover likely failed.
+         * Retry now that the network is up so tools are registered before
+         * the notify poller first runs. */
+#ifdef CONFIG_AI_AGENT_MCP
+        mcp_client_discover();
+#endif
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+        if (notify_service_start() != OK)
+            syslog(LOG_WARNING, "[%s] notify_service_start failed\n", TAG);
 #endif
 
         syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
@@ -405,6 +433,17 @@ static void* outbound_dispatch_task(void* arg)
                 syslog(LOG_ERR, "[%s] lvgl_ui_channel_send failed: %d\n", TAG, uret);
             }
 #endif
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+        } else if (strcmp(msg.channel, AGENT_CHAN_LVGL_NOTIFY) == 0) {
+            /* Transient toast notice. The toast itself is already popped
+             * by the notify service (which knows the exact title + color);
+             * this branch only mirrors to the CLI for debug visibility and
+             * does NOT enter the chat history. */
+            pthread_mutex_lock(&g_stdout_lock);
+            printf("\n[Notify]: %s\nvela> ", msg.content);
+            fflush(stdout);
+            pthread_mutex_unlock(&g_stdout_lock);
+#endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
         } else if (strcmp(msg.channel, AGENT_CHAN_WEIXIN) == 0) {
             /* chat_id format: "from_user_id|context_token" */
@@ -435,6 +474,14 @@ static void* outbound_dispatch_task(void* arg)
             fflush(stdout);
             pthread_mutex_unlock(&g_stdout_lock);
             syslog(LOG_INFO, "[agent] [Agent]: %s\n", msg.content);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* Mirror CLI replies to the LVGL UI so that `ask` responses
+             * (which come in on the "cli" channel) also render as chat
+             * cards on screen, not only as terminal text.  send() shows
+             * the chat screen on first call, so the UI comes up
+             * automatically when the first reply arrives. */
+            lvgl_ui_channel_send(msg.content);
+#endif
         } else {
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }
@@ -470,6 +517,7 @@ int ai_agent_main(int argc, char* argv[])
     (void)argv;
 
     g_shutdown_requested = false;
+
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -585,6 +633,11 @@ int ai_agent_main(int argc, char* argv[])
         BOOT_LOG_RC(&t0, "P3", "mqtt_channel_init", rc);
 #endif
 
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        rc = remote_ctrl_channel_init();
+        BOOT_LOG_RC(&t0, "P3", "remote_ctrl_channel_init", rc);
+#endif
+
         rc = voice_channel_init();
         BOOT_LOG_RC(&t0, "P3", "voice_channel_init", rc);
 
@@ -596,6 +649,14 @@ int ai_agent_main(int argc, char* argv[])
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         rc = lvgl_ui_channel_init();
         BOOT_LOG_RC(&t0, "P3", "lvgl_ui_channel_init", rc);
+#endif
+
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+        /* Loads per-source config + cursors only (no network, no thread).
+         * The polling thread is started later in network_watch_task once
+         * the link is up, since each poll issues a sync MCP HTTP call. */
+        rc = notify_service_init();
+        BOOT_LOG_RC(&t0, "P3", "notify_service_init", rc);
 #endif
     }
 
@@ -722,6 +783,9 @@ int ai_agent_main(int argc, char* argv[])
 #ifdef CONFIG_AI_AGENT_MQTT
     mqtt_channel_stop();
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+    remote_ctrl_channel_stop();
+#endif
     ws_server_stop();
     /* feishu_bot and agent_loop have no _stop(); they will exit
      * naturally once their blocking I/O returns an error after
@@ -735,6 +799,11 @@ int ai_agent_main(int argc, char* argv[])
     /* Phase 5 services (non-network) */
     cron_service_stop();
     heartbeat_stop();
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+    /* Stop the poller before MCP is torn down — the poll thread issues
+     * sync MCP HTTP calls and must not outlive the client module. */
+    notify_service_stop();
+#endif
 
     /* Give threads a moment to notice and exit */
     usleep(500 * 1000);

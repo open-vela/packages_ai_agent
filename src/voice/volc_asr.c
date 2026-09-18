@@ -15,14 +15,15 @@
  */
 
 /*
- * Doubao streaming ASR via WebSocket (V2 binary protocol).
+ * Doubao streaming ASR via WebSocket (V3 bigmodel binary protocol).
  *
- * Protocol: wss://openspeech.bytedance.com/api/v2/asr
+ * Protocol: wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
+ * Auth: X-Api-Key / X-Api-Resource-Id / X-Api-Connect-Id headers (no Bearer).
  * Flow:
  *   1. TLS connect + HTTP Upgrade to WebSocket
  *   2. Send full_client_request (JSON metadata) in Volcengine frame
  *   3. Send audio_only chunks (PCM), last chunk flagged
- *   4. Receive full_server_response, extract result text
+ *   4. Receive full_server_response, extract result.text
  *
  * Volcengine binary frame (carried inside standard WebSocket frames):
  *   Byte 0: [protocol_version:4][header_size:4]  = 0x11
@@ -31,6 +32,12 @@
  *   Byte 3: reserved = 0x00
  *   Bytes 4-7: payload size (big-endian uint32)
  *   Bytes 8+: payload
+ *
+ * V3 server response layout (msg_type 0x9 = full_server_response):
+ *   flags (byte1 low nibble) bit0=1 → a 4-byte sequence follows the header;
+ *   bit1=1 → last packet (final result). So:
+ *     [4B hdr][(4B seq)?][4B payload_size][payload JSON]
+ *   The JSON carries result.text (full accumulated string), not result[0].text.
  */
 
 #include "voice/volc_asr.h"
@@ -75,7 +82,6 @@ static const char* TAG = "volc_asr";
 #define WS_FIN_BIT 0x80
 #define WS_MASK_BIT 0x80
 
-#define ASR_RESP_CODE_OK 1000
 #define ASR_UUID_LEN 37 /* 36 chars + NUL */
 
 /* TLS context for ASR connection (not pooled — single use) */
@@ -272,7 +278,7 @@ static void generate_uuid(char* out, size_t cap)
 /* ── WebSocket upgrade handshake ─────────────────────────────── */
 
 static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
-    const char* path, const char* token)
+    const char* path, const char* api_key, const char* resource)
 {
     /* Generate random 16-byte key, base64-encode it */
     unsigned char key_raw[16];
@@ -283,7 +289,11 @@ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
     mbedtls_base64_encode(key_b64, sizeof(key_b64), &key_b64_len,
         key_raw, sizeof(key_raw));
 
-    char req[768];
+    char connect_id[ASR_UUID_LEN];
+
+    generate_uuid(connect_id, sizeof(connect_id));
+
+    char req[1024];
     int n = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -291,10 +301,12 @@ static int ws_upgrade(asr_tls_ctx_t* ctx, const char* host,
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: %.*s\r\n"
         "Sec-WebSocket-Version: 13\r\n"
-        "Authorization: Bearer;%s\r\n"
+        "X-Api-Key: %s\r\n"
+        "X-Api-Resource-Id: %s\r\n"
+        "X-Api-Connect-Id: %s\r\n"
         "\r\n",
         path, host, (int)key_b64_len, key_b64,
-        token);
+        api_key, resource, connect_id);
 
     if (n <= 0 || n >= (int)sizeof(req)) {
         return -EOVERFLOW;
@@ -508,58 +520,41 @@ static int send_volc_frame(asr_tls_ctx_t* ctx,
     return ret;
 }
 
-/* Build and send the full_client_request JSON metadata. */
-static int send_full_client_request(asr_tls_ctx_t* ctx,
-    const char* app_id,
-    const char* token,
-    const char* cluster)
+/* Build and send the full_client_request JSON metadata (V3 bigmodel).
+ * Auth lives in the WS upgrade headers (X-Api-Key etc.), so there is no
+ * "app" block here. */
+static int send_full_client_request(asr_tls_ctx_t* ctx)
 {
-    char reqid[ASR_UUID_LEN];
-
-    generate_uuid(reqid, sizeof(reqid));
-
     cJSON* root = cJSON_CreateObject();
 
     if (!root) {
         return -ENOMEM;
     }
 
-    /* app */
-    cJSON* app = cJSON_AddObjectToObject(root, "app");
-
-    cJSON_AddStringToObject(app, "appid", app_id);
-    cJSON_AddStringToObject(app, "token", token);
-    cJSON_AddStringToObject(app, "cluster", cluster);
-
     /* user */
     cJSON* user = cJSON_AddObjectToObject(root, "user");
 
     cJSON_AddStringToObject(user, "uid", "agent");
 
-    /* audio */
+    /* audio: raw PCM (format=pcm, codec=raw) */
     cJSON* audio = cJSON_AddObjectToObject(root, "audio");
 
-    cJSON_AddStringToObject(audio, "format", "raw");
+    cJSON_AddStringToObject(audio, "format", "pcm");
+    cJSON_AddStringToObject(audio, "codec", "raw");
     cJSON_AddNumberToObject(audio, "rate",
         AGENT_VOICE_SAMPLE_RATE);
     cJSON_AddNumberToObject(audio, "bits", AGENT_VOICE_BITS);
     cJSON_AddNumberToObject(audio, "channel",
         AGENT_VOICE_CHANNELS);
-    cJSON_AddStringToObject(audio, "language", "zh-CN");
 
-    /* request */
+    /* request: bigmodel recognition */
     cJSON* req = cJSON_AddObjectToObject(root, "request");
 
-    cJSON_AddStringToObject(req, "reqid", reqid);
-    cJSON_AddStringToObject(req, "workflow",
-        "audio_in,resample,partition,vad,fe,decode");
-    cJSON_AddNumberToObject(req, "sequence", 1);
-    cJSON_AddNumberToObject(req, "nbest", 1);
-    cJSON_AddBoolToObject(req, "show_utterances", 0);
-    /* VAD: avoid cutting short commands on QEMU virtual mic */
-    cJSON_AddBoolToObject(req, "vad_signal", 1);
-    cJSON_AddStringToObject(req, "start_silence_time", "3000");
-    cJSON_AddStringToObject(req, "vad_silence_time", "800");
+    cJSON_AddStringToObject(req, "model_name", "bigmodel");
+    cJSON_AddBoolToObject(req, "enable_itn", 0);
+    cJSON_AddBoolToObject(req, "enable_punc", 0);
+    cJSON_AddBoolToObject(req, "show_utterances", 1);
+    cJSON_AddNumberToObject(req, "end_window_size", 800);
 
     char* json_str = cJSON_PrintUnformatted(root);
 
@@ -569,8 +564,7 @@ static int send_full_client_request(asr_tls_ctx_t* ctx,
         return -ENOMEM;
     }
 
-    syslog(LOG_INFO, "[%s] full_client_request: reqid=%s\n",
-        TAG, reqid);
+    syslog(LOG_INFO, "[%s] full_client_request (v3 bigmodel)\n", TAG);
 
     int ret = send_volc_frame(ctx, VOLC_MSG_FULL_REQ, VOLC_SER_JSON,
         (const unsigned char*)json_str,
@@ -649,6 +643,7 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
     size_t volc_hdr_len = (size_t)hdr_units * 4;
     unsigned char msg_type_byte = buf[1];
     unsigned char msg_type_nibble = (msg_type_byte >> 4) & 0x0F;
+    unsigned char msg_flags = msg_type_byte & 0x0F;
 
     if (volc_hdr_len < 4 || flen < volc_hdr_len) {
         syslog(LOG_ERR,
@@ -694,8 +689,15 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
         return -EIO;
     }
 
-    /* ── Normal response: [4B hdr][4B payload_size][payload] ── */
-    if (flen < volc_hdr_len + 4) {
+    /* ── Normal response (msg_type 0x9):
+     *     [4B hdr][(4B seq if flags bit0)][4B payload_size][payload] ── */
+    size_t off = volc_hdr_len;
+
+    if (msg_flags & 0x01) {
+        off += 4; /* sequence field present */
+    }
+
+    if (flen < off + 4) {
         syslog(LOG_ERR,
             "[%s] Frame too short for payload size: %zu\n",
             TAG, flen);
@@ -703,8 +705,8 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
         return -EPROTO;
     }
 
-    uint32_t payload_len = read_be32(buf, volc_hdr_len);
-    size_t data_off = volc_hdr_len + 4;
+    uint32_t payload_len = read_be32(buf, off);
+    size_t data_off = off + 4;
 
     if (data_off + payload_len > flen) {
         syslog(LOG_ERR,
@@ -733,94 +735,53 @@ static int recv_volc_response(asr_tls_ctx_t* ctx,
         return -EPROTO;
     }
 
-    cJSON* code_j = cJSON_GetObjectItem(root, "code");
-    int code = code_j ? (int)code_j->valuedouble : -1;
+    /* V3: result.text is the full accumulated string (no code/message
+     * wrapper).  result is an object; keep array handling for safety. */
+    cJSON* result = cJSON_GetObjectItem(root, "result");
+    const char* txt = NULL;
 
-    if (code != ASR_RESP_CODE_OK) {
-        cJSON* msg_j = cJSON_GetObjectItem(root, "message");
+    if (cJSON_IsObject(result)) {
+        cJSON* t = cJSON_GetObjectItem(result, "text");
 
-        syslog(LOG_ERR, "[%s] ASR error %d: %s\n", TAG, code,
-            (msg_j && msg_j->valuestring)
-                ? msg_j->valuestring
-                : "unknown");
-        cJSON_Delete(root);
-        return -EIO;
+        if (t && cJSON_IsString(t)) {
+            txt = t->valuestring;
+        }
+    } else if (cJSON_IsArray(result)
+        && cJSON_GetArraySize(result) > 0) {
+        cJSON* first = cJSON_GetArrayItem(result, 0);
+        cJSON* t = cJSON_GetObjectItem(first, "text");
+
+        if (t && cJSON_IsString(t)) {
+            txt = t->valuestring;
+        }
     }
 
-    /* Extract result[0].text.
-     * Volcengine streaming ASR sends multiple responses per session.
-     * We maintain a "confirmed" offset: text_out[0..confirmed_len-1]
-     * holds final utterances that must not be overwritten.
-     * Intermediate results (seq >= 0) overwrite only the portion
-     * after confirmed_len.  Final results (seq < 0) append and
-     * advance confirmed_len. */
-    cJSON* result = cJSON_GetObjectItem(root, "result");
-
-    /* Negative sequence means final response */
-    cJSON* seq_j = cJSON_GetObjectItem(root, "sequence");
-    int seq = seq_j ? (int)seq_j->valuedouble : 0;
-
-    if (cJSON_IsArray(result) && cJSON_GetArraySize(result) > 0) {
-        cJSON* first = cJSON_GetArrayItem(result, 0);
-        cJSON* txt = cJSON_GetObjectItem(first, "text");
-
-        if (txt && cJSON_IsString(txt) && txt->valuestring
-            && txt->valuestring[0] != '\0') {
-            static size_t confirmed_len;
-            if (text_out[0] == '\0') {
-                confirmed_len = 0;
-            }
-
-            if (seq < 0) {
-                /* Final: write after confirmed, then advance */
-                size_t remain = text_cap - confirmed_len - 1;
-                if (remain > 0) {
-                    strncpy(text_out + confirmed_len,
-                        txt->valuestring, remain);
-                    text_out[text_cap - 1] = '\0';
-                }
-                confirmed_len = strlen(text_out);
-            } else {
-                /* Intermediate: overwrite only after confirmed */
-                size_t remain = text_cap - confirmed_len - 1;
-                if (remain > 0) {
-                    strncpy(text_out + confirmed_len,
-                        txt->valuestring, remain);
-                    text_out[text_cap - 1] = '\0';
-                }
-            }
-        }
+    if (txt && txt[0] != '\0') {
+        strncpy(text_out, txt, text_cap - 1);
+        text_out[text_cap - 1] = '\0';
     }
 
     cJSON_Delete(root);
 
-    return (seq < 0) ? 1 : 0;
+    /* Final when flags bit1 (0x2) set: last packet */
+    return (msg_flags & 0x02) ? 1 : 0;
 }
 
 /* ── Credentials (self-loaded from config store) ─────────────── */
 
-static char s_app_id[128];
-static char s_token[256];
-static char s_cluster[128];
+static char s_api_key[256];
+static char s_resource[128];
 
 static int volc_asr_init(void)
 {
-    memset(s_app_id, 0, sizeof(s_app_id));
-    memset(s_token, 0, sizeof(s_token));
-    memset(s_cluster, 0, sizeof(s_cluster));
+    memset(s_api_key, 0, sizeof(s_api_key));
+    memset(s_resource, 0, sizeof(s_resource));
 
-    claw_config_get(AGENT_CFG_KEY_VOLC_APPKEY,
-        s_app_id, sizeof(s_app_id));
-    claw_config_get(AGENT_CFG_KEY_VOLC_TOKEN,
-        s_token, sizeof(s_token));
+    claw_config_get(AGENT_CFG_KEY_VOLC_API_KEY,
+        s_api_key, sizeof(s_api_key));
 
-    if (claw_config_get(AGENT_CFG_KEY_VOLC_ASR_CLUSTER,
-            s_cluster, sizeof(s_cluster))
-            != OK
-        || s_cluster[0] == '\0') {
-        strncpy(s_cluster, AGENT_DOUBAO_ASR_CLUSTER,
-            sizeof(s_cluster) - 1);
-    }
+    strncpy(s_resource, AGENT_DOUBAO_ASR_RESOURCE,
+        sizeof(s_resource) - 1);
 
     return 0;
 }
@@ -829,14 +790,13 @@ static int volc_asr_init(void)
 
 int volc_asr_recognize(const unsigned char* pcm_data,
     size_t pcm_len,
-    const char* app_id,
-    const char* token,
-    const char* cluster,
+    const char* api_key,
+    const char* resource,
     char* text_out,
     size_t text_cap)
 {
-    if (!pcm_data || pcm_len == 0 || !app_id || !token
-        || !cluster || !text_out || text_cap == 0) {
+    if (!pcm_data || pcm_len == 0 || !api_key
+        || !resource || !text_out || text_cap == 0) {
         return -EINVAL;
     }
 
@@ -858,14 +818,14 @@ int volc_asr_recognize(const unsigned char* pcm_data,
 
     /* 2. WebSocket upgrade */
     ret = ws_upgrade(&ctx, AGENT_DOUBAO_ASR_HOST,
-        AGENT_DOUBAO_ASR_WS_PATH, token);
+        AGENT_DOUBAO_ASR_WS_PATH, api_key, resource);
     if (ret != 0) {
         asr_tls_free(&ctx);
         return ret;
     }
 
     /* 3. Send full_client_request (JSON metadata) */
-    ret = send_full_client_request(&ctx, app_id, token, cluster);
+    ret = send_full_client_request(&ctx);
     if (ret != 0) {
         asr_tls_free(&ctx);
         return ret;
@@ -943,14 +903,17 @@ int volc_asr_recognize(const unsigned char* pcm_data,
 struct volc_asr_stream {
     asr_tls_ctx_t tls;
     int ready; /* 1 after successful open */
+    unsigned char last_chunk[AGENT_ASR_CHUNK_SIZE]; /* tail to re-send as
+                                                      * the "last" chunk */
+    size_t last_len;
 };
 
 volc_asr_stream_t* volc_asr_stream_open(void)
 {
     volc_asr_init();
 
-    if (s_app_id[0] == '\0' || s_token[0] == '\0') {
-        syslog(LOG_ERR, "[%s] stream: credentials not configured\n",
+    if (s_api_key[0] == '\0') {
+        syslog(LOG_ERR, "[%s] stream: API key not configured\n",
             TAG);
         return NULL;
     }
@@ -970,15 +933,14 @@ volc_asr_stream_t* volc_asr_stream_open(void)
     }
 
     ret = ws_upgrade(&s->tls, AGENT_DOUBAO_ASR_HOST,
-        AGENT_DOUBAO_ASR_WS_PATH, s_token);
+        AGENT_DOUBAO_ASR_WS_PATH, s_api_key, s_resource);
     if (ret != 0) {
         asr_tls_free(&s->tls);
         free(s);
         return NULL;
     }
 
-    ret = send_full_client_request(&s->tls, s_app_id, s_token,
-        s_cluster);
+    ret = send_full_client_request(&s->tls);
     if (ret != 0) {
         asr_tls_free(&s->tls);
         free(s);
@@ -997,7 +959,22 @@ int volc_asr_stream_send(volc_asr_stream_t* s,
         return -EINVAL;
     }
 
-    return send_audio_chunk(&s->tls, pcm, len, 0);
+    int ret = send_audio_chunk(&s->tls, pcm, len, 0);
+
+    if (ret == 0) {
+        /* Remember the tail so finish() can signal end-of-audio with a
+         * NON-EMPTY last chunk.  The v3 bigmodel_async server treats an
+         * empty AUDIO_LAST as an empty utterance; the working offline
+         * path instead marks the last data chunk is_last=1, so mirror
+         * that here. */
+        size_t keep = (len < sizeof(s->last_chunk)) ? len
+                                                    : sizeof(s->last_chunk);
+
+        memcpy(s->last_chunk, pcm + (len - keep), keep);
+        s->last_len = keep;
+    }
+
+    return ret;
 }
 
 int volc_asr_stream_finish(volc_asr_stream_t* s,
@@ -1015,9 +992,15 @@ int volc_asr_stream_finish(volc_asr_stream_t* s,
         return -EINVAL;
     }
 
-    /* Send empty last-chunk to signal end of audio */
-    int ret = send_audio_chunk(&s->tls, (const unsigned char*)"",
-        0, 1);
+    /* Signal end of audio with a NON-EMPTY last chunk: re-send the
+     * remembered tail of the final audio chunk.  An empty AUDIO_LAST
+     * makes the v3 bigmodel_async server finalize with no text. */
+    static const unsigned char last_silence[2] = { 0, 0 };
+    const unsigned char* tail = (s->last_len > 0)
+        ? s->last_chunk : last_silence;
+    size_t tail_len = (s->last_len > 0) ? s->last_len : 2;
+    int ret = send_audio_chunk(&s->tls, tail, tail_len, 1);
+
     if (ret != 0) {
         syslog(LOG_ERR, "[%s] stream: send last chunk failed: %d\n",
             TAG, ret);
@@ -1032,6 +1015,17 @@ int volc_asr_stream_finish(volc_asr_stream_t* s,
     while (attempts < 100) {
         ret = recv_volc_response(&s->tls, text_out, text_cap);
         if (ret < 0) {
+            /* The server can signal end-of-stream by closing or sending
+             * a trailing frame we don't fully parse, WITHOUT setting the
+             * "final" flag on the last result frame.  result.text is the
+             * full accumulated string, so if we already captured text,
+             * accept it as definitive instead of failing the stream. */
+            if (text_out[0] != '\0') {
+                syslog(LOG_WARNING,
+                    "[%s] stream: recv err %d after text, "
+                    "using recognized text\n", TAG, ret);
+                break;
+            }
             syslog(LOG_ERR, "[%s] stream: recv error: %d\n",
                 TAG, ret);
             asr_tls_free(&s->tls);
@@ -1039,10 +1033,19 @@ int volc_asr_stream_finish(volc_asr_stream_t* s,
             return ret;
         }
         if (ret == 1) {
+            /* Final frame: the server sends exactly one final (which
+             * may be empty when no speech was recognized) and then
+             * closes.  Accept it as definitive — a non-empty final
+             * breaks out with the recognized text, an empty final
+             * falls through to the -ENODATA return below. */
+            syslog(LOG_INFO, "[%s] stream: final#%d text='%.120s'\n",
+                TAG, attempts, text_out);
             break;
         }
         attempts++;
     }
+    syslog(LOG_INFO, "[%s] stream: recv done, %d attempts, text='%.120s'\n",
+        TAG, attempts, text_out);
 
     asr_tls_free(&s->tls);
     free(s);
@@ -1082,13 +1085,13 @@ static int volc_asr_recognize_ops(const unsigned char* pcm_data,
     /* Reload credentials in case they changed at runtime */
     volc_asr_init();
 
-    if (s_app_id[0] == '\0' || s_token[0] == '\0') {
-        syslog(LOG_ERR, "[%s] ASR credentials not configured\n", TAG);
+    if (s_api_key[0] == '\0') {
+        syslog(LOG_ERR, "[%s] ASR API key not configured\n", TAG);
         return -ENOENT;
     }
 
     return volc_asr_recognize(pcm_data, pcm_len,
-        s_app_id, s_token, s_cluster,
+        s_api_key, s_resource,
         text_out, text_cap);
 }
 

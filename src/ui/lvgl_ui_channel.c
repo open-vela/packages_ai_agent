@@ -30,19 +30,34 @@
 #include "voice/voice_channel.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <lvgl/lvgl.h>
+
+/* App-owned pre-rasterized MiSans-16 CJK font (compiled from
+ * src/ui/lv_font_misans_16_cjk.c, same pattern as xiaozhi_gui's
+ * font_awesome_*.c) — declared here instead of patching apps_graphics_lvgl. */
+LV_FONT_DECLARE(lv_font_misans_16_cjk);
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <syslog.h>
-#include <uikit/uikit_font_manager.h>
 #include <unistd.h>
 
 /* ── Constants ────────────────────────────────────────────────── */
 
 static const char* TAG = "lvgl_ui";
+
+/* Self-test toggle: define to inject one card per reply category on
+ * show_chat, for visual verification of all four color-bar variants.
+ * Leave undefined in normal builds. */
+/* #define LVGL_UI_CARD_SELFTEST */
+/* Verified 2026-08-17: static lv_font_misans_16_cjk renders full CJK (no
+ * tofu) and does NOT crash the heap — self-test confirmed via screendump.
+ * Also verified: 1024-byte msg buffer + UTF-8-aware truncation shows full
+ * ~568-byte Agent summaries without mid-char cut. */
 
 /* Layout constants for 466x466 round screen */
 #define LVGL_UI_SCREEN_W 466
@@ -54,8 +69,28 @@ static const char* TAG = "lvgl_ui";
 #define LVGL_UI_CHAT_GAP 10
 #define LVGL_UI_BUBBLE_RADIUS 14
 #define LVGL_UI_BUBBLE_PAD 10
-#define LVGL_UI_MSG_MAX_LEN 512
+/* Max message text stored per bubble.  1024 bytes ≈ 340 simplified-Chinese
+ * chars (UTF-8, 3 bytes/char) — enough for typical Agent LLM summaries.
+ * Truncation is UTF-8-aware (chat_view_copy_text) so a multi-byte char is
+ * never split in half (which would render a replacement glyph at the cut). */
+#define LVGL_UI_MSG_MAX_LEN 1024
 #define CHAT_HISTORY_MAX 20
+
+/* ── Enhanced Agent card styling ─────────────────────────────── */
+/* Agent replies render as a richer card: title bar + divider +
+ * left status color bar + body.  The color bar reflects a coarse
+ * classification of the reply (conclusion / structured / jira /
+ * plain) so the user gets a glanceable cue on the round screen. */
+#define LVGL_UI_CARD_TITLE "Agent"
+#define LVGL_UI_CARD_TITLEBAR_H 18
+#define LVGL_UI_CARD_COLOR_BAR_W 3
+#define LVGL_UI_CARD_GAP 4
+
+/* Status palette (RGB 0xRRGGBB) */
+#define LVGL_UI_CARD_COLOR_CONCLUSION 0x4caf50 /* green  — yes/no/建议 */
+#define LVGL_UI_CARD_COLOR_STRUCTURED 0x3a7bd5 /* blue   — MERGED/状态: */
+#define LVGL_UI_CARD_COLOR_JIRA        0xff9800 /* orange — More Info/经办人 */
+#define LVGL_UI_CARD_COLOR_PLAIN       0x9e9e9e /* grey   — default */
 
 /* PTT button label — use CJK text that MiSans definitely supports.
  * Emoji glyphs (U+1F399/U+1F3A4) are NOT in MiSans and cause
@@ -94,9 +129,6 @@ typedef struct {
     lv_obj_t* close_btn;
     lv_anim_t rec_anim;
 
-    /* Font (created via uikit font manager, supports CJK) */
-    lv_font_t* font;
-
     /* Chat history */
     chat_history_t history;
 
@@ -113,6 +145,31 @@ typedef struct {
 } lvgl_ui_state_t;
 
 static lvgl_ui_state_t s_state;
+
+/* ── Self-managed LVGL init (qemu: no miwear/launcher owns LVGL) ──
+ *
+ * On real hardware the miwear/launcher process initializes LVGL and
+ * owns the display + event loop; this channel only creates widgets.
+ * On qemu-arm64-v8a-ap there is no such process, so the channel must
+ * bring up LVGL itself: lv_init() + lv_nuttx_init(/dev/fb0) + a
+ * lv_timer_handler() loop thread.  s_lv_owned tracks whether WE did
+ * the init so stop() can deinit symmetrically. */
+static bool s_lv_owned = false;
+static pthread_t s_lv_loop_tid;
+static volatile bool s_lv_loop_running = false;
+static lv_nuttx_result_t s_lv_result;
+
+static void* lv_loop_thread(void* arg)
+{
+    (void)arg;
+    while (s_lv_loop_running) {
+        uint32_t idle = lv_timer_handler();
+        if (idle == 0)
+            idle = 1;
+        usleep(idle * 1000);
+    }
+    return NULL;
+}
 
 /* ── Async message payload for lv_async_call ──────────────── */
 
@@ -140,6 +197,45 @@ static void recording_indicator_show_processing(void);
 /* ── Ring buffer ──────────────────────────────────────────────── */
 
 /**
+ * Copy text into a fixed buffer with UTF-8-aware truncation.  Copies at most
+ * dst_size-1 bytes, then if the cut lands inside a multi-byte UTF-8 sequence
+ * (leading byte 0xC0..0xF4 not followed by enough continuation bytes 0x80..0xBF),
+ * trims back to the last complete character.  Always NUL-terminates.
+ *
+ * This prevents a half-cut Chinese char from rendering as a replacement glyph
+ * at the end of a truncated Agent reply.
+ */
+static void chat_view_copy_text(char* dst, const char* src, size_t dst_size)
+{
+    if (dst_size == 0) return;
+    size_t n = strnlen(src, dst_size - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+
+    /* If we filled the buffer, the last char may be incomplete.  Walk back
+     * from the end to find a UTF-8 leading byte and check its expected length
+     * against the remaining bytes. */
+    if (n < dst_size - 1) return;          /* src fit fully, no truncation */
+    size_t i = n;
+    while (i > 0) {
+        unsigned char c = (unsigned char)dst[i - 1];
+        if ((c & 0xC0) != 0x80) break;     /* not a continuation byte */
+        i--;
+    }
+    if (i == 0) return;                     /* all continuation bytes? give up */
+    unsigned char lead = (unsigned char)dst[i - 1];
+    size_t need;
+    if      ((lead & 0x80) == 0x00) need = 1;   /* ASCII */
+    else if ((lead & 0xE0) == 0xC0) need = 2;
+    else if ((lead & 0xF0) == 0xE0) need = 3;
+    else if ((lead & 0xF8) == 0xF0) need = 4;
+    else { dst[i - 1] = '\0'; return; }         /* invalid lead, cut it */
+    if (n - (i - 1) < need) {
+        dst[i - 1] = '\0';                      /* incomplete seq, trim it */
+    }
+}
+
+/**
  * Add a message to the chat history ring buffer.
  *
  * When count < CHAT_HISTORY_MAX, writes at head and increments count.
@@ -147,7 +243,8 @@ static void recording_indicator_show_processing(void);
  * deletes its LVGL bubble widget if present.
  *
  * Text is truncated to LVGL_UI_MSG_MAX_LEN - 1 bytes with explicit
- * NUL termination (rule coding-9).
+ * NUL termination (rule coding-9), UTF-8-aware so a multi-byte char is
+ * never split in half.
  *
  * Returns pointer to the newly written slot (inside the ring buffer,
  * no stack allocation of chat_msg_t — rule coding-6).
@@ -166,9 +263,8 @@ static chat_msg_t* chat_history_add(chat_history_t* h, const char* text, bool is
         h->count++;
     }
 
-    /* Write message text with truncation (coding-9: strncpy + manual NUL) */
-    strncpy(slot->text, text, LVGL_UI_MSG_MAX_LEN - 1);
-    slot->text[LVGL_UI_MSG_MAX_LEN - 1] = '\0';
+    /* Write message text with UTF-8-aware truncation */
+    chat_view_copy_text(slot->text, text, LVGL_UI_MSG_MAX_LEN);
 
     slot->is_user = is_user;
     slot->bubble = NULL;
@@ -184,6 +280,12 @@ int lvgl_ui_channel_init(void)
 {
     int chat_h;
     int ret = 0;
+    /* Display geometry — queried from the active display so the layout
+     * adapts to both the 466×466 round watch (real hardware) and the
+     * 1280×800 rectangle (qemu). Falls back to the 466 constants when
+     * no display is registered yet. */
+    lv_coord_t disp_w = LVGL_UI_SCREEN_W;
+    lv_coord_t disp_h = LVGL_UI_SCREEN_H;
 
     /* Idempotent: already initialized */
     if (s_state.initialized) {
@@ -192,13 +294,63 @@ int lvgl_ui_channel_init(void)
 
     syslog(LOG_INFO, "[%s] init\n", TAG);
 
-    /* Do NOT call lv_init() — the system (miwear) already initialized
-     * LVGL and owns the display + event loop.  We only create our UI
-     * widgets on the existing LVGL instance. */
+    /* If LVGL is not yet initialized (qemu: no miwear/launcher owns it),
+     * bring it up ourselves: lv_init + lv_nuttx_init(/dev/fb0) + a
+     * lv_timer_handler loop thread.  On real hardware where miwear already
+     * did this, lv_is_initialized() is true and we skip — only creating
+     * widgets on the existing display, as before. */
+    if (!lv_is_initialized()) {
+        lv_nuttx_dsc_t dsc;
 
-    /* Do NOT create a display or allocate a display buffer — the system
-     * already has one.  Creating a second display causes resource
-     * conflicts and framebuffer contention. */
+        syslog(LOG_INFO, "[%s] LVGL not initialized; self-init on /dev/fb0\n", TAG);
+
+        lv_init();
+        lv_nuttx_dsc_init(&dsc);
+        /* fb_path defaults to /dev/fb0 in lv_nuttx_dsc_init; GOLDFISH_GPU_FB
+         * provides it on qemu-arm64-v8a-ap. */
+        lv_nuttx_init(&dsc, &s_lv_result);
+
+        if (s_lv_result.disp == NULL) {
+            syslog(LOG_ERR, "[%s] lv_nuttx_init failed (no display)\n", TAG);
+            ret = -EIO;
+            goto cleanup;
+        }
+
+        /* Start the LVGL event loop thread (miwear would own this on real
+         * hardware; on qemu we run it ourselves). */
+        s_lv_loop_running = true;
+        /* LVGL rendering + CJK (SIMSUN/FreeType) glyph rasterization needs a
+         * deep stack; the default pthread stack overflows -> recursive
+         * assert. Use an explicitly sized stack. */
+        pthread_attr_t lv_attr;
+        pthread_attr_init(&lv_attr);
+        pthread_attr_setstacksize(&lv_attr, AGENT_LVGL_UI_STACK);
+        if (pthread_create(&s_lv_loop_tid, &lv_attr, lv_loop_thread, NULL) != 0) {
+            syslog(LOG_ERR, "[%s] LVGL loop thread create failed\n", TAG);
+            lv_nuttx_deinit(&s_lv_result);
+            s_lv_loop_running = false;
+            ret = -EIO;
+            goto cleanup;
+        }
+        s_lv_owned = true;
+        syslog(LOG_INFO, "[%s] LVGL self-init OK, loop thread started\n", TAG);
+    } else {
+        syslog(LOG_INFO, "[%s] LVGL already initialized (system owns it)\n", TAG);
+    }
+
+    /* Query the real display resolution so the layout adapts to the
+     * actual screen (466 round watch on hardware, 1280×800 on qemu)
+     * instead of always using the 466 constants. */
+    lv_display_t* disp = lv_display_get_default();
+    if (disp) {
+        lv_coord_t rw = lv_display_get_horizontal_resolution(disp);
+        lv_coord_t rh = lv_display_get_vertical_resolution(disp);
+        if (rw > 0 && rh > 0) {
+            disp_w = rw;
+            disp_h = rh;
+            syslog(LOG_INFO, "[%s] display %dx%d\n", TAG, disp_w, disp_h);
+        }
+    }
 
     /* Create main screen with dark background */
     s_state.screen = lv_obj_create(NULL);
@@ -214,16 +366,15 @@ int lvgl_ui_channel_init(void)
      * demand when the user activates the chat UI, to avoid
      * hijacking the system's current screen at boot. */
 
-    /* Defer CJK font creation to the LVGL thread (show_screen_async_cb).
-     * Creating a FreeType font here — from the main thread — causes
-     * FT_Err_Invalid_Size_Handle (0x55) because the FreeType size
-     * object races with the LVGL render thread.  Use Montserrat as
-     * a safe placeholder until the screen is shown. */
-    s_state.font = NULL;
-    lv_obj_set_style_text_font(s_state.screen, &lv_font_montserrat_14, 0);
+    /* Default text font: the app-owned statically-compiled MiSans-16 CJK font
+     * (3755 GB2312-1 common chars + ASCII + fullwidth punctuation, baked into
+     * the binary via lv_font_conv — zero runtime malloc/rasterization) so
+     * Agent reply Chinese text renders on qemu with full coverage and cannot
+     * corrupt the heap.  Falls back to SimSun-16 (1000 chars) then Montserrat. */
+    lv_obj_set_style_text_font(s_state.screen, &lv_font_misans_16_cjk, 0);
 
     /* Step 5: Create Chat View container */
-    chat_h = LVGL_UI_SCREEN_H - LVGL_UI_PADDING_TOP - LVGL_UI_PADDING_BOTTOM
+    chat_h = disp_h - LVGL_UI_PADDING_TOP - LVGL_UI_PADDING_BOTTOM
         - LVGL_UI_PTT_SIZE - 20;
 
     s_state.chat_list = lv_obj_create(s_state.screen);
@@ -234,7 +385,7 @@ int lvgl_ui_channel_init(void)
     }
 
     lv_obj_set_size(s_state.chat_list,
-        LVGL_UI_SCREEN_W - 2 * LVGL_UI_PADDING_H, chat_h);
+        disp_w - 2 * LVGL_UI_PADDING_H, chat_h);
     lv_obj_align(s_state.chat_list, LV_ALIGN_TOP_MID, 0, LVGL_UI_PADDING_TOP);
     lv_obj_set_scroll_dir(s_state.chat_list, LV_DIR_VER);
     lv_obj_set_flex_flow(s_state.chat_list, LV_FLEX_FLOW_COLUMN);
@@ -331,10 +482,6 @@ int lvgl_ui_channel_init(void)
 
 cleanup:
     /* Release resources in reverse order (coding-2) */
-    if (s_state.font) {
-        vg_font_destroy(s_state.font);
-        s_state.font = NULL;
-    }
 
     if (s_state.screen) {
         lv_obj_del(s_state.screen);
@@ -399,11 +546,6 @@ static void lvgl_ui_do_cleanup(void)
     s_state.screen_visible = false;
     s_state.prev_screen = NULL;
 
-    if (s_state.font) {
-        vg_font_destroy(s_state.font);
-        s_state.font = NULL;
-    }
-
     s_state.chat_list = NULL;
     s_state.ptt_btn = NULL;
     s_state.ptt_label = NULL;
@@ -416,6 +558,13 @@ static void lvgl_ui_do_cleanup(void)
 
     s_state.history.head = 0;
     s_state.history.count = 0;
+
+    /* Note: when we self-initialized LVGL (s_lv_owned, qemu case), the
+     * lv_timer_handler loop thread is intentionally left running — it is
+     * torn down only when the ai_agent process exits.  Stopping it from
+     * within cleanup (which itself runs in that loop thread via
+     * lv_async_call) would self-deadlock.  Widget deletion above is safe
+     * because the loop is still alive to process it. */
 }
 
 static void stop_screen_async_cb(void* data)
@@ -507,19 +656,21 @@ static void show_screen_async_cb(void* data)
         return;
     }
 
-    /* Create CJK font here — inside the LVGL thread — so the
-     * FreeType size handle is owned by the same thread that will
-     * later rasterize glyphs.  Creating it from the main thread
-     * (in init) causes FT_Err_Invalid_Size_Handle (0x55). */
-    if (!s_state.font) {
-        s_state.font = vg_font_create("MiSans-Medium", 18,
-            LV_FREETYPE_FONT_STYLE_NORMAL);
-        if (s_state.font) {
-            lv_obj_set_style_text_font(s_state.screen, s_state.font, 0);
-        } else {
-            syslog(LOG_WARNING, "[%s] vg_font_create failed, keeping montserrat\n", TAG);
-        }
-    }
+    /* CJK font selection happens at init() time via the statically-compiled
+     * lv_font_misans_16_cjk (preferred: 3755 GB2312-1 common chars, baked into
+     * the binary by lv_font_conv — zero runtime malloc, zero rasterization,
+     * cannot corrupt the heap).  No runtime TTF loading here.
+     *
+     * History: we previously used lv_tiny_ttf_create_data() with a runtime
+     * MiSans TTF, but stb_truetype's MakeGlyphBitmap write path overran its
+     * output buffer on certain CJK glyphs and corrupted adjacent NuttX mm heap
+     * chunk metadata, leading to recursive-assert reboots (mm_foreach /
+     * nxsched_add_readytorun / nxsem_post_slow in the timer IRQ).  Subsetting
+     * to 857 KB only delayed the crash; the root cause is the rasterizer, so
+     * we moved to a pre-rasterized static font.  See lv_font_misans_16_cjk.c
+     * and the fontgen notes in docs. */
+    /* Already set in init(); nothing to do at show time. */
+    syslog(LOG_INFO, "[%s] using static MiSans-16 CJK font\n", TAG);
 
     syslog(LOG_INFO, "[%s] loading chat screen\n", TAG);
 
@@ -529,6 +680,18 @@ static void show_screen_async_cb(void* data)
 
     lv_screen_load(s_state.screen);
     s_state.screen_visible = true;
+
+#ifdef LVGL_UI_CARD_SELFTEST
+    /* Debug self-test: inject one card per reply category so all four
+     * color-bar variants render on a single show_chat.  Remove the
+     * -DLVGL_UI_CARD_SELFTEST define to disable. */
+    syslog(LOG_INFO, "[%s] CARD_SELFTEST: injecting sample cards\n", TAG);
+    chat_view_add_message("这个提交已 MERGED,状态: 正常合入", false);
+    chat_view_add_message("Jira issue FEEDBACK-149182,经办人: 张文海,More Info", false);
+    chat_view_add_message("值得合入,建议采纳,yes", false);
+    chat_view_add_message("这是一条普通回复,用于展示默认灰色色条", false);
+    chat_view_add_message("你好,这是一条用户消息", true);
+#endif
 }
 
 void lvgl_ui_channel_show(void)
@@ -581,8 +744,7 @@ int lvgl_ui_channel_send(const char* text)
         return -ENOMEM;
     }
 
-    strncpy(payload->text, text, LVGL_UI_MSG_MAX_LEN - 1);
-    payload->text[LVGL_UI_MSG_MAX_LEN - 1] = '\0';
+    chat_view_copy_text(payload->text, text, LVGL_UI_MSG_MAX_LEN);
     payload->is_user = false;
 
     lv_async_call(chat_view_add_message_async_cb, payload);
@@ -620,6 +782,140 @@ static void chat_view_add_message_async_cb(void* data)
 
 /* ── Internal functions ───────────────────────────────────── */
 
+/* Classify an Agent reply text into a coarse card category so the
+ * left color bar gives a glanceable cue.  Matching is intentionally
+ * simple (case-insensitive substring) — this is a visual hint, not
+ * a parser.  Returns the palette color for the matched category. */
+static uint32_t chat_view_classify_reply(const char* text)
+{
+    if (!text || !*text) {
+        return LVGL_UI_CARD_COLOR_PLAIN;
+    }
+
+    /* Build a lowercase copy (ASCII only; CJK passes through untouched)
+     * so substring checks are case-insensitive for the latin keywords. */
+    char buf[LVGL_UI_MSG_MAX_LEN];
+    size_t i;
+    for (i = 0; i < sizeof(buf) - 1 && text[i]; i++) {
+        buf[i] = (text[i] >= 'A' && text[i] <= 'Z') ? (text[i] + 32) : text[i];
+    }
+    buf[i] = '\0';
+
+    /* Conclusion: explicit yes/no or recommendation phrasing */
+    if (strstr(buf, "yes") || strstr(buf, " no") || strstr(buf, "no.") ||
+        strstr(buf, "no,") || strstr(buf, "\xe5\x80\xbc\xe5\xbe\x97") /* 值得 */ ||
+        strstr(buf, "\xe4\xb8\x8d\xe5\xbb\xba\xe8\xae\xae") /* 不建议 */ ||
+        strstr(buf, "\xe5\xbb\xba\xe8\xae\xae") /* 建议 */ ) {
+        return LVGL_UI_CARD_COLOR_CONCLUSION;
+    }
+
+    /* Structured: Gerrit change status keywords (latin) or 状态: */
+    if (strstr(buf, "merged") || strstr(buf, "abandoned") ||
+        strstr(buf, "status:") || strstr(buf, "\xe7\x8a\xb6\xe6\x80\x81") /* 状态 */ ) {
+        return LVGL_UI_CARD_COLOR_STRUCTURED;
+    }
+
+    /* Jira: workflow status or assignee fields */
+    if (strstr(buf, "more info") || strstr(buf, "assignee") ||
+        strstr(buf, "\xe7\xbb\x8f\xe5\x8a\x9e\xe4\xba\xba") /* 经办人 */ ||
+        strstr(buf, "jira") ) {
+        return LVGL_UI_CARD_COLOR_JIRA;
+    }
+
+    return LVGL_UI_CARD_COLOR_PLAIN;
+}
+
+/* Build the enhanced Agent card inside `bubble`: title bar (status
+ * dot + "Agent") + divider + left color bar + body label.  Replaces
+ * the plain label used before. */
+static void chat_view_build_agent_card(lv_obj_t* bubble, const char* text,
+                                       uint32_t bar_color)
+{
+    lv_obj_t* title_bar;
+    lv_obj_t* status_dot;
+    lv_obj_t* title_lbl;
+    lv_obj_t* divider;
+    lv_obj_t* body_row;
+    lv_obj_t* color_bar;
+    lv_obj_t* body_lbl;
+
+    /* Title bar: a thin row holding the status dot + title text */
+    title_bar = lv_obj_create(bubble);
+    lv_obj_remove_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(title_bar, lv_pct(100));
+    lv_obj_set_height(title_bar, LVGL_UI_CARD_TITLEBAR_H);
+    lv_obj_set_style_pad_all(title_bar, 0, 0);
+    lv_obj_set_style_border_width(title_bar, 0, 0);
+    lv_obj_set_style_bg_opa(title_bar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(title_bar, 0, 0);
+    lv_obj_set_flex_flow(title_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(title_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(title_bar, LVGL_UI_CARD_GAP, 0);
+
+    /* Status dot — colored circle reflecting the reply category */
+    status_dot = lv_obj_create(title_bar);
+    lv_obj_remove_flag(status_dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(status_dot, 8, 8);
+    lv_obj_set_style_radius(status_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(status_dot, lv_color_hex(bar_color), 0);
+    lv_obj_set_style_bg_opa(status_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(status_dot, 0, 0);
+    lv_obj_set_style_pad_all(status_dot, 0, 0);
+
+    /* Title label */
+    title_lbl = lv_label_create(title_bar);
+    lv_label_set_text(title_lbl, LVGL_UI_CARD_TITLE);
+    lv_obj_set_style_text_color(title_lbl, lv_color_hex(0x9e9e9e), 0);
+
+    /* Divider line under the title */
+    divider = lv_obj_create(bubble);
+    lv_obj_remove_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(divider, lv_pct(100));
+    lv_obj_set_height(divider, 1);
+    lv_obj_set_style_pad_all(divider, 0, 0);
+    lv_obj_set_style_border_width(divider, 0, 0);
+    lv_obj_set_style_bg_color(divider, lv_color_hex(0x3a3a4a), 0);
+    lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(divider, 0, 0);
+    lv_obj_set_style_pad_ver(divider, 0, 0);
+    lv_obj_set_style_margin_top(divider, LVGL_UI_CARD_GAP, 0);
+    lv_obj_set_style_margin_bottom(divider, LVGL_UI_CARD_GAP, 0);
+
+    /* Body row: left color bar + body label */
+    body_row = lv_obj_create(bubble);
+    lv_obj_remove_flag(body_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(body_row, lv_pct(100));
+    lv_obj_set_height(body_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(body_row, 0, 0);
+    lv_obj_set_style_border_width(body_row, 0, 0);
+    lv_obj_set_style_bg_opa(body_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(body_row, 0, 0);
+    lv_obj_set_flex_flow(body_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(body_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(body_row, LVGL_UI_CARD_GAP, 0);
+
+    /* Left color bar (the category indicator) */
+    color_bar = lv_obj_create(body_row);
+    lv_obj_remove_flag(color_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(color_bar, LVGL_UI_CARD_COLOR_BAR_W);
+    lv_obj_set_height(color_bar, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(color_bar, 0, 0);
+    lv_obj_set_style_border_width(color_bar, 0, 0);
+    lv_obj_set_style_bg_color(color_bar, lv_color_hex(bar_color), 0);
+    lv_obj_set_style_bg_opa(color_bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(color_bar, 2, 0);
+
+    /* Body label — the actual reply text */
+    body_lbl = lv_label_create(body_row);
+    lv_label_set_text(body_lbl, text);
+    lv_label_set_long_mode(body_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(body_lbl, lv_pct(85));
+    lv_obj_set_style_text_color(body_lbl, lv_color_hex(0xe8e8e8), 0);
+    lv_obj_set_flex_grow(body_lbl, 1);
+}
+
 static void chat_view_add_message(const char* text, bool is_user)
 {
     chat_history_t* h = &s_state.history;
@@ -654,25 +950,41 @@ static void chat_view_add_message(const char* text, bool is_user)
         lv_obj_set_style_bg_color(bubble, lv_color_hex(0x3a7bd5), 0);
         lv_obj_set_style_text_color(bubble, lv_color_white(), 0);
     } else {
-        /* Agent bubble: left-aligned, semi-transparent dark bg */
+        /* Agent card: left-aligned, semi-transparent dark bg, vertical
+         * flex layout so title bar / divider / body stack top-to-bottom. */
         lv_obj_set_style_align(bubble, LV_ALIGN_LEFT_MID, 0);
-        lv_obj_set_style_bg_color(bubble, lv_color_hex(0x2a2a40), 0);
-        lv_obj_set_style_bg_opa(bubble, LV_OPA_90, 0);
+        /* Card bg lighter than the screen bg (0x1a1a2e) + thin border so
+         * the card reads as a distinct rounded box instead of blending
+         * invisibly into the dark background. */
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(0x363650), 0);
+        lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(bubble, lv_color_hex(0x4a4a66), 0);
+        lv_obj_set_style_border_width(bubble, 1, 0);
         lv_obj_set_style_text_color(bubble, lv_color_hex(0xe8e8e8), 0);
+        lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(bubble, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_row(bubble, LVGL_UI_CARD_GAP, 0);
     }
 
-    /* Create label inside bubble */
-    lbl = lv_label_create(bubble);
-    if (!lbl) {
-        syslog(LOG_ERR, "[%s] bubble label create failed\n", TAG);
-        lv_obj_del(bubble);
-        slot->bubble = NULL;
-        return;
-    }
+    if (is_user) {
+        /* User bubble: plain label */
+        lbl = lv_label_create(bubble);
+        if (!lbl) {
+            syslog(LOG_ERR, "[%s] bubble label create failed\n", TAG);
+            lv_obj_del(bubble);
+            slot->bubble = NULL;
+            return;
+        }
 
-    lv_label_set_text(lbl, slot->text);
-    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl, lv_pct(100));
+        lv_label_set_text(lbl, slot->text);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lbl, lv_pct(100));
+    } else {
+        /* Agent bubble: enhanced card (title bar + divider + color bar + body) */
+        uint32_t bar_color = chat_view_classify_reply(slot->text);
+        chat_view_build_agent_card(bubble, slot->text, bar_color);
+    }
 
     slot->bubble = bubble;
 

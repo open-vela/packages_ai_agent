@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -375,7 +376,8 @@ static void* recording_thread(void* arg)
     (void)arg;
     unsigned char chunk[AGENT_ASR_CHUNK_SIZE];
     int need_fallback = 0;
-    // int dump_fd = -1;
+    int dump_fd = open("/data/cap_dump.pcm",
+        O_WRONLY | O_CREAT | O_TRUNC, 0644);
     size_t total_bytes_read = 0;
     size_t total_bytes_sent = 0;
     int chunk_count = 0;
@@ -451,9 +453,9 @@ static void* recording_thread(void* arg)
         chunk_count++;
 
         /* Dump raw PCM to file */
-        // if (dump_fd >= 0) {
-        //     write(dump_fd, chunk, (size_t)n);
-        // }
+        if (dump_fd >= 0) {
+            write(dump_fd, chunk, (size_t)n);
+        }
 
         /* Log audio level for first few chunks and periodically
          * to diagnose silence vs actual speech from QEMU mic. */
@@ -486,10 +488,10 @@ static void* recording_thread(void* arg)
 #endif
 
     /* Store stream handle for voice_channel_stop to finish */
-    // if (dump_fd >= 0) {
-    //     close(dump_fd);
-    //     syslog(LOG_INFO, "[%s] PCM dump saved to /data/cap_dump.pcm\n", TAG);
-    // }
+    if (dump_fd >= 0) {
+        close(dump_fd);
+        syslog(LOG_INFO, "[%s] PCM dump saved to /data/cap_dump.pcm\n", TAG);
+    }
 
     pthread_mutex_lock(&s_voice.lock);
     s_voice.asr_stream = stream;
@@ -733,6 +735,7 @@ int voice_channel_start(void)
     sem_wait(&s_voice.rec_ready);
 
     if (audio_capture_start(s_voice.cap) < 0) {
+        syslog(LOG_ERR, "[%s] capture start failed\n", TAG);
         pthread_mutex_lock(&s_voice.lock);
         s_voice.state = VOICE_IDLE;
         if (s_voice.asr_stream) {
@@ -989,6 +992,92 @@ static void tts_strip_markdown(char* s)
     *w = '\0';
 }
 
+/* ── Attention beep (prompt tone) ───────────────────────── */
+
+#define BEEP_SINE_TABLE 256
+
+/* One full sine period, 16-bit signed, amplitude 8000 (≈ -12 dBFS). */
+static const int16_t beep_sine[BEEP_SINE_TABLE] = {
+    0, 196, 393, 589, 784, 979, 1174, 1368, 1561, 1753, 1944, 2134, 2322, 2509, 2695, 2879,
+    3061, 3242, 3420, 3597, 3771, 3943, 4113, 4280, 4445, 4606, 4766, 4922, 5075, 5225, 5372, 5516,
+    5657, 5794, 5928, 6058, 6184, 6307, 6426, 6541, 6652, 6759, 6862, 6961, 7055, 7146, 7232, 7314,
+    7391, 7464, 7532, 7596, 7656, 7710, 7760, 7806, 7846, 7882, 7913, 7940, 7961, 7978, 7990, 7998,
+    8000, 7998, 7990, 7978, 7961, 7940, 7913, 7882, 7846, 7806, 7760, 7710, 7656, 7596, 7532, 7464,
+    7391, 7314, 7232, 7146, 7055, 6961, 6862, 6759, 6652, 6541, 6426, 6307, 6184, 6058, 5928, 5794,
+    5657, 5516, 5372, 5225, 5075, 4922, 4766, 4606, 4445, 4280, 4113, 3943, 3771, 3597, 3420, 3242,
+    3061, 2879, 2695, 2509, 2322, 2134, 1944, 1753, 1561, 1368, 1174, 979, 784, 589, 393, 196,
+    0, -196, -393, -589, -784, -979, -1174, -1368, -1561, -1753, -1944, -2134, -2322, -2509, -2695, -2879,
+    -3061, -3242, -3420, -3597, -3771, -3943, -4113, -4280, -4445, -4606, -4766, -4922, -5075, -5225, -5372, -5516,
+    -5657, -5794, -5928, -6058, -6184, -6307, -6426, -6541, -6652, -6759, -6862, -6961, -7055, -7146, -7232, -7314,
+    -7391, -7464, -7532, -7596, -7656, -7710, -7760, -7806, -7846, -7882, -7913, -7940, -7961, -7978, -7990, -7998,
+    -8000, -7998, -7990, -7978, -7961, -7940, -7913, -7882, -7846, -7806, -7760, -7710, -7656, -7596, -7532, -7464,
+    -7391, -7314, -7232, -7146, -7055, -6961, -6862, -6759, -6652, -6541, -6426, -6307, -6184, -6058, -5928, -5794,
+    -5657, -5516, -5372, -5225, -5075, -4922, -4766, -4606, -4445, -4280, -4113, -3943, -3771, -3597, -3420, -3242,
+    -3061, -2879, -2695, -2509, -2322, -2134, -1944, -1753, -1561, -1368, -1174, -979, -784, -589, -393, -196,
+};
+
+/* Play a short sine-wave beep as an attention cue. Fades in/out ~15ms to
+ * avoid clicks. Safe to call before TTS to signal an incoming reply while
+ * the (slower) network synthesis is still in flight. */
+int voice_channel_beep(unsigned int freq_hz, unsigned int duration_ms)
+{
+    if (freq_hz < 100 || freq_hz > 8000) {
+        freq_hz = 1000;
+    }
+    if (duration_ms == 0 || duration_ms > 5000) {
+        duration_ms = 200;
+    }
+
+    const unsigned int rate = AGENT_VOICE_SAMPLE_RATE;
+    const unsigned int n = (unsigned int)((uint64_t)rate * duration_ms / 1000);
+
+    int16_t* buf = malloc((size_t)n * sizeof(int16_t));
+    if (!buf) {
+        return -ENOMEM;
+    }
+
+    /* Fixed-point phase accumulator (16.16) into the 256-entry table. */
+    uint32_t phase = 0;
+    uint32_t inc = (uint32_t)((uint64_t)freq_hz * BEEP_SINE_TABLE * 65536 / rate);
+
+    /* ~15ms linear fade-in/out to avoid a click at onset/release. */
+    unsigned int fade = rate * 15 / 1000;
+    if (fade == 0) {
+        fade = 1;
+    }
+
+    for (unsigned int i = 0; i < n; i++) {
+        int32_t s = beep_sine[(phase >> 16) & (BEEP_SINE_TABLE - 1)];
+
+        int32_t gain = 256;
+        if (i < fade) {
+            gain = (int32_t)i * 256 / fade;
+        } else if (i >= n - fade) {
+            gain = (int32_t)(n - 1 - i) * 256 / fade;
+        }
+
+        buf[i] = (int16_t)(s * gain / 256);
+        phase += inc;
+    }
+
+    audio_playback_t* pb = audio_playback_open(
+        AGENT_AUDIO_PLAYBACK_DEV, rate,
+        AGENT_VOICE_CHANNELS, AGENT_VOICE_BITS);
+    if (!pb) {
+        free(buf);
+        return -EIO;
+    }
+
+    int ret = audio_playback_write(pb, buf, (size_t)n * sizeof(int16_t));
+    if (ret < 0) {
+        syslog(LOG_WARNING, "[%s] beep write failed: %d\n", TAG, ret);
+    }
+    audio_playback_close(pb);
+    free(buf);
+
+    return (ret < 0) ? ret : 0;
+}
+
 int voice_channel_speak(const char* text)
 {
     if (!text || text[0] == '\0') {
@@ -1051,10 +1140,16 @@ int voice_channel_speak(const char* text)
         syslog(LOG_INFO, "[%s] LLM latency: %ldms\n", TAG, llm_ms);
     }
 
-    /* Try streaming TTS first (callback per chunk) */
+    /* Play a short attention beep before the (slower) network synthesis so
+     * a notification is audible immediately. Non-fatal on failure. */
+    voice_channel_beep(1000, 200);
+
+    /* Try streaming TTS first (callback per chunk).
+     * NOTE: playback must match the REST v3 synth sample rate
+     * (AGENT_VOICE_SAMPLE_RATE = 16kHz), not the old WS v1 24kHz. */
     audio_playback_t* pb = audio_playback_open(
         AGENT_AUDIO_PLAYBACK_DEV,
-        AGENT_TTS_WS_SAMPLE_RATE,
+        AGENT_VOICE_SAMPLE_RATE,
         AGENT_VOICE_CHANNELS,
         AGENT_VOICE_BITS);
 

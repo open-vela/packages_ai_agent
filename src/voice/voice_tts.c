@@ -110,6 +110,9 @@ int voice_tts_speak_stream(const char* text,
         return -ENODEV;
     }
 
-    return volc_tts_ws_synthesize_stream(text,
+    /* Use the V3 REST streaming path (openspeech /api/v3/tts/unidirectional).
+     * The old WebSocket path (/api/v1/tts/ws_binary) is deprecated on the
+     * Doubao big-model account and fails the same way ASR v2 did. */
+    return volc_tts_synthesize_stream(text,
         (volc_tts_chunk_cb)cb, user_data);
 }

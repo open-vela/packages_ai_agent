@@ -46,6 +46,12 @@ typedef struct {
 
 /**
  * Query current heap memory status via mallinfo().
+ *
+ * The static MiSans font (lv_font_conv pre-rasterized, compiled into
+ * .rodata) replaced the runtime tiny_ttf rasterizer, removing the heap
+ * corruption source that used to trip mallinfo()'s heap walker.  If
+ * mallinfo() ever DEBUGASSERTs again, that is a live heap-corruption
+ * canary: do not paper over it here — find the writer.
  */
 static inline void agent_mem_get_status(agent_mem_status_t* st)
 {
