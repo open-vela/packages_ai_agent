@@ -674,6 +674,16 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     resp_buf[resp_pos] = '\0';
     tls_raw_release(raw);
 
+    /* A body that filled the caller's buffer was cut off mid-stream.  The
+     * caller only sees a short string, so a JSON consumer reports a syntax
+     * error that does not exist in the server's reply.  Name the real cause
+     * here, where the capacity is still known. */
+    if (resp_pos >= resp_cap - 1) {
+        syslog(LOG_ERR, "[%s] response body truncated at %zu bytes "
+               "(buf cap %zu): reply larger than buffer\n",
+               TAG, resp_pos, resp_cap);
+    }
+
     /* Chunked decode */
     if (chunked) {
         resp_pos = decode_chunked(resp_buf, resp_pos);
@@ -1034,6 +1044,13 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
     resp_buf[resp_pos] = '\0';
     free(raw);
     close(fd);
+
+    /* Same as the TLS path: a full buffer means the body was cut off, and the
+     * caller would otherwise diagnose it as malformed JSON. */
+    if (resp_pos >= resp_cap - 1) {
+        syslog(LOG_ERR, "http: response body truncated at %zu bytes "
+               "(buf cap %zu): reply larger than buffer\n", resp_pos, resp_cap);
+    }
 
     /* Chunked decode */
     if (chunked) {
