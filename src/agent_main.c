@@ -558,7 +558,16 @@ int ai_agent_main(int argc, char* argv[])
 
     struct stat st;
     if (stat("/data", &st) != 0) {
-        syslog(LOG_INFO, "[%s] Mounting /data as tmpfs for simulation...\n", TAG);
+        /* Everything the agent persists lives under /data: the skills, the
+         * sessions, and the LLM config including the API key.  Standing up
+         * tmpfs here keeps the agent running, but it also makes every later
+         * write disappear at reboot, and nothing else reports that - the
+         * board simply comes back with no backend configured and looks like
+         * a credentials problem.  Say it loudly, once, at the moment the
+         * fallback happens. */
+        syslog(LOG_ERR, "[%s] /data missing: mounting tmpfs - agent state "
+            "(config, skills, sessions) is RAM-only and will be LOST on "
+            "reboot. Check the eMMC mount.\n", TAG);
         mount(NULL, "/data", "tmpfs", 0, NULL);
     }
 
