@@ -30,6 +30,7 @@ extern "C" {
 
 int agent_loop_init(void);
 int agent_loop_start(void);
+int agent_loop_ask(const char *content);
 
 #ifdef __cplusplus
 }

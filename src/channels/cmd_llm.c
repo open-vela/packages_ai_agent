@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#define printf(...) dprintf(STDOUT_FILENO, __VA_ARGS__)
 
 /* ---- Router presets (shared by set_llm and router_set) ---- */
 
@@ -57,6 +60,7 @@ static const router_preset_t g_router_presets[] = {
 
 void cmd_set_llm(int argc, char** argv)
 {
+    syslog(LOG_DEBUG, "[config] command enter argc=%d\n", argc);
     if (argc < 2) {
         printf("Usage: set_llm <preset> [api_key]\n"
                "       set_llm <url> <model> [api_key]\n"
@@ -201,10 +205,12 @@ void cmd_set_llm(int argc, char** argv)
         backend.api_key[sizeof(backend.api_key) - 1] = '\0';
     } else {
         llm_backend_t old;
+        syslog(LOG_DEBUG, "[config] existing backend read begin\n");
         if (llm_router_get_backend(0, &old) == 0 && old.api_key[0]) {
             strncpy(backend.api_key, old.api_key, sizeof(backend.api_key) - 1);
             backend.api_key[sizeof(backend.api_key) - 1] = '\0';
         }
+        syslog(LOG_DEBUG, "[config] existing backend read done\n");
     }
 
     backend.priority = 0;
@@ -215,8 +221,14 @@ void cmd_set_llm(int argc, char** argv)
      * llm_router_apply() -> llm_set_all() already persists
      * llm_host/llm_path/llm_port/api_key/model to config_store,
      * so config_show and reboot are covered without extra writes here. */
-    llm_router_set_backend(0, &backend);
-    llm_router_apply(0);
+    syslog(LOG_DEBUG, "[config] backend save begin\n");
+    int rc = llm_router_set_backend(0, &backend);
+    syslog(LOG_DEBUG, "[config] backend save returned rc=%d\n", rc);
+    if (rc != 0) return;
+    syslog(LOG_DEBUG, "[config] apply begin\n");
+    rc = llm_router_apply(0);
+    syslog(LOG_DEBUG, "[config] apply returned rc=%d\n", rc);
+    if (rc != 0) return;
 
     printf("LLM backend: %s:%s%s (model: %s) [router slot 0]\n",
         host, port, path, model ? model : "(unchanged)");

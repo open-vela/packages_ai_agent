@@ -172,6 +172,28 @@ config AI_AGENT_CAMERA
 		camera device at /dev/video0. Use for object recognition,
 		text reading, and scene description.
 
+config AI_AGENT_MEDIA
+	bool "Enable media playback tools"
+	default y
+	---help---
+		Enable music search and playback tools. Disable this for CLI-only
+		boards that do not include the openvela multimedia framework.
+
+config AI_AGENT_VOICE
+	bool "Enable voice channel"
+	default y
+	---help---
+		Enable audio capture, playback, ASR, and TTS. Disable this for
+		CLI-only boards without audio and multimedia frameworks.
+
+config AI_AGENT_ESP32P4_TOOLS
+	bool "Enable ESP32-P4 device information tools"
+	default y if ARCH_CHIP_ESP32P4
+	depends on ARCH_CHIP_ESP32P4 && NET && NET_IPv4
+	---help---
+		Enable the read-only device_info and network_status Agent tools for
+		the ESP32-P4 Function EV Board.
+
 config AI_AGENT_NODE
 	bool "Enable Hub-Node cross-device protocol"
 	default y

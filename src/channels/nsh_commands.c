@@ -23,7 +23,9 @@
 #include "channels/nsh_commands.h"
 #include "channels/cmd_channel.h"
 #include "channels/cmd_llm.h"
+#ifdef CONFIG_AI_AGENT_VOICE
 #include "channels/cmd_voice.h"
+#endif
 #include "core/message_bus.h"
 #include "infra/config_store.h"
 #include "infra/cron_service.h"
@@ -59,11 +61,13 @@
 
 #include <malloc.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <system/readline.h>
 
 #ifdef CONFIG_BOARDCTL_RESET
 #include <sys/boardctl.h>
@@ -73,6 +77,20 @@ static const char* TAG = "cli";
 
 #define MAX_ARGS 8
 #define LINE_LEN 256
+
+/* Pace descriptor writes: ESP32-P4 USB serial can miss the TX wakeup when
+ * many small writes fill its queue back-to-back. */
+static int cli_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int ret = vdprintf(STDOUT_FILENO, fmt, ap);
+    va_end(ap);
+    usleep(5 * 1000);
+    return ret;
+}
+
+#define printf(...) cli_printf(__VA_ARGS__)
 
 /* ── Helpers ──────────────────────────────────────────────────── */
 
@@ -127,6 +145,7 @@ static void cmd_help(void)
         "  restart              - Restart the device\n"
         "  quit                 - Exit agent\n"
         "  set_mqtt <broker> [client_id] - Set MQTT broker (host:port)\n"
+#ifdef CONFIG_AI_AGENT_VOICE
         "  set_volc_key <api_key>       - Set Doubao voice API key\n"
         "  set_volc_asr <id> <tok> <cluster> - Set ASR credentials\n"
         "  set_volc_speaker <id>  - Set TTS voice (e.g. zh_female_cancan)\n"
@@ -136,6 +155,7 @@ static void cmd_help(void)
         "  voice_test_asr <file>  - Test ASR recognition\n"
         "  set_voice_tts <name>   - Switch TTS backend\n"
         "  set_voice_asr <name>   - Switch ASR backend\n"
+#endif
         "  set_weixin_token <tok> - Set WeChat bot token\n"
         "  weixin_login           - QR code login to WeChat\n"
         "  router_status          - Show LLM router status\n"
@@ -498,7 +518,7 @@ static void cmd_config_show(void)
     printf("Net Retry: max=%d base=%ds\n",
         network_get_retry_max(), network_get_retry_base_sec());
 #endif
-    printf("=============================\n");
+    dprintf(STDOUT_FILENO, "=============================\n");
 }
 
 static void cmd_config_reset(void)
@@ -883,31 +903,23 @@ static void* cli_thread(void* arg)
     char* argv[MAX_ARGS];
 
     syslog(LOG_INFO, "[%s] NSH CLI started. Type 'help' for commands.\n", TAG);
-    pthread_mutex_lock(&g_stdout_lock);
     printf("vela> ");
-    fflush(stdout);
-    pthread_mutex_unlock(&g_stdout_lock);
 
-    while (fgets(line, sizeof(line), stdin) != NULL) {
-        /* Strip trailing newline */
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+    ssize_t len;
+    while ((len = readline_fd(line, sizeof(line), STDIN_FILENO,
+                              STDOUT_FILENO)) >= 0) {
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
+        }
 
         if (len == 0) {
-            pthread_mutex_lock(&g_stdout_lock);
             printf("vela> ");
-            fflush(stdout);
-            pthread_mutex_unlock(&g_stdout_lock);
             continue;
         }
 
         int argc = tokenise(line, argv, MAX_ARGS);
         if (argc == 0) {
-            pthread_mutex_lock(&g_stdout_lock);
             printf("vela> ");
-            fflush(stdout);
-            pthread_mutex_unlock(&g_stdout_lock);
             continue;
         }
 
@@ -992,6 +1004,7 @@ static void* cli_thread(void* arg)
             break;
         } else if (strcmp(cmd, "set_mqtt") == 0)
             cmd_set_mqtt(argc, argv);
+#ifdef CONFIG_AI_AGENT_VOICE
         else if (strcmp(cmd, "set_volc_key") == 0)
             cmd_set_volc_key(argc, argv);
         else if (strcmp(cmd, "set_volc_asr") == 0)
@@ -1010,6 +1023,7 @@ static void* cli_thread(void* arg)
             cmd_set_voice_tts(argc, argv);
         else if (strcmp(cmd, "set_voice_asr") == 0)
             cmd_set_voice_asr(argc, argv);
+#endif
         else if (strcmp(cmd, "set_weixin_token") == 0)
             cmd_set_weixin_token(argc, argv);
         else if (strcmp(cmd, "weixin_login") == 0)
@@ -1063,14 +1077,33 @@ static void* cli_thread(void* arg)
         else
             printf("Unknown command: %s (type 'help')\n", cmd);
 
-        pthread_mutex_lock(&g_stdout_lock);
         printf("vela> ");
-        fflush(stdout);
-        pthread_mutex_unlock(&g_stdout_lock);
     }
 
     syslog(LOG_INFO, "[%s] CLI thread exiting\n", TAG);
     return NULL;
+}
+
+int nsh_commands_run_once(int argc, char **argv)
+{
+    if (argc < 1 || !argv || !argv[0]) {
+        return ERROR;
+    }
+
+    if (strcmp(argv[0], "set_llm") == 0) {
+        cmd_set_llm(argc, argv);
+    } else if (strcmp(argv[0], "config_show") == 0) {
+        cmd_config_show();
+    } else if (strcmp(argv[0], "ask") == 0) {
+        cmd_ask(argc, argv);
+    } else if (strcmp(argv[0], "help") == 0) {
+        cmd_help();
+    } else {
+        dprintf(STDOUT_FILENO, "Unknown agent command: %s\n", argv[0]);
+        return ERROR;
+    }
+
+    return OK;
 }
 
 /* ── Init / Start ─────────────────────────────────────────────── */
@@ -1086,5 +1119,6 @@ int nsh_commands_init(void)
 
 int nsh_commands_start(void)
 {
-    return agent_task_create(cli_thread, "agent_cli", AGENT_CLI_STACK, NULL, AGENT_CLI_PRIO);
+    cli_thread(NULL);
+    return OK;
 }

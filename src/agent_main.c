@@ -21,6 +21,7 @@
  */
 
 #include <malloc.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,9 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef CONFIG_NETUTILS_NTPCLIENT
+#include <netutils/ntpclient.h>
+#endif
 
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -60,7 +64,9 @@
 #include "infra/http_proxy.h"
 #include "tools/tool_guard.h"
 #include "tools/skill_loader.h"
+#ifdef CONFIG_AI_AGENT_MEDIA
 #include "tools/tool_media.h"
+#endif
 #include "tools/tool_registry.h"
 #ifdef CONFIG_AI_AGENT_MCP
 #include "tools/mcp_bridge.h"
@@ -70,7 +76,9 @@
 #if AGENT_SKILL_SYNC_ENABLED
 #include "tools/skill_sync.h"
 #endif
+#ifdef CONFIG_AI_AGENT_VOICE
 #include "voice/voice_channel.h"
+#endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
 #include "channels/weixin_channel.h"
 #endif
@@ -324,8 +332,10 @@ static void quickapp_mq_dispatch(const char *chat_id, const char *content)
 
 /* ── Voice failure cooldown — prevent error-message cascade ──── */
 
+#ifdef CONFIG_AI_AGENT_VOICE
 static volatile bool s_voice_cooldown;
 static time_t s_voice_cooldown_until;
+#endif
 
 /**
  * Reads messages from the outbound queue and dispatches them to the
@@ -383,7 +393,9 @@ static void* outbound_dispatch_task(void* arg)
         } else if (strcmp(msg.channel, AGENT_CHAN_MQTT) == 0) {
             mqtt_channel_send(msg.chat_id, msg.content);
 #endif
-        } else if (strcmp(msg.channel, AGENT_CHAN_VOICE) == 0) {
+        }
+#ifdef CONFIG_AI_AGENT_VOICE
+        else if (strcmp(msg.channel, AGENT_CHAN_VOICE) == 0) {
             /* Check voice cooldown — skip voice dispatch if a recent
              * speak call failed, to prevent error-message cascade. */
             if (s_voice_cooldown && time(NULL) < s_voice_cooldown_until) {
@@ -398,15 +410,18 @@ static void* outbound_dispatch_task(void* arg)
                     s_voice_cooldown_until = time(NULL) + 5;
                 }
             }
+        }
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
-        } else if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) == 0) {
+        else if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) == 0) {
             int uret = lvgl_ui_channel_send(msg.content);
             if (uret != 0) {
                 syslog(LOG_ERR, "[%s] lvgl_ui_channel_send failed: %d\n", TAG, uret);
             }
+        }
 #endif
 #ifdef CONFIG_AI_AGENT_WEIXIN
-        } else if (strcmp(msg.channel, AGENT_CHAN_WEIXIN) == 0) {
+        else if (strcmp(msg.channel, AGENT_CHAN_WEIXIN) == 0) {
             /* chat_id format: "from_user_id|context_token" */
             char uid[64] = "";
             const char* ctx = "";
@@ -422,19 +437,16 @@ static void* outbound_dispatch_task(void* arg)
                 strncpy(uid, msg.chat_id, sizeof(uid) - 1);
             }
             weixin_channel_send(uid, ctx, msg.content);
+        }
 #endif
-        } else if (strcmp(msg.channel, AGENT_CHAN_SYSTEM) == 0) {
+        else if (strcmp(msg.channel, AGENT_CHAN_SYSTEM) == 0) {
             syslog(LOG_INFO, "[%s] System message [%s]: %.128s\n", TAG, msg.chat_id, msg.content);
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
         } else if (strcmp(msg.channel, AGENT_CHAN_QUICKAPP) == 0) {
             quickapp_mq_dispatch(msg.chat_id, msg.content);
 #endif
         } else if (strcmp(msg.channel, "cli") == 0) {
-            pthread_mutex_lock(&g_stdout_lock);
-            printf("\n[Agent]: %s\nvela> ", msg.content);
-            fflush(stdout);
-            pthread_mutex_unlock(&g_stdout_lock);
-            syslog(LOG_INFO, "[agent] [Agent]: %s\n", msg.content);
+            dprintf(STDOUT_FILENO, "\n[Agent]: %s\n", msg.content);
         } else {
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }
@@ -464,10 +476,60 @@ static inline long boot_ms(struct timespec* t0)
     syslog((rc) == OK ? LOG_INFO : LOG_WARNING, \
         "[%s] [boot +%ldms] " phase ": " msg " (rc=%d)\n", TAG, boot_ms(t0), (rc))
 
+static bool s_cli_ready;
+
+static int cli_ask(int argc, char **argv)
+{
+    char content[1024] = {0};
+    if (argc < 3) {
+        dprintf(STDOUT_FILENO, "Usage: ai_agent ask <message>\n");
+        return ERROR;
+    }
+    for (int i = 2; i < argc; i++) {
+        if (strlen(content) + strlen(argv[i]) + (i > 2) >= sizeof(content)) {
+            dprintf(STDOUT_FILENO, "Agent message too long.\n");
+            return ERROR;
+        }
+        if (i > 2) strcat(content, " ");
+        strcat(content, argv[i]);
+    }
+    if (time(NULL) < 1735689600) {
+#ifdef CONFIG_NETUTILS_NTPCLIENT
+        static bool ntp_started;
+        if (!ntp_started) ntp_started = ntpc_start() >= 0;
+        for (int i = 0; ntp_started && i < 15 && time(NULL) < 1735689600; i++) {
+            sleep(1);
+        }
+#endif
+        if (time(NULL) < 1735689600) {
+            dprintf(STDOUT_FILENO,
+                "Clock not synchronized. Check network/NTP or set date, then retry.\n");
+            return ERROR;
+        }
+    }
+    return agent_loop_ask(content);
+}
+
 int ai_agent_main(int argc, char* argv[])
 {
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && strcmp(argv[1], "ask") == 0) {
+        if (argc < 3 || s_cli_ready) return cli_ask(argc, argv);
+    }
+    /* Configuration commands do not require Agent services or threads. */
+    if (argc > 1 && (strcmp(argv[1], "config_show") == 0 ||
+                     strcmp(argv[1], "set_llm") == 0)) {
+        int rc = config_store_init();
+        if (rc == OK && strcmp(argv[1], "set_llm") == 0) {
+            rc = llm_proxy_init();
+            if (rc == OK) {
+                rc = llm_router_init();
+            }
+        }
+        if (rc == OK) {
+            rc = nsh_commands_run_once(argc - 1, &argv[1]);
+        }
+        return rc;
+    }
 
     g_shutdown_requested = false;
 
@@ -490,10 +552,22 @@ int ai_agent_main(int argc, char* argv[])
     /* ── Phase 0: Storage Bootstrapping (Auto-mount & Mkdir) ── */
 
     struct stat st;
+#ifdef CONFIG_ARCH_SIM
     if (stat("/data", &st) != 0) {
+        mkdir("/data", 0755);
         syslog(LOG_INFO, "[%s] Mounting /data as tmpfs for simulation...\n", TAG);
-        mount(NULL, "/data", "tmpfs", 0, NULL);
+        if (mount(NULL, "/data", "tmpfs", 0, NULL) < 0) {
+            syslog(LOG_ERR, "[%s] Cannot mount simulation storage, errno=%d\n",
+                TAG, errno);
+            return ERROR;
+        }
     }
+#else
+    if (stat("/data", &st) != 0 || !S_ISDIR(st.st_mode)) {
+        syslog(LOG_ERR, "[%s] Persistent storage /data is not mounted\n", TAG);
+        return ERROR;
+    }
+#endif
 
     /* Ensure directory structure exists (No more manual mkdir needed!) */
     mkdir("/data/agent", 0755);
@@ -585,8 +659,10 @@ int ai_agent_main(int argc, char* argv[])
         BOOT_LOG_RC(&t0, "P3", "mqtt_channel_init", rc);
 #endif
 
+#ifdef CONFIG_AI_AGENT_VOICE
         rc = voice_channel_init();
         BOOT_LOG_RC(&t0, "P3", "voice_channel_init", rc);
+#endif
 
 #ifdef CONFIG_AI_AGENT_WEIXIN
         rc = weixin_channel_init();
@@ -603,6 +679,18 @@ int ai_agent_main(int argc, char* argv[])
     {
         int rc = nsh_commands_init();
         BOOT_LOG_RC(&t0, "P4", "nsh_commands_init", rc);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "ask") == 0) {
+        s_cli_ready = true;
+        return cli_ask(argc, argv);
+    }
+
+    /* Configuration commands do not need background services or a nested
+     * console.  Execute them using arguments parsed by the working NSH. */
+    if (argc > 1 && strcmp(argv[1], "ask") != 0) {
+        int rc = nsh_commands_run_once(argc - 1, &argv[1]);
+        return rc;
     }
 
     /* ── Phase 5: Network — async, does NOT block ready ────── */
@@ -691,14 +779,15 @@ int ai_agent_main(int argc, char* argv[])
     }
     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
 
-    /* ── Phase 6: CLI thread — all services now in known state ── */
-    {
-        int rc = nsh_commands_start();
-        BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
+    if (argc > 1) {
+        sleep(1);
+        nsh_commands_run_once(argc - 1, &argv[1]);
+        syslog(LOG_INFO, "[%s] AI Agent running in one-shot ask mode.\n", TAG);
+    } else {
+        syslog(LOG_INFO, "[%s] Interactive child stdin unavailable; use "
+            "'ai_agent <command>' from NSH.\n", TAG);
+        return OK;
     }
-
-    syslog(LOG_INFO, "[%s] [boot +%ldms] AI Agent ready. Type 'help' in NSH for commands.\n",
-        TAG, boot_ms(&t0));
 
     /* Block main thread until shutdown is requested */
     while (!g_shutdown_requested) {
@@ -740,7 +829,9 @@ int ai_agent_main(int argc, char* argv[])
     usleep(500 * 1000);
 
     /* Cleanup — reverse order of init */
+#ifdef CONFIG_AI_AGENT_MEDIA
     tool_media_cleanup();
+#endif
 #ifdef CONFIG_AI_AGENT_MCP
     mcp_bridge_cleanup();
 #endif

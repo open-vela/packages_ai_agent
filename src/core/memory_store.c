@@ -47,7 +47,10 @@ static void get_date_str(char *buf, size_t size, int days_ago)
 static int ensure_dir(const char *path)
 {
     struct stat st = {0};
+    syslog(LOG_INFO, "[%s] ensure_dir stat begin: %s\n", TAG, path);
     if (stat(path, &st) == -1) {
+        syslog(LOG_INFO, "[%s] ensure_dir missing: %s, errno=%d\n",
+               TAG, path, errno);
         /* Try to create parent first */
         char parent[256];
         strncpy(parent, path, sizeof(parent) - 1);
@@ -57,11 +60,16 @@ static int ensure_dir(const char *path)
             if (ensure_dir(parent) != OK) return ERROR;
         }
         
+        syslog(LOG_INFO, "[%s] ensure_dir mkdir begin: %s\n", TAG, path);
         if (mkdir(path, 0755) == -1) {
             syslog(LOG_ERR, "[%s] mkdir failed for %s, errno=%d\n", TAG, path, errno);
             return ERROR;
         }
+        syslog(LOG_INFO, "[%s] ensure_dir mkdir done: %s\n", TAG, path);
         syslog(LOG_INFO, "[%s] Created directory: %s\n", TAG, path);
+    }
+    else {
+        syslog(LOG_INFO, "[%s] ensure_dir exists: %s\n", TAG, path);
     }
     return OK;
 }
@@ -70,18 +78,28 @@ static int ensure_dir(const char *path)
 static int ensure_file(const char *path, const char *default_content)
 {
     struct stat st = {0};
+    syslog(LOG_INFO, "[%s] ensure_file stat begin: %s\n", TAG, path);
     if (stat(path, &st) == -1) {
+        syslog(LOG_INFO, "[%s] ensure_file open begin: %s\n", TAG, path);
         /* File does not exist, create it */
         FILE *f = fopen(path, "w");
         if (!f) {
             syslog(LOG_ERR, "[%s] Cannot create %s, errno=%d\n", TAG, path, errno);
             return ERROR;
         }
+        syslog(LOG_INFO, "[%s] ensure_file open done: %s\n", TAG, path);
         if (default_content) {
+            syslog(LOG_INFO, "[%s] ensure_file write begin: %s\n", TAG, path);
             fputs(default_content, f);
+            syslog(LOG_INFO, "[%s] ensure_file write done: %s\n", TAG, path);
         }
+        syslog(LOG_INFO, "[%s] ensure_file close begin: %s\n", TAG, path);
         fclose(f);
+        syslog(LOG_INFO, "[%s] ensure_file close done: %s\n", TAG, path);
         syslog(LOG_INFO, "[%s] Created file: %s\n", TAG, path);
+    }
+    else {
+        syslog(LOG_INFO, "[%s] ensure_file exists: %s\n", TAG, path);
     }
     return OK;
 }

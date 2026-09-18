@@ -40,3 +40,6 @@ int nsh_commands_init(void);
  * Call after all services are in a known state (post Phase 5).
  */
 int nsh_commands_start(void);
+
+/* Execute one Agent command supplied as ai_agent argv. */
+int nsh_commands_run_once(int argc, char **argv);

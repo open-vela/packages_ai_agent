@@ -46,7 +46,7 @@ typedef struct {
     char run_id[17]; /* 16 hex chars + NUL */
     char chat_id[64];
     char channel[16];
-    uint32_t start_ts; /* epoch seconds */
+    uint32_t start_ts; /* monotonic seconds */
     int iteration; /* current iteration number */
     int backend_idx; /* current router backend index */
     uint32_t total_latency_ms; /* cumulative LLM latency */

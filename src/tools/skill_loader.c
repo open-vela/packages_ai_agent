@@ -25,6 +25,7 @@
 #include "agent_config.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -203,9 +204,10 @@ typedef struct {
 
 static const builtin_skill_t s_builtins[] = {
     { "weather",        BUILTIN_WEATHER        },
-    { "daily-briefing", BUILTIN_DAILY_BRIEFING },
-    { "skill-creator",  BUILTIN_SKILL_CREATOR  },
-    { "system-health",  BUILTIN_SYSTEM_HEALTH  },
+    /* Existing SmartFS volumes use a 16-byte name field including NUL. */
+    { "daily-brief", BUILTIN_DAILY_BRIEFING },
+    { "skill-create",   BUILTIN_SKILL_CREATOR  },
+    { "sys-health",     BUILTIN_SYSTEM_HEALTH  },
     { "reminder",       BUILTIN_REMINDER       },
     { "note-taker",     BUILTIN_NOTE_TAKER     },
     { "translate",      BUILTIN_TRANSLATE      },
@@ -234,12 +236,21 @@ static void install_builtin(const builtin_skill_t *skill)
     /* Write built-in skill */
     f = fopen(path, "w");
     if (!f) {
-        syslog(LOG_ERR, "[%s] Cannot write skill: %s\n", TAG, path);
+        int err = errno;
+        syslog(LOG_ERR, "[%s] Cannot open skill for writing: %s, errno=%d\n",
+               TAG, path, err);
         return;
     }
 
-    fputs(skill->content, f);
-    fclose(f);
+    int written = fputs(skill->content, f);
+    int write_errno = written < 0 ? errno : 0;
+    int closed = fclose(f);
+    int close_errno = closed != 0 ? errno : 0;
+    if (written < 0 || closed != 0) {
+        syslog(LOG_ERR, "[%s] Skill write failed: %s, write_errno=%d close_errno=%d\n",
+               TAG, path, write_errno, close_errno);
+        return;
+    }
     syslog(LOG_INFO, "[%s] Installed built-in skill: %s\n", TAG, path);
 }
 

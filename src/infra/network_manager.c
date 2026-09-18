@@ -18,6 +18,7 @@
 #include "agent_compat.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <string.h>
@@ -765,7 +766,7 @@ int network_wifi_reconnect(void)
     return network_rpmsg_init();
 }
 
-#else
+#elif defined(CONFIG_NETDEV_WIRELESS)
 /* Real hardware: use NuttX wapi shell command to join WiFi */
 #include "infra/config_store.h"
 #include "agent_config.h"
@@ -900,5 +901,22 @@ int network_wifi_reconnect(void)
     }
     agent_config_get(AGENT_CFG_KEY_WIFI_PASS, pass, sizeof(pass));
     return network_wifi_connect(NULL, ssid, pass);
+}
+#else
+/* Wired-only targets are configured by board bring-up and netinit. */
+
+int network_wifi_connect(const char* iface, const char* ssid,
+    const char* pass)
+{
+    (void)iface;
+    (void)ssid;
+    (void)pass;
+    syslog(LOG_WARNING, "[%s] WiFi is not available on this target\n", TAG);
+    return -ENOTSUP;
+}
+
+int network_wifi_reconnect(void)
+{
+    return OK;
 }
 #endif

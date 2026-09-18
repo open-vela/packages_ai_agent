@@ -37,7 +37,6 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/infra/heartbeat.c
     src/channels/nsh_commands.c
     src/channels/cmd_llm.c
-    src/channels/cmd_voice.c
     src/channels/cmd_channel.c
     src/channels/ws_server.c
     src/tools/tool_registry.c
@@ -53,22 +52,35 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_system.c
     src/tools/tool_health.c
     src/tools/tool_control.c
-    src/tools/tool_media.c
     src/tools/tool_proxyquickapp.c
     src/tools/skill_loader.c
     src/tools/tool_guard.c
     src/tools/tool_amap.c
-    src/voice/volc_tts.c
-    src/voice/volc_tts_ws.c
-    src/voice/volc_asr.c
-    src/voice/voice_tts.c
-    src/voice/voice_asr.c
-    src/voice/audio_capture.c
-    src/voice/audio_playback.c
-    src/voice/voice_channel.c
     src/stubs.c
     src/ui/qrcode_display.c
   )
+
+  if(CONFIG_AI_AGENT_VOICE)
+    list(APPEND AGENT_SRCS
+      src/channels/cmd_voice.c
+      src/voice/volc_tts.c
+      src/voice/volc_tts_ws.c
+      src/voice/volc_asr.c
+      src/voice/voice_tts.c
+      src/voice/voice_asr.c
+      src/voice/audio_capture.c
+      src/voice/audio_playback.c
+      src/voice/voice_channel.c
+    )
+  endif()
+
+  if(CONFIG_AI_AGENT_MEDIA)
+    list(APPEND AGENT_SRCS src/tools/tool_media.c)
+  endif()
+
+  if(CONFIG_AI_AGENT_ESP32P4_TOOLS)
+    list(APPEND AGENT_SRCS src/tools/tool_esp32p4.c)
+  endif()
 
   # Optional modules
   if(CONFIG_AI_AGENT_FEISHU)

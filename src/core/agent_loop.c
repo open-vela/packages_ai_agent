@@ -43,10 +43,20 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include "cJSON.h"
 
 static const char* TAG = "agent";
+
+/* Elapsed durations must not change when TLS or NTP sets wall time. */
+static void elapsed_clock(struct timeval *tv)
+{
+    struct timespec ts = {0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    tv->tv_sec = ts.tv_sec;
+    tv->tv_usec = ts.tv_nsec / 1000;
+}
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
@@ -820,9 +830,9 @@ static char* force_finish_reply(const char* system_prompt,
     llm_response_t resp;
     char* result = NULL;
     struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    elapsed_clock(&t0);
     int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
-    gettimeofday(&t1, NULL);
+    elapsed_clock(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -889,6 +899,7 @@ static const char* s_working_phrases[] = {
  * (TTS synthesis of a status phrase wastes time and memory). */
 static void send_working_status(const agent_msg_t* msg, int iteration)
 {
+    if (strcmp(msg->channel, "cli_sync") == 0) return;
     if (iteration != 0) {
         return;
     }
@@ -990,9 +1001,9 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
     llm_response_t final_resp;
     char* result = NULL;
     struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    elapsed_clock(&t0);
     int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
-    gettimeofday(&t1, NULL);
+    elapsed_clock(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -1065,9 +1076,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         llm_response_t resp;
         struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
+        elapsed_clock(&tv_start);
         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
-        gettimeofday(&tv_end, NULL);
+        elapsed_clock(&tv_end);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
         /* Router failover: on LLM call failure, try next backend */
@@ -1083,10 +1094,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 router_idx = next_idx;
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
-                gettimeofday(&tv_start, NULL);
+                elapsed_clock(&tv_start);
                 err = llm_chat_tools(sys_prompt, messages,
                     tools_json, &resp);
-                gettimeofday(&tv_end, NULL);
+                elapsed_clock(&tv_end);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
             }
         }
@@ -1183,10 +1194,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     router_idx = prem_idx;
                     trace.backend_idx = prem_idx;
 
-                    gettimeofday(&tv_start, NULL);
+                    elapsed_clock(&tv_start);
                     err = llm_chat_tools(sys_prompt, messages,
                         tools_json, &resp);
-                    gettimeofday(&tv_end, NULL);
+                    elapsed_clock(&tv_end);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
                     /* Watchdog check on cascade retry */
@@ -1583,6 +1594,48 @@ int agent_loop_init(void)
 {
     syslog(LOG_INFO, "[%s] Agent loop initialized\n", TAG);
     return OK;
+}
+
+/* Foreground CLI request: reuse ReAct without starting background services. */
+int agent_loop_ask(const char *content)
+{
+    const size_t ctx_size = AGENT_CONTEXT_BUF_SIZE;
+    const size_t hist_size = AGENT_LLM_STREAM_BUF_SIZE;
+    char *prompt = calloc(1, ctx_size);
+    char *history = calloc(1, hist_size);
+    char *tool_output = calloc(1, TOOL_OUTPUT_SIZE);
+    char *tools = tool_registry_get_tools_json();
+    cJSON *messages = NULL;
+    char *reply = NULL;
+    int rc = ERROR;
+    agent_msg_t msg = {0};
+
+    if (!prompt || !history || !tool_output || !tools) goto cleanup;
+    strlcpy(msg.channel, "cli_sync", sizeof(msg.channel));
+    strlcpy(msg.chat_id, "console", sizeof(msg.chat_id));
+    msg.content = (char *)content;
+    context_build_system_prompt(prompt, ctx_size);
+    inject_session_context(prompt, ctx_size, msg.channel, msg.chat_id);
+    messages = build_messages(msg.chat_id, content, history, hist_size);
+    if (!messages) goto cleanup;
+    reply = run_react_loop(prompt, messages, tools, tool_output,
+                          TOOL_OUTPUT_SIZE, &msg);
+    if (reply && reply[0]) {
+        session_append(msg.chat_id, "user", content);
+        session_append(msg.chat_id, "assistant", reply);
+        dprintf(STDOUT_FILENO, "\n[Agent]: %s\n", reply);
+        rc = OK;
+    }
+
+cleanup:
+    if (rc != OK) dprintf(STDOUT_FILENO, "Agent request failed.\n");
+    free(reply);
+    cJSON_Delete(messages);
+    free(tools);
+    free(tool_output);
+    free(history);
+    free(prompt);
+    return rc;
 }
 
 int agent_loop_start(void)

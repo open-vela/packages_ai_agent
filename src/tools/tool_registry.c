@@ -34,7 +34,10 @@
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
 #include "tools/tool_health.h"
+#include "tools/tool_esp32p4.h"
+#ifdef CONFIG_AI_AGENT_MEDIA
 #include "tools/tool_media.h"
+#endif
 #include "tools/tool_proxyquickapp.h"
 #include "tools/tool_shell.h"
 #include "tools/tool_system.h"
@@ -357,6 +360,18 @@ int tool_registry_init(void)
         "Get step count and step frequency.",
         tool_get_steps_execute);
 
+#ifdef CONFIG_AI_AGENT_ESP32P4_TOOLS
+    REGISTER_TOOL_NO_PARAMS(
+        "device_info",
+        "Get ESP32-P4 board, openvela kernel, uptime, and heap information.",
+        tool_device_info_execute);
+
+    REGISTER_TOOL_NO_PARAMS(
+        "network_status",
+        "Get the eth0 state, MAC address, IPv4 address, netmask, and gateway.",
+        tool_network_status_execute);
+#endif
+
     /* Device control tools */
     REGISTER_TOOL(
         "vibrate",
@@ -427,6 +442,7 @@ int tool_registry_init(void)
         tool_feishu_send_mention_execute);
 
     /* Music search */
+#ifdef CONFIG_AI_AGENT_MEDIA
     REGISTER_TOOL("music_search",
         "Search songs by keyword. Returns name, artist, URL. "
         "Does NOT play — call music_play with URL after.",
@@ -483,6 +499,7 @@ int tool_registry_init(void)
         "Get current music playback status including state, "
         "position, duration, volume, and track URL.",
         tool_music_status_execute);
+#endif
 
     /* QuickApp launch tool */
     REGISTER_TOOL("launch_quickapp",
