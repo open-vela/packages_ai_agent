@@ -19,7 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
 #include <syslog.h>
 
 static const char* TAG = "trace";
@@ -43,10 +43,10 @@ static const char* status_str(int status)
 void agent_trace_begin(agent_trace_t* t, const char* chat_id,
     const char* channel)
 {
-    struct timeval tv;
+    struct timespec tv = {0};
 
     memset(t, 0, sizeof(*t));
-    gettimeofday(&tv, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &tv);
     t->start_ts = (uint32_t)tv.tv_sec;
 
     /* Generate run_id: lower 32 bits of time + rand for uniqueness */
@@ -90,9 +90,9 @@ void agent_trace_step(agent_trace_t* t, int iteration,
 
 void agent_trace_end(agent_trace_t* t, int status)
 {
-    struct timeval tv;
+    struct timespec tv = {0};
 
-    gettimeofday(&tv, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &tv);
     t->status = status;
 
     uint32_t elapsed = (uint32_t)tv.tv_sec - t->start_ts;

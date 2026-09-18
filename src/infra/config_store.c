@@ -36,6 +36,11 @@
 static const char *TAG = "cfgstore";
 
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static cJSON *s_root;
+
+/* Debugger-visible breadcrumbs; never contain configuration values. */
+volatile unsigned int g_agent_config_stage;
+volatile unsigned int g_agent_config_save_count;
 
 /* ── helpers ─────────────────────────────────────────────────── */
 
@@ -79,21 +84,32 @@ static cJSON *load_json(void)
 
 static int save_json(cJSON *root)
 {
+    g_agent_config_save_count++;
+    g_agent_config_stage = 10;
     char *str = cJSON_PrintUnformatted(root);
+    g_agent_config_stage = 11;
     if (!str) return ERROR;
 
     /* Use open() with explicit 0600 to ensure config file is owner-only.
      * fopen("w") inherits umask which may be too permissive. */
+    g_agent_config_stage = 20;
     int fd = open(AGENT_CONFIG_FILE,
                   O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    g_agent_config_stage = 21;
     if (fd < 0) { free(str); return ERROR; }
 
+    g_agent_config_stage = 30;
     FILE *f = fdopen(fd, "w");
+    g_agent_config_stage = 31;
     if (!f) { close(fd); free(str); return ERROR; }
-    fputs(str, f);
-    fclose(f);
+    g_agent_config_stage = 40;
+    int written = fputs(str, f);
+    g_agent_config_stage = 50;
+    int closed = fclose(f);
+    g_agent_config_stage = 60;
     free(str);
-    return OK;
+    g_agent_config_stage = 61;
+    return written < 0 || closed != 0 ? ERROR : OK;
 }
 
 /* ── public API ──────────────────────────────────────────────── */
@@ -104,6 +120,19 @@ int config_store_init(void)
     mkdirs(AGENT_CONFIG_DIR);
     mkdirs(AGENT_MEMORY_DIR);
     mkdirs(AGENT_SESSION_DIR);
+
+    pthread_mutex_lock(&s_lock);
+    if (s_root) {
+        cJSON_Delete(s_root);
+    }
+    s_root = load_json();
+    pthread_mutex_unlock(&s_lock);
+
+    if (!s_root) {
+        syslog(LOG_ERR, "[%s] Failed to initialize config cache\n", TAG);
+        return ERROR;
+    }
+
     syslog(LOG_INFO, "[%s] Config store ready at %s\n", TAG, AGENT_CONFIG_FILE);
     return OK;
 }
@@ -111,38 +140,45 @@ int config_store_init(void)
 int claw_config_get(const char *key, char *buf, size_t buf_size)
 {
     pthread_mutex_lock(&s_lock);
-    cJSON *root = load_json();
-    cJSON *item = cJSON_GetObjectItem(root, key);
+    cJSON *item = s_root ? cJSON_GetObjectItem(s_root, key) : NULL;
     int ret = ERROR;
     if (item && cJSON_IsString(item) && item->valuestring[0] != '\0') {
         strncpy(buf, item->valuestring, buf_size - 1);
         buf[buf_size - 1] = '\0';
         ret = OK;
     }
-    cJSON_Delete(root);
     pthread_mutex_unlock(&s_lock);
     return ret;
 }
 
 int claw_config_set(const char *key, const char *value)
 {
+    g_agent_config_stage = 1;
     pthread_mutex_lock(&s_lock);
-    cJSON *root = load_json();
-    cJSON_DeleteItemFromObject(root, key);
-    cJSON_AddStringToObject(root, key, value);
-    int ret = save_json(root);
-    cJSON_Delete(root);
+    g_agent_config_stage = 2;
+    if (!s_root) {
+        s_root = cJSON_CreateObject();
+    }
+    g_agent_config_stage = 3;
+    cJSON_DeleteItemFromObject(s_root, key);
+    cJSON_AddStringToObject(s_root, key, value);
+    g_agent_config_stage = 4;
+    int ret = save_json(s_root);
     pthread_mutex_unlock(&s_lock);
+    g_agent_config_stage = 70;
+    syslog(LOG_DEBUG, "[config] save %u returned rc=%d\n",
+            g_agent_config_save_count, ret);
     return ret;
 }
 
 int config_del(const char *key)
 {
     pthread_mutex_lock(&s_lock);
-    cJSON *root = load_json();
-    cJSON_DeleteItemFromObject(root, key);
-    int ret = save_json(root);
-    cJSON_Delete(root);
+    if (!s_root) {
+        s_root = cJSON_CreateObject();
+    }
+    cJSON_DeleteItemFromObject(s_root, key);
+    int ret = save_json(s_root);
     pthread_mutex_unlock(&s_lock);
     return ret;
 }
@@ -150,9 +186,9 @@ int config_del(const char *key)
 int config_erase_all(void)
 {
     pthread_mutex_lock(&s_lock);
-    cJSON *empty = cJSON_CreateObject();
-    int ret = save_json(empty);
-    cJSON_Delete(empty);
+    cJSON_Delete(s_root);
+    s_root = cJSON_CreateObject();
+    int ret = s_root ? save_json(s_root) : ERROR;
     pthread_mutex_unlock(&s_lock);
     return ret;
 }

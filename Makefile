@@ -72,8 +72,13 @@ CSRCS += src/tools/tool_vision.c
 CSRCS += src/tools/tool_shell.c
 CSRCS += src/tools/tool_system.c
 CSRCS += src/tools/tool_health.c
+ifeq ($(CONFIG_AI_AGENT_ESP32P4_TOOLS),y)
+CSRCS += src/tools/tool_esp32p4.c
+endif
 CSRCS += src/tools/tool_control.c
+ifeq ($(CONFIG_AI_AGENT_MEDIA),y)
 CSRCS += src/tools/tool_media.c
+endif
 CSRCS += src/tools/tool_proxyquickapp.c
 ifeq ($(CONFIG_AI_AGENT_MCP),y)
 CSRCS += src/tools/mcp_bridge.c
@@ -115,6 +120,7 @@ endif
 CSRCS += src/channels/ws_server.c
 
 # voice/ - 语音管线
+ifeq ($(CONFIG_AI_AGENT_VOICE),y)
 CSRCS += src/voice/voice_channel.c
 CSRCS += src/voice/voice_tts.c
 CSRCS += src/voice/voice_asr.c
@@ -123,6 +129,7 @@ CSRCS += src/voice/volc_tts_ws.c
 CSRCS += src/voice/volc_asr.c
 CSRCS += src/voice/audio_capture.c
 CSRCS += src/voice/audio_playback.c
+endif
 
 # infra/ - 基础设施
 CSRCS += src/infra/config_store.c

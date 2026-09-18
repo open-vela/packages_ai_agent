@@ -92,11 +92,17 @@ static bool contains_keyword(const char* text, const char** keywords)
 
 int llm_router_init(void)
 {
+    syslog(LOG_INFO, "[%s] init enter\n", TAG);
+    syslog(LOG_INFO, "[%s] lock begin\n", TAG);
     pthread_mutex_lock(&s_router_lock);
+    syslog(LOG_INFO, "[%s] lock done\n", TAG);
 
     /* Load profile from config */
     char tmp[32] = { 0 };
-    if (claw_config_get(CFG_KEY_ROUTER_PROFILE, tmp, sizeof(tmp)) == 0) {
+    syslog(LOG_INFO, "[%s] profile read begin\n", TAG);
+    int profile_rc = claw_config_get(CFG_KEY_ROUTER_PROFILE, tmp, sizeof(tmp));
+    syslog(LOG_INFO, "[%s] profile read done: %d\n", TAG, profile_rc);
+    if (profile_rc == 0) {
         if (strcmp(tmp, "eco") == 0) {
             s_profile = LLM_ROUTE_ECO;
         } else if (strcmp(tmp, "premium") == 0) {
@@ -113,7 +119,11 @@ int llm_router_init(void)
         char json[1024] = { 0 };
 
         snprintf(key, sizeof(key), "%s%d", CFG_KEY_BACKEND_PREFIX, i);
-        if (claw_config_get(key, json, sizeof(json)) != 0 || json[0] == '\0') {
+        syslog(LOG_INFO, "[%s] backend %d read begin\n", TAG, i);
+        int backend_rc = claw_config_get(key, json, sizeof(json));
+        syslog(LOG_INFO, "[%s] backend %d read done: %d\n",
+            TAG, i, backend_rc);
+        if (backend_rc != 0 || json[0] == '\0') {
             continue;
         }
 

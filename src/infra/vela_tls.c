@@ -272,9 +272,7 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
     syslog(LOG_DEBUG, "[%s] Handshake start: Host=%s, UNIX=%ld\n", TAG, host, (long)now);
 
     if (now < 1704067200) { /* Jan 1 2024 */
-        syslog(LOG_WARNING, "[%s] Clock too old, forcing to 2026\n", TAG);
-        struct timespec ts = { .tv_sec = 1772275200, .tv_nsec = 0 };
-        clock_settime(CLOCK_REALTIME, &ts);
+        syslog(LOG_WARNING, "[%s] System clock is not synchronized\n", TAG);
     }
 
     /* TCP connect — use HTTP CONNECT proxy if configured */
