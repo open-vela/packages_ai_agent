@@ -417,6 +417,71 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
 
 /* ── HTTP/1.1 framing ────────────────────────────────────────── */
 
+/* mbedtls_ssl_write() wrapper that survives a full socket send buffer.
+ *
+ * tls_ctx_connect() puts the socket in blocking mode and leaves it there, and
+ * mbedtls' net_would_block() refuses to report a would-block condition on a
+ * blocking socket ("Never return 'WOULD BLOCK' on a blocking socket").  A
+ * send() that meets a full TCP send buffer therefore reaches us as
+ * MBEDTLS_ERR_NET_SEND_FAILED instead of MBEDTLS_ERR_SSL_WANT_WRITE, which
+ * used to abort a ~16 KB LLM request body right after a healthy handshake.
+ *
+ * Keep each record small and treat a short or failed send as retryable for a
+ * bounded budget.  Retrying is safe: mbedtls keeps the unsent tail in
+ * ssl->out_left and flushes it before encrypting anything new. */
+
+#define TLS_WRITE_CHUNK      4096
+#define TLS_WRITE_ATTEMPTS   64
+#define TLS_WRITE_BACKOFF_US 20000
+
+static int tls_ssl_write_all(tls_ctx_t* ctx, const char* what,
+    const unsigned char* buf, size_t len)
+{
+    size_t off = 0;
+    int attempts = 0;
+
+    while (off < len) {
+        size_t chunk = len - off;
+        int ret;
+
+        if (chunk > TLS_WRITE_CHUNK) {
+            chunk = TLS_WRITE_CHUNK;
+        }
+
+        ret = mbedtls_ssl_write(&ctx->ssl, buf + off, chunk);
+        if (ret > 0) {
+            off += (size_t)ret;
+            attempts = 0;
+            continue;
+        }
+
+        if (ret == 0) {
+            syslog(LOG_ERR, "[%s] %s write stalled at %u/%u\n",
+                TAG, what, (unsigned)off, (unsigned)len);
+            return VELA_TLS_ERR_WRITE;
+        }
+
+        attempts++;
+        if (attempts == 1 || attempts >= TLS_WRITE_ATTEMPTS) {
+            int err = errno;
+            int fl = (ctx->net.fd >= 0) ? fcntl(ctx->net.fd, F_GETFL) : -1;
+
+            syslog(attempts == 1 ? LOG_WARNING : LOG_ERR,
+                "[%s] %s write retry %d at %u/%u ret=-0x%04x errno=%d fl=0x%x\n",
+                TAG, what, attempts, (unsigned)off, (unsigned)len,
+                -ret, err, (unsigned)fl);
+        }
+
+        if (attempts >= TLS_WRITE_ATTEMPTS) {
+            return VELA_TLS_ERR_WRITE;
+        }
+
+        usleep(TLS_WRITE_BACKOFF_US);
+    }
+
+    return 0;
+}
+
 static int tls_write_request(tls_ctx_t* ctx,
     const char* method, const char* host,
     const char* path,
@@ -432,7 +497,6 @@ static int tls_write_request(tls_ctx_t* ctx,
         return VELA_TLS_ERR_OVERFLOW;
 
     int pos = 0;
-    int ret;
 
 #define HDR_APPEND(fmt, ...)                                    \
     pos += snprintf(hdr + pos, 4096 - pos, fmt, ##__VA_ARGS__); \
@@ -460,38 +524,19 @@ static int tls_write_request(tls_ctx_t* ctx,
 #undef HDR_APPEND
 
     /* Write headers */
-    int written = 0;
-    while (written < pos) {
-        ret = mbedtls_ssl_write(&ctx->ssl,
-            (const unsigned char*)(hdr + written),
-            (size_t)(pos - written));
-        if (ret > 0) {
-            written += ret;
-        } else if (ret == 0) {
-            free(hdr);
-            return VELA_TLS_ERR_WRITE;
-        } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            free(hdr);
-            return VELA_TLS_ERR_WRITE;
-        }
+    if (tls_ssl_write_all(ctx, "hdr",
+            (const unsigned char*)hdr, (size_t)pos) != 0) {
+        free(hdr);
+        return VELA_TLS_ERR_WRITE;
     }
 
     free(hdr);
 
     /* Write body */
     if (body && body_len > 0) {
-        size_t bw = 0;
-        while (bw < body_len) {
-            ret = mbedtls_ssl_write(&ctx->ssl,
-                (const unsigned char*)(body + bw),
-                body_len - bw);
-            if (ret > 0) {
-                bw += (size_t)ret;
-            } else if (ret == 0) {
-                return VELA_TLS_ERR_WRITE;
-            } else if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-                return VELA_TLS_ERR_WRITE;
-            }
+        if (tls_ssl_write_all(ctx, "body",
+                (const unsigned char*)body, body_len) != 0) {
+            return VELA_TLS_ERR_WRITE;
         }
     }
 
@@ -651,6 +696,16 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
 
     resp_buf[resp_pos] = '\0';
     tls_raw_release(raw);
+
+    /* A body that filled the caller's buffer was cut off mid-stream.  The
+     * caller only sees a short string, so a JSON consumer reports a syntax
+     * error that does not exist in the server's reply.  Name the real cause
+     * here, where the capacity is still known. */
+    if (resp_pos >= resp_cap - 1) {
+        syslog(LOG_ERR, "[%s] response body truncated at %zu bytes "
+               "(buf cap %zu): reply larger than buffer\n",
+               TAG, resp_pos, resp_cap);
+    }
 
     /* Chunked decode */
     if (chunked) {
@@ -1012,6 +1067,13 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
     resp_buf[resp_pos] = '\0';
     free(raw);
     close(fd);
+
+    /* Same as the TLS path: a full buffer means the body was cut off, and the
+     * caller would otherwise diagnose it as malformed JSON. */
+    if (resp_pos >= resp_cap - 1) {
+        syslog(LOG_ERR, "http: response body truncated at %zu bytes "
+               "(buf cap %zu): reply larger than buffer\n", resp_pos, resp_cap);
+    }
 
     /* Chunked decode */
     if (chunked) {

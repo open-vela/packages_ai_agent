@@ -78,28 +78,11 @@ typedef struct {
 
 /* ── External tool provider callback (breaks circular dependency) ──── */
 
-/**
- * Callback type for external tool providers.
- * Returns a JSON array string of tools (caller must free), or NULL if none.
- */
-typedef char* (*tool_provider_fn)(void);
-
-/**
- * Callback type for external tool executors.
- * Returns OK if tool was found and executed, ERROR otherwise.
- */
-typedef int (*tool_executor_fn)(const char* name, const char* input_json,
-                                char* output, size_t output_size);
-
-/**
- * Register an external tool provider (e.g., node_manager, mcp_client).
- * The provider's get_tools_json callback will be called during tools JSON build.
- * The executor callback will be called as fallback during tool execution.
- * Max 4 providers supported.
- */
-void tool_registry_register_provider(const char* name,
-                                     tool_provider_fn get_tools,
-                                     tool_executor_fn execute);
+/* The provider types move to the public header so a board can register tools
+ * without reaching into src/.  Keep them declared in exactly one place: the
+ * callback types are passed by value to tool_registry_register_provider, so a
+ * second, structurally identical definition would be a different type. */
+#include "tools/tool_provider.h"
 
 int   tool_registry_init(void);
 char *tool_registry_get_tools_json(void);  /* caller must free() */

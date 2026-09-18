@@ -42,6 +42,14 @@ config EXAMPLES_AI_AGENT_VELA_STACKSIZE
 	int "Agent main stack size"
 	default 32768
 
+config EXAMPLES_AI_AGENT_VELA_TIME_OFFSET_SEC
+	int "Seconds added to the system clock for local time (CST=28800)"
+	default 28800
+	---help---
+		get_current_time and the system prompt header compute local
+		time as clock + this offset. Set 0 when the system clock already
+		runs local wall time (e.g. VelaGuard HMI syncs Beijing time).
+
 config EXAMPLES_AI_AGENT_VELA_DATA_DIR
 	string "Persistent data directory"
 	default "/data/ai_agent"

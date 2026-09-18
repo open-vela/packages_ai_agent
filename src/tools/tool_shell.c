@@ -90,8 +90,37 @@ static const char *s_allowed[] = {
     "set_gateway", "set_mqtt",
     "session_list", "memory_read",
     "mcp_list", "mcp_discover",
-    
+
+    /* VelaGuard read-only bring-up tools (stage1 ai_agent).  Being listed
+     * here means "reachable at all"; s_vg_readonly below narrows each one to
+     * the subcommands that cannot change board state. */
+    "vgmodbus", "vgstats", "vgruntime", "vgcfg", "vgnet",
+
     NULL
+};
+
+/* Per-command gate for the VelaGuard tools.  This has to live in C rather
+ * than in the skill text: these commands are reachable through the generic
+ * run_shell tool, and vgstats inject/reset mutate frame counters, vgnet
+ * inject/wifi rewrite network policy, and vgruntime report <path> writes an
+ * arbitrary file.
+ *
+ *   subcmd == NULL  read-only by construction, the whole command is fine
+ *   subcmd == ""    no subcommand is permitted at all
+ *   otherwise       the first token after the command must equal subcmd   */
+
+static const struct {
+    const char *name;
+    const char *subcmd;
+} s_vg_readonly[] = {
+    { "vgmodbus",   NULL     },
+    { "vgstats",    "dump"   },
+    { "vgruntime",  "dump"   },
+    { "vgcfg",      "dump"   },
+    { "vgnet",      "status" },
+    { "vgpoint",    ""       },
+    { "vgdiscover", ""       },
+    { NULL, NULL }
 };
 #endif
 
@@ -157,6 +186,28 @@ static int is_blocked(const char *cmd)
     /* Strip path prefix: /bin/rm -> rm, /usr/bin/dd -> dd */
     const char *basename = strrchr(first, '/');
     const char *name = basename ? basename + 1 : first;
+
+    /* VelaGuard: the agent may read board state, never change it. */
+    for (int k = 0; s_vg_readonly[k].name; k++) {
+        if (strcmp(name, s_vg_readonly[k].name) != 0)
+            continue;
+
+        const char *want = s_vg_readonly[k].subcmd;
+
+        if (want == NULL)
+            return 0;           /* read-only by construction */
+
+        if (want[0] == '\0')
+            return 1;           /* nothing permitted, including bare name */
+
+        while (cmd[i] == ' ') i++;
+        size_t wlen = strlen(want);
+        if (strncmp(cmd + i, want, wlen) != 0)
+            return 1;
+        if (cmd[i + wlen] != '\0' && cmd[i + wlen] != ' ')
+            return 1;           /* "dumpsters" must not pass as "dump" */
+        return 0;
+    }
 
     /* Check whitelist first */
     for (int k = 0; s_allowed[k]; k++) {
@@ -278,7 +329,7 @@ static int builtin_uname(char *output, size_t output_size)
 
 /* Allowed path prefixes for file access (symlink escape protection) */
 static const char *s_allowed_prefixes[] = {
-    "/proc/", "/data/agent/", "/tmp/", NULL
+    "/proc/", "/data/agent/", "/data/velaguard/", "/tmp/", NULL
 };
 
 static bool is_path_allowed(const char *path)
@@ -353,13 +404,17 @@ static int builtin_popen_cmd(const char *cmd, char *output, size_t output_size)
     size_t n = fread(output, 1, output_size - 1, fp);
     output[n] = '\0';
     int status = pclose(fp);
-    if (status != 0 && n == 0) {
+    /* NuttX pclose often returns -1 for NSH builtins even with stdout. */
+    if (n > 0) {
+        return OK;
+    }
+    if (status != 0) {
         snprintf(output, output_size,
                  "Command failed with exit code %d", WEXITSTATUS(status));
         return ERROR;
     }
 
-    return (status == 0) ? OK : ERROR;
+    return OK;
 #else
     (void)cmd;
     snprintf(output, output_size, "popen not available (enable CONFIG_SYSTEM_POPEN)");
@@ -484,10 +539,17 @@ int tool_run_shell_execute(const char *input_json, char *output, size_t output_s
             size_t n = fread(cmd_buf, 1, SHELL_OUTPUT_MAX - 1, fp);
             cmd_buf[n] = '\0';
             int status = pclose(fp);
-            ret = (status == 0) ? OK : ERROR;
-            if (ret != OK && n == 0) {
+            /* NuttX popen/waitpid often returns -1 for NSH builtins even
+             * when stdout is valid; treat captured output as success. */
+            if (n > 0) {
+                ret = OK;
+            } else {
+                ret = (status == 0) ? OK : ERROR;
+            }
+            if (ret != OK) {
                 snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                         "Command failed with exit code %d", WEXITSTATUS(status));
+                         "Command failed with exit code %d",
+                         WEXITSTATUS(status));
             }
             syslog(LOG_INFO, "[%s] popen(%s) exit=%d, %zu bytes\n",
                    TAG, command, status, n);
@@ -510,27 +572,31 @@ int tool_run_shell_execute(const char *input_json, char *output, size_t output_s
 
     cJSON_Delete(root);
 
-    if (ret != OK) {
-        snprintf(output, output_size, "{\"error\":\"Command failed: %s\"}", command);
+    /* Always return structured JSON so the LLM sees stdout even on non-zero exit. */
+    {
+        int exit_code = (ret == OK) ? 0 : 1;
+        cJSON *result = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(result, "exit_code", exit_code);
+        cJSON_AddStringToObject(result, "output", cmd_buf);
+        if (exit_code != 0) {
+            cJSON_AddStringToObject(result, "error", "non-zero exit");
+        }
+
+        char *json_str = cJSON_PrintUnformatted(result);
+        cJSON_Delete(result);
         free(cmd_buf);
-        return ERROR;
-    }
 
-    /* Build JSON result */
-    cJSON *result = cJSON_CreateObject();
-    cJSON_AddNumberToObject(result, "exit_code", 0);
-    cJSON_AddStringToObject(result, "output", cmd_buf);
-    free(cmd_buf);
+        if (!json_str) {
+            snprintf(output, output_size, "{\"exit_code\":1,\"output\":\"\"}");
+            return ERROR;
+        }
 
-    char *json_str = cJSON_PrintUnformatted(result);
-    cJSON_Delete(result);
-
-    if (json_str) {
         strncpy(output, json_str, output_size - 1);
         output[output_size - 1] = '\0';
-        syslog(LOG_INFO, "[%s] Result: %d bytes\n", TAG, (int)strlen(output));
         free(json_str);
+        syslog(LOG_INFO, "[%s] Result: %d bytes (exit=%d)\n",
+            TAG, (int)strlen(output), exit_code);
+        return OK;
     }
-
-    return OK;
 }

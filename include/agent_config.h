@@ -101,6 +101,15 @@
 #define AGENT_FEISHU_POLL_PRIO 50
 #define AGENT_FEISHU_MAX_MSG_LEN 4000 /* Feishu text message limit */
 
+/* ── Time ───────────────────────────────────────────────────── */
+/* Offset applied by get_current_time / context header on top of the
+ * system clock. 0 when the clock already runs local wall time. */
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA_TIME_OFFSET_SEC
+#define AGENT_TIME_OFFSET_SEC CONFIG_EXAMPLES_AI_AGENT_VELA_TIME_OFFSET_SEC
+#else
+#define AGENT_TIME_OFFSET_SEC (8 * 3600)
+#endif
+
 /* ── Agent Loop ─────────────────────────────────────────────── */
 #define AGENT_AI_AGENT_STACK (32 * 1024)
 #define AGENT_AI_AGENT_PRIO 60
@@ -116,7 +125,7 @@
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
  * acts as the hard backstop that actually unblocks the read. */
-#define AGENT_LLM_TIMEOUT_SEC 60
+#define AGENT_LLM_TIMEOUT_SEC 120
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
@@ -142,6 +151,15 @@
 #define AGENT_LLM_STREAM_BUF_SIZE (8 * 1024)
 #define AGENT_LLM_MAX_RESP_SIZE \
     (512 * 1024) /* hard cap for growable resp buffer */
+
+/* Response cap for the direct (non-proxy) HTTPS path, which hands its buffer
+ * straight to vela_tls instead of growing it.  vela_tls stops reading at
+ * resp_cap-1, so this has to clear the largest real reply: a tool-calling
+ * round carries the model's entire tool_arguments inline, and the document the
+ * advice round asks for is written through that argument.  The 4 KiB VG_HMI
+ * stream buffer cut an advice reply off mid-JSON on 2026-09-17, which reached
+ * the log as "Failed to parse API JSON". */
+#define AGENT_LLM_DIRECT_RESP_CAP (64 * 1024)
 
 /* ── Qwen (Alibaba DashScope) backend constants ─────────────── */
 #define AGENT_LLM_QWEN_HOST "dashscope.aliyuncs.com"
@@ -177,7 +195,11 @@
 #define AGENT_CRON_STACK (8 * 1024)
 #define AGENT_CRON_PRIO 40
 #define AGENT_HEARTBEAT_FILE AGENT_DATA_DIR "/HEARTBEAT.md"
-#define AGENT_HEARTBEAT_INTERVAL_MS (30 * 60 * 1000)
+#define AGENT_HEARTBEAT_INTERVAL_MS (3 * 60 * 1000)
+/* Touch this file to run a heartbeat check immediately (consumed+unlinked
+ * by the heartbeat thread); used for on-demand tasks e.g. daily report. */
+#define AGENT_HEARTBEAT_POKE_FILE AGENT_DATA_DIR "/HEARTBEAT.poke"
+#define AGENT_HEARTBEAT_POLL_SLICE_S 5
 
 /* ── Skills ─────────────────────────────────────────────────── */
 #define AGENT_SKILLS_DIR AGENT_DATA_DIR "/skills/"
@@ -406,4 +428,32 @@
 #else
 #define AGENT_SHELL_SECURITY AGENT_SHELL_SECURITY_ALLOWLIST /* default \
                                                                    */
+#endif
+
+/* ── VelaGuard HMI (SRAM-tight) ──────────────────────────────── */
+#ifdef CONFIG_VG_HMI
+/* The agent loop thread runs the whole ReAct round on one stack:
+ * mbedTLS handshake (~14KB), 15KB tools-JSON request build/parse, and
+ * tool dispatch. 16KB overflowed into heap-adjacent memory and
+ * corrupted free-node metadata (HARDFAULT in mallinfo/mm_foreach on
+ * VelaGuard H750B-DK, deterministic with any tool-calling round).
+ * 32KB matches the non-HMI default; SRAM budget on H750B-DK allows it. */
+#undef AGENT_AI_AGENT_STACK
+#define AGENT_AI_AGENT_STACK (32 * 1024)
+#undef AGENT_CLI_STACK
+#define AGENT_CLI_STACK (12 * 1024)
+#undef AGENT_CRON_STACK
+#define AGENT_CRON_STACK (4 * 1024)
+#define AGENT_VG_HMI_SKIP_WS 1
+#define AGENT_VG_HMI_LAZY_LOOP 1
+#define AGENT_MEM_RESERVE_BYTES (8 * 1024)
+#undef AGENT_CONTEXT_BUF_SIZE
+#define AGENT_CONTEXT_BUF_SIZE (4 * 1024)
+#undef AGENT_LLM_STREAM_BUF_SIZE
+#define AGENT_LLM_STREAM_BUF_SIZE (4 * 1024)
+#undef AGENT_OUTBOUND_STACK
+#define AGENT_OUTBOUND_STACK (12 * 1024)
+#define AGENT_NET_WATCH_STACK (28 * 1024)
+#else
+#define AGENT_NET_WATCH_STACK AGENT_OUTBOUND_STACK
 #endif

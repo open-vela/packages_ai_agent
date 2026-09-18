@@ -61,6 +61,37 @@ bool is_openai_compat_host(const char* host)
         || strstr(host, "xiaomimimo.com");
 }
 
+bool llm_proxy_echo_reasoning(void)
+{
+    char host[128];
+
+    pthread_mutex_lock(&s_llm_lock);
+    memcpy(host, s_llm_host, sizeof(host));
+    pthread_mutex_unlock(&s_llm_lock);
+
+    return strstr(host, "moonshot") != NULL
+        || strstr(host, "kimi") != NULL;
+}
+
+/* MiMo/OpenAI-compat: null content and unknown fields break the API. */
+static void llm_sanitize_messages_for_api(cJSON* msgs)
+{
+    cJSON* msg;
+
+    cJSON_ArrayForEach(msg, msgs)
+    {
+        cJSON* content = cJSON_GetObjectItem(msg, "content");
+
+        if (content && cJSON_IsNull(content)) {
+            cJSON_DeleteItemFromObject(msg, "content");
+        }
+
+        if (!llm_proxy_echo_reasoning()) {
+            cJSON_DeleteItemFromObject(msg, "reasoning_content");
+        }
+    }
+}
+
 
 int resp_buf_init(resp_buf_t* rb, size_t initial_cap)
 {
@@ -336,8 +367,10 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
     /* Allocate the response buffer once and hand it directly to the
      * TLS layer.  Previously we allocated a separate raw_buf and then
      * copied into resp_buf — doubling peak memory usage.  Now the
-     * resp_buf IS the raw buffer, eliminating the copy. */
-    size_t raw_cap = AGENT_LLM_STREAM_BUF_SIZE;
+     * resp_buf IS the raw buffer, eliminating the copy.  The capacity
+     * has to clear a whole tool-calling reply: this path cannot grow
+     * the buffer the way the proxy path does. */
+    size_t raw_cap = AGENT_LLM_DIRECT_RESP_CAP;
     if (resp_buf_init(rb, raw_cap) != OK)
         return ERROR;
 
@@ -356,17 +389,22 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
         memcpy(provider, model, plen);
     }
 
-    vela_header_t hdrs[] = { { "Authorization", auth_header },
+    vela_header_t hdrs[] = { { "Content-Type", "application/json" },
+        { "Authorization", auth_header },
         { provider[0] ? "X-Model-Provider-Id" : NULL,
             provider[0] ? provider : NULL },
         { NULL, NULL } };
 
+    size_t body_len = 0;
     int status;
     int use_tls = (strcmp(llm_port, "443") == 0);
 
     if (use_tls) {
-        status = vela_https_post_json(llm_host, llm_port, llm_path, hdrs, post_data,
-            rb->data, raw_cap);
+        /* Call the request API rather than the post_json wrapper: the wrapper
+         * discards the body length, and without it a reply that filled the
+         * buffer is indistinguishable from a complete one. */
+        status = vela_https_request(llm_host, llm_port, "POST", llm_path, hdrs,
+            post_data, strlen(post_data), rb->data, raw_cap, &body_len);
     } else {
         status = vela_http_post_json(llm_host, llm_port, llm_path, hdrs, post_data,
             rb->data, raw_cap);
@@ -378,7 +416,18 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
     }
 
     /* Update length — TLS layer NUL-terminated the buffer */
-    rb->len = strlen(rb->data);
+    rb->len = (body_len > 0) ? body_len : strlen(rb->data);
+
+    /* vela_tls stops reading at resp_cap-1, so a body that lands exactly there
+     * was cut off.  Say so: the caller's cJSON_Parse then reports a syntax
+     * error that lives nowhere in the model's output, and the real cause (a
+     * reply larger than the buffer) is invisible. */
+    if (rb->len >= raw_cap - 1) {
+        syslog(LOG_ERR, "[%s] response truncated at %zu bytes (cap %zu)\n",
+            TAG, rb->len, raw_cap);
+        resp_buf_free(rb);
+        return ERROR;
+    }
 
     *out_status = status;
     return OK;
@@ -722,6 +771,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     cJSON_AddStringToObject(sys_msg, "role", "system");
     cJSON_AddStringToObject(sys_msg, "content", system_prompt);
     cJSON_InsertItemInArray(msgs, 0, sys_msg);
+    llm_sanitize_messages_for_api(msgs);
     cJSON_AddItemToObject(body, "messages", msgs);
 
     /* Convert tools to OpenAI format */
