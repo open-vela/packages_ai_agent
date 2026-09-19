@@ -66,30 +66,55 @@ static bool llm_call_timed_out(uint32_t latency_ms);
     "任务已完成，但生成确认消息超时。"
 
 /* ── Clock-safe elapsed time calculation ───────────────────── */
+/* Monotonic timestamps are used so that adjusting the wall clock while an LLM
+ * call is in flight -- for example the TLS layer setting the time forward so
+ * certificate validation succeeds on a board without an RTC -- cannot make a
+ * fast call look like a timeout. */
 
-static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
-    const struct timeval* t1)
+static inline uint32_t calc_elapsed_ms(const struct timespec* t0,
+    const struct timespec* t1)
 {
-    int32_t sec_diff = (int32_t)(t1->tv_sec - t0->tv_sec);
-    int32_t usec_diff = (int32_t)(t1->tv_usec - t0->tv_usec);
+    int64_t sec_diff = (int64_t)t1->tv_sec - (int64_t)t0->tv_sec;
+    int64_t nsec_diff = (int64_t)t1->tv_nsec - (int64_t)t0->tv_nsec;
+    int64_t total;
 
-    /* Clock went backwards (NTP jump, manual adjustment) */
-    if (sec_diff < 0) {
-        syslog(LOG_WARNING, "[%s] Clock went backwards, ignoring\n", TAG);
-        return 0;
-    }
+    if (sec_diff < 0)
+        {
+            return 0;
+        }
 
-    /* Microsecond borrow */
-    if (usec_diff < 0) {
-        sec_diff--;
-        usec_diff += 1000000;
-    }
+    /* Nanosecond borrow */
+    if (nsec_diff < 0)
+        {
+            if (sec_diff > 0)
+                {
+                    sec_diff--;
+                    nsec_diff += 1000000000L;
+                }
+            else
+                {
+                    nsec_diff = 0;
+                }
+        }
 
-    if (sec_diff < 0) {
-        return 0;
-    }
+    total = sec_diff * 1000 + nsec_diff / 1000000L;
+    if (total > (int64_t)UINT32_MAX)
+        {
+            return UINT32_MAX;
+        }
 
-    return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
+    return (uint32_t)total;
+}
+
+/* Sample CLOCK_MONOTONIC, which settimeofday()/clock_settime() cannot move. */
+
+static inline void agent_now(struct timespec* ts)
+{
+    if (clock_gettime(CLOCK_MONOTONIC, ts) != 0)
+        {
+            ts->tv_sec = 0;
+            ts->tv_nsec = 0;
+        }
 }
 
 /* ── Memory pool (pre-allocated tool output buffers) ───────── */
@@ -819,10 +844,10 @@ static char* force_finish_reply(const char* system_prompt,
 
     llm_response_t resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    struct timespec t0, t1;
+    agent_now(&t0);
     int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
-    gettimeofday(&t1, NULL);
+    agent_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -989,10 +1014,10 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
 
     llm_response_t final_resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
+    struct timespec t0, t1;
+    agent_now(&t0);
     int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
-    gettimeofday(&t1, NULL);
+    agent_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -1064,10 +1089,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         send_working_status(msg, iteration);
 
         llm_response_t resp;
-        struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
+        struct timespec tv_start, tv_end;
+        agent_now(&tv_start);
         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
-        gettimeofday(&tv_end, NULL);
+        agent_now(&tv_end);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
         /* Router failover: on LLM call failure, try next backend */
@@ -1083,10 +1108,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 router_idx = next_idx;
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
-                gettimeofday(&tv_start, NULL);
+                agent_now(&tv_start);
                 err = llm_chat_tools(sys_prompt, messages,
                     tools_json, &resp);
-                gettimeofday(&tv_end, NULL);
+                agent_now(&tv_end);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
             }
         }
@@ -1183,10 +1208,10 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     router_idx = prem_idx;
                     trace.backend_idx = prem_idx;
 
-                    gettimeofday(&tv_start, NULL);
+                    agent_now(&tv_start);
                     err = llm_chat_tools(sys_prompt, messages,
                         tools_json, &resp);
-                    gettimeofday(&tv_end, NULL);
+                    agent_now(&tv_end);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
                     /* Watchdog check on cascade retry */
