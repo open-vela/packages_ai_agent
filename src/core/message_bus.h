@@ -36,6 +36,10 @@ typedef struct {
     char  chat_id[64];   /**< chat_id (Feishu IDs are ~36 chars) */
     char *content;       /**< Heap-allocated text; receiver must free. */
     char *image_b64;     /**< Optional base64-encoded image; receiver must free. NULL if none. */
+    bool  from_local;    /**< Outbound only: the answer came from the on-device
+                              model, not the cloud.  Lets the phone page and the
+                              watch label the reply ("本地"/"云端") - otherwise
+                              端云协同 is invisible without a serial log. */
 } agent_msg_t;
 
 /** Free heap members (content, image_b64) of a message.

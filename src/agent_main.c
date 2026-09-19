@@ -393,6 +393,22 @@ static time_t s_voice_cooldown_until;
  * Reads messages from the outbound queue and dispatches them to the
  * appropriate channel (FeiShu, WebSocket, CLI, etc.).
  */
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+/* Mirror an answer to the watch UI, tagging on-device answers so the pet page
+ * itself shows which half of the 端云 pair answered - without a serial log the
+ * routing is otherwise invisible. */
+static void ui_mirror_answer(const char* text, bool from_local)
+{
+    if (from_local) {
+        char tagged[768];
+        snprintf(tagged, sizeof(tagged), "%s（本地）", text);
+        lvgl_ui_channel_log(tagged, false);
+    } else {
+        lvgl_ui_channel_log(text, false);
+    }
+}
+#endif
+
 static void* outbound_dispatch_task(void* arg)
 {
     (void)arg;
@@ -440,7 +456,12 @@ static void* outbound_dispatch_task(void* arg)
                     TAG);
             }
         } else if (strcmp(msg.channel, AGENT_CHAN_WEBSOCKET) == 0) {
-            ws_server_send(msg.chat_id, msg.content);
+            ws_server_send(msg.chat_id, msg.content, msg.from_local);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* 手机侧对话同样上手表小云：写进历史环与桌宠页文本层，
+             * 用户在桌面时还会被自动带到桌宠页（与 cli 通道一致） */
+            ui_mirror_answer(msg.content, msg.from_local);
+#endif
 #ifdef CONFIG_AI_AGENT_MQTT
         } else if (strcmp(msg.channel, AGENT_CHAN_MQTT) == 0) {
             mqtt_channel_send(msg.chat_id, msg.content);
@@ -500,7 +521,7 @@ static void* outbound_dispatch_task(void* arg)
 #ifdef CONFIG_AI_AGENT_LVGL_UI
             /* Mirror into the chat ring so the pet page history window shows
              * console conversations too; this channel renders no bubble. */
-            lvgl_ui_channel_log(msg.content, false);
+            ui_mirror_answer(msg.content, msg.from_local);
 #endif
         } else if (strcmp(msg.channel, "care") == 0) {
             /* pet_care L2 follow-up: rendered as a second bubble on the pet

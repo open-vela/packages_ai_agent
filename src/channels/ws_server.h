@@ -25,5 +25,5 @@
 #include "agent_compat.h"
 
 int ws_server_start(void);
-int ws_server_send(const char *chat_id, const char *text);
+int ws_server_send(const char *chat_id, const char *text, bool from_local);
 int ws_server_stop(void);

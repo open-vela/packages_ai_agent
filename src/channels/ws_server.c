@@ -30,6 +30,9 @@
 #ifdef CONFIG_AI_AGENT_REST_API
 #include "infra/api_handler.h"
 #endif
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+#include "ui/lvgl_ui_channel.h"
+#endif
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -69,6 +72,73 @@ static pthread_mutex_t s_clients_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static int s_listen_fd = -1;
 static volatile bool s_running = false;
+
+/* ── Undelivered replies ──────────────────────────────────────── */
+
+/* The phone page keeps a WebSocket open, but our bt-pan link drops for tens
+ * of seconds at a time, and a cloud call that meets a drop can take a minute
+ * to fail before the on-device model answers.  The answer used to be dropped
+ * here (only a log line), which on the phone looked exactly like "发了消息，
+ * 却没有回复".  Hold the last few undelivered replies per chat_id and send
+ * them as soon as that chat_id is back. */
+#define WS_PENDING_MAX   3     /* replies held per chat_id */
+#define WS_PENDING_LEN   768   /* bytes per held reply */
+#define WS_PENDING_SLOTS 2     /* chat_ids tracked (the phone page uses one) */
+
+typedef struct {
+    char chat_id[32];
+    int head;                    /* next slot to overwrite */
+    int count;
+    char text[WS_PENDING_MAX][WS_PENDING_LEN];
+    bool from_local[WS_PENDING_MAX];   /* keep the 本地/云端 label with the text */
+} ws_pending_t;
+
+static ws_pending_t s_pending[WS_PENDING_SLOTS];
+
+static void pending_flush(const char* chat_id, int fd);
+
+/* Call with s_clients_mtx held. */
+static ws_pending_t* pending_slot_locked(const char* chat_id, bool create)
+{
+    ws_pending_t* free_slot = NULL;
+    int i;
+
+    for (i = 0; i < AGENT_WS_MAX_CLIENTS; i++) {
+        if (s_pending[i].chat_id[0] != '\0' &&
+            strcmp(s_pending[i].chat_id, chat_id) == 0) {
+            return &s_pending[i];
+        }
+        if (s_pending[i].chat_id[0] == '\0' && free_slot == NULL) {
+            free_slot = &s_pending[i];
+        }
+    }
+    if (!create || free_slot == NULL) {
+        return NULL;
+    }
+    snprintf(free_slot->chat_id, sizeof(free_slot->chat_id), "%s", chat_id);
+    free_slot->head = 0;
+    free_slot->count = 0;
+    return free_slot;
+}
+
+/* Call with s_clients_mtx held. */
+static void pending_hold_locked(const char* chat_id, const char* text,
+    bool from_local)
+{
+    ws_pending_t* p = pending_slot_locked(chat_id, true);
+
+    if (p == NULL) {
+        return;
+    }
+    snprintf(p->text[p->head], WS_PENDING_LEN, "%s", text);
+    p->from_local[p->head] = from_local;
+    p->head = (p->head + 1) % WS_PENDING_MAX;
+    if (p->count < WS_PENDING_MAX) {
+        p->count++;
+    }
+    syslog(LOG_INFO, "[%s] holding reply for %s (%d pending)\n", TAG, chat_id,
+        p->count);
+}
 
 /* ── Client helpers (call with mtx held) ──────────────────────── */
 
@@ -149,6 +219,24 @@ static int make_accept_key(const char* key, char* out, size_t out_size)
  * Read full HTTP upgrade request, extract Sec-WebSocket-Key.
  * Returns 0 on success; sends 101 response.
  */
+/* Write exactly len bytes: lwIP's send() may accept only part of the buffer
+ * even on a blocking socket, and a short 101 response leaves the browser
+ * waiting for the rest of the handshake. */
+static int send_all(int fd, const char* buf, size_t len)
+{
+    size_t left = len;
+
+    while (left > 0) {
+        ssize_t n = send(fd, buf, left, 0);
+        if (n <= 0) {
+            return -1;
+        }
+        buf += n;
+        left -= (size_t)n;
+    }
+    return 0;
+}
+
 static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
     char* chat_id_out, size_t chat_id_size)
 {
@@ -156,25 +244,32 @@ static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
     /* Extract Sec-WebSocket-Key */
     char* key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
     if (!key_hdr) {
-        syslog(LOG_WARNING, "[%s] No Sec-WebSocket-Key\n", TAG);
+        syslog(LOG_WARNING, "[%s] No Sec-WebSocket-Key (fd=%d)\n", TAG, fd);
         return -1;
     }
     key_hdr += 21;
     char* eol = strstr(key_hdr, "\r\n");
-    if (!eol)
+    if (!eol) {
+        syslog(LOG_WARNING, "[%s] key not terminated (fd=%d)\n", TAG, fd);
         return -1;
+    }
 
     char ws_key[128] = { 0 };
     size_t klen = (size_t)(eol - key_hdr);
-    if (klen >= sizeof(ws_key))
+    if (klen >= sizeof(ws_key)) {
+        syslog(LOG_WARNING, "[%s] key too long (%d, fd=%d)\n", TAG,
+            (int)klen, fd);
         return -1;
+    }
     memcpy(ws_key, key_hdr, klen);
     ws_key[klen] = '\0';
 
     /* Compute accept */
     char accept[64] = { 0 };
-    if (make_accept_key(ws_key, accept, sizeof(accept)) < 0)
+    if (make_accept_key(ws_key, accept, sizeof(accept)) < 0) {
+        syslog(LOG_WARNING, "[%s] accept key failed (fd=%d)\n", TAG, fd);
         return -1;
+    }
 
     /* Send 101 */
     char resp[512];
@@ -184,8 +279,10 @@ static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: %s\r\n\r\n",
         accept);
-    if (send(fd, resp, rlen, 0) != rlen)
+    if (send_all(fd, resp, (size_t)rlen) != 0) {
+        syslog(LOG_WARNING, "[%s] 101 send failed (fd=%d)\n", TAG, fd);
         return -1;
+    }
 
     /* Default chat_id from fd (may be overridden by first message) */
     snprintf(chat_id_out, chat_id_size, "ws_%d", fd);
@@ -373,8 +470,14 @@ static void* client_thread(void* arg)
 #ifdef CONFIG_AI_AGENT_REST_API
     if (api_try_handle(fd, peek_buf, peek_total)) {
         free(peek_buf);
-        struct linger lg = { .l_onoff = 1, .l_linger = 0 };
-        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        /* 关之前先给协议栈时间把响应真正发出去。
+         *
+         * 原先这里是 SO_LINGER(0) 立即发 RST；改成 shutdown(SHUT_WR) 也不行
+         * —— lwIP 在还有排队数据时关连接同样走 RST，客户端只收到前半段。
+         * JSON 响应小到能塞进一个包所以一直没暴露，7 KB 的网页则每次都断在
+         * 中途（浏览器表现为"页面在但脚本没跑"，永远停在连接中）。
+         * 这里改成：等数据发完（PAN 上 7 KB 约 200 ms）再正常关闭走 FIN。*/
+        usleep(250 * 1000);
         close(fd);
         return NULL;
     }
@@ -439,23 +542,49 @@ static void* client_thread(void* arg)
 
         cJSON* type_item = cJSON_GetObjectItem(root, "type");
         cJSON* content_item = cJSON_GetObjectItem(root, "content");
+        cJSON* cid_item = cJSON_GetObjectItem(root, "chat_id");
+
+        /* Any frame carrying a chat_id re-claims that identity for this fd -
+         * the phone page sends one on connect ("hello") so replies that were
+         * held while its link was down are delivered right away. */
+        if (cJSON_IsString(cid_item)) {
+            bool claimed = false;
+
+            pthread_mutex_lock(&s_clients_mtx);
+            ws_client_t* c = find_by_fd_locked(fd);
+            if (c && strcmp(c->chat_id, cid_item->valuestring) != 0) {
+                strncpy(c->chat_id, cid_item->valuestring,
+                    sizeof(c->chat_id) - 1);
+                c->chat_id[sizeof(c->chat_id) - 1] = '\0';
+                claimed = true;
+            }
+            pthread_mutex_unlock(&s_clients_mtx);
+
+            if (claimed) {
+                syslog(LOG_INFO, "[%s] fd=%d claims chat_id=%s\n", TAG, fd,
+                    cid_item->valuestring);
+                pending_flush(cid_item->valuestring, fd);
+            }
+        }
 
         if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "message") == 0 && cJSON_IsString(content_item)) {
 
             /* Determine/update chat_id */
-            cJSON* cid_item = cJSON_GetObjectItem(root, "chat_id");
             pthread_mutex_lock(&s_clients_mtx);
             ws_client_t* c = find_by_fd_locked(fd);
             if (c) {
-                if (cJSON_IsString(cid_item)) {
-                    strncpy(c->chat_id, cid_item->valuestring, sizeof(c->chat_id) - 1);
-                }
                 strncpy(chat_id, c->chat_id, sizeof(chat_id) - 1);
             }
             pthread_mutex_unlock(&s_clients_mtx);
 
             syslog(LOG_INFO, "[%s] WS msg from %s: %.40s\n", TAG, chat_id,
                 content_item->valuestring);
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* 手机侧发来的话也要落到手表上：用户方进历史环，答案由出站
+             * 分支回写桌宠页文本层（见 agent_main 的 websocket 分支） */
+            lvgl_ui_channel_log(content_item->valuestring, true);
+#endif
 
             agent_msg_t msg = { 0 };
             strncpy(msg.channel, AGENT_CHAN_WEBSOCKET, sizeof(msg.channel) - 1);
@@ -577,24 +706,107 @@ int ws_server_start(void)
     return OK;
 }
 
-int ws_server_send(const char* chat_id, const char* text)
+/* Build one {"type":"response",...} frame and write it. */
+static int send_response_frame(int fd, const char* chat_id, const char* text,
+    bool from_local)
 {
-    if (s_listen_fd < 0 || !s_running)
-        return ERROR;
-
-    /* Build JSON response */
     cJSON* resp = cJSON_CreateObject();
+    char* json_str;
+    int rc;
+
+    if (resp == NULL) {
+        return ERROR;
+    }
     cJSON_AddStringToObject(resp, "type", "response");
     cJSON_AddStringToObject(resp, "content", text);
     cJSON_AddStringToObject(resp, "chat_id", chat_id);
-    char* json_str = cJSON_PrintUnformatted(resp);
+    cJSON_AddStringToObject(resp, "source", from_local ? "local" : "cloud");
+    json_str = cJSON_PrintUnformatted(resp);
     cJSON_Delete(resp);
-    if (!json_str)
+    if (json_str == NULL) {
         return ERROR;
+    }
+    rc = ws_send_frame(fd, json_str, strlen(json_str));
+    free(json_str);
+    return (rc == 0) ? OK : ERROR;
+}
+
+/* Deliver everything held for this chat_id.  Takes the lock itself and sends
+ * outside it (a send on a slow link can block for a while). */
+static void pending_flush(const char* chat_id, int fd)
+{
+    char out[WS_PENDING_MAX][WS_PENDING_LEN];
+    bool out_local[WS_PENDING_MAX];
+    ws_pending_t* p;
+    int start;
+    int n = 0;
+    int i;
+
+    pthread_mutex_lock(&s_clients_mtx);
+    p = pending_slot_locked(chat_id, false);
+    if (p != NULL && p->count > 0) {
+        start = (p->head - p->count + WS_PENDING_MAX * 2) % WS_PENDING_MAX;
+        for (i = 0; i < p->count; i++) {
+            int slot = (start + i) % WS_PENDING_MAX;
+            memcpy(out[n], p->text[slot], WS_PENDING_LEN);
+            out[n][WS_PENDING_LEN - 1] = '\0';
+            out_local[n] = p->from_local[slot];
+            n++;
+        }
+        p->count = 0;
+        p->head = 0;
+    }
+    pthread_mutex_unlock(&s_clients_mtx);
+
+    for (i = 0; i < n; i++) {
+        if (send_response_frame(fd, chat_id, out[i], out_local[i]) == OK) {
+            syslog(LOG_INFO, "[%s] delivered held reply to %s\n", TAG, chat_id);
+        }
+    }
+}
+
+int ws_server_send(const char* chat_id, const char* text, bool from_local)
+{
+#define STACK_JSON_LEN 1600
+    char json_str[STACK_JSON_LEN];
+    cJSON* resp;
+    int rc = -1;
+    bool held = false;
+
+    if (s_listen_fd < 0 || !s_running)
+        return ERROR;
+
+    /* Build JSON response (on the stack: this runs on the agent's outbound
+     * thread, and the reply is a few hundred bytes at most). */
+    resp = cJSON_CreateObject();
+    if (resp == NULL)
+        return ERROR;
+    cJSON_AddStringToObject(resp, "type", "response");
+    cJSON_AddStringToObject(resp, "content", text);
+    cJSON_AddStringToObject(resp, "chat_id", chat_id);
+    cJSON_AddStringToObject(resp, "source", from_local ? "local" : "cloud");
+    if (cJSON_PrintPreallocated(resp, json_str, STACK_JSON_LEN, 0) != 1) {
+        /* Too long for the buffer: fall back to the heap. */
+        char* heap = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        if (heap == NULL)
+            return ERROR;
+        pthread_mutex_lock(&s_clients_mtx);
+        ws_client_t* c2 = find_by_chat_id_locked(chat_id);
+        if (c2) {
+            rc = ws_send_frame(c2->fd, heap, strlen(heap));
+        } else {
+            pending_hold_locked(chat_id, text, from_local);
+            held = true;
+        }
+        pthread_mutex_unlock(&s_clients_mtx);
+        free(heap);
+        return held ? OK : (rc == 0 ? OK : ERROR);
+    }
+    cJSON_Delete(resp);
 
     pthread_mutex_lock(&s_clients_mtx);
     ws_client_t* client = find_by_chat_id_locked(chat_id);
-    int rc = -1;
     if (client) {
         rc = ws_send_frame(client->fd, json_str, strlen(json_str));
         if (rc != 0) {
@@ -606,12 +818,18 @@ int ws_server_send(const char* chat_id, const char* text)
              * The recv() in client_thread will fail and trigger cleanup. */
         }
     } else {
-        syslog(LOG_WARNING, "[%s] No WS client for chat_id=%s\n", TAG, chat_id);
+        /* Client is away (its link dropped): keep it for the next connect
+         * instead of throwing the answer away. */
+        pending_hold_locked(chat_id, text, from_local);
+        held = true;
     }
     pthread_mutex_unlock(&s_clients_mtx);
 
-    free(json_str);
+    if (held) {
+        return OK;
+    }
     return (client == NULL) ? ERROR : (rc == 0 ? OK : ERROR);
+#undef STACK_JSON_LEN
 }
 
 int ws_server_stop(void)

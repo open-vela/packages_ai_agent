@@ -16,6 +16,7 @@
 
 #include "infra/api_handler.h"
 #include "agent_config.h"
+#include "infra/chat_page.h"
 #include "infra/config_store.h"
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
@@ -60,6 +61,23 @@ static void send_response(int fd, int code, const char* body)
     int hlen = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n",
+        code, status, (int)strlen(body));
+    send(fd, hdr, hlen, 0);
+    send(fd, body, strlen(body), 0);
+}
+
+/* Same as send_response() but for the phone chat page.  Kept separate so the
+ * JSON endpoints keep advertising application/json. */
+static void send_response_html(int fd, int code, const char* body)
+{
+    const char* status = (code == 200) ? "OK" : "Bad Request";
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n\r\n",
         code, status, (int)strlen(body));
@@ -552,10 +570,46 @@ static bool handle_logs_get(int fd)
 
 bool api_try_handle(int fd, const char* buf, int buf_len)
 {
-    /* Quick check: must start with a valid HTTP method targeting /api/ */
     if (!buf || buf_len < 10) {
         return false;
     }
+
+    /* A WebSocket upgrade is also a "GET /" -- it must be left to the
+     * ws_server handshake, otherwise the browser gets HTML instead of 101. */
+    if (strcasestr(buf, "Sec-WebSocket-Key:") != NULL) {
+        return false;
+    }
+
+    /* Route: page-script beacon.  The chat page's script requests this right
+     * after it starts running, so the device log proves whether the page was
+     * delivered completely enough for its JavaScript to execute. */
+    if (strncmp(buf, "GET /alive", 10) == 0) {
+        syslog(LOG_INFO, "[%s] page script alive\n", TAG);
+        send_response_html(fd, 200, "ok");
+        return true;
+    }
+
+    /* Route: the phone chat page itself.  A browser opening
+     * http://<device-ip>:28789/ gets this page, and the page then talks to
+     * the WebSocket server on the same port -- so the phone needs no app,
+     * no file transfer and no internet: only the Bluetooth PAN link. */
+    if (strncmp(buf, "GET /", 5) == 0 &&
+        (buf[5] == ' ' ||
+         strncmp(buf + 5, "chat", 4) == 0 ||
+         strncmp(buf + 5, "index.html", 10) == 0)) {
+        char req[32] = { 0 };
+        int i;
+        for (i = 0; i < (int)sizeof(req) - 1 && buf[i] != '\r' && buf[i] != '\n';
+             i++) {
+            req[i] = buf[i];
+        }
+        syslog(LOG_INFO, "[%s] serving phone chat page (%d bytes) for '%s'\n",
+            TAG, (int)(sizeof(CHAT_PAGE_HTML) - 1), req);
+        send_response_html(fd, 200, CHAT_PAGE_HTML);
+        return true;
+    }
+
+    /* Quick check: must start with a valid HTTP method targeting /api/ */
 
     if (strncmp(buf, "GET /api/", 9) != 0 && strncmp(buf, "PUT /api/", 9) != 0 && strncmp(buf, "POST /api/", 10) != 0 && strncmp(buf, "DELETE /api/", 12) != 0) {
         return false;
