@@ -102,6 +102,65 @@ config AI_AGENT_LVGL_UI
 		Provides a chat-bubble interface on a round watch screen
 		with PTT (Push-to-Talk) voice input.
 
+config AI_AGENT_LCD_PATH
+	string "LVGL display device path"
+	default "/dev/lcd0"
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Framebuffer/LCD device used by the LVGL UI.
+		/dev/lcd0 on SF32LB52-DevKit-LCD, /dev/fb0 on the
+		goldfish emulator. Lets UI iterate in the emulator
+		without touching the real board.
+
+config AI_AGENT_TOUCH_PATH
+	string "LVGL touch input device path"
+	default "/dev/input0"
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Framebuffer/LCD device used by the LVGL UI.
+		/dev/input0 on both SF32LB52 and the goldfish emulator.
+
+config AI_AGENT_CARE_IDLE_MIN
+	int "Idle minutes before proactive care"
+	default 5
+	range 1 120
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_COOLDOWN_MIN
+	int "Minimum minutes between proactive care messages"
+	default 10
+	range 1 240
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_QUIET_START
+	int "Quiet hours start (local hour)"
+	default 22
+	range 0 23
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_QUIET_END
+	int "Quiet hours end (local hour)"
+	default 7
+	range 0 23
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_HR_HIGH
+	int "Simulated heart-rate reminder threshold (bpm)"
+	default 120
+	range 90 180
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_HR_ALERT_COOLDOWN_S
+	int "Heart-rate alert cooldown (seconds)"
+	default 60
+	range 10 3600
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Seconds between two heart-rate reminders during sustained
+		high readings. Kept short (60s) so back-to-back demo
+		injections are not swallowed; a single injected event still
+		only alerts once thanks to the per-event latch in hr_monitor.
+
 config AI_AGENT_FEISHU
 	bool "Enable Feishu bot channel"
 	default y

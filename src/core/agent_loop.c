@@ -28,9 +28,11 @@
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
+#include "infra/network_manager.h"
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
+#include "llm/local_lm.h"
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
@@ -840,6 +842,11 @@ static char* force_finish_reply(const char* system_prompt,
 
 /* ── Extracted: dispatch response to outbound bus ─────────── */
 
+/* Set by run_react_loop when the answer came from the on-device model, so the
+ * reply can be labelled on the phone page and on the watch.  The agent loop
+ * handles one message at a time, so a plain static is enough. */
+static bool s_answer_from_local;
+
 static void dispatch_response(const agent_msg_t* msg,
     char* final_text)
 {
@@ -853,6 +860,7 @@ static void dispatch_response(const agent_msg_t* msg,
         strncpy(out.chat_id, msg->chat_id,
             sizeof(out.chat_id) - 1);
         out.content = final_text;
+        out.from_local = s_answer_from_local;
         if (message_bus_push_outbound(&out) != OK) {
             free(final_text);
         }
@@ -1023,6 +1031,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     int iteration;
     char* final_text = NULL;
 
+    s_answer_from_local = false;   /* cleared per request; set on local fallback */
     prev_sig[0] = '\0';
     dup_count = 0;
     prev_name[0] = '\0';
@@ -1065,13 +1074,29 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         llm_response_t resp;
         struct timeval tv_start, tv_end;
+        bool uplink_down = false;
+        int err;
+
         gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        if (network_get_state() != NET_STATE_CONNECTED) {
+            /* No uplink: a cloud call could only hang until the socket
+             * timeout and fall back anyway, so answer from the on-device
+             * model right away.  Deliberately NOT counted as a backend
+             * failure (llm_router_report_failure) - the backend is fine,
+             * the radio is not, and penalising it would take the cloud down
+             * for the whole recovery window even after the link returns. */
+            syslog(LOG_WARNING,
+                "[%s] no uplink, answering on-device (cloud skipped)\n", TAG);
+            err = ERROR;
+            uplink_down = true;
+        } else {
+            err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        }
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
         /* Router failover: on LLM call failure, try next backend */
-        if (err != OK && router_idx >= 0) {
+        if (err != OK && router_idx >= 0 && !uplink_down) {
             syslog(LOG_WARNING,
                 "[%s] LLM call failed on backend %d, trying failover\n",
                 TAG, router_idx);
@@ -1092,23 +1117,40 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         }
 
         if (err != OK) {
-            /* Distinguish timeout-induced failure from other errors */
-            if (llm_call_timed_out(latency_ms)) {
+            /* Cloud is unreachable, or has no API key at all -- which is the
+             * normal state on this board.  Fall back to the on-device model
+             * before giving up: the user's message is right here, and a real
+             * answer beats an apology.  Everything downstream (session append,
+             * cache, outbound dispatch) is shared with the cloud path.
+             */
+
+            char *local_text = NULL;
+            bool timed_out = llm_call_timed_out(latency_ms);
+
+            if (timed_out) {
                 syslog(LOG_WARNING,
                     "[%s] LLM watchdog: call failed after %" PRIu32 " ms "
                     "(limit %ds)\n",
                     TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
-                agent_trace_step(&trace, iteration, NULL,
-                    latency_ms, 0);
-                llm_response_free(&resp);
-                final_text = strdup(LLM_TIMEOUT_MSG);
-                watchdog_fired = true;
-                break;
+            } else {
+                syslog(LOG_ERR, "[%s] LLM call failed (iter %d)\n",
+                    TAG, iteration);
             }
-            syslog(LOG_ERR, "[%s] LLM call failed (iter %d)\n",
-                TAG, iteration);
+
             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
             llm_response_free(&resp);
+
+            if (local_lm_available() &&
+                local_lm_reply(msg->content, &local_text) == 0) {
+                final_text = local_text;
+                s_answer_from_local = true;   /* label the reply 本地 */
+                break;
+            }
+
+            if (timed_out) {
+                final_text = strdup(LLM_TIMEOUT_MSG);
+                watchdog_fired = true;
+            }
             break;
         }
 
@@ -1335,6 +1377,15 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
         final_text = force_finish_reply(sys_prompt, messages);
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
+    } else if (!final_text && trace.total_tool_calls > 0) {
+        /* Tools ran but the model closed with no text (observed with
+         * StepFun right after a successful set_alarm). The action already
+         * happened on the device, so confirm it instead of apologising. */
+        final_text = strdup("好的，已经为你安排好了。");
+        syslog(LOG_INFO,
+            "[%s] Empty closing text after %d tool call(s); confirming\n",
+            TAG, trace.total_tool_calls);
+        agent_trace_end(&trace, AGENT_TRACE_OK);
     } else if (watchdog_fired) {
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
     } else if (final_text) {
@@ -1519,6 +1570,11 @@ static void* agent_loop_task(void* arg)
             strncpy(out.chat_id, msg.chat_id,
                 sizeof(out.chat_id) - 1);
             out.content = reply;
+            /* Slash commands and the NL fast path (时间/电量/心率/步数/音乐,
+             * 技能列表, 天气) are handled on the device by tools - no model is
+             * involved, so label them 本地 rather than letting them inherit
+             * the default 云端. */
+            out.from_local = true;
             if (message_bus_push_outbound(&out) != OK) {
                 free(reply);
             }
@@ -1587,12 +1643,29 @@ int agent_loop_init(void)
 
 int agent_loop_start(void)
 {
-    int ret = agent_task_create(agent_loop_task, "agent_loop",
+    static bool s_started = false;
+    int ret;
+
+    /* Called from three places now: boot phase 5, and the two network-up
+     * paths that predate it.  The loop is the only consumer of the inbound
+     * queue, so it has to run even when the link never comes up -- that is
+     * what makes the on-device model reachable offline.  Guard here rather
+     * than at the call sites so none of them can start a second thread.
+     */
+
+    if (s_started) {
+        return OK;
+    }
+
+    ret = agent_task_create(agent_loop_task, "agent_loop",
         AGENT_AI_AGENT_STACK, NULL, AGENT_AI_AGENT_PRIO);
 
     if (ret != OK) {
         syslog(LOG_ERR,
             "[%s] Failed to create agent_loop task\n", TAG);
+        return ret;
     }
-    return ret;
+
+    s_started = true;
+    return OK;
 }

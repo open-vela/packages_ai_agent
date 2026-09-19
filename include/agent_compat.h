@@ -104,11 +104,14 @@ static inline int agent_task_create(void* (*func)(void*), const char* name,
 #include <fcntl.h>
 
 /**
- * Fill buffer with cryptographically secure random bytes.
- * Uses /dev/urandom (preferred) or /dev/random as fallback.
+ * Fill buffer with secure random bytes.
  *
- * SECURITY: This function will block or fail rather than return
- * predictable data. For TLS entropy, this is the correct behavior.
+ * WORKAROUND (SF32LB52): the /dev/urandom path crashes on this board
+ * because a pre-existing heap overflow corrupts the inode list and
+ * _inode_compare dereferences a broken node (hardfault observed in
+ * cmd_net_test -> TLS entropy init). arc4random_buf needs no inode
+ * lookup and is already used by the SF32LB52 H4 driver. TODO: locate
+ * the heap overflow root cause and restore /dev/urandom entropy.
  *
  * Returns 0 on success, -1 on failure (caller must handle).
  */
@@ -116,31 +119,7 @@ static inline int agent_secure_random(void *buf, size_t len)
 {
     if (len == 0) return 0;
 
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) fd = open("/dev/random", O_RDONLY);
-    if (fd < 0) return -1;
-
-    unsigned char *p = (unsigned char *)buf;
-    size_t remaining = len;
-
-    while (remaining > 0) {
-        ssize_t n = read(fd, p, remaining);
-        if (n > 0) {
-            p += n;
-            remaining -= (size_t)n;
-        } else if (n == 0) {
-            /* EOF on random device — should not happen */
-            close(fd);
-            return -1;
-        } else if (errno != EINTR) {
-            /* Real error */
-            close(fd);
-            return -1;
-        }
-        /* EINTR: retry */
-    }
-
-    close(fd);
+    arc4random_buf(buf, len);
     return 0;
 }
 

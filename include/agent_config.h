@@ -102,7 +102,12 @@
 #define AGENT_FEISHU_MAX_MSG_LEN 4000 /* Feishu text message limit */
 
 /* ── Agent Loop ─────────────────────────────────────────────── */
-#define AGENT_AI_AGENT_STACK (32 * 1024)
+/* 64 KB, not 32: with CONFIG_TFLITEMICRO the on-device model runs on this
+ * thread, and its tokenizer/generation frames overflow 32 KB (the team app's
+ * standalone worker needed 48 KB).  Thread stacks come from the heap, which on
+ * this board means PSRAM, so the extra 32 KB costs no SRAM.
+ */
+#define AGENT_AI_AGENT_STACK (64 * 1024)
 #define AGENT_AI_AGENT_PRIO 60
 #define AGENT_AI_AGENT_CORE 0
 #define AGENT_AI_AGENT_MAX_HISTORY 10
@@ -116,16 +121,37 @@
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
  * acts as the hard backstop that actually unblocks the read. */
-#define AGENT_LLM_TIMEOUT_SEC 60
+/* 90 s, not 60: this watchdog runs *after* the call returns and a call that
+ * succeeded but took longer would have its perfectly good answer thrown away
+ * and replaced by a timeout message.  Measured single StepFun round trips
+ * reach ~45 s (two-iteration tool questions double that), so it must sit
+ * above the socket timeout below, not below it. */
+#define AGENT_LLM_TIMEOUT_SEC 90
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
- * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
- * watchdog to fire first on normal slow responses.  Set higher
- * to cover TLS handshake + full response read. */
-#define AGENT_LLM_SOCKET_TIMEOUT_SEC 120
+ *
+ * Was 120 s: on a half-dead bt-pan link a request could hang for two minutes
+ * before the fallback to the on-device model even started.  60 s still
+ * covers real responses (single round trips measured at 4-45 s) while
+ * halving the worst-case wait. */
+#define AGENT_LLM_SOCKET_TIMEOUT_SEC 60
 
 /* ── Timezone (POSIX TZ format) ────────────────────────────── */
 #define AGENT_TIMEZONE "CST-8"
+
+/* CONFIG_LIBC_LOCALTIME is off in this build, so NuttX's localtime_r() is
+ * gmtime() and the TZ environment variable is ignored -- the setenv/tzset at
+ * boot has no effect.  Enabling LIBC_LOCALTIME would pull in tzcode plus a
+ * timezone database on the filesystem, which is a lot to carry for a product
+ * that only ever runs in one zone.  Instead time_sync.c stores local time in
+ * the RTC, so date, time() and the model's answers all agree.
+ *
+ * Consequence to remember: time() is local, not UTC.  Nothing here needs true
+ * UTC (TLS only cares about the date for cert validity), but a cloud API that
+ * signs requests with a UTC timestamp would need the offset subtracted back
+ * out at the call site.
+ */
+#define AGENT_UTC_OFFSET_SEC (8 * 3600)
 
 /* ── LLM ────────────────────────────────────────────────────── */
 #define AGENT_LLM_DEFAULT_MODEL ""

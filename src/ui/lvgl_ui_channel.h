@@ -16,6 +16,11 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "pet_display.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,6 +53,12 @@ void lvgl_ui_channel_stop(void);
 void lvgl_ui_channel_show(void);
 
 /**
+ * Bring the pet stage (pet + bubble + menu) to the foreground.
+ * Used by the launcher desktop when entering the pet app.
+ */
+void lvgl_ui_enter_pet_stage(void);
+
+/**
  * 发送 Agent 回复到 UI。
  * 在 Chat View 中添加 Agent 消息气泡，并调用 voice_channel_speak() 进行 TTS 播报。
  * 首次调用时自动显示聊天界面。由 outbound_dispatch_task 调用。
@@ -56,6 +67,59 @@ void lvgl_ui_channel_show(void);
  * @return 0 成功，负值表示错误
  */
 int lvgl_ui_channel_send(const char* text);
+
+/**
+ * 发送 Agent 气泡但不触发 TTS。供 render 线程内的主动关怀使用，
+ * 避免在 LVGL render loop 中同步等待语音播放。
+ */
+int lvgl_ui_channel_send_silent(const char* text, pet_emotion_t emotion);
+
+/**
+ * 线程安全地向 LVGL 投递一次异步回调。
+ * LVGL 以 LV_OS_NONE 构建（无内部锁），任何非 render 线程直接调
+ * lv_async_call / lv_timer_* 都会与 lv_timer_handler 竞态并损坏定时器
+ * 链表（Round 27：ask 回复后 render 线程睡死）。此函数只做加锁入队，
+ * 由 render 线程每圈统一落地。回调在 LVGL 线程执行，语义与
+ * lv_async_call 相同。
+ */
+int lvgl_ui_post(lv_async_cb_t cb, void* data);
+
+/**
+ * 发送用户消息到 UI（ASR 识别结果）。
+ * 在头顶气泡显示用户气泡并记录到历史。由语音通道（阶段 B）调用。
+ *
+ * @param text  UTF-8 文本，用户说话内容
+ * @return 0 成功，负值表示错误
+ */
+int lvgl_ui_channel_send_user(const char* text);
+
+/**
+ * 只把一条消息记入聊天历史环，不改气泡、不动桌宠表情。
+ * 给那些不以气泡形式呈现的流量用（NSH `ask` 的提问、以 "cli" 通道回来的回复），
+ * 这样历史窗口看到的是完整对话，而不只是 LVGL 通道那一部分。
+ * 线程安全：内部经 lv_async_call 转到 LVGL 线程。
+ *
+ * @param text     UTF-8 文本
+ * @param is_user  true 表示用户说的，false 表示 Agent 回的
+ * @return 0 成功，负值表示错误
+ */
+int lvgl_ui_channel_log(const char* text, bool is_user);
+
+/**
+ * 聊天历史条数（上限 20 条）。只能在 LVGL 线程上调用。
+ */
+int lvgl_ui_history_count(void);
+
+/**
+ * 取第 newest_first 条历史，0 是最新的一条。只能在 LVGL 线程上调用。
+ *
+ * @param newest_first  0 = 最新
+ * @param buf / len     输出缓冲
+ * @param is_user       可为 NULL；输出这条是谁说的
+ * @return true 取到了，false 表示下标越界
+ */
+bool lvgl_ui_history_get(int newest_first, char* buf, size_t len,
+    bool* is_user);
 
 #ifdef __cplusplus
 }

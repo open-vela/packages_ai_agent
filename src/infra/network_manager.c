@@ -17,6 +17,7 @@
 #include "network_manager.h"
 #include "agent_compat.h"
 
+#include <nuttx/net/dns.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
@@ -144,10 +145,130 @@ int network_wifi_reconnect(void)
     return network_wait_connected(5000);
 }
 
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
+/* ── QEMU stub: real NIC present, RPMSG state machine not needed ── */
+/* The state-machine APIs below normally live in the RPMSG/TUN branch.
+ * On QEMU the virtio-net NIC provides connectivity directly, so they
+ * return sane defaults (connected, no resource limits). */
+
+#include <errno.h>
+
+static net_state_cb_t s_qemu_listeners[NET_MAX_LISTENERS];
+static void *s_qemu_listener_args[NET_MAX_LISTENERS];
+static int s_qemu_listener_count;
+
+int network_register_listener(net_state_cb_t cb, void *arg)
+{
+    if (s_qemu_listener_count >= NET_MAX_LISTENERS)
+        return -ENOMEM;
+    s_qemu_listeners[s_qemu_listener_count] = cb;
+    s_qemu_listener_args[s_qemu_listener_count] = arg;
+    s_qemu_listener_count++;
+    return OK;
+}
+
+net_state_t network_get_state(void)
+{
+    return network_is_connected() ? NET_STATE_CONNECTED
+                                  : NET_STATE_DISCONNECTED;
+}
+
+int network_get_active_conns(void)
+{
+    return 0;
+}
+
+int network_get_iob_usage(void)
+{
+    return 0;
+}
+
+int network_rpmsg_init(void)
+{
+    return OK;
+}
+
+int network_reconnect(void)
+{
+    return network_wifi_reconnect();
+}
+
+int network_set_dns(const char *primary, const char *secondary)
+{
+    (void)primary;
+    (void)secondary;
+    return OK;
+}
+
+int network_diag(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    syslog(LOG_INFO, "[%s] QEMU: eth0 via virtio-net, state=%s\n", TAG,
+           network_is_connected() ? "connected" : "disconnected");
+    return OK;
+}
+
+int network_save_proxy_config(const char *mode, const char *cpu_name)
+{
+    (void)mode;
+    (void)cpu_name;
+    return OK;
+}
+
+int network_get_connect_timeout(void)
+{
+    return 15;
+}
+
+int network_get_read_timeout(void)
+{
+    return 30;
+}
+
+int network_get_retry_max(void)
+{
+    return 3;
+}
+
+int network_get_retry_base_sec(void)
+{
+    return 2;
+}
+
+const char *network_get_proxy_mode(void)
+{
+    return "usrsock";
+}
+
+const char *network_get_rpmsg_cpu(void)
+{
+    return "";
+}
+
+int network_acquire_resource(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return OK;
+}
+
+void network_release_resource(void)
+{
+}
+#endif /* CONFIG_AI_AGENT_NET_RPMSG */
+
 #elif defined(CONFIG_AI_AGENT_NET_RPMSG)
 /* ── RPMSG/TUN network via BLE proxy ─────────────────────────── */
 
 #include "config/config_store.h"
+
+#ifdef CONFIG_AI_AGENT_BLE_NET
+#include "ble_net.h"
+#endif
+
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+#include "ble_gatt_net.h"
+#endif
 
 #include <errno.h>
 #include <pthread.h>
@@ -273,6 +394,72 @@ static bool check_interfaces(void)
 
         found = true;
         break;
+    }
+
+    freeifaddrs(ifa_list);
+    return found;
+}
+
+/**
+ * Check if bt-pan specifically has a valid IPv4 address.
+ * Returns true if bt-pan is up with an IP (primary channel ready).
+ */
+static bool check_btpan_has_ip(void)
+{
+    struct ifaddrs* ifa_list = NULL;
+    bool found = false;
+
+    if (getifaddrs(&ifa_list) != 0) {
+        return false;
+    }
+
+    for (struct ifaddrs* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        if (!ifa->ifa_name || strncmp(ifa->ifa_name, "bt-pan", 6) != 0) {
+            continue;
+        }
+
+        struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+        uint32_t addr = ntohl(sin->sin_addr.s_addr);
+        if (addr != 0 && (addr >> 24) != 127) {
+            found = true;
+        }
+        break;
+    }
+
+    freeifaddrs(ifa_list);
+    return found;
+}
+
+/**
+ * Check if any non-bt-pan interface has a valid IPv4 address
+ * (for BLE GATT NUS+TUN backup channel detection).
+ */
+static bool check_backup_channel_has_ip(void)
+{
+    struct ifaddrs* ifa_list = NULL;
+    bool found = false;
+
+    if (getifaddrs(&ifa_list) != 0) {
+        return false;
+    }
+
+    for (struct ifaddrs* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        if (!ifa->ifa_name) continue;
+        /* Skip loopback and bt-pan */
+        if (strncmp(ifa->ifa_name, "lo", 2) == 0) continue;
+        if (strncmp(ifa->ifa_name, "bt-pan", 6) == 0) continue;
+
+        struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+        uint32_t addr = ntohl(sin->sin_addr.s_addr);
+        if (addr != 0 && (addr >> 24) != 127) {
+            found = true;
+        }
     }
 
     freeifaddrs(ifa_list);
@@ -415,8 +602,51 @@ static void* iface_poll_thread(void* arg)
     clock_gettime(CLOCK_MONOTONIC, &start);
     bool startup_warned = false;
 
+    /* Dual-channel tracking: bt-pan (primary) vs BLE GATT (backup) */
+    const char* active_channel = "none";
+
     while (g_poll_running) {
-        bool has_ip = check_interfaces();
+        /*
+         * Dual-channel priority switching (ported from xiaozhi-sf32):
+         *   Primary:  bt-pan (BR/EDR PAN via phone Bluetooth tethering)
+         *   Backup:   BLE GATT NUS+TUN proxy (via phone companion app)
+         *
+         * bt-pan is preferred because it provides standard IP networking
+         * with DHCP. BLE GATT is a fallback when PAN is unavailable.
+         */
+        bool btpan_ready = check_btpan_has_ip();
+        bool backup_ready = false;
+        bool has_ip = false;
+
+        if (btpan_ready) {
+            /* Primary channel (bt-pan) is up — use it */
+            has_ip = true;
+            if (active_channel != "bt-pan") {
+                active_channel = "bt-pan";
+                syslog(LOG_INFO, "[%s] Active channel: bt-pan (primary)\n", TAG);
+            }
+        } else {
+            /* Primary down — check backup channels */
+#ifdef CONFIG_AI_AGENT_BLE_NET
+            backup_ready = backup_ready || ble_net_is_connected();
+#endif
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+            backup_ready = backup_ready || ble_gatt_net_is_connected();
+#endif
+            if (backup_ready && check_backup_channel_has_ip()) {
+                has_ip = true;
+                if (active_channel != "ble-gatt") {
+                    active_channel = "ble-gatt";
+                    syslog(LOG_INFO, "[%s] Active channel: BLE GATT (backup)\n", TAG);
+                }
+            } else {
+                if (active_channel != "none") {
+                    syslog(LOG_WARNING, "[%s] All channels down, was: %s\n",
+                           TAG, active_channel);
+                    active_channel = "none";
+                }
+            }
+        }
 
         if (has_ip) {
             set_net_state(NET_STATE_CONNECTED);
@@ -575,19 +805,41 @@ int network_set_dns(const char* primary, const char* secondary)
         return -EINVAL;
     }
 
+    /* Register with the NuttX DNS resolver FIRST. CONFIG_NETDB_RESOLVCONF
+     * is off on this board, so the resolver never reads /tmp/resolv.conf —
+     * without this the domain lookup fails with
+     * MBEDTLS_ERR_NET_UNKNOWN_HOST on every HTTPS request. */
+    const char* servers[2] = { primary, secondary };
+    for (int i = 0; i < 2; i++) {
+        struct sockaddr_in addr;
+
+        if (!servers[i] || servers[i][0] == '\0') {
+            continue;
+        }
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        if (inet_pton(AF_INET, servers[i], &addr.sin_addr) != 1) {
+            syslog(LOG_ERR, "[%s] set_dns: invalid addr %s\n",
+                TAG, servers[i]);
+            continue;
+        }
+        dns_add_nameserver((FAR const struct sockaddr*)&addr,
+                           sizeof(addr));
+    }
+
+    /* The file write below is best-effort: /tmp may not exist and the
+     * NuttX resolver does not read this file anyway. */
     fp = fopen("/tmp/resolv.conf", "w");
     if (!fp) {
-        syslog(LOG_ERR, "[%s] Cannot open /tmp/resolv.conf: %d\n",
-            TAG, errno);
-        return -errno;
+        syslog(LOG_WARNING, "[%s] Cannot open /tmp/resolv.conf: %d "
+            "(non-fatal, resolver registered directly)\n", TAG, errno);
+    } else {
+        fprintf(fp, "nameserver %s\n", primary);
+        if (secondary && secondary[0] != '\0') {
+            fprintf(fp, "nameserver %s\n", secondary);
+        }
+        fclose(fp);
     }
-
-    fprintf(fp, "nameserver %s\n", primary);
-    if (secondary && secondary[0] != '\0') {
-        fprintf(fp, "nameserver %s\n", secondary);
-    }
-
-    fclose(fp);
 
     /* Persist to config_store */
     claw_config_set("net.dns_primary", primary);
@@ -663,6 +915,36 @@ int network_rpmsg_init(void)
 
     /* Configure DNS */
     network_set_dns(dns_primary, dns_secondary);
+
+#ifdef CONFIG_AI_AGENT_BLE_NET
+    /* Start BLE SPP + TUN proxy channel (phone companion app) */
+    ret = ble_net_init();
+    if (ret != 0) {
+        syslog(LOG_ERR, "[%s] ble_net_init failed: %d\n", TAG, ret);
+    } else {
+        syslog(LOG_INFO, "[%s] BLE SPP+TUN proxy channel started\n", TAG);
+    }
+#endif
+
+#ifdef CONFIG_AI_AGENT_BLE_GATT
+    /* Start BLE GATT NUS + TUN proxy channel (phone companion app).
+     * Retry with backoff: bluetoothd may still be starting here (no BT
+     * instance yet, or gatts registration fails), and without the
+     * channel the phone can never connect. Each failed attempt cleans
+     * up after itself, so retrying is safe. */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ret = ble_gatt_net_init();
+        if (ret == 0) {
+            syslog(LOG_INFO, "[%s] BLE GATT+TUN proxy channel started\n",
+                TAG);
+            break;
+        }
+        syslog(LOG_WARNING,
+            "[%s] ble_gatt_net_init failed (%d), retry %d/5\n",
+            TAG, ret, attempt + 1);
+        sleep(3);
+    }
+#endif
 
     /* Start interface poll thread */
     g_poll_running = true;

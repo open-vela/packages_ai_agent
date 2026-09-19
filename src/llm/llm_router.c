@@ -49,7 +49,14 @@ static pthread_mutex_t s_router_lock = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_CONSECUTIVE_FAILURES 3
 
 /* Auto-recovery: disabled backends retry after this many seconds */
-#define RECOVERY_INTERVAL_SEC 300
+/* Transient phone-tethering flaps used to cost a full 5 minutes of silent
+ * local-model fallback, then one minute.  Measured bt-pan drops last ~40 s,
+ * so 60 s still meant "the next message is answered by the slow on-device
+ * model" almost every time the link hiccuped.  15 s is short enough that a
+ * recovered link is used again on the next message, while still stopping a
+ * hammering loop against a genuinely dead backend (and the agent now fails
+ * fast on its own when there is no uplink at all). */
+#define RECOVERY_INTERVAL_SEC 15
 
 /* Backoff: ignore rapid failures within this window (seconds) */
 #define BACKOFF_DEBOUNCE_SEC 5

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>小云手表 · 手机对话</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;height:100dvh;display:flex;flex-direction:column;background:#12121f;color:#eef1f7;font:16px/1.5 -apple-system,"PingFang SC",sans-serif}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px 8px}
+h1{margin:0;font-size:18px;font-weight:600}
+h1 span{color:#9aa3b8;font-size:13px;font-weight:400;margin-left:6px}
+#status{font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid #33334d;color:#9aa3b8;white-space:nowrap}
+#status.on{color:#3ddc84;border-color:rgba(61,220,132,.5)}
+#status.bad{color:#ff7676;border-color:rgba(255,118,118,.5)}
+main{flex:1;overflow-y:auto;padding:4px 16px 10px}
+.row{display:flex;margin:10px 0}
+.row.me{justify-content:flex-end}
+.b{max-width:82%;padding:10px 14px;border-radius:16px;background:#262640;border:1px solid #33334d;white-space:pre-wrap;word-break:break-word}
+.row.me .b{background:#2f6fd0;border-color:transparent}
+.m{font-size:11px;color:#9aa3b8;margin:2px 6px 0}
+.row.me+.m{text-align:right}
+#tip{color:#9aa3b8;font-size:14px;text-align:center;margin-top:26vh}
+#chips{display:flex;gap:8px;overflow-x:auto;padding:8px 16px}
+#chips button{flex:0 0 auto;font:inherit;font-size:13px;color:#eef1f7;background:#1a1a2e;border:1px solid #33334d;border-radius:999px;padding:8px 14px}
+footer{display:flex;gap:8px;padding:8px 16px 14px;border-top:1px solid #33334d;background:#1a1a2e}
+#txt{flex:1;font:inherit;color:#eef1f7;background:#12121f;border:1px solid #33334d;border-radius:12px;padding:12px 14px}
+#txt:focus{outline:none;border-color:#2f6fd0}
+#send{font:inherit;font-weight:600;color:#fff;background:#2f6fd0;border:0;border-radius:12px;padding:12px 20px}
+</style>
+</head>
+<body>
+<header>
+<h1>小云手表<span>· 手机对话</span></h1>
+<div id="status">连接中…</div>
+</header>
+<main id="log"><div id="tip">正在通过蓝牙网络连接手表…</div></main>
+<div id="chips">
+<button data-q="3分钟后提醒我喝水">⏰ 3分钟后提醒我喝水</button>
+<button data-q="取消提醒">⏰ 取消提醒</button>
+<button data-q="现在几点了">🕐 现在几点了</button>
+<button data-q="打开客厅的灯">💡 打开客厅的灯</button>
+<button data-q="北京今天天气怎么样">🌤 北京今天天气怎么样</button>
+</div>
+<footer>
+<input id="txt" placeholder="对她说点什么…" autocomplete="off" enterkeyhint="send">
+<button id="send">发送</button>
+</footer>
+<script>
+/* 页面由手表托管（同主机同端口 28789），页面再连同一端口的 WebSocket。
+   被存成本地文件打开时 location.host 为空，退回默认地址。 */
+(function(){
+'use strict';
+var host=location.host||'192.168.44.140:28789',url='ws://'+host+'/';
+var st=document.getElementById('status'),log=document.getElementById('log'),
+tip=document.getElementById('tip'),txt=document.getElementById('txt'),
+ws=null,retry=0;
+
+function status(t,c){st.textContent=t;st.className=c||'';}
+/* 心跳：脚本跑到这里就会请求 /alive。设备日志里能看到这行，就等于证明
+   "页面被完整送达且脚本执行了"——否则说明传输中断在末尾。 */
+try{var beacon=new Image();beacon.src='/alive?t='+Date.now();}catch(e){}
+if(tip)tip.textContent='脚本已运行 · 正在连接手表…';
+function now(){var d=new Date();return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);}
+function add(text,me,src){
+  if(tip){tip.remove();tip=null;}
+  var r=document.createElement('div');r.className='row'+(me?' me':'');
+  var b=document.createElement('div');b.className='b';b.textContent=text;
+  r.appendChild(b);log.appendChild(r);
+  var m=document.createElement('div');m.className='m';
+  /* 标注这次是谁答的：端侧（本地）还是云端 —— 端云协同在界面上可见 */
+  m.textContent=(me?'我':'小云')+' · '+now()+(src?(src==='local'?' · 本地':' · 云端'):'');
+  log.appendChild(m);
+  log.scrollTop=log.scrollHeight;
+}
+function connect(){
+  if(ws&&(ws.readyState===0||ws.readyState===1))return;
+  status('连接中…','');
+  try{ws=new WebSocket(url);}
+  catch(e){status('无法连接','bad');retry++;setTimeout(connect,2000);return;}
+  ws.onopen=function(){
+    retry=0;status('已连接 · 蓝牙网络','on');
+    /* 认领身份：手表会把断线期间暂存的回复立刻补发给我 */
+    try{ws.send(JSON.stringify({type:'hello',chat_id:'phone'}));}catch(e){}
+  };
+  ws.onmessage=function(ev){
+    var d=ev.data;
+    try{var m=JSON.parse(d);if(m&&m.type==='response'&&m.content)return add(m.content,false,m.source);}catch(e){}
+    if(d)add(String(d),false);
+  };
+  ws.onclose=function(){status('已断开 · 自动重连','bad');retry++;setTimeout(connect,Math.min(1500+retry*500,6000));};
+  ws.onerror=function(){};
+}
+function send(t){
+  t=(t||'').trim();if(!t)return;
+  add(t,true);
+  if(ws&&ws.readyState===1){
+    ws.send(JSON.stringify({type:'message',content:t,chat_id:'phone'}));
+    /* "正在思考…" 由手表自己发（agent 的 working 状态语），不在这里重复 */
+  }else{
+    add('（还没连上手表，正在重试…）',false);
+  }
+}
+document.getElementById('send').onclick=function(){send(txt.value);txt.value='';txt.focus();};
+txt.onkeydown=function(e){if(e.key==='Enter'){send(txt.value);txt.value='';}};
+document.getElementById('chips').onclick=function(e){
+  var q=e.target&&e.target.getAttribute&&e.target.getAttribute('data-q');
+  if(q)send(q);
+};
+connect();
+})();
+</script>
+</body>
+</html>

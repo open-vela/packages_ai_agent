@@ -74,25 +74,61 @@ static cJSON *load_json(void)
 
     cJSON *root = cJSON_Parse(buf);
     free(buf);
-    return root ? root : cJSON_CreateObject();
+    if (root) {
+        return root;
+    }
+
+    /* Parse failure used to be silent, and the next claw_config_set()
+     * would then merge into an empty object and save - wiping every other
+     * key in the file. Make it loud. */
+    syslog(LOG_ERR, "[%s] %s is not valid JSON (%ld bytes); "
+           "starting from an empty object\n",
+           TAG, AGENT_CONFIG_FILE, (long)sz);
+    return cJSON_CreateObject();
 }
+
+#define AGENT_CONFIG_TMP AGENT_CONFIG_FILE ".tmp"
 
 static int save_json(cJSON *root)
 {
     char *str = cJSON_PrintUnformatted(root);
     if (!str) return ERROR;
 
-    /* Use open() with explicit 0600 to ensure config file is owner-only.
-     * fopen("w") inherits umask which may be too permissive. */
-    int fd = open(AGENT_CONFIG_FILE,
+    /* Write to a temp file and rename over the target: a partial write
+     * (power cut, flash error) then leaves the previous config intact
+     * instead of a truncated file. That truncation was observed on
+     * hardware - config.json came back holding only the DNS keys after a
+     * failed write, which silently dropped the LLM backend and API key.
+     * 0600 on open() keeps the file owner-only (fopen's umask may not). */
+    int fd = open(AGENT_CONFIG_TMP,
                   O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) { free(str); return ERROR; }
 
     FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); free(str); return ERROR; }
-    fputs(str, f);
-    fclose(f);
+    if (!f) { close(fd); unlink(AGENT_CONFIG_TMP); free(str); return ERROR; }
+
+    int rc = OK;
+    if (fputs(str, f) == EOF || fflush(f) != 0) {
+        syslog(LOG_ERR, "[%s] Short write to %s: %d\n",
+               TAG, AGENT_CONFIG_TMP, errno);
+        rc = ERROR;
+    }
+    if (fclose(f) != 0) {
+        rc = ERROR;
+    }
     free(str);
+
+    if (rc != OK) {
+        unlink(AGENT_CONFIG_TMP);
+        return ERROR;
+    }
+
+    if (rename(AGENT_CONFIG_TMP, AGENT_CONFIG_FILE) != 0) {
+        syslog(LOG_ERR, "[%s] rename %s -> %s failed: %d\n",
+               TAG, AGENT_CONFIG_TMP, AGENT_CONFIG_FILE, errno);
+        unlink(AGENT_CONFIG_TMP);
+        return ERROR;
+    }
     return OK;
 }
 

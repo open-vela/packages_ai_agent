@@ -36,6 +36,10 @@ typedef struct {
     char  chat_id[64];   /**< chat_id (Feishu IDs are ~36 chars) */
     char *content;       /**< Heap-allocated text; receiver must free. */
     char *image_b64;     /**< Optional base64-encoded image; receiver must free. NULL if none. */
+    bool  from_local;    /**< Outbound only: the answer came from the on-device
+                              model, not the cloud.  Lets the phone page and the
+                              watch label the reply ("本地"/"云端") - otherwise
+                              端云协同 is invisible without a serial log. */
 } agent_msg_t;
 
 /** Free heap members (content, image_b64) of a message.
@@ -55,6 +59,10 @@ void message_bus_wakeup(void);
  *  On success the bus takes ownership of heap members.
  *  On failure (queue full / timeout) the caller still owns them. */
 int message_bus_push_inbound(const agent_msg_t *msg);
+
+/** Try to push inbound without waiting.  On success the bus owns heap members;
+ *  on failure the caller retains ownership.  Use from render/UI threads. */
+int message_bus_try_push_inbound(const agent_msg_t *msg);
 
 /** Block until an inbound message is available (or timeout expires).
  *  Caller must free msg->content / msg->image_b64 when done. */

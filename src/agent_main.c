@@ -39,6 +39,7 @@
 #include "core/message_bus_tap.h"
 #include "channels/nsh_commands.h"
 #include "infra/config_store.h"
+#include "infra/time_sync.h"
 #include "infra/cron_service.h"
 #ifdef CONFIG_AI_AGENT_FEISHU
 #include "channels/feishu_bot.h"
@@ -76,13 +77,16 @@
 #endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #include "ui/lvgl_ui_channel.h"
+#ifdef CONFIG_INPUT_BUTTONS
+#include "ui/key_input.h"
+#endif
 #endif
 #ifdef CONFIG_AI_AGENT_BLE_GATT
 #include "infra/ble_cmd_handler.h"
 #include "infra/ble_gatt.h"
+#endif
 #include <bluetooth.h>
 #include <bt_adapter.h>
-#endif
 
 static const char* TAG = "agent";
 
@@ -116,6 +120,7 @@ static void net_state_change_cb(net_state_t state, void* arg)
     (void)arg;
     if (state == NET_STATE_CONNECTED && !g_net_services_started) {
         syslog(LOG_INFO, "[%s] Network recovered, starting services\n", TAG);
+        time_sync_start();
 #ifdef CONFIG_AI_AGENT_FEISHU
         feishu_bot_start();
 #endif
@@ -141,6 +146,61 @@ static void net_state_change_cb(net_state_t state, void* arg)
 }
 #endif
 
+/* ── Classic-BT local name override ──────────────────────────────
+ * The PAN service names the adapter "<prefix>-<MAC>" on every adapter-on
+ * event (panu_service.c: pan_set_local_name_with_mac), which shows up in
+ * the phone's pairing list as a long pseudo-address. Override it app-side
+ * with a product name: wait for the adapter to reach ON, give the PAN
+ * handler a moment to finish, then write our name and read it back.
+ * One-shot task - it exits once done, so there is no resident cost.
+ * If BT is restarted, PAN re-applies its name; re-running this task
+ * (or a reboot) restores ours. */
+#define AGENT_BT_LOCAL_NAME  "小云手表"
+
+static void* bt_name_task(void* arg)
+{
+    bt_instance_t* ins;
+    char cur[64] = { 0 };
+    int i;
+
+    (void)arg;
+
+    ins = bluetooth_get_instance();
+    if (ins == NULL)
+    {
+        syslog(LOG_WARNING, "[%s] bt_name: no bt instance, skipped\n", TAG);
+        return NULL;
+    }
+
+    for (i = 0; i < 60; i++)
+    {
+        if (bt_adapter_get_state(ins) == BT_ADAPTER_STATE_ON)
+        {
+            break;
+        }
+        sleep(1);
+    }
+    if (i >= 60)
+    {
+        syslog(LOG_WARNING, "[%s] bt_name: adapter never reached ON\n", TAG);
+        return NULL;
+    }
+
+    /* Let PAN's own adapter-on handler land first, otherwise it would
+     * overwrite us a moment later. */
+    sleep(3);
+
+    if (bt_adapter_set_name(ins, AGENT_BT_LOCAL_NAME) != BT_STATUS_SUCCESS)
+    {
+        syslog(LOG_WARNING, "[%s] bt_name: set_name failed\n", TAG);
+        return NULL;
+    }
+
+    bt_adapter_get_name(ins, cur, sizeof(cur));
+    syslog(LOG_INFO, "[%s] bt_name: local name now \"%s\"\n", TAG, cur);
+    return NULL;
+}
+
 /**
  * Runs in a background thread: waits for network, then starts all
  * network-dependent services. Main thread is NOT blocked.
@@ -154,6 +214,8 @@ static void* network_watch_task(void* arg)
 
     if (network_wait_connected(30000) == OK) {
         syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, network_get_ip());
+
+        time_sync_start();
 
 #if AGENT_SKILL_SYNC_ENABLED
         /* Sync skills from Bitable before starting agent loop */
@@ -331,6 +393,22 @@ static time_t s_voice_cooldown_until;
  * Reads messages from the outbound queue and dispatches them to the
  * appropriate channel (FeiShu, WebSocket, CLI, etc.).
  */
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+/* Mirror an answer to the watch UI, tagging on-device answers so the pet page
+ * itself shows which half of the 端云 pair answered - without a serial log the
+ * routing is otherwise invisible. */
+static void ui_mirror_answer(const char* text, bool from_local)
+{
+    if (from_local) {
+        char tagged[768];
+        snprintf(tagged, sizeof(tagged), "%s（本地）", text);
+        lvgl_ui_channel_log(tagged, false);
+    } else {
+        lvgl_ui_channel_log(text, false);
+    }
+}
+#endif
+
 static void* outbound_dispatch_task(void* arg)
 {
     (void)arg;
@@ -378,7 +456,12 @@ static void* outbound_dispatch_task(void* arg)
                     TAG);
             }
         } else if (strcmp(msg.channel, AGENT_CHAN_WEBSOCKET) == 0) {
-            ws_server_send(msg.chat_id, msg.content);
+            ws_server_send(msg.chat_id, msg.content, msg.from_local);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* 手机侧对话同样上手表小云：写进历史环与桌宠页文本层，
+             * 用户在桌面时还会被自动带到桌宠页（与 cli 通道一致） */
+            ui_mirror_answer(msg.content, msg.from_local);
+#endif
 #ifdef CONFIG_AI_AGENT_MQTT
         } else if (strcmp(msg.channel, AGENT_CHAN_MQTT) == 0) {
             mqtt_channel_send(msg.chat_id, msg.content);
@@ -435,6 +518,18 @@ static void* outbound_dispatch_task(void* arg)
             fflush(stdout);
             pthread_mutex_unlock(&g_stdout_lock);
             syslog(LOG_INFO, "[agent] [Agent]: %s\n", msg.content);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* Mirror into the chat ring so the pet page history window shows
+             * console conversations too; this channel renders no bubble. */
+            ui_mirror_answer(msg.content, msg.from_local);
+#endif
+        } else if (strcmp(msg.channel, "care") == 0) {
+            /* pet_care L2 follow-up: rendered as a second bubble on the pet
+             * stage (L1 template already went out first). */
+            syslog(LOG_INFO, "[agent] [Care]: %s\n", msg.content);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            lvgl_ui_channel_send(msg.content);
+#endif
         } else {
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }
@@ -622,6 +717,16 @@ int ai_agent_main(int argc, char* argv[])
     }
     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
 
+    /* Agent loop — started here, not only from the network-up callback.  It is
+     * the only consumer of the inbound queue, so leaving it to the network
+     * meant that with no link (or no API key) nothing ever drained a query and
+     * the on-device model was unreachable.  agent_loop_start() is idempotent,
+     * so the later network-up call is a no-op. */
+    if (agent_loop_start() != OK) {
+        syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
+    }
+    BOOT_LOG(&t0, "P5", "agent loop started");
+
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
     /* Quickapp mqueue listener - receives requests from quickapp process */
     if (agent_task_create(quickapp_mq_listener_task, "qapp_mq",
@@ -641,13 +746,21 @@ int ai_agent_main(int argc, char* argv[])
     if (lvgl_ui_channel_start() != OK)
         syslog(LOG_WARNING, "[%s] lvgl_ui_channel_start failed\n", TAG);
     BOOT_LOG(&t0, "P5", "lvgl_ui_channel started");
+#ifdef CONFIG_INPUT_BUTTONS
+    /* Physical keys: Key1 opens the pet page, Key2 asks the on-device model
+     * one of the demo questions.  Started after the UI so the first press
+     * always finds the launcher built. */
+    if (key_input_start() != OK)
+        syslog(LOG_WARNING, "[%s] key_input_start failed\n", TAG);
+    BOOT_LOG(&t0, "P5", "key input started");
+#endif
 #endif
 
 #ifdef CONFIG_AI_AGENT_BLE_GATT
-    /* BLE GATT: ensure adapter enabled, then init with retries */
+    /* BLE GATT: ensure adapter enabled. The data channel (recv_cb) is
+     * owned by the network bridge (ble_gatt_net) which calls ble_gatt_init;
+     * the legacy command channel is disabled to avoid taking the instance. */
     {
-        extern void ble_cmd_handler_recv(const uint8_t* data, uint16_t len,
-            void* user_data);
         bt_instance_t* bt_ins = bluetooth_get_instance();
         if (bt_ins) {
             bt_adapter_state_t state = bt_adapter_get_state(bt_ins);
@@ -657,27 +770,6 @@ int ai_agent_main(int argc, char* argv[])
                 bt_adapter_enable_le(bt_ins);
                 sleep(2);
             }
-        }
-
-        ble_gatt_config_t ble_cfg = {
-            .device_name = "VelaClaw",
-            .recv_cb = ble_cmd_handler_recv,
-        };
-        int rc = -1;
-        int attempts = 0;
-        while (rc < 0 && attempts < 5) {
-            rc = ble_gatt_init(&ble_cfg);
-            if (rc < 0) {
-                syslog(LOG_WARNING, "[%s] ble_gatt_init attempt %d failed: %d\n",
-                    TAG, attempts + 1, rc);
-                sleep(3);
-            }
-            attempts++;
-        }
-        if (rc == 0) {
-            BOOT_LOG(&t0, "P5", "ble_gatt init OK");
-        } else {
-            BOOT_LOG(&t0, "P5", "ble_gatt FAILED after retries");
         }
     }
 #endif
@@ -690,6 +782,13 @@ int ai_agent_main(int argc, char* argv[])
         syslog(LOG_WARNING, "[%s] Failed to start network_watch thread\n", TAG);
     }
     BOOT_LOG(&t0, "P5", "network_watch thread started (async)");
+
+    /* One-shot: rename the adapter once BT is up (see bt_name_task). */
+    if (agent_task_create(bt_name_task, "bt_name", 4096, NULL,
+            AGENT_OUTBOUND_PRIO)
+        != OK) {
+        syslog(LOG_WARNING, "[%s] Failed to start bt_name thread\n", TAG);
+    }
 
     /* ── Phase 6: CLI thread — all services now in known state ── */
     {
