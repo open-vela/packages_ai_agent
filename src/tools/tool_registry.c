@@ -35,6 +35,7 @@
 #include "tools/tool_get_time.h"
 #include "tools/tool_health.h"
 #include "tools/tool_media.h"
+#include "tools/tool_mooncat_coach.h"
 #include "tools/tool_proxyquickapp.h"
 #include "tools/tool_shell.h"
 #include "tools/tool_system.h"
@@ -367,6 +368,29 @@ int tool_registry_init(void)
             "Strength 1-255")
             TOOL_SCHEMA_END(),
         tool_vibrate_execute);
+
+    REGISTER_TOOL(
+        "mooncat_coach_tick",
+        "Evaluate an explicit MoonCat recovery observation. Milestone 1 "
+        "accepts simulated demo data only. mode=preview returns advice; "
+        "mode=execute sends an active [DEMO] notification on channel mooncat "
+        "when the deterministic policy triggers. Process-local cooldown "
+        "prevents repeated cron delivery.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_ENUM("mode", "preview or execute", "\"preview\",\"execute\"") ","
+            TOOL_PARAM_ENUM("source", "Evidence source", "\"simulated\",\"live\"") ","
+            TOOL_PARAM_BOOL("valid", "Whether the observation is valid") ","
+            TOOL_PARAM_BOOL("workout_active", "Whether a workout is active") ","
+            TOOL_PARAM_BOOL("do_not_disturb", "Whether DND is active") ","
+            TOOL_PARAM_NUM("inactivity_minutes", "Minutes without activity") ","
+            TOOL_PARAM_NUM("sleep_debt_minutes", "Estimated sleep debt minutes") ","
+            TOOL_PARAM_NUM("stress_score", "Demo stress score from 0 to 100") ","
+            TOOL_PARAM_NUM("battery_percent", "Battery percentage from 0 to 100")
+            TOOL_SCHEMA_END_REQUIRED(
+                "\"mode\",\"source\",\"valid\",\"workout_active\","
+                "\"do_not_disturb\",\"inactivity_minutes\","
+                "\"sleep_debt_minutes\",\"stress_score\",\"battery_percent\""),
+        tool_mooncat_coach_execute);
 
     /* Feishu document tools */
     REGISTER_TOOL(

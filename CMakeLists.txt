@@ -54,6 +54,8 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_health.c
     src/tools/tool_control.c
     src/tools/tool_media.c
+    src/tools/mooncat_coach_policy.c
+    src/tools/tool_mooncat_coach.c
     src/tools/tool_proxyquickapp.c
     src/tools/skill_loader.c
     src/tools/tool_guard.c
@@ -69,6 +71,13 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/stubs.c
     src/ui/qrcode_display.c
   )
+
+  if(CONFIG_AI_AGENT_LOCAL_TOOL_ROUTER)
+    list(APPEND AGENT_SRCS
+      src/tools/mooncat_local_router.c
+      src/tools/mooncat_intent_model.cc
+    )
+  endif()
 
   # Optional modules
   if(CONFIG_AI_AGENT_FEISHU)
@@ -199,6 +208,11 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_INCDIRS ${ALSA_DIRECT_INC})
   endif()
 
+  set(AGENT_DEPENDS mqttc)
+  if(CONFIG_AI_AGENT_LOCAL_TOOL_ROUTER)
+    list(APPEND AGENT_DEPENDS tflite_micro)
+  endif()
+
   nuttx_add_application(
     NAME
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_PROGNAME}
@@ -207,7 +221,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     INCLUDE_DIRECTORIES
       ${AGENT_INCDIRS}
     DEPENDS
-      mqttc
+      ${AGENT_DEPENDS}
     STACKSIZE
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_STACKSIZE}
     PRIORITY

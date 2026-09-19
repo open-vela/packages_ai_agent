@@ -49,6 +49,16 @@ config EXAMPLES_AI_AGENT_VELA_DATA_DIR
 		Base directory for config, memory and session files.
 		Must be on a writable filesystem (e.g. littlefs, romfs+ramdisk).
 
+config AI_AGENT_LOCAL_TOOL_ROUTER
+	bool "Enable offline MoonCat tool router"
+	default n
+	depends on TFLITEMICRO
+	---help---
+		Run the small int8 MoonCat intent model after the prompt-injection
+		guard and established keyword paths, but before the cloud LLM.
+		Accepted intents call the existing MoonCat and cron tools;
+		low-confidence and out-of-domain input continues to the LLM.
+
 config EXAMPLES_AI_AGENT_VELA_NODE_ID
 	string "Node client ID"
 	default "watch-01"

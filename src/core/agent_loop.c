@@ -32,6 +32,9 @@
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
+#ifdef CONFIG_AI_AGENT_LOCAL_TOOL_ROUTER
+#include "tools/mooncat_local_router.h"
+#endif
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
 #include "agent_compat.h"
@@ -354,8 +357,32 @@ static const nl_intent_t s_intents[] = {
     { NULL,         NULL,               NULL,  0    },
 };
 
+/* Explicit Skill requests and supplied observations need the full agent
+ * context.  Keyword tools and the tiny demo router must not replace the
+ * requested operation or silently substitute their fixed demo observation.
+ * Keep the four simple discovery commands local, including offline use. */
+static bool nl_requires_agent_context(const char *text)
+{
+    static const char *markers[] = {
+        "mooncat-active-coach", "mooncat_coach_tick",
+        "battery_percent", "inactivity_minutes", "sleep_debt_minutes",
+        "stress_score", "workout_active", "do_not_disturb", NULL
+    };
+    if (contains_any(text, markers)) {
+        return true;
+    }
+    if (!strcasecmp(text, "list skill") || !strcasecmp(text, "list skills") ||
+        !strcmp(text, "技能列表") || !strcmp(text, "有什么技能")) {
+        return false;
+    }
+    return strcasestr(text, "skill") != NULL || strstr(text, "技能") != NULL;
+}
+
 static char* handle_nl_fast_path(const char* text)
 {
+    if (!text || nl_requires_agent_context(text)) {
+        return NULL;
+    }
     /* Table-driven: scan intents, first match wins */
     for (int i = 0; s_intents[i].keywords; i++) {
         if (contains_any(text, s_intents[i].keywords)) {
@@ -488,7 +515,12 @@ static char* handle_nl_fast_path(const char* text)
         }
     }
 
+#ifdef CONFIG_AI_AGENT_LOCAL_TOOL_ROUTER
+    /* Preserve all established keyword routes; NULL continues to cloud LLM. */
+    return mooncat_local_router_handle(text);
+#else
     return NULL;
+#endif
 }
 
 /* ── Handle slash commands + NL fast path (bypass LLM) ─── */
