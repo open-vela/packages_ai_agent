@@ -22,6 +22,7 @@
 #endif
 #include "core/message_bus.h"
 #include "infra/config_store.h"
+#include "infra/network_manager.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 #include "voice/audio_capture.h"
@@ -30,6 +31,8 @@
 #include "voice/voice_tts.h"
 #include "voice/volc_asr.h"
 #include "voice/volc_tts.h"
+#include "voice/mimo_tts.h"
+#include "voice/mimo_asr.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -551,37 +554,14 @@ static void* asr_and_dispatch(void* arg)
     return NULL;
 }
 
-/* ── TTS streaming callback ──────────────────────────────── */
+/* ── TTS streaming timing ───────────────────────────────── */
 
+/* s_tts_start is set at the top of voice_channel_speak(); s_tts_first_chunk
+ * is cleared there and set by the first PCM chunk captured during the
+ * fetch-then-play pipeline (see tts_capture_cb below). */
 static struct timespec s_tts_start;
 static int s_tts_first_chunk;
 static struct timespec s_asr_done_ts;
-
-static void tts_stream_cb(const unsigned char* pcm_data,
-    size_t pcm_len, int is_last, void* user_data)
-{
-    audio_playback_t* pb = (audio_playback_t*)user_data;
-
-    /* Abort early if PTT recording started */
-    if (s_voice.tts_abort) {
-        return;
-    }
-
-    if (pcm_data && pcm_len > 0 && pb) {
-        if (!s_tts_first_chunk) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long ms = (now.tv_sec - s_tts_start.tv_sec) * 1000
-                + (now.tv_nsec - s_tts_start.tv_nsec) / 1000000;
-            syslog(LOG_INFO, "[%s] TTS first chunk: %ldms\n",
-                TAG, ms);
-            s_tts_first_chunk = 1;
-        }
-        audio_playback_write(pb, pcm_data, pcm_len);
-    }
-
-    (void)is_last;
-}
 
 /* ── Public API ──────────────────────────────────────────── */
 
@@ -601,7 +581,14 @@ int voice_channel_init(void)
     sem_init(&s_voice.rec_ready, 0, 0);
 
     if (!s_backends_registered) {
+        /* MiMo first so it becomes the default active TTS backend. */
+        mimo_tts_register();
         volc_tts_register();
+        /* MiMo ASR first so it becomes the default batch-ASR backend
+         * (the wake-word loop calls voice_asr_recognize(), which uses the
+         * first-registered backend). Streaming PTT still uses volc via
+         * voice_asr_stream_*(), so this does not change that path. */
+        mimo_asr_register();
         volc_asr_register();
         s_backends_registered = 1;
     }
@@ -989,6 +976,343 @@ static void tts_strip_markdown(char* s)
     *w = '\0';
 }
 
+/* ── Sentence chunking for TTS ──────────────────────────────── */
+
+/* Return the byte length of a sentence-terminating punctuation mark at
+ * *p (0 if *p is not a terminator). Full-width Chinese punctuation is
+ * 3 bytes in UTF-8, so we match the whole character, not just one byte. */
+static int tts_sentence_end_len(const char* p)
+{
+    static const char* const TERM[] = {
+        "。", "！", "？", "；", "…", "\n", "!", "?", ";", ".", "~", NULL
+    };
+
+    for (int i = 0; TERM[i] != NULL; i++) {
+        size_t n = strlen(TERM[i]);
+
+        if (strncmp(p, TERM[i], n) == 0) {
+            return (int)n;
+        }
+    }
+
+    return 0;
+}
+
+/* ── TTS: fetch-then-play ───────────────────────────────────── */
+
+/* One sentence's decoded PCM (owned). Sentences are fetched sequentially,
+ * buffered, then played back-to-back so the story reads continuously with
+ * no network-sized silence between sentences. */
+typedef struct {
+    unsigned char* pcm;
+    size_t pcm_len;
+    size_t pcm_cap;
+    int rc;   /* 0 on success; backend error, or -ENOMEM on capture failure */
+} tts_buf_t;
+
+/* Capture callback: accumulate streamed PCM into b->pcm. (voice_tts_chunk_cb
+ * returns void, so a capture failure just sets b->rc and stops copying.) */
+static void tts_capture_cb(const unsigned char* pcm, size_t len,
+    int is_last, void* user_data)
+{
+    tts_buf_t* b = user_data;
+    (void)is_last;
+
+    if (s_voice.tts_abort || b->rc != 0) {
+        return;
+    }
+
+    if (pcm && len > 0) {
+        if (!s_tts_first_chunk) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long ms = (now.tv_sec - s_tts_start.tv_sec) * 1000
+                + (now.tv_nsec - s_tts_start.tv_nsec) / 1000000;
+            syslog(LOG_INFO, "[%s] TTS first chunk: %ldms\n", TAG, ms);
+            s_tts_first_chunk = 1;
+        }
+
+        if (b->pcm_len + len > b->pcm_cap) {
+            size_t ncap = b->pcm_cap ? b->pcm_cap : 0;
+            while (ncap < b->pcm_len + len) {
+                ncap = ncap ? ncap * 2 : (64 * 1024);
+            }
+            unsigned char* nd = realloc(b->pcm, ncap);
+            if (!nd) {
+                b->rc = -ENOMEM;
+                return;
+            }
+            b->pcm = nd;
+            b->pcm_cap = ncap;
+        }
+        memcpy(b->pcm + b->pcm_len, pcm, len);
+        b->pcm_len += len;
+    }
+}
+
+/* Copy a [s, s+len) slice into a NUL-terminated string with leading
+ * whitespace stripped; returns NULL if nothing but whitespace remains. */
+static char* tts_slice_dup(const char* s, int len)
+{
+    char* d = malloc(len + 1);
+    if (!d) {
+        return NULL;
+    }
+    memcpy(d, s, len);
+    d[len] = '\0';
+
+    char* c = d;
+    while (*c == ' ' || *c == '\n' || *c == '\t' || *c == '\r') {
+        c++;
+    }
+    if (*c == '\0') {
+        free(d);
+        return NULL;
+    }
+    if (c != d) {
+        memmove(d, c, strlen(c) + 1);
+    }
+    return d;
+}
+
+/* ── TTS: pipelined fetch + play ───────────────────────────────
+ *
+ * Synthesize text one sentence at a time (each sentence is its own MiMo TTS
+ * request, so a long reply never overflows MIMO_TTS_RESP_SIZE), but overlap
+ * synthesis with playback: a fetch thread runs one sentence ahead while the
+ * caller writes the previous sentence to the already-open ALSA stream. This
+ * drops time-to-first-word from "sum of all fetches" to "first sentence's
+ * fetch" and hides the remaining network latency behind playback — roughly
+ * halving the total for a multi-sentence story.
+ *
+ * Playback stays a single ALSA session (open once in voice_channel_speak(),
+ * write N times here, close once), so the codec's external-speaker PA re-arm
+ * issue — which made the old per-sentence open/close only play the first
+ * sentence — is NOT reintroduced. Capacity 2 prefetches at most one sentence,
+ * so a slow network can't exhaust memory; a fetch slower than its sentence's
+ * playback just leaves a brief silence before the next sentence. */
+
+#define TTS_PIPE_CAP 2
+
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;           /* broadcast on filled-- (space) / filled++ (data) */
+    tts_buf_t       slots[TTS_PIPE_CAP];
+    const char* const* slice_start;
+    const int*      slice_len;
+    int             nslices;
+    int             put_idx;        /* producer fills slots[put_idx] */
+    int             get_idx;        /* consumer drains slots[get_idx] */
+    int             filled;         /* produced-but-not-drained slots */
+    int             producer_done;
+    int             abort;          /* consumer -> producer: stop */
+} tts_pipe_t;
+
+/* Producer: synthesize sentences in order, one ahead of the consumer, so the
+ * playback of sentence i overlaps the fetch of sentence i+1. */
+static void* tts_fetch_thread(void* arg)
+{
+    tts_pipe_t* p = arg;
+
+    for (int i = 0; i < p->nslices; i++) {
+        pthread_mutex_lock(&p->lock);
+        while (p->filled == TTS_PIPE_CAP && !p->abort && !s_voice.tts_abort) {
+            pthread_cond_wait(&p->cond, &p->lock);
+        }
+        if (p->abort || s_voice.tts_abort) {
+            pthread_mutex_unlock(&p->lock);
+            break;
+        }
+        tts_buf_t* b = &p->slots[p->put_idx];
+        pthread_mutex_unlock(&p->lock);
+
+        int net_down = 0;
+        if (!network_is_connected()) {
+            syslog(LOG_WARNING, "[%s] network down, stopping TTS\n", TAG);
+            b->rc = -EIO;
+            net_down = 1;
+        } else {
+            char* sent = tts_slice_dup(p->slice_start[i], p->slice_len[i]);
+            if (!sent) {
+                b->rc = -ENOMEM;
+            } else {
+                int r = voice_tts_speak_stream(sent, tts_capture_cb, b);
+                free(sent);
+                /* Keep a capture failure (e.g. -ENOMEM) over a clean backend result. */
+                if (b->rc == 0) {
+                    b->rc = r;
+                }
+            }
+        }
+
+        pthread_mutex_lock(&p->lock);
+        p->put_idx = (p->put_idx + 1) % TTS_PIPE_CAP;
+        p->filled++;
+        pthread_cond_broadcast(&p->cond);
+        pthread_mutex_unlock(&p->lock);
+
+        if (net_down) {
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&p->lock);
+    p->producer_done = 1;
+    pthread_cond_broadcast(&p->cond);
+    pthread_mutex_unlock(&p->lock);
+    return NULL;
+}
+
+static int tts_speak_chunked(const char* text, audio_playback_t* pb)
+{
+    /* First pass: split into sentence slices. */
+    #define MAX_SLICES 128
+    const char* slice_start[MAX_SLICES];
+    int slice_len[MAX_SLICES];
+    int nslices = 0;
+
+    const char* start = text;
+    while (*start && nslices < MAX_SLICES) {
+        const char* p = start;
+        int tlen = 0;
+        while (*p) {
+            tlen = tts_sentence_end_len(p);
+            if (tlen > 0) {
+                break;
+            }
+            p++;
+        }
+
+        const char* end;
+        if (*p) {
+            end = p + tlen;
+
+            /* Absorb immediately-following terminators (e.g. "!!!") so
+             * they don't become empty one-punctuation sentences. */
+            while (*end) {
+                int n = tts_sentence_end_len(end);
+                if (n > 0) {
+                    end += n;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            end = p; /* end of string */
+        }
+
+        if (end > start) {
+            slice_start[nslices] = start;
+            slice_len[nslices] = (int)(end - start);
+            nslices++;
+        }
+
+        if (*end == '\0') {
+            break;
+        }
+        start = end;
+    }
+
+    if (nslices == 0) {
+        return -EPROTO;
+    }
+
+    tts_pipe_t p;
+    memset(&p, 0, sizeof(p));
+    pthread_mutex_init(&p.lock, NULL);
+    pthread_cond_init(&p.cond, NULL);
+    p.slice_start = slice_start;
+    p.slice_len = slice_len;
+    p.nslices = nslices;
+
+    int first_err = 0;
+    int any_ok = 0;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, AGENT_VOICE_STACK);
+    pthread_t tid;
+    int created = (pthread_create(&tid, &attr, tts_fetch_thread, &p) == 0);
+    pthread_attr_destroy(&attr);
+
+    if (!created) {
+        /* Synchronous fallback: fetch + play each sentence in order. */
+        syslog(LOG_ERR, "[%s] TTS fetch thread failed; sync fallback\n", TAG);
+        for (int i = 0; i < nslices && !s_voice.tts_abort; i++) {
+            tts_buf_t b;
+            memset(&b, 0, sizeof(b));
+            char* sent = tts_slice_dup(slice_start[i], slice_len[i]);
+            if (!sent) {
+                if (first_err == 0) {
+                    first_err = -ENOMEM;
+                }
+                continue;
+            }
+            int r = voice_tts_speak_stream(sent, tts_capture_cb, &b);
+            free(sent);
+            if (b.rc == 0) {
+                b.rc = r;
+            }
+            if (b.rc == 0 && b.pcm_len > 0) {
+                audio_playback_write(pb, b.pcm, b.pcm_len);
+                any_ok = 1;
+            } else if (b.rc != 0 && first_err == 0) {
+                first_err = b.rc;
+            }
+            free(b.pcm);
+        }
+        pthread_cond_destroy(&p.cond);
+        pthread_mutex_destroy(&p.lock);
+        #undef MAX_SLICES
+        return any_ok ? 0 : (first_err ? first_err : -EPROTO);
+    }
+
+    /* Consumer: drain sentences in order, writing each to the open stream. */
+    for (int i = 0; i < nslices; i++) {
+        pthread_mutex_lock(&p.lock);
+        while (p.filled == 0 && !p.producer_done && !s_voice.tts_abort) {
+            pthread_cond_wait(&p.cond, &p.lock);
+        }
+        if (p.filled == 0) {
+            pthread_mutex_unlock(&p.lock);
+            break;
+        }
+
+        tts_buf_t b = p.slots[p.get_idx];   /* take ownership */
+        memset(&p.slots[p.get_idx], 0, sizeof(b));
+        p.get_idx = (p.get_idx + 1) % TTS_PIPE_CAP;
+        p.filled--;
+        pthread_cond_broadcast(&p.cond);    /* free a slot for the producer */
+        pthread_mutex_unlock(&p.lock);
+
+        if (s_voice.tts_abort) {
+            free(b.pcm);
+            break;
+        }
+
+        if (b.rc == 0 && b.pcm_len > 0) {
+            audio_playback_write(pb, b.pcm, b.pcm_len);
+            any_ok = 1;
+        } else if (b.rc != 0 && first_err == 0) {
+            first_err = b.rc;
+        }
+        free(b.pcm);
+    }
+
+    /* Stop the producer and wait for it before returning. */
+    pthread_mutex_lock(&p.lock);
+    p.abort = 1;
+    pthread_cond_broadcast(&p.cond);
+    pthread_mutex_unlock(&p.lock);
+    pthread_join(tid, NULL);
+
+    pthread_cond_destroy(&p.cond);
+    pthread_mutex_destroy(&p.lock);
+
+    #undef MAX_SLICES
+    return any_ok ? 0 : (first_err ? first_err : -EPROTO);
+}
+
 int voice_channel_speak(const char* text)
 {
     if (!text || text[0] == '\0') {
@@ -1071,9 +1395,9 @@ int voice_channel_speak(const char* text)
     s_voice.tts_pb = pb;
     pthread_mutex_unlock(&s_voice.lock);
 
-    /* Use streaming TTS: each chunk writes to playback file */
-    int ret = voice_tts_speak_stream(clean,
-        tts_stream_cb, pb);
+    /* Use streaming TTS, split sentence-by-sentence so a long story
+     * doesn't overflow the TTS response buffer. */
+    int ret = tts_speak_chunked(clean, pb);
 
     struct timespec tts_net;
     clock_gettime(CLOCK_MONOTONIC, &tts_net);

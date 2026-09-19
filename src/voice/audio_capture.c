@@ -27,6 +27,7 @@
 
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
 #include <aw-alsa-lib/pcm.h>
+#include <aw-alsa-lib/control.h>
 #endif
 #include <errno.h>
 #include <media_recorder.h>
@@ -275,6 +276,51 @@ static void downmix_interleaved_s16_to_mono(audio_capture_t* cap,
     }
 }
 
+/*
+ * The codec's analog MIC front-end (MIC PGA + MICBIAS) is NOT enabled by the
+ * codec driver on boot, and the DAPM power-up in sunxi_codec_dapm_control only
+ * runs AFTER hw_params.  sunxi_codec_hw_params() -> sunxi_get_adc_ch() reads the
+ * MIC_PGA_EN bits and rejects capture with "capture only support 1~3 channel"
+ * (-EINVAL) when none is armed.  The machine driver normally sets these via
+ * snd_ctl_set() in sunxi_audio_start(), but the direct-ALSA capture path here
+ * bypasses that, so we must arm the MIC input switch(es) + ADC digital volume
+ * ourselves before opening the PCM.  Mirror sunxi_alsa.c:821-845.
+ */
+#define CAP_CODEC_CARD_NAME "audiocodec"
+#define CAP_ADC_INIT_VOLUME 160
+
+static void enable_codec_mic(unsigned int nchannels)
+{
+    const char* card = CAP_CODEC_CARD_NAME;
+
+    switch (nchannels) {
+    case 1:
+        snd_ctl_set(card, "MIC1 input switch", 1);
+        snd_ctl_set(card, "ADC1_2 digital volume switch", 1);
+        snd_ctl_set(card, "ADC1 digital volume", CAP_ADC_INIT_VOLUME);
+        break;
+    case 2:
+        snd_ctl_set(card, "MIC1 input switch", 1);
+        snd_ctl_set(card, "MIC2 input switch", 1);
+        snd_ctl_set(card, "ADC1_2 digital volume switch", 1);
+        snd_ctl_set(card, "ADC1 digital volume", CAP_ADC_INIT_VOLUME);
+        snd_ctl_set(card, "ADC2 digital volume", CAP_ADC_INIT_VOLUME);
+        break;
+    case 3:
+        snd_ctl_set(card, "MIC1 input switch", 1);
+        snd_ctl_set(card, "MIC2 input switch", 1);
+        snd_ctl_set(card, "MIC3 input switch", 1);
+        snd_ctl_set(card, "ADC1_2 digital volume switch", 1);
+        snd_ctl_set(card, "ADC3 digital volume switch", 1);
+        snd_ctl_set(card, "ADC1 digital volume", CAP_ADC_INIT_VOLUME);
+        snd_ctl_set(card, "ADC2 digital volume", CAP_ADC_INIT_VOLUME);
+        snd_ctl_set(card, "ADC3 digital volume", CAP_ADC_INIT_VOLUME);
+        break;
+    default:
+        break;
+    }
+}
+
 static int open_alsa_capture(audio_capture_t* cap, const char* dev_path,
     unsigned int sample_rate, unsigned int channels,
     unsigned int bits_per_sample)
@@ -297,7 +343,13 @@ static int open_alsa_capture(audio_capture_t* cap, const char* dev_path,
     for (int i = 0; i < attempt_count; i++) {
         snd_pcm_t* pcm = NULL;
         unsigned int hw_channels = attempts[i];
-        int ret = snd_vela_pcm_open(&pcm, alsa_name,
+        int ret;
+
+        /* Arm the analog MIC front-end before hw_params, keyed to the
+         * channel count we are about to open (see enable_codec_mic). */
+        enable_codec_mic(hw_channels);
+
+        ret = snd_vela_pcm_open(&pcm, alsa_name,
             SND_VELA_PCM_STREAM_CAPTURE, 0);
 
         if (ret < 0) {

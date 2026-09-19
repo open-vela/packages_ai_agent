@@ -431,10 +431,20 @@ int volc_tts_synthesize_compat(const char* text,
 }
 
 /* Backend ops registration */
+
+static int volc_tts_synthesize_stream_adapt(const char* text,
+    voice_tts_chunk_cb cb,
+    void* user_data)
+{
+    return volc_tts_ws_synthesize_stream(text,
+        (volc_tts_chunk_cb)cb, user_data);
+}
+
 static const voice_tts_ops_t s_volc_tts_ops = {
     .name = "volcengine",
     .init = volc_tts_init,
     .synthesize = volc_tts_synthesize,
+    .synthesize_stream = volc_tts_synthesize_stream_adapt,
     .deinit = NULL,
 };
 
