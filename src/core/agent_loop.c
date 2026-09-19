@@ -28,6 +28,7 @@
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
+#include "infra/network_manager.h"
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
@@ -841,6 +842,11 @@ static char* force_finish_reply(const char* system_prompt,
 
 /* ── Extracted: dispatch response to outbound bus ─────────── */
 
+/* Set by run_react_loop when the answer came from the on-device model, so the
+ * reply can be labelled on the phone page and on the watch.  The agent loop
+ * handles one message at a time, so a plain static is enough. */
+static bool s_answer_from_local;
+
 static void dispatch_response(const agent_msg_t* msg,
     char* final_text)
 {
@@ -854,6 +860,7 @@ static void dispatch_response(const agent_msg_t* msg,
         strncpy(out.chat_id, msg->chat_id,
             sizeof(out.chat_id) - 1);
         out.content = final_text;
+        out.from_local = s_answer_from_local;
         if (message_bus_push_outbound(&out) != OK) {
             free(final_text);
         }
@@ -1024,6 +1031,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     int iteration;
     char* final_text = NULL;
 
+    s_answer_from_local = false;   /* cleared per request; set on local fallback */
     prev_sig[0] = '\0';
     dup_count = 0;
     prev_name[0] = '\0';
@@ -1066,13 +1074,29 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         llm_response_t resp;
         struct timeval tv_start, tv_end;
+        bool uplink_down = false;
+        int err;
+
         gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        if (network_get_state() != NET_STATE_CONNECTED) {
+            /* No uplink: a cloud call could only hang until the socket
+             * timeout and fall back anyway, so answer from the on-device
+             * model right away.  Deliberately NOT counted as a backend
+             * failure (llm_router_report_failure) - the backend is fine,
+             * the radio is not, and penalising it would take the cloud down
+             * for the whole recovery window even after the link returns. */
+            syslog(LOG_WARNING,
+                "[%s] no uplink, answering on-device (cloud skipped)\n", TAG);
+            err = ERROR;
+            uplink_down = true;
+        } else {
+            err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        }
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
         /* Router failover: on LLM call failure, try next backend */
-        if (err != OK && router_idx >= 0) {
+        if (err != OK && router_idx >= 0 && !uplink_down) {
             syslog(LOG_WARNING,
                 "[%s] LLM call failed on backend %d, trying failover\n",
                 TAG, router_idx);
@@ -1119,6 +1143,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             if (local_lm_available() &&
                 local_lm_reply(msg->content, &local_text) == 0) {
                 final_text = local_text;
+                s_answer_from_local = true;   /* label the reply 本地 */
                 break;
             }
 
@@ -1545,6 +1570,11 @@ static void* agent_loop_task(void* arg)
             strncpy(out.chat_id, msg.chat_id,
                 sizeof(out.chat_id) - 1);
             out.content = reply;
+            /* Slash commands and the NL fast path (时间/电量/心率/步数/音乐,
+             * 技能列表, 天气) are handled on the device by tools - no model is
+             * involved, so label them 本地 rather than letting them inherit
+             * the default 云端. */
+            out.from_local = true;
             if (message_bus_push_outbound(&out) != OK) {
                 free(reply);
             }

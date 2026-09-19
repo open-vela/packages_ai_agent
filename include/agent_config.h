@@ -121,13 +121,20 @@
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
  * acts as the hard backstop that actually unblocks the read. */
-#define AGENT_LLM_TIMEOUT_SEC 60
+/* 90 s, not 60: this watchdog runs *after* the call returns and a call that
+ * succeeded but took longer would have its perfectly good answer thrown away
+ * and replaced by a timeout message.  Measured single StepFun round trips
+ * reach ~45 s (two-iteration tool questions double that), so it must sit
+ * above the socket timeout below, not below it. */
+#define AGENT_LLM_TIMEOUT_SEC 90
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
- * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
- * watchdog to fire first on normal slow responses.  Set higher
- * to cover TLS handshake + full response read. */
-#define AGENT_LLM_SOCKET_TIMEOUT_SEC 120
+ *
+ * Was 120 s: on a half-dead bt-pan link a request could hang for two minutes
+ * before the fallback to the on-device model even started.  60 s still
+ * covers real responses (single round trips measured at 4-45 s) while
+ * halving the worst-case wait. */
+#define AGENT_LLM_SOCKET_TIMEOUT_SEC 60
 
 /* ── Timezone (POSIX TZ format) ────────────────────────────── */
 #define AGENT_TIMEZONE "CST-8"
