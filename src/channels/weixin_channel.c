@@ -604,6 +604,8 @@ int weixin_channel_login(char* qr_url, size_t qr_cap,
     int rc = vela_https_get(s_host, s_port,
         "/ilink/bot/get_bot_qrcode?bot_type=3",
         resp_buf, sizeof(resp_buf));
+    syslog(LOG_INFO, "[%s] get_bot_qrcode host=%s port=%s rc=%d body=%.256s\n",
+        TAG, s_host, s_port, rc, resp_buf);
     if (rc != 200) {
         syslog(LOG_WARNING, "[%s] get_bot_qrcode HTTP %d\n", TAG, rc);
         return -1;
