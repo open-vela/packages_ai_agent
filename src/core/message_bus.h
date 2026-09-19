@@ -36,6 +36,13 @@ typedef struct {
     char  chat_id[64];   /**< chat_id (Feishu IDs are ~36 chars) */
     char *content;       /**< Heap-allocated text; receiver must free. */
     char *image_b64;     /**< Optional base64-encoded image; receiver must free. NULL if none. */
+    uint8_t internal;    /**< Non-zero: machine-generated prompt, not something a
+                          *   person said. A cron wake-up reuses the session's
+                          *   channel and chat_id so its reply lands back with
+                          *   the user, which leaves the message itself
+                          *   indistinguishable from real user input -- and the
+                          *   watch screen would show the agent's own scheduler
+                          *   prompt in a user bubble. */
 } agent_msg_t;
 
 /** Free heap members (content, image_b64) of a message.

@@ -115,14 +115,23 @@
  * If llm_chat_tools takes longer than this, the agent treats it as
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
- * acts as the hard backstop that actually unblocks the read. */
-#define AGENT_LLM_TIMEOUT_SEC 60
+ * acts as the hard backstop that actually unblocks the read.
+ *
+ * Sized for a real endpoint reached over this board's PPP link, not for a
+ * mock on the host. A request carrying the system prompt and every tool
+ * definition is ~15.5 KB, and the link carries roughly 6 KB/s with the
+ * microphone stream running -- so the round trip to a hosted model measures
+ * around 83 s here, and a 60 s limit threw away perfectly good answers
+ * ("Response: ... 1 tool calls" followed immediately by "treating as
+ * timeout"). The phone-home latency is not the model's; it is the wire.
+ */
+#define AGENT_LLM_TIMEOUT_SEC 180
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
  * watchdog to fire first on normal slow responses.  Set higher
  * to cover TLS handshake + full response read. */
-#define AGENT_LLM_SOCKET_TIMEOUT_SEC 120
+#define AGENT_LLM_SOCKET_TIMEOUT_SEC 240
 
 /* ── Timezone (POSIX TZ format) ────────────────────────────── */
 #define AGENT_TIMEZONE "CST-8"

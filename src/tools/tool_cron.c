@@ -196,6 +196,12 @@ int tool_cron_add_execute(const char* input_json,
         strncpy(job.action_args, action_args, sizeof(job.action_args) - 1);
     }
 
+    /* wake_agent: the message is a prompt for the agent loop instead of a
+     * canned reminder. The agent acts on it (tools/skills) and its reply is
+     * delivered to channel/chat_id — used for proactive scheduled tasks. */
+    cJSON* wake = cJSON_GetObjectItem(root, "wake_agent");
+    job.wake_agent = wake ? cJSON_IsTrue(wake) : false;
+
     if (strcmp(job.channel, AGENT_CHAN_FEISHU) == 0
         && (job.chat_id[0] == '\0'
             || strcmp(job.chat_id, "cron") == 0)) {

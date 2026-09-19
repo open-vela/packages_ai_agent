@@ -161,6 +161,9 @@ static int cron_parse_job_item(cJSON* item, cron_job_t* job)
         strncpy(job->action_args, action_args, sizeof(job->action_args) - 1);
     }
 
+    cJSON* wake = cJSON_GetObjectItem(item, "wake_agent");
+    job->wake_agent = wake ? cJSON_IsTrue(wake) : false;
+
     return OK;
 }
 
@@ -280,6 +283,10 @@ static int cron_save_jobs(void)
             cJSON_AddStringToObject(item, "action_args", job->action_args);
         }
 
+        if (job->wake_agent) {
+            cJSON_AddBoolToObject(item, "wake_agent", true);
+        }
+
         cJSON_AddItemToArray(jobs_arr, item);
     }
 
@@ -321,6 +328,33 @@ static int cron_save_jobs(void)
 static void cron_fire_job(cron_job_t* job, time_t now)
 {
     syslog(LOG_INFO, "[%s] Cron job firing: %s (%s)\n", TAG, job->name, job->id);
+
+    if (job->wake_agent) {
+        /* Proactive agent turn: the message is a prompt for the agent loop,
+         * not a canned notification. The agent decides what to do (it may
+         * call tools and consult skills), and its reply is delivered to
+         * channel/chat_id by the normal outbound path. */
+        agent_msg_t msg;
+        memset(&msg, 0, sizeof(msg));
+        strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
+        strncpy(msg.chat_id, job->chat_id, sizeof(msg.chat_id) - 1);
+        msg.content = strdup(job->message);
+        msg.internal = 1;  /* a prompt we wrote to ourselves, not user input */
+
+        if (msg.content) {
+            syslog(LOG_INFO, "[%s] Waking agent: channel=%s chat_id=%s\n",
+                TAG, msg.channel, msg.chat_id);
+            if (message_bus_push_inbound(&msg) != OK) {
+                syslog(LOG_WARNING, "[%s] Failed to wake agent\n", TAG);
+                free(msg.content);
+            }
+        } else {
+            syslog(LOG_WARNING, "[%s] OOM waking agent\n", TAG);
+        }
+
+        job->last_run = now;
+        return;
+    }
 
     if (job->action[0] != '\0') {
         /* Direct tool execution — no queue contention with agent loop */

@@ -26,4 +26,10 @@
 
 int ws_server_start(void);
 int ws_server_send(const char *chat_id, const char *text);
+int ws_server_send_json(const char *chat_id, const char *json);
+/* 广播控制帧给所有已连接客户端。用于事件源头在设备侧、却不知道宿主
+ * chat_id 的场景（屏幕上的 PTT 按钮就是：拿不到 chat_id，建屏时宿主
+ * 甚至可能还没连上来）。返回 OK 表示至少发出去一份。 */
+int ws_server_broadcast_json(const char *json);
+int ws_server_send_binary(const char *chat_id, const void *data, size_t len);
 int ws_server_stop(void);

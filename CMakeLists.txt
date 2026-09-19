@@ -40,6 +40,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/channels/cmd_voice.c
     src/channels/cmd_channel.c
     src/channels/ws_server.c
+    src/channels/mic_stream.c
     src/tools/tool_registry.c
     src/tools/tool_files.c
     src/tools/tool_get_time.c
@@ -100,6 +101,19 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   if(CONFIG_AI_AGENT_LVGL_UI)
     list(APPEND AGENT_SRCS src/ui/lvgl_ui_channel.c)
+    # Compiled-in CJK font for the chat UI. The chat text is Chinese; LVGL's
+    # built-in fonts have no CJK glyphs and the uikit font manager needs
+    # FreeType plus a .ttf on the device, neither of which this firmware has.
+    if(CONFIG_AI_AGENT_LVGL_UI_CJK_FONT)
+      list(APPEND AGENT_SRCS src/ui/fonts/lv_font_misans_18_cjk.c)
+    endif()
+  endif()
+
+  # On-board MEMS microphone bring-up commands. The capture driver itself
+  # lives in the chip layer (vendor/sifli/chips/sf32lb52), which is where the
+  # AUDCODEC HAL headers are reachable from.
+  if(CONFIG_SF32LB52_AUDCODEC)
+    list(APPEND AGENT_SRCS src/channels/cmd_mic.c)
   endif()
 
   if(CONFIG_AI_AGENT_CAMERA)
@@ -162,6 +176,9 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   # MQTT-C library
   set(MQTTC_INC ${NUTTX_APPS_DIR}/netutils/mqttc/MQTT-C/include)
 
+  # SIFLI chip drivers (AUDCODEC microphone capture)
+  set(SIFLI_CHIP_INC ${CMAKE_SOURCE_DIR}/../vendor/sifli/chips/sf32lb52/include)
+
   # Direct ALSA capture backend (chip-specific, opt-in)
   if(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT)
     set(ALSA_DIRECT_INC
@@ -193,6 +210,10 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
     list(APPEND AGENT_INCDIRS ${BES_AEC_INC})
+  endif()
+
+  if(CONFIG_SF32LB52_AUDCODEC)
+    list(APPEND AGENT_INCDIRS ${SIFLI_CHIP_INC})
   endif()
 
   if(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT)

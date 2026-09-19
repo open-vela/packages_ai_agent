@@ -24,6 +24,7 @@
  */
 
 #include "ui/lvgl_ui_channel.h"
+#include "channels/ws_server.h"
 #include "core/message_bus.h"
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -37,12 +38,39 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
-#include <uikit/uikit_font_manager.h>
 #include <unistd.h>
+
+/* CJK font sources, in order of preference:
+ *   1. uikit's font manager — needs CONFIG_UIKIT + LV_USE_FREETYPE and a .ttf
+ *      deployed on the device at runtime (the original design).
+ *   2. A font compiled into the firmware (CONFIG_AI_AGENT_LVGL_UI_CJK_FONT) —
+ *      no runtime dependency, which is what standalone agent firmware uses.
+ * Without either, the file must still build: the chat text is Chinese, so it
+ * would then render blank with LVGL's built-in Montserrat. This include used
+ * to be unconditional, which made the whole channel fail to compile whenever
+ * uikit was absent. */
+#if defined(CONFIG_UIKIT) && defined(CONFIG_UIKIT_FONT_MANAGER)
+#include <uikit/uikit_font_manager.h>
+#define LVGL_UI_HAVE_CJK_FONT 1
+#else
+#define LVGL_UI_HAVE_CJK_FONT 0
+#endif
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI_CJK_FONT)
+extern const lv_font_t lv_font_misans_18_cjk;
+#define LVGL_UI_BUILTIN_CJK_FONT (&lv_font_misans_18_cjk)
+#else
+#define LVGL_UI_BUILTIN_CJK_FONT NULL
+#endif
 
 /* ── Constants ────────────────────────────────────────────────── */
 
 static const char* TAG = "lvgl_ui";
+
+/* Display/input devices used when this channel has to bring LVGL up by
+ * itself (standalone agent firmware, i.e. no launcher owns the display). */
+#define LVGL_UI_FB_PATH "/dev/lcd0"
+#define LVGL_UI_INPUT_PATH "/dev/input0"
 
 /* Layout constants for 466x466 round screen */
 #define LVGL_UI_SCREEN_W 466
@@ -110,24 +138,50 @@ typedef struct {
     /* Previous screen to restore on stop */
     lv_obj_t* prev_screen;
 
+    /* Set when no host system owns LVGL: we bring it up (lv_init +
+     * display/input) and run the event loop ourselves. */
+    bool lvgl_owned;
+    pthread_t lvgl_thread;
+
 } lvgl_ui_state_t;
 
 static lvgl_ui_state_t s_state;
 
-/* ── Async message payload for lv_async_call ──────────────── */
+/* ── Cross-thread message queue ───────────────────────────── */
 
-/* Heap-allocated payload passed to lv_async_call so the LVGL thread
- * can safely create widgets without cross-thread invalidation.
- * Freed by the async callback after use. */
+/* Heap-allocated payload queued for the LVGL thread to render. */
 typedef struct {
     char text[LVGL_UI_MSG_MAX_LEN];
     bool is_user;
 } async_msg_t;
 
+/* lv_async_call() must not be used to hand work to the LVGL thread.
+ *
+ * It is not thread safe: it mallocs a request and links it into an internal
+ * LVGL list with no locking at all. One writer is fine and two are fine as
+ * long as they are the same thread, but this code has several -- the agent
+ * loop showing a recognised command, the outbound dispatcher mirroring a
+ * reply, the event loop itself -- and once two of them interleave inside
+ * that list it is corrupted. The next tick walks the wreckage and takes a
+ * hard fault inside lv_async_timer_cb, on the LVGL thread, which is exactly
+ * what a device dump showed after a few minutes of load.
+ *
+ * So nothing off the LVGL thread touches LVGL, not even to queue. Senders
+ * put a message here under a plain mutex; the event loop takes them out and
+ * builds the widgets itself.
+ */
+#define UI_QUEUE_MAX 12
+
+static async_msg_t* s_queue[UI_QUEUE_MAX];
+static int s_queue_head;
+static int s_queue_count;
+static bool s_show_requested;
+static pthread_mutex_t s_queue_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 /* ── Forward declarations ─────────────────────────────────── */
 
 static void chat_view_add_message(const char* text, bool is_user);
-static void chat_view_add_message_async_cb(void* data);
+static void ui_drain(void);
 static void chat_view_scroll_to_bottom(void);
 static void chat_view_trim_history(void);
 static void show_screen_async_cb(void* data);
@@ -192,13 +246,32 @@ int lvgl_ui_channel_init(void)
 
     syslog(LOG_INFO, "[%s] init\n", TAG);
 
-    /* Do NOT call lv_init() — the system (miwear) already initialized
-     * LVGL and owns the display + event loop.  We only create our UI
-     * widgets on the existing LVGL instance. */
+    /* A host system UI (e.g. the miwear launcher) may already own LVGL,
+     * the display and the event loop — in that case we only add widgets to
+     * the existing instance and must not create a second display.
+     * Standalone agent firmware has no such host, so bring LVGL up here or
+     * lv_obj_create() below would assert on an uninitialized instance. */
+    if (!lv_is_initialized()) {
+        lv_nuttx_dsc_t dsc;
+        lv_nuttx_result_t res;
 
-    /* Do NOT create a display or allocate a display buffer — the system
-     * already has one.  Creating a second display causes resource
-     * conflicts and framebuffer contention. */
+        lv_init();
+        lv_nuttx_dsc_init(&dsc);
+        dsc.fb_path = LVGL_UI_FB_PATH;
+        dsc.input_path = LVGL_UI_INPUT_PATH;
+        lv_nuttx_init(&dsc, &res);
+
+        if (res.disp == NULL) {
+            syslog(LOG_ERR, "[%s] lv_nuttx_init found no display (%s)\n",
+                TAG, LVGL_UI_FB_PATH);
+            ret = -EIO;
+            goto cleanup;
+        }
+
+        s_state.lvgl_owned = true;
+        syslog(LOG_INFO, "[%s] LVGL brought up standalone: fb=%s input=%s\n",
+            TAG, LVGL_UI_FB_PATH, LVGL_UI_INPUT_PATH);
+    }
 
     /* Create main screen with dark background */
     s_state.screen = lv_obj_create(NULL);
@@ -214,13 +287,16 @@ int lvgl_ui_channel_init(void)
      * demand when the user activates the chat UI, to avoid
      * hijacking the system's current screen at boot. */
 
-    /* Defer CJK font creation to the LVGL thread (show_screen_async_cb).
-     * Creating a FreeType font here — from the main thread — causes
-     * FT_Err_Invalid_Size_Handle (0x55) because the FreeType size
-     * object races with the LVGL render thread.  Use Montserrat as
-     * a safe placeholder until the screen is shown. */
+    /* uikit/FreeType fonts must be created in the LVGL thread (see
+     * show_screen_async_cb): creating one here races with the render thread
+     * and fails with FT_Err_Invalid_Size_Handle (0x55).  A font compiled
+     * into the firmware has no such constraint, so apply it right away;
+     * otherwise Montserrat stands in until the screen is shown. */
     s_state.font = NULL;
-    lv_obj_set_style_text_font(s_state.screen, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_state.screen,
+        LVGL_UI_BUILTIN_CJK_FONT ? LVGL_UI_BUILTIN_CJK_FONT
+                                 : &lv_font_montserrat_14,
+        0);
 
     /* Step 5: Create Chat View container */
     chat_h = LVGL_UI_SCREEN_H - LVGL_UI_PADDING_TOP - LVGL_UI_PADDING_BOTTOM
@@ -331,10 +407,12 @@ int lvgl_ui_channel_init(void)
 
 cleanup:
     /* Release resources in reverse order (coding-2) */
+#if LVGL_UI_HAVE_CJK_FONT
     if (s_state.font) {
         vg_font_destroy(s_state.font);
         s_state.font = NULL;
     }
+#endif
 
     if (s_state.screen) {
         lv_obj_del(s_state.screen);
@@ -351,6 +429,35 @@ cleanup:
     return ret;
 }
 
+/* LVGL event loop — only used when we brought LVGL up ourselves.
+ * The host system (miwear) normally drives lv_timer_handler() for us. */
+static void* lvgl_event_loop(void* arg)
+{
+    (void)arg;
+
+    /* Keep pumping until teardown finishes: lvgl_ui_channel_stop() clears
+     * "running" first and then relies on this loop to run the queued
+     * lv_async_call() cleanup, so keying on "running" would abort it. */
+    while (s_state.initialized) {
+        uint32_t idle;
+
+        /* Put anything other threads have queued on screen first, then let
+         * LVGL do its own work. This is the only place widgets get touched. */
+        ui_drain();
+
+        idle = lv_timer_handler();
+
+        /* Never busy-spin, but do not sleep so long that a queued line sits
+         * there visibly late either. */
+        if (idle > 50) {
+            idle = 50;
+        }
+        usleep((idle ? idle : 5) * 1000);
+    }
+
+    return NULL;
+}
+
 int lvgl_ui_channel_start(void)
 {
     if (!s_state.initialized) {
@@ -365,10 +472,30 @@ int lvgl_ui_channel_start(void)
 
     s_state.running = true;
 
-    /* No dedicated UI thread needed — the system's miwear LVGL event
-     * loop already calls lv_timer_handler() which processes our widgets.
-     * We only need to mark ourselves as running so send/PTT callbacks
-     * know the channel is active. */
+    /* When a host system owns LVGL, its event loop already calls
+     * lv_timer_handler() and processes our widgets — nothing to do here.
+     * Standalone, nobody would pump the loop, so run one ourselves. */
+    if (s_state.lvgl_owned) {
+        if (pthread_create(&s_state.lvgl_thread, NULL, lvgl_event_loop, NULL)
+            != 0) {
+            syslog(LOG_ERR, "[%s] failed to start LVGL event loop\n", TAG);
+            s_state.running = false;
+            return -EIO;
+        }
+        syslog(LOG_INFO, "[%s] LVGL event loop thread started\n", TAG);
+    }
+
+    /* Put the chat screen up immediately instead of waiting for the first
+     * message.
+     *
+     * Lazy-showing it means the one control a person needs in order to say
+     * anything -- the push-to-talk button -- does not exist until after they
+     * have already said something, which is circular. It also leaves the
+     * display sitting on a blank default screen, which reads as "the UI did
+     * not start" rather than "waiting for input". Show() only queues an
+     * lv_async_call, so this is safe to call before the event loop runs.
+     */
+    lvgl_ui_channel_show();
 
     syslog(LOG_INFO, "[%s] started\n", TAG);
     return 0;
@@ -399,10 +526,12 @@ static void lvgl_ui_do_cleanup(void)
     s_state.screen_visible = false;
     s_state.prev_screen = NULL;
 
+#if LVGL_UI_HAVE_CJK_FONT
     if (s_state.font) {
         vg_font_destroy(s_state.font);
         s_state.font = NULL;
     }
+#endif
 
     s_state.chat_list = NULL;
     s_state.ptt_btn = NULL;
@@ -426,6 +555,23 @@ static void stop_screen_async_cb(void* data)
     sem_post(&s_stop_sem);
 }
 
+/* Join the event loop thread we own, if any.  Never joins from the LVGL
+ * thread itself (stop_sync runs there). */
+static void lvgl_ui_join_event_loop(void)
+{
+    if (!s_state.lvgl_owned) {
+        return;
+    }
+
+    if (pthread_equal(pthread_self(), s_state.lvgl_thread)) {
+        s_state.lvgl_owned = false;
+        return;
+    }
+
+    pthread_join(s_state.lvgl_thread, NULL);
+    s_state.lvgl_owned = false;
+}
+
 /* Stop from within the LVGL thread (e.g. close button callback).
  * Performs cleanup directly — no async scheduling needed. */
 void lvgl_ui_channel_stop_sync(void)
@@ -440,6 +586,8 @@ void lvgl_ui_channel_stop_sync(void)
     lvgl_ui_do_cleanup();
     pthread_mutex_destroy(&s_state.lock);
     s_state.initialized = false;
+
+    lvgl_ui_join_event_loop();
 
     syslog(LOG_INFO, "[%s] stopped\n", TAG);
 }
@@ -493,6 +641,8 @@ void lvgl_ui_channel_stop(void)
 
     s_state.initialized = false;
 
+    lvgl_ui_join_event_loop();
+
     syslog(LOG_INFO, "[%s] stopped\n", TAG);
 }
 
@@ -511,6 +661,7 @@ static void show_screen_async_cb(void* data)
      * FreeType size handle is owned by the same thread that will
      * later rasterize glyphs.  Creating it from the main thread
      * (in init) causes FT_Err_Invalid_Size_Handle (0x55). */
+#if LVGL_UI_HAVE_CJK_FONT
     if (!s_state.font) {
         s_state.font = vg_font_create("MiSans-Medium", 18,
             LV_FREETYPE_FONT_STYLE_NORMAL);
@@ -520,6 +671,7 @@ static void show_screen_async_cb(void* data)
             syslog(LOG_WARNING, "[%s] vg_font_create failed, keeping montserrat\n", TAG);
         }
     }
+#endif
 
     syslog(LOG_INFO, "[%s] loading chat screen\n", TAG);
 
@@ -542,81 +694,143 @@ void lvgl_ui_channel_show(void)
         return;
     }
 
-    /* Schedule screen load in LVGL thread to avoid cross-thread
-     * invalidation assertion. */
-    lv_async_call(show_screen_async_cb, NULL);
+    /* Ask rather than schedule: the event loop picks this up on its next
+     * pass. See the note on the queue -- lv_async_call() from here is what
+     * corrupted LVGL's list. */
+    pthread_mutex_lock(&s_queue_mtx);
+    s_show_requested = true;
+    pthread_mutex_unlock(&s_queue_mtx);
 }
 
-int lvgl_ui_channel_send(const char* text)
+/* Common body for every way a line reaches the screen. 'speak' is separate
+ * from 'is_user' because the two callers want different things: an Agent
+ * reply is worth reading aloud, a mirrored or user line is not. */
+static int ui_post(const char* text, bool is_user, bool speak)
 {
-    int ret;
     async_msg_t* payload;
+    int slot;
 
-    /* Parameter validation: NULL or empty string */
     if (!text || text[0] == '\0') {
-        syslog(LOG_ERR, "[%s] send: invalid text (NULL or empty)\n", TAG);
         return -EINVAL;
     }
 
-    /* Check channel readiness */
     if (!s_state.initialized || !s_state.running) {
-        syslog(LOG_ERR, "[%s] send: channel not ready (init=%d run=%d)\n",
-            TAG, s_state.initialized, s_state.running);
         return -EINVAL;
     }
 
-    /* Auto-show chat screen on first Agent reply */
-    if (!s_state.screen_visible) {
-        lvgl_ui_channel_show();
-    }
-
-    /* Schedule bubble creation in LVGL thread via lv_async_call.
-     * This avoids the "Invalidate area is not allowed during rendering"
-     * assertion crash that occurs when we create LVGL widgets from
-     * the agent dispatch thread while miwear's LVGL thread is
-     * mid-render. */
     payload = malloc(sizeof(async_msg_t));
     if (!payload) {
-        syslog(LOG_ERR, "[%s] send: async payload alloc failed\n", TAG);
+        syslog(LOG_ERR, "[%s] queue payload alloc failed\n", TAG);
         return -ENOMEM;
     }
 
     strncpy(payload->text, text, LVGL_UI_MSG_MAX_LEN - 1);
     payload->text[LVGL_UI_MSG_MAX_LEN - 1] = '\0';
-    payload->is_user = false;
+    payload->is_user = is_user;
 
-    lv_async_call(chat_view_add_message_async_cb, payload);
+    pthread_mutex_lock(&s_queue_mtx);
 
-    /* TTS is blocking — run after scheduling the UI update */
-    ret = voice_channel_speak(text);
-    if (ret != 0) {
-        syslog(LOG_ERR, "[%s] voice_channel_speak failed (rc=%d)\n", TAG, ret);
+    if (s_queue_count == UI_QUEUE_MAX) {
+        /* Full: drop the oldest so the line the user just caused still
+         * gets through. Losing the tail of a burst is better than losing
+         * the thing that prompted it. */
+        free(s_queue[s_queue_head]);
+        s_queue[s_queue_head] = NULL;
+        s_queue_head = (s_queue_head + 1) % UI_QUEUE_MAX;
+        s_queue_count--;
+    }
+
+    slot = (s_queue_head + s_queue_count) % UI_QUEUE_MAX;
+    s_queue[slot] = payload;
+    s_queue_count++;
+
+    /* First line of any kind brings the chat screen up */
+    s_show_requested = true;
+
+    pthread_mutex_unlock(&s_queue_mtx);
+
+    if (speak) {
+        /* TTS is blocking — run after queueing the UI update */
+        int ret = voice_channel_speak(text);
+        if (ret != 0) {
+            syslog(LOG_ERR, "[%s] voice_channel_speak failed (rc=%d)\n",
+                TAG, ret);
+        }
     }
 
     return 0;
 }
 
+/* Take everything queued and put it on screen. Runs on the LVGL thread only,
+ * so it is the one place allowed to create or touch widgets. */
+static void ui_drain(void)
+{
+    async_msg_t* batch[UI_QUEUE_MAX];
+    bool show;
+    int n = 0;
+    int i;
+
+    pthread_mutex_lock(&s_queue_mtx);
+
+    show = s_show_requested;
+    s_show_requested = false;
+
+    while (s_queue_count > 0 && n < UI_QUEUE_MAX) {
+        batch[n++] = s_queue[s_queue_head];
+        s_queue[s_queue_head] = NULL;
+        s_queue_head = (s_queue_head + 1) % UI_QUEUE_MAX;
+        s_queue_count--;
+    }
+
+    pthread_mutex_unlock(&s_queue_mtx);
+
+    if (show && !s_state.screen_visible) {
+        show_screen_async_cb(NULL);
+    }
+
+    for (i = 0; i < n; i++) {
+        chat_view_add_message(batch[i]->text, batch[i]->is_user);
+        free(batch[i]);
+        batch[i] = NULL;
+    }
+
+    /* A line landing means recognition finished -- either the recognised
+     * command itself or the answer to it -- so the "识别中..." indicator has
+     * done its job and goes back to idle. */
+    if (n > 0 && s_state.is_processing) {
+        s_state.is_processing = false;
+        recording_indicator_stop();
+    }
+}
+
+int lvgl_ui_channel_send(const char* text)
+{
+    return ui_post(text, false, true);
+}
+
+void lvgl_ui_channel_send_user(const char* text)
+{
+    /* The other side of the conversation. Without it the screen only ever
+     * shows answers, and a command whose reply happens to be short looks
+     * exactly like one that was never heard at all -- which is the hardest
+     * case to debug when it is the recogniser that is wrong. */
+    ui_post(text, true, false);
+}
+
+int lvgl_ui_channel_post(const char* text)
+{
+    /* Display only, no TTS. Used to mirror traffic that was addressed to
+     * another channel; speaking it would both duplicate whatever the
+     * intended channel does with it and, since voice_channel_speak() is
+     * blocking, hold up the outbound dispatcher on every message. */
+    return ui_post(text, false, false);
+}
+
 /* ── Async callback for LVGL thread ────────────────────────── */
 
-/* Called by lv_timer_handler() inside the LVGL thread.
- * Safe to create/modify LVGL objects here. */
-static void chat_view_add_message_async_cb(void* data)
-{
-    async_msg_t* payload = (async_msg_t*)data;
-
-    if (!payload) {
-        return;
-    }
-
-    if (!s_state.initialized || !s_state.running) {
-        free(payload);
-        return;
-    }
-
-    chat_view_add_message(payload->text, payload->is_user);
-    free(payload);
-    payload = NULL;
-}
+/* The lv_async_call() callback that used to live here is gone with the call
+ * itself; ui_drain() does the same work, from the event loop, with the queue
+ * providing the thread safety that lv_async_call lacked. */
 
 /* ── Internal functions ───────────────────────────────────── */
 
@@ -708,77 +922,25 @@ static void ptt_btn_event_cb(lv_event_t* e)
     }
 
     if (!s_state.is_recording) {
-        /* First click: start recording */
-        int ret = voice_channel_start();
-        if (ret != 0) {
-            syslog(LOG_ERR, "[%s] voice_channel_start failed (rc=%d)\n", TAG, ret);
-            pthread_mutex_unlock(&s_state.lock);
-            chat_view_add_message("录音启动失败", false);
-            return;
-        }
-
         s_state.is_recording = true;
         pthread_mutex_unlock(&s_state.lock);
 
+        /* The microphone already streams to the host continuously; this
+         * frame only says that whatever arrives from now on was meant as a
+         * command. Recognition stays on the host because that is the only
+         * place with a recogniser: this board's own voice channel wants
+         * /dev/audio/pcm0c, and there is no NuttX audio driver under it, so
+         * the button used to answer every press with "录音启动失败".
+         * The other end is voice_bridge.py (see its "ptt" handler). */
+        ws_server_broadcast_json("{\"type\":\"ptt\",\"state\":\"start\"}");
         recording_indicator_start();
     } else {
-        /* Second click: stop recording and process */
         s_state.is_recording = false;
         s_state.is_processing = true;
         pthread_mutex_unlock(&s_state.lock);
 
+        ws_server_broadcast_json("{\"type\":\"ptt\",\"state\":\"stop\"}");
         recording_indicator_show_processing();
-
-        /* Stop recording and get ASR text synchronously */
-        char asr_text[LVGL_UI_MSG_MAX_LEN];
-        int ret = voice_channel_stop_with_text(asr_text,
-            sizeof(asr_text));
-
-        if (ret != 0) {
-            syslog(LOG_ERR,
-                "[%s] voice_channel_stop_with_text failed (rc=%d)\n",
-                TAG, ret);
-            goto done;
-        }
-
-        if (asr_text[0] == '\0') {
-            chat_view_add_message("未识别到语音", false);
-            goto done;
-        }
-
-        /* Construct inbound message with channel="lvgl_ui" */
-        agent_msg_t msg;
-
-        memset(&msg, 0, sizeof(msg));
-        strncpy(msg.channel, AGENT_CHAN_LVGL_UI,
-            sizeof(msg.channel) - 1);
-        msg.channel[sizeof(msg.channel) - 1] = '\0';
-        strncpy(msg.chat_id, "lvgl_ui",
-            sizeof(msg.chat_id) - 1);
-        msg.chat_id[sizeof(msg.chat_id) - 1] = '\0';
-
-        msg.content = strdup(asr_text);
-        if (!msg.content) {
-            syslog(LOG_ERR, "[%s] strdup failed\n", TAG);
-            goto done;
-        }
-
-        if (message_bus_push_inbound(&msg) != 0) {
-            syslog(LOG_ERR,
-                "[%s] message_bus_push_inbound failed\n", TAG);
-            free(msg.content);
-            msg.content = NULL;
-            chat_view_add_message("发送失败", false);
-            goto done;
-        }
-
-        chat_view_add_message(asr_text, true);
-
-    done:
-        pthread_mutex_lock(&s_state.lock);
-        s_state.is_processing = false;
-        pthread_mutex_unlock(&s_state.lock);
-        recording_indicator_stop();
     }
 }
 

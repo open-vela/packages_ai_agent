@@ -52,6 +52,9 @@ typedef struct {
     bool delete_after_run; /* Remove job after firing (for AT jobs) */
     char action[32];       /* Tool name to execute directly (empty = send message) */
     char action_args[256]; /* JSON args for the tool action */
+    bool wake_agent;       /* true = message is a prompt for the agent loop
+                            * (proactive turn); agent's reply is delivered
+                            * to channel/chat_id. false = push message as-is */
 } cron_job_t;
 
 /**

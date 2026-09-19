@@ -96,6 +96,52 @@ static void register_tool(const agent_tool_t* tool)
     syslog(LOG_INFO, "[%s] Registered tool: %s\n", TAG, tool->name);
 }
 
+/* Which tools the model is actually offered.
+ *
+ * The definitions travel to the model on every single request, and on this
+ * board that request goes out over a link that carries about 6 KB/s. All 37
+ * of them come to roughly 15.5 KB -- the descriptions ARE the payload. A
+ * patrol takes four round trips, so the definitions alone cost ~60 KB, and
+ * the measured round trip against a hosted endpoint was 83 s, which then
+ * tripped the agent's (then) 60 s watchdog and threw a perfectly good answer
+ * away.
+ *
+ * Offering only what this build can be asked to do cuts the request to about
+ * a quarter and changes nothing else: the agent still runs here, still
+ * decides, still executes. What goes is what the demo cannot reach anyway --
+ * music, camera, Feishu, the health sensors, the quickapp launcher.
+ *
+ * read_file is not optional in any sense: skills are read through it, so
+ * dropping it silently disables the whole skill mechanism.
+ *
+ * Filtering the offered list rather than unregistering the tools keeps them
+ * callable from elsewhere (cron actions, MCP) and makes this one array the
+ * single place to change.
+ */
+static const char* const s_exposed_tools[] = {
+    "run_shell",         /* telemetry, dmesg, ping */
+    "read_file",         /* skills are read with this one */
+    "write_file",        /* notes and memory */
+    "edit_file",
+    "list_dir",
+    "get_current_time",
+    "cron_add",          /* scheduled patrols */
+    "cron_list",
+    "cron_remove",
+    NULL
+};
+
+static bool tool_is_exposed(const char* name)
+{
+    for (int i = 0; s_exposed_tools[i] != NULL; i++) {
+        if (strcmp(s_exposed_tools[i], name) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /* Rebuild tools JSON under lock. Only rebuilds when dirty flag is set. */
 static void build_tools_json_locked(void)
 {
@@ -106,7 +152,13 @@ static void build_tools_json_locked(void)
     cJSON* arr = cJSON_CreateArray();
 
     for (int i = 0; i < s_tool_count; i++) {
-        cJSON* tool = cJSON_CreateObject();
+        cJSON* tool;
+
+        if (!tool_is_exposed(s_tools[i].name)) {
+            continue;
+        }
+
+        tool = cJSON_CreateObject();
         cJSON_AddStringToObject(tool, "name", s_tools[i].name);
         cJSON_AddStringToObject(tool, "description", s_tools[i].description);
         cJSON* schema = cJSON_Parse(s_tools[i].input_schema_json);
@@ -251,13 +303,17 @@ int tool_registry_init(void)
         "Steps: get_current_time→compute at_epoch→call this. "
         "at_epoch must be plain integer. "
         "Recurring: schedule_type='every', interval_s=seconds. "
-        "Action: set action=tool_name, action_args=JSON.",
+        "Action: set action=tool_name, action_args=JSON. "
+        "Proactive task: set wake_agent=true and write message as an "
+        "instruction for yourself; when the job fires you are woken up to "
+        "carry it out and the result is sent to channel/chat_id.",
         TOOL_SCHEMA_BEGIN()
             TOOL_PARAM_STR("name", "Job name") "," TOOL_PARAM_ENUM("schedule_type", "Schedule type", "\"every\",\"at\"") "," TOOL_PARAM_NUM("interval_s", "Interval in seconds (for every)") "," TOOL_PARAM_NUM("at_epoch",
                 "Target UNIX timestamp as a plain integer") "," TOOL_PARAM_STR("message",
                 "Notification message sent to user when job fires") "," TOOL_PARAM_STR("channel", "Reply channel (default system)") "," TOOL_PARAM_STR("chat_id", "Reply chat_id") "," TOOL_PARAM_STR("action",
                 "Tool name to execute when job fires (e.g. music_play)") "," TOOL_PARAM_STR("action_args",
-                "JSON arguments for the action tool")
+                "JSON arguments for the action tool") "," TOOL_PARAM_BOOL("wake_agent",
+                "true = message is an instruction you will be woken up to perform; the result is sent to channel/chat_id")
                 TOOL_SCHEMA_END_REQUIRED("\"name\",\"schedule_type\",\"message\""),
         tool_cron_add_execute);
 
