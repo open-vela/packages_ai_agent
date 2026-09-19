@@ -21,6 +21,7 @@
  */
 
 #include "channels/ws_server.h"
+#include "channels/mic_stream.h"
 #include "core/message_bus.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_manager.h"
@@ -58,20 +59,47 @@ static const char* TAG = "ws";
 
 /* ── Client table ─────────────────────────────────────────────── */
 
+/* Size of the per-client scratch used to coalesce a frame's header and
+ * payload into a single send(). 2 KB covers an audio frame (the stream caps
+ * at 1024 samples) with room to spare; anything larger falls back to a heap
+ * buffer. It is per-client rather than shared because two clients are
+ * written concurrently by different threads now that sending no longer
+ * serialises globally. */
+#define WS_FRAME_SCRATCH 2048
+
 typedef struct {
     int fd;
     char chat_id[32];
     bool active;
+
+    /* Serialises frames on THIS client's socket.
+     *
+     * It used to be one mutex for every client, held across the send itself.
+     * A send is a blocked send for as long as the frame takes to shift over
+     * a ~6 KB/s link, so one peer that stopped reading -- or just a busy one
+     * -- parked that mutex inside send() and starved every other writer:
+     * the microphone stream, agent replies, and the pong that answers the
+     * far end's keepalive. Losing the pong drops the session, and losing the
+     * stream stalls the demo, both caused by a third party doing nothing
+     * wrong. Per-client means a slow peer only slows itself.
+     *
+     * Lock order is always table-lock then client-lock; that is the only
+     * order taken anywhere, so it cannot deadlock.
+     */
+    pthread_mutex_t tx_mtx;
+    unsigned char   scratch[WS_FRAME_SCRATCH];
 } ws_client_t;
 
 static ws_client_t s_clients[AGENT_WS_MAX_CLIENTS];
 static pthread_mutex_t s_clients_mtx = PTHREAD_MUTEX_INITIALIZER;
+static bool s_tx_mtx_ready = false;
 
 static int s_listen_fd = -1;
 static volatile bool s_running = false;
 
-/* ── Client helpers (call with mtx held) ──────────────────────── */
+/* ── Client helpers ───────────────────────────────────────────── */
 
+/* Call with s_clients_mtx held. */
 static ws_client_t* find_by_fd_locked(int fd)
 {
     for (int i = 0; i < AGENT_WS_MAX_CLIENTS; i++) {
@@ -81,6 +109,7 @@ static ws_client_t* find_by_fd_locked(int fd)
     return NULL;
 }
 
+/* Call with s_clients_mtx held. */
 static ws_client_t* find_by_chat_id_locked(const char* chat_id)
 {
     for (int i = 0; i < AGENT_WS_MAX_CLIENTS; i++) {
@@ -88,6 +117,51 @@ static ws_client_t* find_by_chat_id_locked(const char* chat_id)
             return &s_clients[i];
     }
     return NULL;
+}
+
+/* Hold a client's transmit lock, or NULL if it is not there.
+ *
+ * The table lock is taken only long enough to find the entry and claim its
+ * transmit lock. Holding it across the send instead is what let one slow
+ * peer stall the whole server; holding it only for the lookup means the
+ * table can still be read and written while a frame is going out -- which
+ * is why the transmit lock has to be claimed here, before the table lock is
+ * released: otherwise the entry could be removed and its fd closed and
+ * reused underneath the sender.
+ */
+static ws_client_t* lock_client_for_send(const char* chat_id)
+{
+    ws_client_t* client;
+
+    pthread_mutex_lock(&s_clients_mtx);
+    client = find_by_chat_id_locked(chat_id);
+    if (client != NULL) {
+        pthread_mutex_lock(&client->tx_mtx);
+    }
+    pthread_mutex_unlock(&s_clients_mtx);
+
+    return client;
+}
+
+static ws_client_t* lock_client_by_fd(int fd)
+{
+    ws_client_t* client;
+
+    pthread_mutex_lock(&s_clients_mtx);
+    client = find_by_fd_locked(fd);
+    if (client != NULL) {
+        pthread_mutex_lock(&client->tx_mtx);
+    }
+    pthread_mutex_unlock(&s_clients_mtx);
+
+    return client;
+}
+
+static void unlock_client(ws_client_t* client)
+{
+    if (client != NULL) {
+        pthread_mutex_unlock(&client->tx_mtx);
+    }
 }
 
 static ws_client_t* add_client_locked(int fd)
@@ -111,8 +185,15 @@ static void remove_client_locked(int fd)
         if (s_clients[i].active && s_clients[i].fd == fd) {
             syslog(LOG_INFO, "[%s] Client disconnected: %s\n", TAG,
                 s_clients[i].chat_id);
+
+            /* Wait for a send that is already in flight before closing, or
+             * the fd could be closed and handed to something else while the
+             * sender still writes to it. Same lock order as the send path. */
+            pthread_mutex_lock(&s_clients[i].tx_mtx);
             s_clients[i].active = false;
             s_clients[i].fd = -1; /* invalidate fd before closing */
+            pthread_mutex_unlock(&s_clients[i].tx_mtx);
+
             close(fd);
             return;
         }
@@ -194,16 +275,22 @@ static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
 
 /* ── WS frame encode/decode ───────────────────────────────────── */
 
+/* Opcodes this server emits. Incoming frames are decoded separately. */
+#define WS_OPCODE_TEXT   0x1
+#define WS_OPCODE_BINARY 0x2
+
 /**
- * Send a text frame (server → client, no masking).
- * Caller must hold s_clients_mtx.
+ * Send one unfragmented frame (server → client, no masking).
+ * Caller must hold the client's tx_mtx, which also covers its scratch.
  */
-static int ws_send_frame(int fd, const char* payload, size_t len)
+static int ws_send_frame_op(ws_client_t* client, const void* payload,
+    size_t len, int opcode)
 {
     unsigned char hdr[10];
     int hdr_len = 0;
+    int fd = client->fd;
 
-    hdr[0] = 0x81; /* FIN + text opcode */
+    hdr[0] = (unsigned char)(0x80 | opcode); /* FIN + opcode */
     if (len < 126) {
         hdr[1] = (unsigned char)len;
         hdr_len = 2;
@@ -217,11 +304,51 @@ static int ws_send_frame(int fd, const char* payload, size_t len)
         return -1;
     }
 
-    if (send(fd, hdr, hdr_len, 0) != hdr_len)
+    /* Header and payload go out in a single send().
+     *
+     * Emitting them separately makes Nagle hold the payload back until the
+     * header is acknowledged, while the peer's delayed ACK waits for a second
+     * segment before acknowledging -- the two together stall each frame for
+     * roughly the delayed-ACK timer. On a microphone stream that is fatal:
+     * at 100 ms per frame it throttles delivery to about a third of the
+     * capture rate, and the samples the reader never gets to are silently
+     * overwritten by the DMA.
+     */
+    if (hdr_len + len <= sizeof(client->scratch))
+      {
+        memcpy(client->scratch, hdr, hdr_len);
+        memcpy(client->scratch + hdr_len, payload, len);
+        if (send(fd, client->scratch, hdr_len + len, 0) != hdr_len + (int)len)
+          {
+            return -1;
+          }
+
+        return 0;
+      }
+
+    /* Larger frames: still one send(), from the heap. Never two sends -- see
+     * the note above about interleaving with other writers. */
+    unsigned char* big = malloc(hdr_len + len);
+    if (big == NULL)
+      {
+        syslog(LOG_ERR, "[%s] out of memory for %d byte frame\n", TAG,
+            (int)(hdr_len + len));
         return -1;
-    if (send(fd, payload, len, 0) != (int)len)
-        return -1;
-    return 0;
+      }
+
+    memcpy(big, hdr, hdr_len);
+    memcpy(big + hdr_len, payload, len);
+    int rc = (send(fd, big, hdr_len + len, 0) == hdr_len + (int)len) ? 0 : -1;
+    free(big);
+    return rc;
+}
+
+/**
+ * Send a text frame. Caller must hold the client's tx_mtx.
+ */
+static int ws_send_frame(ws_client_t* client, const char* payload, size_t len)
+{
+    return ws_send_frame_op(client, payload, len, WS_OPCODE_TEXT);
 }
 
 /**
@@ -281,12 +408,35 @@ static int ws_recv_frame(int fd, char* buf, size_t buf_size)
             }
         }
 
-        /* Reply with pong if it was a ping */
+        /* Reply with pong if it was a ping.
+         *
+         * Assembled into one buffer and sent holding this client's transmit
+         * lock: this runs on the client thread while other threads (the
+         * microphone stream, agent replies) write to the same socket, and a
+         * control frame that lands between another frame's header and its
+         * payload desynchronises the peer's parser. Coalescing also avoids
+         * the same Nagle/delayed-ACK stall that splitting a frame across two
+         * sends causes.
+         *
+         * This is the send that used to be the most expensive to delay: the
+         * far end treats a late pong as a dead connection and drops a
+         * session that is working perfectly.
+         */
         if (opcode == 0x9) {
-            unsigned char pong_hdr[2] = { 0x8A, (unsigned char)plen };
-            send(fd, pong_hdr, 2, 0);
+            unsigned char pong[2 + 125];
+            size_t n = 0;
+
+            pong[n++] = 0x8A;
+            pong[n++] = (unsigned char)plen;
             if (plen > 0) {
-                send(fd, ctrl_payload, plen, 0);
+                memcpy(pong + n, ctrl_payload, plen);
+                n += plen;
+            }
+
+            ws_client_t* c = lock_client_by_fd(fd);
+            if (c != NULL) {
+                send(fd, pong, n, 0);
+                unlock_client(c);
             }
         }
         return -2;
@@ -342,11 +492,34 @@ typedef struct {
     int fd;
 } client_arg_t;
 
+/* How long a send to one client may block before it is treated as failed.
+ *
+ * A healthy peer drains in milliseconds -- the worst real frame is a few KB
+ * over a ~6 KB/s link, so a few hundred of them -- and anything approaching
+ * this is a peer that has stopped reading or vanished without the socket
+ * noticing. Without a bound, send() parks for as long as the stack takes to
+ * give up, and a blocked send sits inside the network lock: one stalled peer
+ * then stops the microphone stream and every other socket on the device,
+ * which is exactly what a load test with a silent client reproduced. With
+ * it, the frame fails, the client is dropped, and the rest carries on.
+ */
+#define WS_SEND_TIMEOUT_S 5
+
 static void* client_thread(void* arg)
 {
     client_arg_t ca = *(client_arg_t*)arg;
     free(arg);
     int fd = ca.fd;
+
+    {
+        struct timeval tv;
+        tv.tv_sec = WS_SEND_TIMEOUT_S;
+        tv.tv_usec = 0;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+            syslog(LOG_WARNING, "[%s] fd=%d: SO_SNDTIMEO not set (%d)\n",
+                TAG, fd, errno);
+        }
+    }
 
     /* Peek HTTP headers to decide: REST API or WebSocket */
     char* peek_buf = malloc(2048);
@@ -369,12 +542,17 @@ static void* client_thread(void* arg)
             break;
     }
 
+    syslog(LOG_INFO, "[%s] fd=%d: %d bytes, first line: %.60s\n", TAG, fd,
+        peek_total, peek_buf);
+
     /* Try REST API (config/skills/logs) */
 #ifdef CONFIG_AI_AGENT_REST_API
     if (api_try_handle(fd, peek_buf, peek_total)) {
         free(peek_buf);
-        struct linger lg = { .l_onoff = 1, .l_linger = 0 };
-        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        /* Graceful close only. SO_LINGER with l_linger=0 here used to send
+         * an RST that discarded the response still in the send buffer,
+         * so REST clients saw "Connection reset by peer" and no body. */
+        shutdown(fd, SHUT_WR);
         close(fd);
         return NULL;
     }
@@ -387,6 +565,16 @@ static void* client_thread(void* arg)
         != 0) {
         syslog(LOG_WARNING, "[%s] Handshake failed for fd=%d\n", TAG, fd);
         free(peek_buf);
+        /* Answer plain-HTTP callers with a 400 instead of a silent close,
+         * so the client sees a real response instead of a bare FIN/RST. */
+        static const char bad[] =
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 20\r\n"
+            "Connection: close\r\n\r\n"
+            "not a WebSocket peer\n";
+        send(fd, bad, sizeof(bad) - 1, 0);
+        shutdown(fd, SHUT_WR);
         close(fd);
         return NULL;
     }
@@ -439,6 +627,27 @@ static void* client_thread(void* arg)
 
         cJSON* type_item = cJSON_GetObjectItem(root, "type");
         cJSON* content_item = cJSON_GetObjectItem(root, "content");
+
+        /* Microphone streaming control. These frames carry no content; they
+         * switch this client's capture stream on and off. The reply, if any,
+         * arrives asynchronously as binary PCM frames plus normal agent
+         * responses.
+         */
+        if (cJSON_IsString(type_item)
+            && (strcmp(type_item->valuestring, "mic_start") == 0
+                || strcmp(type_item->valuestring, "mic_stop") == 0)) {
+            bool want = (strcmp(type_item->valuestring, "mic_start") == 0);
+            cJSON* n_item = cJSON_GetObjectItem(root, "samples");
+            int samples = cJSON_IsNumber(n_item) ? (int)n_item->valuedouble : 0;
+            syslog(LOG_INFO, "[%s] %s request from %s\n", TAG,
+                type_item->valuestring, chat_id);
+            cJSON_Delete(root);
+            if (want)
+                mic_stream_start(chat_id, samples);
+            else
+                mic_stream_stop();
+            continue;
+        }
 
         if (cJSON_IsString(type_item) && strcmp(type_item->valuestring, "message") == 0 && cJSON_IsString(content_item)) {
 
@@ -497,6 +706,9 @@ static void* accept_thread(void* arg)
         if (cfd < 0)
             continue;
 
+        syslog(LOG_INFO, "[%s] accepted fd=%d from %s:%d\n", TAG, cfd,
+            inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+
         client_arg_t* ca = malloc(sizeof(client_arg_t));
         if (!ca) {
             close(cfd);
@@ -522,7 +734,23 @@ static void* accept_thread(void* arg)
 
 int ws_server_start(void)
 {
-    memset(s_clients, 0, sizeof(s_clients));
+    /* The transmit mutexes live in the table, so the table cannot simply be
+     * memset() on a restart -- that would zero live mutexes. Re-initialising
+     * them is equally wrong, so first time round zero the table and create
+     * them; after that, clear only the fields that describe the connection. */
+    if (!s_tx_mtx_ready) {
+        memset(s_clients, 0, sizeof(s_clients));
+        for (int i = 0; i < AGENT_WS_MAX_CLIENTS; i++) {
+            pthread_mutex_init(&s_clients[i].tx_mtx, NULL);
+        }
+        s_tx_mtx_ready = true;
+    } else {
+        for (int i = 0; i < AGENT_WS_MAX_CLIENTS; i++) {
+            s_clients[i].fd = -1;
+            s_clients[i].active = false;
+            s_clients[i].chat_id[0] = '\0';
+        }
+    }
 
     s_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (s_listen_fd < 0) {
@@ -592,11 +820,10 @@ int ws_server_send(const char* chat_id, const char* text)
     if (!json_str)
         return ERROR;
 
-    pthread_mutex_lock(&s_clients_mtx);
-    ws_client_t* client = find_by_chat_id_locked(chat_id);
+    ws_client_t* client = lock_client_for_send(chat_id);
     int rc = -1;
     if (client) {
-        rc = ws_send_frame(client->fd, json_str, strlen(json_str));
+        rc = ws_send_frame(client, json_str, strlen(json_str));
         if (rc != 0) {
             syslog(
                 LOG_WARNING,
@@ -605,12 +832,97 @@ int ws_server_send(const char* chat_id, const char* text)
             /* Don't remove/close here — the client_thread owns the fd lifecycle.
              * The recv() in client_thread will fail and trigger cleanup. */
         }
+        unlock_client(client);
     } else {
         syslog(LOG_WARNING, "[%s] No WS client for chat_id=%s\n", TAG, chat_id);
     }
-    pthread_mutex_unlock(&s_clients_mtx);
 
     free(json_str);
+    return (client == NULL) ? ERROR : (rc == 0 ? OK : ERROR);
+}
+
+/**
+ * Send a pre-built JSON control frame to a client.
+ *
+ * Unlike ws_server_send() this does not wrap the payload in a chat response
+ * envelope, which is what control and status frames need.
+ */
+int ws_server_send_json(const char* chat_id, const char* json)
+{
+    if (s_listen_fd < 0 || !s_running || json == NULL)
+        return ERROR;
+
+    ws_client_t* client = lock_client_for_send(chat_id);
+    int rc = -1;
+    if (client) {
+        rc = ws_send_frame(client, json, strlen(json));
+        unlock_client(client);
+    }
+
+    return (client == NULL) ? ERROR : (rc == 0 ? OK : ERROR);
+}
+
+/**
+ * Send a control frame to every connected client.
+ *
+ * For events that originate on the device and belong to whichever host
+ * happens to be attached, rather than to one named peer: the UI's
+ * push-to-talk button is the case this exists for, and the button has no
+ * way to know which chat_id the host registered under -- it may not even
+ * be connected yet when the screen is built.
+ */
+int ws_server_broadcast_json(const char* json)
+{
+    int sent = 0;
+
+    if (s_listen_fd < 0 || !s_running || json == NULL)
+        return ERROR;
+
+    /* One client at a time, each claimed under the table lock and released
+     * before moving on: a peer that is not reading must not hold up the
+     * broadcast to the others, which is the whole reason sends no longer
+     * share one mutex. */
+    for (int i = 0; i < AGENT_WS_MAX_CLIENTS; i++) {
+        int fd;
+
+        pthread_mutex_lock(&s_clients_mtx);
+        if (!s_clients[i].active) {
+            pthread_mutex_unlock(&s_clients_mtx);
+            continue;
+        }
+        pthread_mutex_lock(&s_clients[i].tx_mtx);
+        fd = s_clients[i].fd;
+        pthread_mutex_unlock(&s_clients_mtx);
+
+        if (fd >= 0 && ws_send_frame(&s_clients[i], json, strlen(json)) == 0)
+            sent++;
+
+        pthread_mutex_unlock(&s_clients[i].tx_mtx);
+    }
+
+    syslog(LOG_INFO, "[%s] broadcast %s to %d client(s)\n", TAG, json, sent);
+    return sent > 0 ? OK : ERROR;
+}
+
+/**
+ * Push one binary frame to a client.
+ *
+ * Used for raw stream payloads (currently microphone PCM) that would be
+ * wasteful and fragile to carry as base64 inside JSON. Frames larger than
+ * 65535 bytes are rejected by the encoder, so callers must chunk.
+ */
+int ws_server_send_binary(const char* chat_id, const void* data, size_t len)
+{
+    if (s_listen_fd < 0 || !s_running || data == NULL || len == 0)
+        return ERROR;
+
+    ws_client_t* client = lock_client_for_send(chat_id);
+    int rc = -1;
+    if (client) {
+        rc = ws_send_frame_op(client, data, len, WS_OPCODE_BINARY);
+        unlock_client(client);
+    }
+
     return (client == NULL) ? ERROR : (rc == 0 ? OK : ERROR);
 }
 

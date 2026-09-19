@@ -102,6 +102,21 @@ config AI_AGENT_LVGL_UI
 		Provides a chat-bubble interface on a round watch screen
 		with PTT (Push-to-Talk) voice input.
 
+config AI_AGENT_LVGL_UI_CJK_FONT
+	bool "Built-in CJK font for the LVGL UI"
+	default n
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Compile a GB2312 + ASCII 18px font (lv_font_misans_18_cjk) into the
+		agent so the chat UI can render Chinese text.
+
+		Without it the chat UI falls back to LVGL's built-in Montserrat
+		font, which has no CJK glyphs, so Chinese messages render blank.
+		The uikit font manager is an alternative, but it needs FreeType and
+		a .ttf deployed on the device at runtime.
+
+		Costs roughly 0.8 MB of flash.
+
 config AI_AGENT_FEISHU
 	bool "Enable Feishu bot channel"
 	default y

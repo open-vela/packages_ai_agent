@@ -57,6 +57,26 @@ void lvgl_ui_channel_show(void);
  */
 int lvgl_ui_channel_send(const char* text);
 
+/**
+ * 发送用户消息到 UI。
+ * 对话的另一侧：在 Chat View 中添加用户气泡，用来显示识别出来的命令原文。
+ * 不触发 TTS——把用户自己的话念回给他只是噪音，何况本板没有播放设备。
+ * 首次调用同样会自动显示聊天界面。
+ *
+ * @param text  UTF-8 文本，用户说的话
+ */
+void lvgl_ui_channel_send_user(const char* text);
+
+/**
+ * 把一条消息显示到屏幕上，不触发 TTS。
+ * 用于镜像那些本来发给别的通道的流量——播报会让原通道重复一次，而且
+ * voice_channel_speak() 是阻塞的，会让 outbound 分发线程卡在每条消息上。
+ *
+ * @param text  UTF-8 文本
+ * @return 0 成功，负值表示错误
+ */
+int lvgl_ui_channel_post(const char* text);
+
 #ifdef __cplusplus
 }
 #endif

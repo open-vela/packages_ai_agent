@@ -338,7 +338,13 @@ static void* outbound_dispatch_task(void* arg)
 
     while (!g_shutdown_requested) {
         agent_msg_t msg;
-        if (message_bus_pop_outbound(&msg, 1000) != OK)
+        /* Wait indefinitely rather than polling once a second. There is
+         * nothing to do on a timeout -- the loop just goes round -- and the
+         * timeout costs a full timed release-and-reacquire of the queue's
+         * mutex every second for the life of the device, which is a lot of
+         * traffic through the scheduler's mutex bookkeeping for no gain.
+         * Shutdown wakes this with a broadcast, so it cannot get stuck. */
+        if (message_bus_pop_outbound(&msg, UINT32_MAX) != OK)
             continue;
         msg.channel[sizeof(msg.channel) - 1] = '\0';
         msg.chat_id[sizeof(msg.chat_id) - 1] = '\0';
@@ -349,6 +355,21 @@ static void* outbound_dispatch_task(void* arg)
         }
 
         syslog(LOG_INFO, "[%s] Dispatching response → %s:%s\n", TAG, msg.channel, msg.chat_id);
+
+        /* Mirror to the watch screen, whatever channel this is bound for.
+         *
+         * A reply is only routed to the channel it came from, so an exchange
+         * over voice or WebSocket is invisible on the device even though the
+         * device is what did the work. Mirroring at this one point covers
+         * every channel at once -- including cron wake-ups and proactive
+         * pushes -- instead of adding a special case to each path that
+         * happens to remember. Skipped when the screen is already the
+         * destination, which would otherwise double up. */
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+        if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) != 0) {
+            lvgl_ui_channel_post(msg.content);
+        }
+#endif
 
         /* Let registered taps intercept before normal dispatch */
         if (mbus_tap_try_deliver(&msg)) {

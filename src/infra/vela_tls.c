@@ -478,13 +478,35 @@ static int tls_write_request(tls_ctx_t* ctx,
 
     free(hdr);
 
-    /* Write body */
+    /* Write body.
+     *
+     * One TLS record cannot exceed MBEDTLS_SSL_OUT_CONTENT_LEN (16 KB here),
+     * and mbedtls_ssl_write() refuses anything longer outright rather than
+     * fragmenting it for you. Handing it the whole remaining body -- which is
+     * what this did -- works fine for a small request and fails instantly for
+     * a large one, with an error that is not WANT_WRITE, so the loop gives up
+     * on the first call.
+     *
+     * That is the whole reason a real endpoint failed while the local mock
+     * worked: the mock is plain HTTP, where no record size applies. An LLM
+     * request carrying the system prompt and all the tool definitions is well
+     * over 16 KB, so every HTTPS turn died at the first write.
+     *
+     * Clamp each call to what a record can hold and let the loop carry the
+     * rest.
+     */
     if (body && body_len > 0) {
         size_t bw = 0;
         while (bw < body_len) {
+            size_t chunk = body_len - bw;
+
+            if (chunk > MBEDTLS_SSL_OUT_CONTENT_LEN) {
+                chunk = MBEDTLS_SSL_OUT_CONTENT_LEN;
+            }
+
             ret = mbedtls_ssl_write(&ctx->ssl,
                 (const unsigned char*)(body + bw),
-                body_len - bw);
+                chunk);
             if (ret > 0) {
                 bw += (size_t)ret;
             } else if (ret == 0) {

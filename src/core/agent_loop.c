@@ -33,6 +33,7 @@
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
+#include "ui/lvgl_ui_channel.h"
 #include "tools/tool_registry.h"
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -1029,6 +1030,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     name_repeat = 0;
     int last_total_tokens = 0;
     bool watchdog_fired = false;
+    bool used_tools = false; /* set when this turn executed any tool */
 
     /* Router: select and apply best backend before first LLM call.
      * Estimate complexity from the last user message. */
@@ -1250,6 +1252,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             add_assistant_message(messages, &resp);
             add_tool_result_messages(messages, &resp, tool_output,
                 tool_size, msg->channel, msg->chat_id);
+            used_tools = true;
             llm_response_free(&resp);
             break;
         }
@@ -1257,6 +1260,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         add_assistant_message(messages, &resp);
         add_tool_result_messages(messages, &resp, tool_output,
             tool_size, msg->channel, msg->chat_id);
+        used_tools = true;
 
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool
@@ -1344,8 +1348,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
 
 send_reply:
-    /* Cache store: save simple query responses for future reuse */
-    if (final_text && msg->content
+    /* Cache store: save simple query responses for future reuse.
+     * Never cache a turn that executed tools: its answer depends on live
+     * device state, and replaying it would skip the tool loop entirely
+     * (the cache is keyed on the raw user text only). */
+    if (final_text && msg->content && !used_tools
         && complexity == LLM_COMPLEXITY_SIMPLE) {
         llm_cache_put(msg->content, strlen(msg->content), final_text);
         if (last_total_tokens > 0) {
@@ -1469,6 +1476,18 @@ static void* agent_loop_task(void* arg)
 
         syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
             TAG, msg.channel, msg.chat_id);
+
+        /* Show what was heard on the watch screen, so the conversation has
+         * both sides on it. A voice command is recognised somewhere else
+         * entirely, and without this a misheard command and an ignored one
+         * look the same from the device. Cron wake-ups carry the session's
+         * own channel and are excluded -- they are our prompt, not the
+         * user's words. */
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+        if (!msg.internal && msg.content) {
+            lvgl_ui_channel_send_user(msg.content);
+        }
+#endif
 
         /* Check memory pressure */
         agent_mem_get_status(&mem_st);

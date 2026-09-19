@@ -24,6 +24,9 @@
 #include "channels/cmd_channel.h"
 #include "channels/cmd_llm.h"
 #include "channels/cmd_voice.h"
+#ifdef CONFIG_SF32LB52_AUDCODEC
+#include "channels/cmd_mic.h"
+#endif
 #include "core/message_bus.h"
 #include "infra/config_store.h"
 #include "infra/cron_service.h"
@@ -1006,6 +1009,16 @@ static void* cli_thread(void* arg)
             cmd_voice_test_tts(argc, argv);
         else if (strcmp(cmd, "voice_test_asr") == 0)
             cmd_voice_test_asr(argc, argv);
+#ifdef CONFIG_SF32LB52_AUDCODEC
+        else if (strcmp(cmd, "mic_test") == 0)
+            cmd_mic_test(argc, argv);
+        else if (strcmp(cmd, "mic_raw") == 0)
+            cmd_mic_raw(argc, argv);
+        else if (strcmp(cmd, "mic_dump") == 0)
+            cmd_mic_dump(argc, argv);
+        else if (strcmp(cmd, "mic_rate") == 0)
+            cmd_mic_rate(argc, argv);
+#endif
         else if (strcmp(cmd, "set_voice_tts") == 0)
             cmd_set_voice_tts(argc, argv);
         else if (strcmp(cmd, "set_voice_asr") == 0)

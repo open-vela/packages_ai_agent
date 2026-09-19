@@ -24,6 +24,17 @@
 
 #include "agent_compat.h"
 #include <stddef.h>
+#include <time.h>
+
+/**
+ * The correction to add to time() for this board's clock, in seconds.
+ *
+ * Zero until a network time has been obtained. Anything that reports or
+ * reasons about wall-clock time should add this, so that a board whose RTC
+ * is years out still says the right thing -- without the clock being moved,
+ * which disturbs timers that are already armed.
+ */
+time_t tool_get_time_offset(void);
 
 /**
  * Execute get_current_time tool.

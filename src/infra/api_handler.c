@@ -16,6 +16,7 @@
 
 #include "infra/api_handler.h"
 #include "agent_config.h"
+#include "infra/agent_logbuf.h"
 #include "infra/config_store.h"
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
@@ -137,6 +138,7 @@ static const char* s_backend_key_map[][2] = {
     { "api_key", "api_key" },
     { "model", "model" },
     { "llm_host", "host" },
+    { "llm_port", "port" },
     { "llm_path", "path" },
 };
 

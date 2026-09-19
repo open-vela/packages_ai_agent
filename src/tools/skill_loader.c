@@ -195,6 +195,84 @@ static const char *TAG = "skills";
     "- Add: get_current_time, then edit_file/write_file to append: - [ ] [YYYY-MM-DD] desc\n" \
     "- Complete: edit_file to change - [ ] to - [x]\n"
 
+#define BUILTIN_DEVICE_GUARDIAN \
+    "# Device Guardian\n\n" \
+    "Inspect this device's live health with run_shell telemetry and report it concisely in the user's language (Chinese for zh users).\n\n" \
+    "## When to use\n" \
+    "When woken by a scheduled task (wake_agent cron job) to check the device, " \
+    "or when the user asks about device health, memory, storage, network, or uptime.\n\n" \
+    "## How to use\n" \
+    "Collect telemetry with run_shell, one command per call:\n" \
+    "1. run_shell command=\"free\"   - heap usage (columns: total used free ...)\n" \
+    "2. run_shell command=\"ps\"     - task list; confirms pppd/agent are alive\n" \
+    "3. run_shell command=\"df\"     - filesystem usage\n" \
+    "4. run_shell command=\"uptime\" - uptime\n" \
+    "Only run the commands you need; skip any that fail.\n\n" \
+    "## Rules\n" \
+    "- Free heap below 1 MB is critical, below 2 MB is a warning.\n" \
+    "- A filesystem above 85% used is a warning.\n" \
+    "- No interface holding an IPv4 address means the network is down.\n" \
+    "- Report only values you actually read; never invent numbers.\n" \
+    "- If the task is unrelated to device health, answer normally instead.\n\n" \
+    "## Output format\n" \
+    "Start with 【设备巡检 hh:mm】 then 3-6 short bullets:\n" \
+    "- 运行时长 / 负载\n" \
+    "- 内存 (free heap)\n" \
+    "- 网络 (interface + address)\n" \
+    "- 存储 (usage)\n" \
+    "- 异常与建议 (only when something is off)\n"
+
+/* Command routing.
+ *
+ * The system prompt carries only each skill's title and first paragraph; the
+ * body is read on demand with read_file. So the opening lines have to be what
+ * makes the model decide to open this file at all, and everything after them
+ * is the detail it gets once it has.
+ *
+ * What this is for: this build is spoken to, not typed at, and the transcript
+ * of a spoken command is a bare imperative -- "巡检", "现在几点了". Left alone
+ * the model answers those out of its own head, and for questions about *this*
+ * device that means inventing a plausible memory figure and printing it on
+ * the watch screen. Routing them to real tool calls is the difference between
+ * a demo showing live telemetry and one showing numbers the model made up.
+ */
+
+#define BUILTIN_COMMAND_ROUTER \
+    "# Command Router\n\n" \
+    "Route a short spoken command to the exact tool calls that carry it out. " \
+    "Read this before acting on any short imperative that arrived from the " \
+    "voice or WebSocket channel: those are commands to this device, and the " \
+    "reply is rendered on the watch screen in front of the person who spoke.\n\n" \
+    "## When to use\n" \
+    "Whenever the message is a short command about this device rather than a " \
+    "question about the world -- \"巡检\", \"看一下内存\", \"现在几点了\", " \
+    "\"在屏幕上显示你好\", \"取消定时任务\". For ordinary conversation, answer " \
+    "normally instead.\n\n" \
+    "## Routing\n" \
+    "Work down this table. Where a row lists several tools, call them one per " \
+    "turn, in that order, and read each result before choosing the next.\n\n" \
+    "| The user says | Call | Then |\n" \
+    "|---|---|---|\n" \
+    "| 巡检 / 检查一下设备 / 体检 | run_shell: free, then ps, then df, then uptime | report in device-guardian format |\n" \
+    "| 内存 / 存储 / 空间 / 还剩多少 | run_shell: free, then df | one line with the real numbers |\n" \
+    "| 任务 / 进程 / 运行着什么 | run_shell: ps | how many tasks, and whether pppd is alive |\n" \
+    "| 几点 / 现在几点 / 时间 | get_current_time | the time it returned |\n" \
+    "| 在屏幕上显示<X> | no tool | reply with exactly <X> and nothing else |\n" \
+    "| 每隔 N 分钟巡检 | cron_add with wake_agent true | confirm in one line |\n" \
+    "| 取消 / 停止 / 不用了 | cron_list, then cron_remove once per job | confirm in one line |\n\n" \
+    "## Rules\n" \
+    "- Call the tool. Device facts come from a tool result, never from memory. " \
+    "A confident invented figure is the worst answer available here, because " \
+    "on the screen it looks exactly like a real one.\n" \
+    "- One tool per turn. Look at what came back before picking the next.\n" \
+    "- The reply is rendered on a watch screen: one or two short lines, no " \
+    "tables, no markdown, no long strings of digits.\n" \
+    "- Answer in the language the user used (Chinese for Chinese).\n" \
+    "- If a tool fails, say so plainly rather than substituting a plausible " \
+    "value.\n" \
+    "- A scheduled patrol is device-guardian's job; defer to it once the " \
+    "telemetry is in hand.\n"
+
 /* Built-in skill registry */
 typedef struct {
     const char *filename;   /* e.g. "weather" */
@@ -212,6 +290,8 @@ static const builtin_skill_t s_builtins[] = {
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
     { "task-manager",   BUILTIN_TASK_MANAGER   },
+    { "device-guardian", BUILTIN_DEVICE_GUARDIAN },
+    { "command-router", BUILTIN_COMMAND_ROUTER },
 };
 
 #define NUM_BUILTINS (sizeof(s_builtins) / sizeof(s_builtins[0]))
@@ -294,14 +374,25 @@ static void extract_description(FILE *f, char *out, size_t out_size)
     while (fgets(line, sizeof(line), f) && off < out_size - 1) {
         size_t len = strlen(line);
 
-        /* Stop at blank line or section header */
-        if (len == 0 || (len == 1 && line[0] == '\n') ||
-            (len >= 2 && line[0] == '#' && line[1] == '#')) {
+        /* A leading blank line is not the end of the description -- it is
+         * the ordinary Markdown shape, where the title sits on its own line
+         * and the text starts after a blank one. Breaking on it here made
+         * every skill written that way describe itself as nothing, so the
+         * prompt showed a list of bare titles and the model had no reason to
+         * open any of them: the whole skill mechanism did nothing. Only a
+         * blank line after some text has been collected ends the
+         * description. */
+        if (len == 0 || (len == 1 && line[0] == '\n')) {
+            if (off == 0) {
+                continue;
+            }
             break;
         }
 
-        /* Skip leading blank lines */
-        if (off == 0 && line[0] == '\n') continue;
+        /* A section header ends it too */
+        if (len >= 2 && line[0] == '#' && line[1] == '#') {
+            break;
+        }
 
         /* Trim trailing newline for concatenation */
         if (line[len - 1] == '\n') {
