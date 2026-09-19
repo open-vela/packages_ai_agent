@@ -21,6 +21,7 @@
  */
 
 #include "tools/skill_loader.h"
+#include "tools/mooncat_skill_builtin.h"
 #include "tools/tool_registry.h"
 #include "agent_config.h"
 
@@ -212,6 +213,7 @@ static const builtin_skill_t s_builtins[] = {
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
     { "task-manager",   BUILTIN_TASK_MANAGER   },
+    { "mooncat-active-coach", MOONCAT_SKILL_BUILTIN },
 };
 
 #define NUM_BUILTINS (sizeof(s_builtins) / sizeof(s_builtins[0]))

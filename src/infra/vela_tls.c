@@ -63,6 +63,56 @@ static const char* TAG = "vela_tls";
 
 /* ── Chunked transfer decoding ───────────────────────────────── */
 
+/* 1 = complete message, 0 = need more bytes, -1 = malformed framing.
+ * Walk chunk boundaries, not a substring search: chunk data may itself
+ * contain "0\r\n\r\n". The empty trailer line terminates a keep-alive body. */
+static int chunked_wire_length(const char* buf, size_t len, size_t* wire_len)
+{
+    size_t pos = 0;
+    while (pos < len) {
+        const char* line = buf + pos;
+        const char* crlf = memmem(line, len - pos, "\r\n", 2);
+        if (!crlf) return 0;
+        const char* p = line;
+        size_t size = 0;
+        unsigned digits = 0;
+        while (p < crlf) {
+            unsigned char c = (unsigned char)*p;
+            unsigned digit;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+            else break;
+            if (size > (SIZE_MAX - digit) / 16) return -1;
+            size = size * 16 + digit;
+            p++;
+            digits++;
+        }
+        if (!digits) return -1;
+        while (p < crlf && *p == ' ') p++;
+        if (p < crlf && *p != ';') return -1;
+        pos = (size_t)(crlf - buf) + 2;
+        if (size == 0) {
+            for (;;) {
+                crlf = memmem(buf + pos, len - pos, "\r\n", 2);
+                if (!crlf) return 0;
+                size_t end = (size_t)(crlf - buf);
+                if (end == pos) {
+                    *wire_len = end + 2;
+                    return 1;
+                }
+                pos = end + 2;
+            }
+        }
+        if (size > len - pos) return 0;
+        pos += size;
+        if (len - pos < 2) return 0;
+        if (buf[pos] != '\r' || buf[pos + 1] != '\n') return -1;
+        pos += 2;
+    }
+    return 0;
+}
+
 /**
  * Decode chunked transfer encoding in-place.
  * Format: <hex-size>\r\n<data>\r\n ... 0\r\n\r\n
@@ -82,13 +132,14 @@ static size_t decode_chunked(char* buf, size_t len)
 
         /* Parse hex chunk size */
         char* endptr;
-        long chunk_sz = strtol(src, &endptr, 16);
+        unsigned long chunk_sz = strtoul(src, &endptr, 16);
 
         /* Validate: endptr should reach the CRLF (skip spaces) */
         while (endptr < crlf && *endptr == ' ')
             endptr++;
 
-        if (endptr != crlf || chunk_sz < 0 || chunk_sz > (long)(end - crlf - 2))
+        if ((endptr != crlf && *endptr != ';') ||
+            chunk_sz > (unsigned long)(end - crlf - 2))
             break;  /* malformed or oversized chunk header */
 
         if (chunk_sz == 0)
@@ -110,25 +161,6 @@ static size_t decode_chunked(char* buf, size_t len)
     }
 
     return (size_t)(dst - buf);
-}
-
-/* Check whether the raw accumulated body ends with the chunked
- * terminator ("...\r\n0\r\n\r\n", or "0\r\n\r\n" for an empty body).
- * Without this check the read loop below blocks on keep-alive
- * connections until the server closes them (~60s idle timeout),
- * tripping the agent's 60s LLM watchdog. */
-static int chunked_end_seen(const char* buf, size_t len)
-{
-    static const char term_empty[] = "0\r\n\r\n";
-    static const char term_last[] = "\r\n0\r\n\r\n";
-    size_t n1 = sizeof(term_empty) - 1; /* 5 */
-    size_t n2 = sizeof(term_last) - 1;  /* 7 */
-
-    if (len >= n2 && memcmp(buf + len - n2, term_last, n2) == 0)
-        return 1;
-    if (len >= n1 && memcmp(buf + len - n1, term_empty, n1) == 0)
-        return 1;
-    return 0;
 }
 
 /* ── TLS context ─────────────────────────────────────────────── */
@@ -630,17 +662,17 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     /* Keep reading body */
     if (!eof) {
         while (resp_pos < resp_cap - 1) {
-            if (content_length >= 0 && (long)resp_pos >= content_length)
-                break;
-            if (chunked && chunked_end_seen(resp_buf, resp_pos))
+            if (chunked) {
+                size_t wire_len;
+                if (chunked_wire_length(resp_buf, resp_pos, &wire_len) != 0)
+                    break;
+            } else if (content_length >= 0 && (long)resp_pos >= content_length)
                 break;
             ret = mbedtls_ssl_read(&ctx->ssl,
                 (unsigned char*)(resp_buf + resp_pos),
                 resp_cap - 1 - resp_pos);
             if (ret > 0) {
                 resp_pos += (size_t)ret;
-                if (chunked && chunked_end_seen(resp_buf, resp_pos))
-                    break;
             } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
                 break;
             } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
@@ -654,6 +686,13 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
 
     /* Chunked decode */
     if (chunked) {
+        size_t wire_len;
+        if (chunked_wire_length(resp_buf, resp_pos, &wire_len) != 1 ||
+            wire_len != resp_pos) {
+            resp_buf[0] = '\0';
+            if (out_keep_alive) *out_keep_alive = false;
+            return VELA_TLS_ERR_READ;
+        }
         resp_pos = decode_chunked(resp_buf, resp_pos);
         resp_buf[resp_pos] = '\0';
     }
@@ -1001,7 +1040,11 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
     /* Keep reading body */
     if (!eof) {
         while (resp_pos < resp_cap - 1) {
-            if (content_length >= 0 && (long)resp_pos >= content_length)
+            if (chunked) {
+                size_t wire_len;
+                if (chunked_wire_length(resp_buf, resp_pos, &wire_len) != 0)
+                    break;
+            } else if (content_length >= 0 && (long)resp_pos >= content_length)
                 break;
             ssize_t n = read(fd, resp_buf + resp_pos, resp_cap - 1 - resp_pos);
             if (n <= 0)
@@ -1015,6 +1058,12 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
 
     /* Chunked decode */
     if (chunked) {
+        size_t wire_len;
+        if (chunked_wire_length(resp_buf, resp_pos, &wire_len) != 1 ||
+            wire_len != resp_pos) {
+            resp_buf[0] = '\0';
+            return VELA_TLS_ERR_READ;
+        }
         resp_pos = decode_chunked(resp_buf, resp_pos);
         resp_buf[resp_pos] = '\0';
     }
