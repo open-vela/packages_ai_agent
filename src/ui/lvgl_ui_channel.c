@@ -311,6 +311,14 @@ static void bubble_update_async_cb(void *data)
 
     history_add(m->text, m->is_user);
     bubble_set_text(m->text);
+    /* An agent reply -- including the proactive care messages -- that lands
+     * while the user is still on the desktop brings the pet page up by
+     * itself.  Both the text layer and the reply belong to that page, so
+     * writing without entering would put the message where nobody sees it.
+     * Runs on the LVGL thread (posted), which is what makes it safe here. */
+    if (!m->is_user && launcher_is_on_desktop()) {
+        launcher_enter_page(PAGE_PET);
+    }
     /* AI reply text also lands in the pet page text layer (no-op when
      * the page is not open); user words never overwrite the greeting. */
     if (!m->is_user) {
@@ -925,8 +933,12 @@ static void history_log_async_cb(void *data)
             history_rebuild_list();
         }
         /* Replies reaching the ring through this path (NSH `ask`, the Key2
-         * demo question) still belong on the pet page text layer -- it is a
-         * no-op while that page is closed. */
+         * demo question) still belong on the pet page text layer, so bring
+         * that page up first when the user is still on the desktop -- writing
+         * it while the page is closed would drop the answer on the floor. */
+        if (!m->is_user && launcher_is_on_desktop()) {
+            launcher_enter_page(PAGE_PET);
+        }
         if (!m->is_user) {
             pet_page_update_response(m->text);
         }

@@ -556,6 +556,10 @@ void launcher_back_to_desktop(void)
  */
 bool launcher_is_on_desktop(void)
 {
-    lv_obj_t *current = lv_screen_active();
-    return (current == desktop_page);
+    /* desktop_page is a child of the active screen (lv_obj_create(lv_scr_act())),
+     * never a screen object itself, so comparing it against lv_screen_active()
+     * could never be true.  Pages are stacked above the desktop instead of being
+     * loaded as screens, so s_current_page is NULL exactly while the desktop is
+     * the topmost page -- which is the condition the callers actually mean. */
+    return (s_current_page == NULL);
 }
