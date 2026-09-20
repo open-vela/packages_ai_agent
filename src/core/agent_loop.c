@@ -136,6 +136,50 @@ static void add_assistant_message(cJSON* messages, const llm_response_t* resp)
     cJSON_AddItemToArray(messages, asst_msg);
 }
 
+/*
+ * Build the destination chat_id used by future cron notifications.
+ *
+ * Normal QuickApp ask() requests use qapp_ask_N. That ID belongs to
+ * the one-shot ask Promise and must not also be used by a future cron
+ * notification.
+ *
+ * Otherwise, if the cron fires before the Agent has produced its final
+ * normal response, the cron notification can accidentally resolve the
+ * pending ask Promise.
+ *
+ * QuickApp cron notifications therefore use qapp_push_N.
+ * Other channels keep their original chat_id.
+ */
+static void build_cron_chat_id(const char* channel,
+    const char* chat_id, char* out, size_t out_size)
+{
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+
+    if (!chat_id || !chat_id[0]) {
+        return;
+    }
+
+    if (channel
+        && strcmp(channel, "quickapp") == 0
+        && strncmp(chat_id, "qapp_ask_", 9) == 0) {
+
+        snprintf(out, out_size,
+            "qapp_push_%s", chat_id + 9);
+
+        syslog(LOG_INFO,
+            "[%s] cron quickapp route: %s -> %s\n",
+            TAG, chat_id, out);
+
+        return;
+    }
+
+    snprintf(out, out_size, "%s", chat_id);
+}
+
 /* Auto-inject channel/chat_id into cron_add input JSON. */
 static char* inject_cron_context(const char* tool_name,
     const char* input_json, const char* channel, const char* chat_id)
@@ -143,6 +187,7 @@ static char* inject_cron_context(const char* tool_name,
     if (strcmp(tool_name, "cron_add") != 0) {
         return NULL;
     }
+
     if (!channel || !channel[0] || !chat_id || !chat_id[0]) {
         return NULL;
     }
@@ -152,13 +197,23 @@ static char* inject_cron_context(const char* tool_name,
         return NULL;
     }
 
+    char cron_chat_id[64];
+
+    build_cron_chat_id(
+        channel,
+        chat_id,
+        cron_chat_id,
+        sizeof(cron_chat_id));
+
     cJSON_DeleteItemFromObject(root, "channel");
     cJSON_DeleteItemFromObject(root, "chat_id");
+
     cJSON_AddStringToObject(root, "channel", channel);
-    cJSON_AddStringToObject(root, "chat_id", chat_id);
+    cJSON_AddStringToObject(root, "chat_id", cron_chat_id);
 
     char* patched = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
+
     return patched;
 }
 
@@ -350,7 +405,7 @@ static const nl_intent_t s_intents[] = {
     { kw_steps,     "get_steps",        "{}",  256  },
     { kw_pause,     "music_pause",      "{}",  256  },
     { kw_stop,      "music_stop",       "{}",  256  },
-    { kw_resume,    "music_resume",     "{}",  256  },
+    { kw_resume,    "music_resume",      "{}",  256  },
     { NULL,         NULL,               NULL,  0    },
 };
 
@@ -642,29 +697,52 @@ static char* handle_slash_remind(const agent_msg_t* msg)
     char remind_msg[512];
 
     remind_msg[0] = '\0';
+
     if (sscanf(msg->content + 8, "%d %511[^\n]",
             &secs, remind_msg)
         < 1) {
         return NULL;
     }
+
     if (!remind_msg[0]) {
-        strncpy(remind_msg, "提醒时间到", sizeof(remind_msg) - 1);
+        strncpy(remind_msg, "提醒时间到",
+            sizeof(remind_msg) - 1);
     }
 
+    char cron_chat_id[64];
+
+    build_cron_chat_id(
+        msg->channel,
+        msg->chat_id,
+        cron_chat_id,
+        sizeof(cron_chat_id));
+
     char input[1024];
+
     snprintf(input, sizeof(input),
         "{\"name\":\"remind\",\"schedule_type\":\"at\","
         "\"at_epoch\":%lld,\"message\":\"%s\","
         "\"channel\":\"%s\",\"chat_id\":\"%s\"}",
-        (long long)(time(NULL) + secs), remind_msg,
-        msg->channel, msg->chat_id);
+        (long long)(time(NULL) + secs),
+        remind_msg,
+        msg->channel,
+        cron_chat_id);
 
     char* reply = calloc(1, 512);
+
     if (reply) {
-        tool_registry_execute("cron_add", input, reply, 512);
-        snprintf(reply, 512, "好的，%d 秒后提醒你：%s",
-            secs, remind_msg);
+        tool_registry_execute(
+            "cron_add",
+            input,
+            reply,
+            512);
+
+        snprintf(reply, 512,
+            "好的，%d 秒后提醒你：%s",
+            secs,
+            remind_msg);
     }
+
     return reply;
 }
 
@@ -872,7 +950,7 @@ static void dispatch_response(const agent_msg_t* msg,
     }
 }
 
-/* ── ReAct tool-calling loop ──────────────────────────────── */
+/* ── ReAct tool-calling loop ─────────── */
 
 static const char* s_working_phrases[] = {
     "正在思考中...",
@@ -881,6 +959,7 @@ static const char* s_working_phrases[] = {
     "正在分析...",
     "马上好...",
 };
+
 #define WORKING_PHRASE_COUNT \
     ((int)(sizeof(s_working_phrases) / sizeof(s_working_phrases[0])))
 
@@ -892,6 +971,7 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
     if (iteration != 0) {
         return;
     }
+
     if (strcmp(msg->channel, AGENT_CHAN_FEISHU) == 0
         || strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
@@ -903,10 +983,15 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
 
     agent_msg_t status = { 0 };
 
-    strncpy(status.channel, msg->channel, sizeof(status.channel) - 1);
-    strncpy(status.chat_id, msg->chat_id, sizeof(status.chat_id) - 1);
+    strncpy(status.channel, msg->channel,
+        sizeof(status.channel) - 1);
+    strncpy(status.chat_id, msg->chat_id,
+        sizeof(status.chat_id) - 1);
+
     status.content = strdup(
-        s_working_phrases[(unsigned)rand() % WORKING_PHRASE_COUNT]);
+        s_working_phrases[
+            (unsigned)rand() % WORKING_PHRASE_COUNT]);
+
     if (status.content) {
         if (message_bus_push_outbound(&status) != OK) {
             free(status.content);
@@ -932,7 +1017,9 @@ static bool check_tool_dup(const llm_response_t* resp,
 
     snprintf(cur_sig, sizeof(cur_sig), "%s|%.400s",
         resp->calls[0].name,
-        resp->calls[0].input ? resp->calls[0].input : "");
+        resp->calls[0].input
+            ? resp->calls[0].input
+            : "");
 
     if (strcmp(cur_sig, prev_sig) == 0) {
         (*dup_count)++;
@@ -945,6 +1032,7 @@ static bool check_tool_dup(const llm_response_t* resp,
     } else {
         *dup_count = 0;
     }
+
     strncpy(prev_sig, cur_sig, 511);
     prev_sig[511] = '\0';
 
@@ -954,12 +1042,15 @@ static bool check_tool_dup(const llm_response_t* resp,
         if (*name_repeat >= AGENT_TOOL_NAME_REPEAT_MAX) {
             syslog(LOG_WARNING,
                 "[%s] Tool name repeat limit (%s called %d times)\n",
-                TAG, resp->calls[0].name, *name_repeat + 1);
+                TAG,
+                resp->calls[0].name,
+                *name_repeat + 1);
             return true;
         }
     } else {
         *name_repeat = 0;
     }
+
     strncpy(prev_name, resp->calls[0].name, 63);
     prev_name[63] = '\0';
 
@@ -970,13 +1061,14 @@ static bool check_tool_dup(const llm_response_t* resp,
  * Returns true when latency_ms exceeds AGENT_LLM_TIMEOUT_SEC. */
 static bool llm_call_timed_out(uint32_t latency_ms)
 {
-    return latency_ms > (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000;
+    return latency_ms >
+        (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000;
 }
 
 /* Handle TASK_COMPLETE: inject hint and do one final LLM call.
  * If the LLM call times out, *out_timed_out is set to true. */
-static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
-    bool* out_timed_out)
+static char* handle_task_complete(const char* sys_prompt,
+    cJSON* messages, bool* out_timed_out)
 {
     cJSON* hint = cJSON_CreateObject();
 
@@ -985,35 +1077,59 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
         "The task has been completed successfully. "
         "Do NOT call any more tools. "
         "Reply to the user now confirming what was done.");
+
     cJSON_AddItemToArray(messages, hint);
 
     llm_response_t final_resp;
     char* result = NULL;
     struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
-    int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
-    gettimeofday(&t1, NULL);
-    uint32_t ms = calc_elapsed_ms(&t0, &t1);
-    bool timed_out = llm_call_timed_out(ms);
 
-    if (err == OK && !timed_out
-        && final_resp.text && final_resp.text_len > 0) {
-        result = strdup(final_resp.text);
+    gettimeofday(&t0, NULL);
+
+    int err = llm_chat_tools(
+        sys_prompt,
+        messages,
+        NULL,
+        &final_resp);
+
+    gettimeofday(&t1, NULL);
+
+    uint32_t ms =
+        calc_elapsed_ms(&t0, &t1);
+
+    bool timed_out =
+        llm_call_timed_out(ms);
+
+    if (err == OK
+        && !timed_out
+        && final_resp.text
+        && final_resp.text_len > 0) {
+
+        result =
+            strdup(final_resp.text);
     }
+
     llm_response_free(&final_resp);
 
     if (!result && timed_out) {
+
         if (out_timed_out) {
             *out_timed_out = true;
         }
-        return strdup(LLM_TIMEOUT_TASK_COMPLETE_MSG);
+
+        return strdup(
+            LLM_TIMEOUT_TASK_COMPLETE_MSG);
     }
+
     return result;
 }
 
 /* Run the ReAct tool-calling loop. Returns final_text (caller owns). */
-static char* run_react_loop(const char* sys_prompt, cJSON* messages,
-    const char* tools_json, char* tool_output, size_t tool_size,
+static char* run_react_loop(const char* sys_prompt,
+    cJSON* messages,
+    const char* tools_json,
+    char* tool_output,
+    size_t tool_size,
     const agent_msg_t* msg)
 {
     char prev_sig[512];
@@ -1027,282 +1143,591 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     dup_count = 0;
     prev_name[0] = '\0';
     name_repeat = 0;
+
     int last_total_tokens = 0;
     bool watchdog_fired = false;
 
     /* Router: select and apply best backend before first LLM call.
      * Estimate complexity from the last user message. */
-    llm_complexity_t complexity = LLM_COMPLEXITY_SIMPLE;
+    llm_complexity_t complexity =
+        LLM_COMPLEXITY_SIMPLE;
+
     if (msg->content) {
-        complexity = llm_router_estimate_complexity(
-            msg->content, strlen(msg->content));
+        complexity =
+            llm_router_estimate_complexity(
+                msg->content,
+                strlen(msg->content));
     }
-    int router_idx = llm_router_select(complexity);
+
+    int router_idx =
+        llm_router_select(complexity);
+
     if (router_idx >= 0) {
         llm_router_apply(router_idx);
     }
 
     /* Structured trace: begin */
     agent_trace_t trace;
-    agent_trace_begin(&trace, msg->chat_id, msg->channel);
+
+    agent_trace_begin(
+        &trace,
+        msg->chat_id,
+        msg->channel);
+
     trace.backend_idx = router_idx;
 
+    const bool allow_response_cache = false;
+
     /* Cache check: for simple queries, try cache before LLM call */
-    if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
-        char* cached = llm_cache_get(msg->content, strlen(msg->content));
+    if (allow_response_cache
+        && msg->content
+        && complexity == LLM_COMPLEXITY_SIMPLE) {
+
+        char* cached =
+            llm_cache_get(
+                msg->content,
+                strlen(msg->content));
+
         if (cached) {
-            syslog(LOG_INFO, "[%s] Cache hit, skipping LLM call\n", TAG);
+
+            syslog(LOG_INFO,
+                "[%s] Cache hit, skipping LLM call\n",
+                TAG);
+
             final_text = cached;
-            agent_trace_step(&trace, 0, NULL, 0, 1);
-            agent_trace_end(&trace, AGENT_TRACE_OK);
+
+            agent_trace_step(
+                &trace,
+                0,
+                NULL,
+                0,
+                1);
+
+            agent_trace_end(
+                &trace,
+                AGENT_TRACE_OK);
+
             goto send_reply;
         }
     }
 
-    for (iteration = 0; iteration < AGENT_AI_AGENT_MAX_TOOL_ITER;
+    for (iteration = 0;
+         iteration < AGENT_AI_AGENT_MAX_TOOL_ITER;
          iteration++) {
-        send_working_status(msg, iteration);
+
+        send_working_status(
+            msg,
+            iteration);
 
         llm_response_t resp;
-        struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
-        gettimeofday(&tv_end, NULL);
-        uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+
+        struct timeval tv_start;
+        struct timeval tv_end;
+
+        gettimeofday(
+            &tv_start,
+            NULL);
+
+        int err =
+            llm_chat_tools(
+                sys_prompt,
+                messages,
+                tools_json,
+                &resp);
+
+        gettimeofday(
+            &tv_end,
+            NULL);
+
+        uint32_t latency_ms =
+            calc_elapsed_ms(
+                &tv_start,
+                &tv_end);
 
         /* Router failover: on LLM call failure, try next backend */
-        if (err != OK && router_idx >= 0) {
+        if (err != OK
+            && router_idx >= 0) {
+
             syslog(LOG_WARNING,
                 "[%s] LLM call failed on backend %d, trying failover\n",
-                TAG, router_idx);
-            llm_router_report_failure(router_idx);
+                TAG,
+                router_idx);
 
-            int next_idx = llm_router_select(complexity);
-            if (next_idx >= 0 && next_idx != router_idx) {
-                llm_router_apply(next_idx);
+            llm_router_report_failure(
+                router_idx);
+
+            int next_idx =
+                llm_router_select(
+                    complexity);
+
+            if (next_idx >= 0
+                && next_idx != router_idx) {
+
+                llm_router_apply(
+                    next_idx);
+
                 router_idx = next_idx;
                 trace.backend_idx = next_idx;
-                llm_response_free(&resp);
-                gettimeofday(&tv_start, NULL);
-                err = llm_chat_tools(sys_prompt, messages,
-                    tools_json, &resp);
-                gettimeofday(&tv_end, NULL);
-                latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+
+                llm_response_free(
+                    &resp);
+
+                gettimeofday(
+                    &tv_start,
+                    NULL);
+
+                err =
+                    llm_chat_tools(
+                        sys_prompt,
+                        messages,
+                        tools_json,
+                        &resp);
+
+                gettimeofday(
+                    &tv_end,
+                    NULL);
+
+                latency_ms =
+                    calc_elapsed_ms(
+                        &tv_start,
+                        &tv_end);
             }
         }
 
         if (err != OK) {
+
             /* Distinguish timeout-induced failure from other errors */
-            if (llm_call_timed_out(latency_ms)) {
+            if (llm_call_timed_out(
+                    latency_ms)) {
+
                 syslog(LOG_WARNING,
                     "[%s] LLM watchdog: call failed after %" PRIu32 " ms "
                     "(limit %ds)\n",
-                    TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
-                agent_trace_step(&trace, iteration, NULL,
-                    latency_ms, 0);
-                llm_response_free(&resp);
-                final_text = strdup(LLM_TIMEOUT_MSG);
+                    TAG,
+                    latency_ms,
+                    AGENT_LLM_TIMEOUT_SEC);
+
+                agent_trace_step(
+                    &trace,
+                    iteration,
+                    NULL,
+                    latency_ms,
+                    0);
+
+                llm_response_free(
+                    &resp);
+
+                final_text =
+                    strdup(
+                        LLM_TIMEOUT_MSG);
+
                 watchdog_fired = true;
+
                 break;
             }
-            syslog(LOG_ERR, "[%s] LLM call failed (iter %d)\n",
-                TAG, iteration);
-            agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
-            llm_response_free(&resp);
+
+            syslog(LOG_ERR,
+                "[%s] LLM call failed (iter %d)\n",
+                TAG,
+                iteration);
+
+            agent_trace_step(
+                &trace,
+                iteration,
+                NULL,
+                latency_ms,
+                0);
+
+            llm_response_free(
+                &resp);
+
             break;
         }
 
         /* Watchdog: if the LLM call took longer than the configured
-         * timeout, treat it as a timeout even if it returned OK.
-         * The socket SO_RCVTIMEO may have fired and caused a partial
-         * or error response that llm_chat_tools mapped to ERROR above,
-         * but if the call barely completed, we still flag it. */
-        if (llm_call_timed_out(latency_ms)) {
+         * timeout, treat it as a timeout even if it returned OK. */
+        if (llm_call_timed_out(
+                latency_ms)) {
+
             syslog(LOG_WARNING,
                 "[%s] LLM watchdog: call took %" PRIu32 " ms (limit %ds), "
                 "treating as timeout\n",
-                TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
-            agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
-            llm_response_free(&resp);
-            final_text = strdup(LLM_TIMEOUT_MSG);
+                TAG,
+                latency_ms,
+                AGENT_LLM_TIMEOUT_SEC);
+
+            agent_trace_step(
+                &trace,
+                iteration,
+                NULL,
+                latency_ms,
+                0);
+
+            llm_response_free(
+                &resp);
+
+            final_text =
+                strdup(
+                    LLM_TIMEOUT_MSG);
+
             watchdog_fired = true;
+
             break;
         }
 
         /* Report success to router */
         if (router_idx >= 0) {
-            llm_router_report_success(router_idx);
-            llm_router_report_latency(router_idx, latency_ms);
+
+            llm_router_report_success(
+                router_idx);
+
+            llm_router_report_latency(
+                router_idx,
+                latency_ms);
+
             if (resp.total_tokens > 0) {
-                llm_router_report_tokens(router_idx,
-                    resp.prompt_tokens, resp.completion_tokens);
-                last_total_tokens = resp.total_tokens;
+
+                llm_router_report_tokens(
+                    router_idx,
+                    resp.prompt_tokens,
+                    resp.completion_tokens);
+
+                last_total_tokens =
+                    resp.total_tokens;
             }
         }
 
         syslog(LOG_INFO,
             "[%s] LLM resp: text=%zu, tool_use=%d, calls=%d\n",
-            TAG, resp.text_len, resp.tool_use, resp.call_count);
+            TAG,
+            resp.text_len,
+            resp.tool_use,
+            resp.call_count);
 
         if (!resp.tool_use) {
-            /* Cascade routing: if AUTO profile selected a cheap backend
-             * for a SIMPLE query but the response looks inadequate,
-             * retry once with PREMIUM tier. */
+
+            /* Cascade routing */
             bool cascade_retry = false;
-            if (llm_router_get_profile() == LLM_ROUTE_AUTO
-                && complexity == LLM_COMPLEXITY_SIMPLE
+
+            if (llm_router_get_profile()
+                    == LLM_ROUTE_AUTO
+                && complexity
+                    == LLM_COMPLEXITY_SIMPLE
                 && router_idx >= 0
                 && resp.text != NULL) {
-                bool low_quality = (strstr(resp.text, "I don't know") != NULL
-                    || strstr(resp.text, "I cannot") != NULL
-                    || strstr(resp.text, "无法") != NULL);
+
+                bool low_quality =
+                    (strstr(
+                        resp.text,
+                        "I don't know") != NULL
+                    || strstr(
+                        resp.text,
+                        "I cannot") != NULL
+                    || strstr(
+                        resp.text,
+                        "无法") != NULL);
+
                 if (low_quality) {
                     cascade_retry = true;
                 }
             }
 
             if (cascade_retry) {
+
                 syslog(LOG_INFO,
                     "[%s] Cascade: cheap response inadequate, "
                     "retrying with PREMIUM\n",
                     TAG);
 
-                /* Save the cheap response as fallback before freeing */
                 char* fallback_text = NULL;
-                if (resp.text && resp.text_len > 0) {
-                    fallback_text = strdup(resp.text);
+
+                if (resp.text
+                    && resp.text_len > 0) {
+
+                    fallback_text =
+                        strdup(resp.text);
                 }
-                llm_response_free(&resp);
 
-                /* Select a PREMIUM backend without changing profile */
-                int prem_idx = llm_router_select_with_profile(
-                    LLM_COMPLEXITY_MEDIUM, LLM_ROUTE_PREMIUM);
+                llm_response_free(
+                    &resp);
 
-                if (prem_idx >= 0 && prem_idx != router_idx) {
-                    llm_router_apply(prem_idx);
+                int prem_idx =
+                    llm_router_select_with_profile(
+                        LLM_COMPLEXITY_MEDIUM,
+                        LLM_ROUTE_PREMIUM);
+
+                if (prem_idx >= 0
+                    && prem_idx != router_idx) {
+
+                    llm_router_apply(
+                        prem_idx);
+
                     router_idx = prem_idx;
                     trace.backend_idx = prem_idx;
 
-                    gettimeofday(&tv_start, NULL);
-                    err = llm_chat_tools(sys_prompt, messages,
-                        tools_json, &resp);
-                    gettimeofday(&tv_end, NULL);
-                    latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+                    gettimeofday(
+                        &tv_start,
+                        NULL);
 
-                    /* Watchdog check on cascade retry */
-                    if (llm_call_timed_out(latency_ms)) {
+                    err =
+                        llm_chat_tools(
+                            sys_prompt,
+                            messages,
+                            tools_json,
+                            &resp);
+
+                    gettimeofday(
+                        &tv_end,
+                        NULL);
+
+                    latency_ms =
+                        calc_elapsed_ms(
+                            &tv_start,
+                            &tv_end);
+
+                    if (llm_call_timed_out(
+                            latency_ms)) {
+
                         syslog(LOG_WARNING,
                             "[%s] LLM watchdog: cascade retry "
                             "took %" PRIu32 " ms\n",
-                            TAG, latency_ms);
-                        free(fallback_text);
+                            TAG,
+                            latency_ms);
+
+                        free(
+                            fallback_text);
+
                         fallback_text = NULL;
-                        final_text = strdup(LLM_TIMEOUT_MSG);
+
+                        final_text =
+                            strdup(
+                                LLM_TIMEOUT_MSG);
+
                         watchdog_fired = true;
-                        agent_trace_step(&trace, iteration, NULL,
-                            latency_ms, 0);
-                        llm_response_free(&resp);
+
+                        agent_trace_step(
+                            &trace,
+                            iteration,
+                            NULL,
+                            latency_ms,
+                            0);
+
+                        llm_response_free(
+                            &resp);
+
                         break;
                     }
 
-                    if (err == OK && resp.text && resp.text_len > 0) {
-                        final_text = strdup(resp.text);
-                        free(fallback_text);
+                    if (err == OK
+                        && resp.text
+                        && resp.text_len > 0) {
+
+                        final_text =
+                            strdup(
+                                resp.text);
+
+                        free(
+                            fallback_text);
+
                         fallback_text = NULL;
+
                     } else {
-                        /* Premium failed — fall back to cheap response */
-                        final_text = fallback_text;
+
+                        final_text =
+                            fallback_text;
+
                         fallback_text = NULL;
                     }
-                    agent_trace_step(&trace, iteration, NULL,
-                        latency_ms, err == OK);
-                    llm_response_free(&resp);
+
+                    agent_trace_step(
+                        &trace,
+                        iteration,
+                        NULL,
+                        latency_ms,
+                        err == OK);
+
+                    llm_response_free(
+                        &resp);
+
                     break;
                 }
-                /* No premium backend available — use cheap response */
-                final_text = fallback_text;
+
+                final_text =
+                    fallback_text;
+
                 fallback_text = NULL;
-                agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
+
+                agent_trace_step(
+                    &trace,
+                    iteration,
+                    NULL,
+                    latency_ms,
+                    1);
+
                 break;
             }
 
-            if (resp.text && resp.text_len > 0 && !final_text) {
-                final_text = strdup(resp.text);
+            if (resp.text
+                && resp.text_len > 0
+                && !final_text) {
+
+                final_text =
+                    strdup(
+                        resp.text);
             }
-            agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
-            llm_response_free(&resp);
+
+            agent_trace_step(
+                &trace,
+                iteration,
+                NULL,
+                latency_ms,
+                1);
+
+            llm_response_free(
+                &resp);
+
             break;
         }
 
-        syslog(LOG_INFO, "[%s] Tool iter %d: %d calls\n",
-            TAG, iteration + 1, resp.call_count);
+        syslog(LOG_INFO,
+            "[%s] Tool iter %d: %d calls\n",
+            TAG,
+            iteration + 1,
+            resp.call_count);
 
         /* Trace: log tool step */
-        agent_trace_step(&trace, iteration,
-            resp.call_count > 0 ? resp.calls[0].name : NULL,
-            latency_ms, 1);
+        agent_trace_step(
+            &trace,
+            iteration,
+            resp.call_count > 0
+                ? resp.calls[0].name
+                : NULL,
+            latency_ms,
+            1);
 
-        /* Duplicate detection — break if stuck in a loop */
-        bool should_break = check_tool_dup(
-            &resp, prev_sig, &dup_count, prev_name, &name_repeat);
+        /* Duplicate detection */
+        bool should_break =
+            check_tool_dup(
+                &resp,
+                prev_sig,
+                &dup_count,
+                prev_name,
+                &name_repeat);
 
         if (should_break) {
-            add_assistant_message(messages, &resp);
-            add_tool_result_messages(messages, &resp, tool_output,
-                tool_size, msg->channel, msg->chat_id);
-            llm_response_free(&resp);
+
+            add_assistant_message(
+                messages,
+                &resp);
+
+            add_tool_result_messages(
+                messages,
+                &resp,
+                tool_output,
+                tool_size,
+                msg->channel,
+                msg->chat_id);
+
+            llm_response_free(
+                &resp);
+
             break;
         }
 
-        add_assistant_message(messages, &resp);
-        add_tool_result_messages(messages, &resp, tool_output,
-            tool_size, msg->channel, msg->chat_id);
+        add_assistant_message(
+            messages,
+            &resp);
 
-        /* Local tool shortcut: if the single tool in this round is a
-         * local file op, skip the next LLM round and use the tool
-         * output directly as the reply. Saves ~2s.
-         * Restricted to call_count == 1: the parallel path does not
-         * write into tool_output, so multi-call rounds must go through
-         * the LLM to aggregate results (and tool_output would be stale
-         * from a prior iteration if we allowed call_count > 1 here). */
+        add_tool_result_messages(
+            messages,
+            &resp,
+            tool_output,
+            tool_size,
+            msg->channel,
+            msg->chat_id);
+
+        /* Local tool shortcut */
         if (resp.call_count == 1) {
+
             bool all_local = true;
-            for (int i = 0; i < resp.call_count; i++) {
-                if (strcmp(resp.calls[i].name, "read_file") != 0
-                    && strcmp(resp.calls[i].name, "write_file") != 0
-                    && strcmp(resp.calls[i].name, "edit_file") != 0
-                    && strcmp(resp.calls[i].name, "list_dir") != 0) {
+
+            for (int i = 0;
+                 i < resp.call_count;
+                 i++) {
+
+                if (strcmp(
+                        resp.calls[i].name,
+                        "read_file") != 0
+                    && strcmp(
+                        resp.calls[i].name,
+                        "write_file") != 0
+                    && strcmp(
+                        resp.calls[i].name,
+                        "edit_file") != 0
+                    && strcmp(
+                        resp.calls[i].name,
+                        "list_dir") != 0) {
+
                     all_local = false;
                     break;
                 }
             }
-            if (all_local && tool_output[0]) {
-                /* Don't shortcut if the tool read a skill file
-                 * from AGENT_SKILLS_DIR — the LLM needs to process
-                 * the skill content and generate a proper user-facing
-                 * response instead of dumping raw markdown to the user. */
-                bool is_skill_read = false;
-                if (strcmp(resp.calls[0].name, "read_file") == 0
-                    && resp.calls[0].input != NULL) {
-                    cJSON *input_obj = cJSON_Parse(resp.calls[0].input);
+
+            if (all_local
+                && tool_output[0]) {
+
+                bool is_skill_read =
+                    false;
+
+                if (strcmp(
+                        resp.calls[0].name,
+                        "read_file") == 0
+                    && resp.calls[0].input
+                        != NULL) {
+
+                    cJSON* input_obj =
+                        cJSON_Parse(
+                            resp.calls[0].input);
+
                     if (input_obj) {
-                        cJSON *path_obj = cJSON_GetObjectItem(input_obj, "path");
-                        if (path_obj && cJSON_IsString(path_obj)
-                            && strncmp(path_obj->valuestring,
+
+                        cJSON* path_obj =
+                            cJSON_GetObjectItem(
+                                input_obj,
+                                "path");
+
+                        if (path_obj
+                            && cJSON_IsString(
+                                path_obj)
+                            && strncmp(
+                                path_obj->valuestring,
                                 AGENT_SKILLS_DIR,
-                                strlen(AGENT_SKILLS_DIR)) == 0) {
-                            is_skill_read = true;
+                                strlen(
+                                    AGENT_SKILLS_DIR))
+                                == 0) {
+
+                            is_skill_read =
+                                true;
                         }
-                        cJSON_Delete(input_obj);
+
+                        cJSON_Delete(
+                            input_obj);
                     }
                 }
 
                 if (!is_skill_read) {
+
                     syslog(LOG_INFO,
                         "[%s] Local tool shortcut: skip LLM round\n",
                         TAG);
-                    final_text = strdup(tool_output);
-                    llm_response_free(&resp);
+
+                    final_text =
+                        strdup(
+                            tool_output);
+
+                    llm_response_free(
+                        &resp);
+
                     break;
                 }
 
@@ -1313,43 +1738,92 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         }
 
         /* TASK_COMPLETE detection */
-        if (resp.call_count == 1 && tool_output[0]
-            && strstr(tool_output, "TASK_COMPLETE")) {
+        if (resp.call_count == 1
+            && tool_output[0]
+            && strstr(
+                tool_output,
+                "TASK_COMPLETE")) {
+
             syslog(LOG_INFO,
                 "[%s] Tool %s returned TASK_COMPLETE\n",
-                TAG, resp.calls[0].name);
-            llm_response_free(&resp);
-            bool task_timed_out = false;
-            final_text = handle_task_complete(sys_prompt, messages,
-                &task_timed_out);
+                TAG,
+                resp.calls[0].name);
+
+            llm_response_free(
+                &resp);
+
+            bool task_timed_out =
+                false;
+
+            final_text =
+                handle_task_complete(
+                    sys_prompt,
+                    messages,
+                    &task_timed_out);
+
             if (task_timed_out) {
                 watchdog_fired = true;
             }
+
             break;
         }
 
-        llm_response_free(&resp);
+        llm_response_free(
+            &resp);
     }
 
     /* Iteration limit reached — force a summary reply */
-    if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
-        final_text = force_finish_reply(sys_prompt, messages);
-        agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
+    if (!final_text
+        && iteration
+            >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
+
+        final_text =
+            force_finish_reply(
+                sys_prompt,
+                messages);
+
+        agent_trace_end(
+            &trace,
+            AGENT_TRACE_TIMEOUT);
+
     } else if (watchdog_fired) {
-        agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
+
+        agent_trace_end(
+            &trace,
+            AGENT_TRACE_TIMEOUT);
+
     } else if (final_text) {
-        agent_trace_end(&trace, AGENT_TRACE_OK);
+
+        agent_trace_end(
+            &trace,
+            AGENT_TRACE_OK);
+
     } else {
-        agent_trace_end(&trace, AGENT_TRACE_FAIL);
+
+        agent_trace_end(
+            &trace,
+            AGENT_TRACE_FAIL);
     }
 
 send_reply:
+
     /* Cache store: save simple query responses for future reuse */
-    if (final_text && msg->content
-        && complexity == LLM_COMPLEXITY_SIMPLE) {
-        llm_cache_put(msg->content, strlen(msg->content), final_text);
+    if (allow_response_cache
+        && final_text
+        && msg->content
+        && complexity
+            == LLM_COMPLEXITY_SIMPLE) {
+
+        llm_cache_put(
+            msg->content,
+            strlen(msg->content),
+            final_text);
+
         if (last_total_tokens > 0) {
-            llm_cache_put_tokens(msg->content, strlen(msg->content),
+
+            llm_cache_put_tokens(
+                msg->content,
+                strlen(msg->content),
                 last_total_tokens);
         }
     }
@@ -1359,34 +1833,59 @@ send_reply:
 
 /* ── Build messages array from session history + current msg ─ */
 
-static cJSON* build_messages(const char* chat_id, const char* content,
-    char* history_json, size_t hist_size)
+static cJSON* build_messages(const char* chat_id,
+    const char* content,
+    char* history_json,
+    size_t hist_size)
 {
-    session_get_history_json(chat_id, history_json, hist_size,
+    session_get_history_json(
+        chat_id,
+        history_json,
+        hist_size,
         AGENT_AI_AGENT_MAX_HISTORY);
 
-    cJSON* messages = cJSON_Parse(history_json);
+    cJSON* messages =
+        cJSON_Parse(
+            history_json);
 
     if (!messages) {
-        messages = cJSON_CreateArray();
+        messages =
+            cJSON_CreateArray();
     }
 
-    cJSON* user_msg = cJSON_CreateObject();
+    cJSON* user_msg =
+        cJSON_CreateObject();
 
-    cJSON_AddStringToObject(user_msg, "role", "user");
-    cJSON_AddStringToObject(user_msg, "content", content);
-    cJSON_AddItemToArray(messages, user_msg);
+    cJSON_AddStringToObject(
+        user_msg,
+        "role",
+        "user");
+
+    cJSON_AddStringToObject(
+        user_msg,
+        "content",
+        content);
+
+    cJSON_AddItemToArray(
+        messages,
+        user_msg);
+
     return messages;
 }
 
 /* ── Inject session context into system prompt ───────────── */
 
-static void inject_session_context(char* sys_prompt, size_t size,
-    const char* channel, const char* chat_id)
+static void inject_session_context(char* sys_prompt,
+    size_t size,
+    const char* channel,
+    const char* chat_id)
 {
-    size_t len = strlen(sys_prompt);
+    size_t len =
+        strlen(sys_prompt);
 
-    snprintf(sys_prompt + len, size - len,
+    snprintf(
+        sys_prompt + len,
+        size - len,
         "\n## Current Session\n"
         "channel: %s\n"
         "chat_id: %s\n"
@@ -1398,7 +1897,8 @@ static void inject_session_context(char* sys_prompt, size_t size,
         "use those open_ids when you need to @mention or remind "
         "those users. Do NOT include the [mentioned_users: ...] "
         "block in your reply text.\n",
-        channel, chat_id);
+        channel,
+        chat_id);
 }
 
 /* ── Main agent loop task ─────────────────────────────────── */
@@ -1406,174 +1906,345 @@ static void inject_session_context(char* sys_prompt, size_t size,
 static void* agent_loop_task(void* arg)
 {
     (void)arg;
+
     agent_mem_status_t mem_st;
 
-    agent_mem_get_status(&mem_st);
-    syslog(LOG_INFO, "[%s] Agent loop started, free heap: %zu\n",
-        TAG, mem_st.free_heap);
+    agent_mem_get_status(
+        &mem_st);
 
-    size_t ctx_size = agent_mem_safe_size(
-        AGENT_CONTEXT_BUF_SIZE, 4 * 1024);
-    size_t hist_size = agent_mem_safe_size(
-        AGENT_LLM_STREAM_BUF_SIZE, 8 * 1024);
-    size_t tool_size = agent_mem_safe_size(
-        TOOL_OUTPUT_SIZE, TOOL_OUTPUT_SIZE_MIN);
+    syslog(LOG_INFO,
+        "[%s] Agent loop started, free heap: %zu\n",
+        TAG,
+        mem_st.free_heap);
 
-    char* sys_prompt = calloc(1, ctx_size);
-    char* history_json = calloc(1, hist_size);
-    char* tool_output = calloc(1, tool_size);
+    size_t ctx_size =
+        agent_mem_safe_size(
+            AGENT_CONTEXT_BUF_SIZE,
+            4 * 1024);
 
-    if (!sys_prompt || !history_json || !tool_output) {
-        syslog(LOG_ERR, "[%s] Failed to allocate agent buffers\n", TAG);
+    size_t hist_size =
+        agent_mem_safe_size(
+            AGENT_LLM_STREAM_BUF_SIZE,
+            8 * 1024);
+
+    size_t tool_size =
+        agent_mem_safe_size(
+            TOOL_OUTPUT_SIZE,
+            TOOL_OUTPUT_SIZE_MIN);
+
+    char* sys_prompt =
+        calloc(
+            1,
+            ctx_size);
+
+    char* history_json =
+        calloc(
+            1,
+            hist_size);
+
+    char* tool_output =
+        calloc(
+            1,
+            tool_size);
+
+    if (!sys_prompt
+        || !history_json
+        || !tool_output) {
+
+        syslog(LOG_ERR,
+            "[%s] Failed to allocate agent buffers\n",
+            TAG);
+
         free(sys_prompt);
         free(history_json);
         free(tool_output);
+
         return NULL;
     }
 
-    syslog(LOG_INFO, "[%s] Buffers: ctx=%zu hist=%zu tool=%zu\n",
-        TAG, ctx_size, hist_size, tool_size);
+    syslog(LOG_INFO,
+        "[%s] Buffers: ctx=%zu hist=%zu tool=%zu\n",
+        TAG,
+        ctx_size,
+        hist_size,
+        tool_size);
 
     /* Initialize memory pool for parallel tool outputs */
-    size_t pool_buf_size = agent_mem_safe_size(
-        TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
-    if (agent_pool_init(&s_tool_pool, pool_buf_size,
+    size_t pool_buf_size =
+        agent_mem_safe_size(
+            TOOL_OUTPUT_SIZE_LARGE,
+            TOOL_OUTPUT_SIZE_MIN);
+
+    if (agent_pool_init(
+            &s_tool_pool,
+            pool_buf_size,
             AGENT_MAX_TOOL_CALLS)
         == OK) {
+
         s_pool_ready = true;
-        syslog(LOG_INFO, "[%s] Tool output pool: %d x %zu bytes\n",
-            TAG, AGENT_MAX_TOOL_CALLS, pool_buf_size);
+
+        syslog(LOG_INFO,
+            "[%s] Tool output pool: %d x %zu bytes\n",
+            TAG,
+            AGENT_MAX_TOOL_CALLS,
+            pool_buf_size);
+
     } else {
+
         syslog(LOG_WARNING,
-            "[%s] Pool init failed, using heap fallback\n", TAG);
+            "[%s] Pool init failed, using heap fallback\n",
+            TAG);
     }
 
-    char* tools_json = tool_registry_get_tools_json();
+    char* tools_json =
+        tool_registry_get_tools_json();
 
-    syslog(LOG_INFO, "[%s] Tools JSON loaded: %d bytes\n",
-        TAG, tools_json ? (int)strlen(tools_json) : 0);
+    syslog(LOG_INFO,
+        "[%s] Tools JSON loaded: %d bytes\n",
+        TAG,
+        tools_json
+            ? (int)strlen(tools_json)
+            : 0);
 
     while (!agent_shutdown_requested()) {
+
         agent_msg_t msg;
-        int err = message_bus_pop_inbound(&msg, UINT32_MAX);
+
+        int err =
+            message_bus_pop_inbound(
+                &msg,
+                UINT32_MAX);
 
         if (err != OK) {
             continue;
         }
 
         if (agent_shutdown_requested()) {
+
             free(msg.content);
             free(msg.image_b64);
+
             break;
         }
 
-        syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
-            TAG, msg.channel, msg.chat_id);
+        syslog(LOG_INFO,
+            "[%s] Processing message from %s:%s\n",
+            TAG,
+            msg.channel,
+            msg.chat_id);
 
         /* Check memory pressure */
-        agent_mem_get_status(&mem_st);
-        if (mem_st.free_heap < AGENT_MEM_RESERVE_BYTES) {
+        agent_mem_get_status(
+            &mem_st);
+
+        if (mem_st.free_heap
+            < AGENT_MEM_RESERVE_BYTES) {
+
             syslog(LOG_WARNING,
                 "[%s] Low memory: %zu bytes free, skipping\n",
-                TAG, mem_st.free_heap);
+                TAG,
+                mem_st.free_heap);
+
             agent_msg_t out = { 0 };
-            strncpy(out.channel, msg.channel,
+
+            strncpy(
+                out.channel,
+                msg.channel,
                 sizeof(out.channel) - 1);
-            strncpy(out.chat_id, msg.chat_id,
+
+            strncpy(
+                out.chat_id,
+                msg.chat_id,
                 sizeof(out.chat_id) - 1);
-            out.content = strdup("系统内存不足，请稍后再试。");
+
+            out.content =
+                strdup(
+                    "系统内存不足，请稍后再试。");
+
             if (out.content) {
-                if (message_bus_push_outbound(&out) != OK) {
-                    free(out.content);
+
+                if (message_bus_push_outbound(
+                        &out) != OK) {
+
+                    free(
+                        out.content);
                 }
             }
-            free(msg.content);
+
+            free(
+                msg.content);
+
             continue;
         }
 
         /* Slash commands — fast path, bypass LLM */
-        char* reply = handle_slash_command(&msg);
+        char* reply =
+            handle_slash_command(
+                &msg);
 
         /* Prompt injection check — before LLM */
-        if (!reply && tool_guard_check_injection(msg.content)) {
+        if (!reply
+            && tool_guard_check_injection(
+                msg.content)) {
+
             syslog(LOG_WARNING,
                 "[%s] Prompt injection blocked from %s:%s\n",
-                TAG, msg.channel, msg.chat_id);
-            reply = strdup("I can't do that.");
+                TAG,
+                msg.channel,
+                msg.chat_id);
+
+            reply =
+                strdup(
+                    "I can't do that.");
+
             if (!reply) {
-                /* Fail-closed: skip this message entirely */
-                free(msg.content);
+
+                free(
+                    msg.content);
+
                 continue;
             }
         }
 
         /* NL fast path — after injection check, before LLM */
         if (!reply) {
-            reply = handle_nl_fast_path(msg.content);
+
+            reply =
+                handle_nl_fast_path(
+                    msg.content);
         }
 
         if (reply) {
+
             agent_msg_t out = { 0 };
-            strncpy(out.channel, msg.channel,
+
+            strncpy(
+                out.channel,
+                msg.channel,
                 sizeof(out.channel) - 1);
-            strncpy(out.chat_id, msg.chat_id,
+
+            strncpy(
+                out.chat_id,
+                msg.chat_id,
                 sizeof(out.chat_id) - 1);
-            out.content = reply;
-            if (message_bus_push_outbound(&out) != OK) {
-                free(reply);
+
+            out.content =
+                reply;
+
+            if (message_bus_push_outbound(
+                    &out) != OK) {
+
+                free(
+                    reply);
             }
-            free(msg.content);
+
+            free(
+                msg.content);
+
             continue;
         }
 
         /* Hot-reload skills if directory changed */
         if (skill_loader_check_changed()) {
-            syslog(LOG_INFO, "[%s] Skills changed, refreshing\n", TAG);
+
+            syslog(LOG_INFO,
+                "[%s] Skills changed, refreshing\n",
+                TAG);
+
             skill_loader_refresh();
         }
 
-        context_build_system_prompt(sys_prompt, ctx_size);
-        inject_session_context(sys_prompt, ctx_size,
-            msg.channel, msg.chat_id);
+        context_build_system_prompt(
+            sys_prompt,
+            ctx_size);
+
+        inject_session_context(
+            sys_prompt,
+            ctx_size,
+            msg.channel,
+            msg.chat_id);
 
         /* Refresh tools JSON — Node tools are dynamic */
-        free(tools_json);
-        tools_json = tool_registry_get_tools_json();
+        free(
+            tools_json);
 
-        cJSON* messages = build_messages(msg.chat_id, msg.content,
-            history_json, hist_size);
+        tools_json =
+            tool_registry_get_tools_json();
 
-        char* final_text = NULL;
+        cJSON* messages =
+            build_messages(
+                msg.chat_id,
+                msg.content,
+                history_json,
+                hist_size);
+
+        char* final_text =
+            NULL;
 
         /* Vision path */
-        final_text = handle_vision_message(&msg);
+        final_text =
+            handle_vision_message(
+                &msg);
+
         if (final_text) {
-            cJSON_Delete(messages);
+
+            cJSON_Delete(
+                messages);
+
         } else {
+
             /* ReAct loop */
             s_llm_path_count++;
-            final_text = run_react_loop(sys_prompt, messages,
-                tools_json, tool_output, tool_size, &msg);
-            cJSON_Delete(messages);
+
+            final_text =
+                run_react_loop(
+                    sys_prompt,
+                    messages,
+                    tools_json,
+                    tool_output,
+                    tool_size,
+                    &msg);
+
+            cJSON_Delete(
+                messages);
         }
 
-        dispatch_response(&msg, final_text);
+        dispatch_response(
+            &msg,
+            final_text);
 
         /* Free image_b64 if not already freed by vision path */
-        free(msg.image_b64);
+        free(
+            msg.image_b64);
+
         msg.image_b64 = NULL;
-        free(msg.content);
+
+        free(
+            msg.content);
     }
 
     /* Cleanup (unreachable in normal operation) */
     if (s_pool_ready) {
-        agent_pool_destroy(&s_tool_pool);
-        s_pool_ready = false;
+
+        agent_pool_destroy(
+            &s_tool_pool);
+
+        s_pool_ready =
+            false;
     }
-    free(tools_json);
-    free(sys_prompt);
-    free(history_json);
-    free(tool_output);
+
+    free(
+        tools_json);
+
+    free(
+        sys_prompt);
+
+    free(
+        history_json);
+
+    free(
+        tool_output);
+
     return NULL;
 }
 
@@ -1581,18 +2252,29 @@ static void* agent_loop_task(void* arg)
 
 int agent_loop_init(void)
 {
-    syslog(LOG_INFO, "[%s] Agent loop initialized\n", TAG);
+    syslog(LOG_INFO,
+        "[%s] Agent loop initialized\n",
+        TAG);
+
     return OK;
 }
 
 int agent_loop_start(void)
 {
-    int ret = agent_task_create(agent_loop_task, "agent_loop",
-        AGENT_AI_AGENT_STACK, NULL, AGENT_AI_AGENT_PRIO);
+    int ret =
+        agent_task_create(
+            agent_loop_task,
+            "agent_loop",
+            AGENT_AI_AGENT_STACK,
+            NULL,
+            AGENT_AI_AGENT_PRIO);
 
     if (ret != OK) {
+
         syslog(LOG_ERR,
-            "[%s] Failed to create agent_loop task\n", TAG);
+            "[%s] Failed to create agent_loop task\n",
+            TAG);
     }
+
     return ret;
 }

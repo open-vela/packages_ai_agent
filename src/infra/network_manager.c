@@ -765,7 +765,7 @@ int network_wifi_reconnect(void)
     return network_rpmsg_init();
 }
 
-#else
+#elif defined(CONFIG_WIRELESS_WAPI) && defined(CONFIG_DRIVERS_IEEE80211)
 /* Real hardware: use NuttX wapi shell command to join WiFi */
 #include "infra/config_store.h"
 #include "agent_config.h"
@@ -900,5 +900,31 @@ int network_wifi_reconnect(void)
     }
     agent_config_get(AGENT_CFG_KEY_WIFI_PASS, pass, sizeof(pass));
     return network_wifi_connect(NULL, ssid, pass);
+}
+#else
+
+/* Hardware without WiFi.
+ * Networking may be provided by another transport later.
+ */
+
+int network_wifi_connect(const char* iface, const char* ssid,
+                         const char* pass)
+{
+    (void)iface;
+    (void)ssid;
+    (void)pass;
+
+    syslog(LOG_WARNING,
+           "[%s] WiFi is not supported on this board\n", TAG);
+
+    return ERROR;
+}
+
+int network_wifi_reconnect(void)
+{
+    syslog(LOG_WARNING,
+           "[%s] WiFi is not supported on this board\n", TAG);
+
+    return ERROR;
 }
 #endif

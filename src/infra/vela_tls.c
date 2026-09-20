@@ -763,7 +763,12 @@ int vela_https_request(
 
     bool keep = false;
     ret = tls_read_response(&slot->ctx, resp_buf, resp_cap, out_body_len, &keep);
-    pool_release(slot, host, port, ret > 0 && keep);
+    /* QEMU/NuttX workaround: do not retain HTTPS connection for reuse.
+     * The persistent-connection reuse path may hit an fdcheck assertion
+     * when setsockopt() is called on a stale pooled socket.
+     * Keep the original TLS/HTTP flow, but close the connection after
+     * each request so the next request performs a fresh handshake. */
+    pool_release(slot, host, port, false);
     return ret;
 }
 

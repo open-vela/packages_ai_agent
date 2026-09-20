@@ -195,6 +195,21 @@ static const char *TAG = "skills";
     "- Add: get_current_time, then edit_file/write_file to append: - [ ] [YYYY-MM-DD] desc\n" \
     "- Complete: edit_file to change - [ ] to - [x]\n"
 
+#define BUILTIN_ALIVE_GUARDIAN \
+    "# Alive Guardian 个人安全守护\n" \
+    "用于 Are You OK 应用的安全守护。当用户说“我还活着”“我没事”“我安全”时，必须调用 alive_guardian action=confirm，不得直接声称已经重置守护。\n\n" \
+    "## 使用规则\n" \
+    "- 用户要求30秒守护测试：调用 alive_guardian，action=test\n" \
+    "- 用户说“我还活着”“我没事”“我安全”或要求重置守护：调用 alive_guardian，action=confirm\n" \
+    "- 用户查询守护状态：调用 alive_guardian，action=status\n" \
+    "- 用户要求取消或关闭守护：调用 alive_guardian，action=cancel\n\n" \
+    "## Important\n" \
+    "- 不要调用 cron_list、cron_add、cron_remove 或 get_current_time\n" \
+    "- 不要自行计算时间戳\n" \
+    "- 所有守护逻辑由 alive_guardian 工具在本地完成\n" \
+    "- 未实际成功调用 alive_guardian 前，不得声称守护已经启动、重置、确认或取消\n" \
+    "- 必须以 alive_guardian 工具返回结果为准\n"
+
 /* Built-in skill registry */
 typedef struct {
     const char *filename;   /* e.g. "weather" */
@@ -212,6 +227,7 @@ static const builtin_skill_t s_builtins[] = {
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
     { "task-manager",   BUILTIN_TASK_MANAGER   },
+    { "alive-guardian", BUILTIN_ALIVE_GUARDIAN },
 };
 
 #define NUM_BUILTINS (sizeof(s_builtins) / sizeof(s_builtins[0]))

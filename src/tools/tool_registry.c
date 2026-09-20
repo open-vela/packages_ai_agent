@@ -28,6 +28,7 @@
 #include "tools/tool_guard.h"
 #include "tools/tool_control.h"
 #include "tools/tool_cron.h"
+#include "tools/tool_alive_guardian.h"
 #include "tools/tool_feishu_chat.h"
 #include "tools/tool_feishu_doc.h"
 #include "tools/tool_fetch_url.h"
@@ -269,6 +270,29 @@ int tool_registry_init(void)
             TOOL_PARAM_STR("job_id", "8-char hex job ID")
                 TOOL_SCHEMA_END_REQUIRED("\"job_id\""),
         tool_cron_remove_execute);
+
+    /* Alive Guardian */
+    REGISTER_TOOL(
+        "alive_guardian",
+        "Manage the Are You OK safety guard locally. "
+        "You MUST call this tool when the user says "
+        "\"我还活着\", \"我没事\", or \"我安全\"; use action=confirm. "
+        "You MUST call it for a 30-second safety guard test with action=test, "
+        "for guard status queries with action=status, "
+        "and for cancel/disable requests with action=cancel. "
+        "Never claim that the guard was started, reset, confirmed, or cancelled "
+        "unless this tool was actually called successfully. "
+        "Do not use cron_add, cron_list, cron_remove, or get_current_time "
+        "for Alive Guardian operations.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_ENUM(
+                "action",
+                "Required action: test=30-second demo; "
+                "confirm=user says 我还活着/我没事/我安全 and resets the 72-hour guard; "
+                "status=query current guard; cancel=disable guard",
+                "\"test\",\"confirm\",\"status\",\"cancel\"")
+            TOOL_SCHEMA_END_REQUIRED("\"action\""),
+        tool_alive_guardian_execute);
 
     /* Fetch URL tool */
     REGISTER_TOOL(
