@@ -128,72 +128,7 @@ __attribute__((weak)) int mqtt_publish(void* client, const char* topic,
 }
 #endif
 
-/* Media player stubs for sim build */
-#ifndef CONFIG_MEDIA
-__attribute__((weak)) void* media_player_open(const char* url)
-{
-    (void)url;
-    return NULL;
-}
-__attribute__((weak)) int media_player_close(void* player, int dummy)
-{
-    (void)player;
-    (void)dummy;
-    return -1;
-}
-__attribute__((weak)) int media_player_start(void* player)
-{
-    (void)player;
-    return -1;
-}
-__attribute__((weak)) int media_player_stop(void* player)
-{
-    (void)player;
-    return -1;
-}
-__attribute__((weak)) int media_player_pause(void* player)
-{
-    (void)player;
-    return -1;
-}
-__attribute__((weak)) int media_player_seek(void* player, unsigned int msec)
-{
-    (void)player;
-    (void)msec;
-    return -1;
-}
-__attribute__((weak)) int media_player_prepare(void* player, const char* url, const char* opts)
-{
-    (void)player;
-    (void)url;
-    (void)opts;
-    return -1;
-}
-__attribute__((weak)) int media_player_set_event_callback(void* player, void* cookie, void* cb)
-{
-    (void)player;
-    (void)cookie;
-    (void)cb;
-    return -1;
-}
-__attribute__((weak)) int media_player_get_position(void* player, unsigned int* msec)
-{
-    (void)player;
-    (void)msec;
-    return -1;
-}
-__attribute__((weak)) int media_player_get_duration(void* player, unsigned int* msec)
-{
-    (void)player;
-    (void)msec;
-    return -1;
-}
-__attribute__((weak)) int media_policy_set_stream_volume(const char* stream, int volume)
-{
-    (void)stream;
-    (void)volume;
-    return -1;
-}
+/* media_player_* 的实现在 src/voice/pcm_media_player.c（强符号）。 */
 
 /* Media recorder stubs for sim build */
 __attribute__((weak)) void* media_recorder_open(const char* src)
@@ -230,7 +165,6 @@ __attribute__((weak)) ssize_t media_recorder_read_data(void* rec, void* buf, siz
     (void)len;
     return -1;
 }
-#endif
 
 /* WeChat channel stubs for sim build */
 __attribute__((weak)) int weixin_channel_init(void) { return 0; }
@@ -271,16 +205,7 @@ __attribute__((weak)) bool agent_shutdown_requested(void)
     return _stub_shutdown;
 }
 
-/* ── Media player write_data stub ─────────────────────────── */
-
-__attribute__((weak)) int media_player_write_data(void* player,
-    const void* data, size_t len)
-{
-    (void)player;
-    (void)data;
-    (void)len;
-    return -1;
-}
+/* media_player_write_data() 由上面的 pcm0p 实现提供 (强符号)。 */
 
 /* ── QR code display stub ─────────────────────────────────── */
 

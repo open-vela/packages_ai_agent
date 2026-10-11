@@ -68,6 +68,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/audio_capture.c
     src/voice/audio_playback.c
     src/voice/voice_channel.c
+    src/voice/pcm_media_player.c
     src/stubs.c
     src/ui/qrcode_display.c
   )
