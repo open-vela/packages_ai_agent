@@ -29,7 +29,7 @@ extern "C" {
  * "authorisation" is the Sec-MS-GEC token derived from the wall clock. */
 int edge_tts_register(void);
 
-/* Streaming synthesis: raw 16 kHz/16-bit/mono PCM chunks are delivered
+/* Streaming synthesis: raw 24 kHz/16-bit/mono PCM chunks are delivered
  * through cb as they arrive; cb is finally called with is_last == 1.
  * Returns 0 as soon as at least one chunk was delivered (partial audio is
  * better than replaying the same sentence through the next fallback),

@@ -121,10 +121,10 @@ int voice_tts_speak(const char* text,
  *
  * The playback device is opened once, before the chain runs, with the rate
  * reported by voice_tts_get_sample_rate() (the *active* backend's rate).
- * A fallback backend may disagree: the Volcengine WebSocket stream is 24kHz,
- * the Volcengine HTTP and the Edge streams are 16kHz.  Feeding 16kHz samples
- * to a device opened for 24kHz plays them 1.5x too slow, so chunks crossing
- * that boundary are resampled here (streaming linear interpolation).
+ * A fallback backend may disagree: the Volcengine WebSocket stream and the
+ * Edge stream are 24kHz, the Volcengine HTTP one-shot is 16kHz.  Feeding
+ * 16kHz samples to a device opened for 24kHz plays them 1.5x too slow, so
+ * chunks crossing that boundary are resampled here (linear interpolation).
  *
  * When both rates match - the normal case, and the whole Volcengine path -
  * no wrapper is installed at all and the callback is called directly. */

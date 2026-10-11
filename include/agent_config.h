@@ -437,16 +437,31 @@
 #define AGENT_EDGE_TTS_ORIGIN \
     "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
 
-/* Raw headerless PCM, no MP3 decode on the device.  16 kHz mono 16-bit is
- * also the capture rate; the playback path resamples if it was opened for
- * the 24 kHz Volcengine stream (voice_tts.c installs that shim). */
-#define AGENT_EDGE_TTS_FORMAT "raw-16khz-16bit-mono-pcm"
-#define AGENT_EDGE_TTS_SAMPLE_RATE 16000
+/* Output formats, tried in order by src/voice/edge_tts.c.
+ *
+ * The Edge read-aloud endpoint only serves a subset of the Azure formats:
+ * every client that enumerates it enables the 24 kHz MP3s plus webm/opus and
+ * leaves the raw/riff PCM entries commented out ("Only a few of the possible
+ * formats are accepted" - msedge-tts dist/Output.js).  raw-16khz-16bit-mono-pcm
+ * is in no accepted list, and on hardware the service opened the turn
+ * (Path:response) and then closed it without one audio frame.
+ *
+ * Every rung is 24 kHz, which is also what the rest of the pipeline uses
+ * (Volcengine WS), so the Edge fallback needs no resampling at all. */
+#define AGENT_EDGE_TTS_FORMAT "raw-24khz-16bit-mono-pcm"
+#define AGENT_EDGE_TTS_FORMAT_FALLBACK "riff-24khz-16bit-mono-pcm"
+/* Probe only, never played: if this rung answers while the PCM rungs do not,
+ * the endpoint refuses to emit PCM here and the device would need an MP3/Opus
+ * decoder (libmad/opus exist in the tree but are disabled in this defconfig). */
+#define AGENT_EDGE_TTS_FORMAT_PROBE "audio-24khz-48kbitrate-mono-mp3"
+#define AGENT_EDGE_TTS_SAMPLE_RATE 24000
 #define AGENT_EDGE_DEFAULT_VOICE "zh-CN-XiaoxiaoNeural"
 #define AGENT_EDGE_MAX_TEXT_SEGMENT 4096 /* bytes per SSML request (edge-tts) */
 
 /* Config store keys (all optional — the backend works with zero config) */
 #define AGENT_CFG_KEY_EDGE_VOICE "edge_voice"
+/* "0" turns off the Edge wire dump (default: on). */
+#define AGENT_CFG_KEY_EDGE_DEBUG "edge_debug"
 
 /* ── Tool Guard (security) ──────────────────────────────────── */
 #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)

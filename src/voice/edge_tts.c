@@ -115,12 +115,54 @@ static const char* TAG = "edge_tts";
 /* Windows file time epoch offset (1601-01-01 -> 1970-01-01), drm.py */
 #define EDGE_WIN_EPOCH 11644473600LL
 
-/* speech.config payload.  metadataoptions are disabled: this backend does not
- * use word/sentence boundary events.  The trailing CRLF is in the reference. */
-static const char EDGE_SPEECH_CONFIG[] =
-  "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{"
-  "\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},"
-  "\"outputFormat\":\"" AGENT_EDGE_TTS_FORMAT "\"}}}}\r\n";
+/* Output formats tried in order until one of them produces audio.
+ *
+ * See the comment next to AGENT_EDGE_TTS_FORMAT in agent_config.h: the Edge
+ * read-aloud endpoint answers 101 and starts a turn for formats it cannot
+ * synthesise, then closes the socket without a single Path:audio frame - which
+ * is exactly what raw-16khz-16bit-mono-pcm did on hardware.  The rungs below
+ * are all 24 kHz, matching the Volcengine WS stream, so no rate conversion is
+ * needed when Edge takes over from it.
+ *
+ * The last rung is a probe: its bytes are counted but never played.  If only
+ * that one answers, the service refuses PCM on this endpoint and an MP3/Opus
+ * decoder would be required. */
+typedef struct
+{
+  const char* format;
+  int is_pcm;
+} edge_format_t;
+
+static const edge_format_t EDGE_FORMATS[] =
+{
+  { AGENT_EDGE_TTS_FORMAT, 1 },
+  { AGENT_EDGE_TTS_FORMAT_FALLBACK, 1 },
+  { AGENT_EDGE_TTS_FORMAT_PROBE, 0 },
+};
+
+#define EDGE_NFORMATS ((int)(sizeof(EDGE_FORMATS) / sizeof(EDGE_FORMATS[0])))
+
+/* Rung that produced audio last time; later segments start there. */
+static int s_format_index;
+
+/* speech.config payload.  sentenceBoundaryEnabled is "true" and
+ * wordBoundaryEnabled is "false" - the reference defaults; the trailing CRLF
+ * is in the reference too.  Metadata frames are ignored on receive. */
+static int edge_build_speech_config(char* buf, size_t cap, const char* format)
+{
+  int n = snprintf(buf, cap,
+    "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{"
+    "\"sentenceBoundaryEnabled\":\"true\",\"wordBoundaryEnabled\":\"false\"},"
+    "\"outputFormat\":\"%s\"}}}}\r\n",
+    format);
+
+  if (n <= 0 || (size_t)n >= cap)
+    {
+      return -EOVERFLOW;
+    }
+
+  return n;
+}
 
 /* ── Clock / DRM ─────────────────────────────────────────────── */
 
@@ -130,6 +172,59 @@ static long s_skew_secs;
 
 /* Voice name (SSML <voice name=...>), from config store or the default. */
 static char s_voice[64];
+
+/* Wire dump of the Edge protocol.  Default on ("edge_debug" = "0" turns it
+ * off); it is the only way to see what the service actually answered when a
+ * turn ends without audio.  CR/LF are escaped so frame boundaries are visible. */
+static int s_debug = 1;
+static int s_debug_known;
+
+static void edge_dump(const char* what, const unsigned char* data, size_t len)
+{
+  char buf[1200];
+  size_t n = len < 280 ? len : 280;
+  size_t o = 0;
+  size_t i;
+
+  if (!s_debug)
+    {
+      return;
+    }
+
+  if (!data)
+    {
+      syslog(LOG_INFO, "[%s] %s (%zu bytes): <null>\n", TAG, what, len);
+      return;
+    }
+
+  for (i = 0; i < n && o + 6 < sizeof(buf); i++)
+    {
+      unsigned char c = data[i];
+
+      if (c == '\r')
+        {
+          memcpy(buf + o, "\\r", 2);
+          o += 2;
+        }
+      else if (c == '\n')
+        {
+          memcpy(buf + o, "\\n", 2);
+          o += 2;
+        }
+      else if (c >= 0x20 && c < 0x7f)
+        {
+          buf[o++] = (char)c;
+        }
+      else
+        {
+          o += (size_t)snprintf(buf + o, sizeof(buf) - o, "\\x%02x", c);
+        }
+    }
+
+  buf[o] = '\0';
+  syslog(LOG_INFO, "[%s] %s (%zu bytes)%s: %s\n", TAG, what, len,
+         len > n ? " [truncated]" : "", buf);
+}
 
 static time_t edge_local_now(void)
 {
@@ -1040,17 +1135,26 @@ static size_t edge_segment_len(const char* text, size_t len)
 
 /* ── Request payloads ────────────────────────────────────────── */
 
-static int edge_send_speech_config(edge_tls_t* ctx)
+static int edge_send_speech_config(edge_tls_t* ctx, const char* format)
 {
   char date[64];
-  size_t cap = sizeof(date) + sizeof(EDGE_SPEECH_CONFIG) + 128;
+  char json[256];
+  size_t cap = sizeof(date) + sizeof(json) + 128;
   char* msg = malloc(cap);
+  int jlen;
   int n;
   int ret;
 
   if (!msg)
     {
       return -ENOMEM;
+    }
+
+  jlen = edge_build_speech_config(json, sizeof(json), format);
+  if (jlen < 0)
+    {
+      free(msg);
+      return jlen;
     }
 
   edge_js_date(edge_utc_now(), date, sizeof(date));
@@ -1060,13 +1164,15 @@ static int edge_send_speech_config(edge_tls_t* ctx)
                "Content-Type:application/json; charset=utf-8\r\n"
                "Path:speech.config\r\n\r\n"
                "%s",
-               date, EDGE_SPEECH_CONFIG);
+               date, json);
 
   if (n <= 0 || (size_t)n >= cap)
     {
       free(msg);
       return -EOVERFLOW;
     }
+
+  edge_dump(">> speech.config", (const unsigned char*)msg, (size_t)n);
 
   ret = edge_ws_send_frame(ctx, EDGE_WS_OP_TEXT, (const unsigned char*)msg,
                            (size_t)n);
@@ -1121,6 +1227,8 @@ static int edge_send_ssml(edge_tls_t* ctx, const char* escaped, size_t elen)
       return -EOVERFLOW;
     }
 
+  edge_dump(">> ssml", (const unsigned char*)msg, (size_t)n);
+
   ret = edge_ws_send_frame(ctx, EDGE_WS_OP_TEXT, (const unsigned char*)msg,
                            (size_t)n);
   free(msg);
@@ -1133,9 +1241,14 @@ typedef struct
 {
   voice_tts_chunk_cb cb;
   void* user_data;
-  size_t pcm_bytes;
+  size_t pcm_bytes;   /* bytes that were (or would have been) playable */
+  size_t probe_bytes; /* bytes from a probe-only format */
   int riff_checked;
+  int probe_only; /* current format is not PCM: count, never deliver */
 } edge_sink_t;
+
+/* Any bytes at all (playable or probe) mean the turn produced audio. */
+#define EDGE_SINK_GOT_AUDIO(s) (((s)->pcm_bytes + (s)->probe_bytes) > 0)
 
 static void edge_sink_pcm(edge_sink_t* sink, const unsigned char* pcm,
                           size_t len)
@@ -1162,6 +1275,14 @@ static void edge_sink_pcm(edge_sink_t* sink, const unsigned char* pcm,
 
   if (len == 0)
     {
+      return;
+    }
+
+  if (sink->probe_only)
+    {
+      /* Diagnostic rung: the service answered, but with a codec the device
+       * cannot play.  Count the bytes and keep them away from the speaker. */
+      sink->probe_bytes += len;
       return;
     }
 
@@ -1195,7 +1316,7 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
               /* Silence after audio started usually means the turn is over
                * and turn.end was lost; report success so the caller does not
                * replay the sentence through the next backend. */
-              if (sink->pcm_bytes > 0
+              if (EDGE_SINK_GOT_AUDIO(sink)
                   && ++consecutive_timeouts < EDGE_MAX_CONSEC_TIMEOUTS)
                 {
                   syslog(LOG_DEBUG, "[%s] recv timeout %d/%d\n", TAG,
@@ -1203,7 +1324,7 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
                   continue;
                 }
 
-              if (sink->pcm_bytes > 0)
+              if (EDGE_SINK_GOT_AUDIO(sink))
                 {
                   syslog(LOG_WARNING,
                          "[%s] no turn.end after %zu PCM bytes, assuming end\n",
@@ -1211,7 +1332,7 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
                   break;
                 }
             }
-          else if (ret == -ECONNRESET && sink->pcm_bytes > 0)
+          else if (ret == -ECONNRESET && EDGE_SINK_GOT_AUDIO(sink))
             {
               syslog(LOG_INFO, "[%s] peer closed after %zu PCM bytes\n", TAG,
                      sink->pcm_bytes);
@@ -1233,12 +1354,28 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
 
       if (opcode == EDGE_WS_OP_CLOSE)
         {
-          syslog(LOG_INFO, "[%s] server closed the WebSocket\n", TAG);
+          /* RFC 6455 close payload: 2-byte status code + UTF-8 reason.  This
+           * is where the service explains an aborted turn - always log it. */
+          if (flen >= 2)
+            {
+              unsigned code = ((unsigned)buf[0] << 8) | (unsigned)buf[1];
+
+              syslog(LOG_WARNING,
+                     "[%s] server closed the WebSocket: code=%u reason='%.*s'\n",
+                     TAG, code, (int)(flen - 2), (const char*)buf + 2);
+            }
+          else
+            {
+              syslog(LOG_WARNING, "[%s] server closed the WebSocket\n", TAG);
+            }
+
+          edge_dump("< close", buf, flen);
           break;
         }
 
       if (opcode == EDGE_WS_OP_PING || opcode == EDGE_WS_OP_PONG)
         {
+          edge_dump(opcode == EDGE_WS_OP_PING ? "< ping" : "< pong", buf, flen);
           continue;
         }
 
@@ -1267,12 +1404,24 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
 
           if (!edge_header_is((const char*)buf + 2, hdr_len, "Path", "audio"))
             {
+              /* Never drop a frame silently: this is how a server-side error
+               * payload would hide. */
+              syslog(LOG_WARNING,
+                     "[%s] binary frame without Path:audio (%zu bytes)\n", TAG,
+                     flen - hdr_len - 2);
+              edge_dump("< binary hdr", buf + 2, hdr_len);
+              edge_dump("< binary body", payload, flen - hdr_len - 2);
               continue;
+            }
+
+          if (s_debug && sink->pcm_bytes == 0 && sink->probe_bytes == 0)
+            {
+              edge_dump("< audio hdr", buf + 2, hdr_len);
             }
 
           edge_sink_pcm(sink, payload, flen - hdr_len - 2);
 
-          if (sink->pcm_bytes > 0)
+          if (EDGE_SINK_GOT_AUDIO(sink))
             {
               /* From here on a stall is treated as end of turn. */
               edge_set_recv_timeout(ctx, EDGE_RECV_TIMEOUT_AUDIO_MS);
@@ -1281,10 +1430,13 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
           continue;
         }
 
-      /* Text frame: header block, CRLFCRLF, optional body. */
+      /* Text frame: header block, CRLFCRLF, optional body.  Dump the whole
+       * frame (headers included) - this is where an error shows up. */
       {
         const char* body = NULL;
         size_t hlen = flen;
+
+        edge_dump("< text", buf, flen);
 
         if (flen > 0)
           {
@@ -1320,13 +1472,31 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
             continue;
           }
 
-        /* "response" carries server-side error details; log it for the field
-         * report, everything else is metadata we do not use. */
-        if (body && (size_t)(flen - (size_t)(body - (char*)buf)) > 0)
+        if (edge_header_is((const char*)buf, hlen, "Path", "audio.metadata"))
           {
-            syslog(LOG_WARNING, "[%s] service: %.*s\n", TAG,
-                   (int)(flen - (size_t)(body - (char*)buf)), body);
+            continue; /* boundary events: not used by this backend */
           }
+
+        /* Normally "response"; anything else is worth a look.  The Path is
+         * printed because it tells an abort from a normal turn. */
+        {
+          const char* path = edge_header_value((const char*)buf, hlen, "Path");
+          size_t plen = 0;
+          size_t body_len = body
+            ? (size_t)(flen - (size_t)(body - (char*)buf)) : 0;
+
+          if (path)
+            {
+              while ((size_t)(path - (const char*)buf) + plen < hlen
+                     && path[plen] != '\r' && path[plen] != '\n')
+                {
+                  plen++;
+                }
+            }
+
+          syslog(LOG_WARNING, "[%s] service frame: Path=%.*s body=%.*s\n", TAG,
+                 (int)plen, path ? path : "", (int)body_len, body ? body : "");
+        }
       }
     }
 
@@ -1374,9 +1544,10 @@ static int edge_build_path(char* buf, size_t cap)
   return 0;
 }
 
-/* Synthesise one text segment over one WebSocket session. */
+/* Synthesise one text segment over one WebSocket session, asking for the
+ * given output format. */
 static int edge_stream_segment(const char* raw_text, size_t raw_len,
-                               edge_sink_t* sink)
+                               edge_sink_t* sink, const char* format)
 {
   edge_tls_t ctx;
   char path[320];
@@ -1429,7 +1600,7 @@ static int edge_stream_segment(const char* raw_text, size_t raw_len,
           break;
         }
 
-      ret = edge_send_speech_config(&ctx);
+      ret = edge_send_speech_config(&ctx, format);
       if (ret == 0)
         {
           xml = edge_xml_escape(escaped);
@@ -1470,8 +1641,23 @@ static int edge_tts_init(void)
       strncpy(s_voice, AGENT_EDGE_DEFAULT_VOICE, sizeof(s_voice) - 1);
     }
 
+  if (!s_debug_known)
+    {
+      char v[8];
+
+      s_debug_known = 1;
+
+      if (claw_config_get(AGENT_CFG_KEY_EDGE_DEBUG, v, sizeof(v)) == OK)
+        {
+          s_debug = atoi(v) != 0;
+        }
+
+      syslog(LOG_INFO, "[%s] wire debug %s (edge_debug=0 to disable)\n", TAG,
+             s_debug ? "on" : "off");
+    }
+
   syslog(LOG_INFO, "[%s] voice: %s, format: %s\n", TAG, s_voice,
-         AGENT_EDGE_TTS_FORMAT);
+         EDGE_FORMATS[s_format_index].format);
   return 0;
 }
 
@@ -1500,10 +1686,55 @@ int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
   while (remaining > 0)
     {
       size_t seg = edge_segment_len(p, remaining);
+      int fmt;
+      int delivered = 0;
 
-      ret = edge_stream_segment(p, seg, &sink);
+      /* Format ladder: the endpoint answers 101 and starts a turn even for
+       * output formats it will not synthesise, then closes without audio, so
+       * the only reliable probe is "did any Path:audio frame arrive". */
+      for (fmt = s_format_index; fmt < EDGE_NFORMATS; fmt++)
+        {
+          size_t before = sink.pcm_bytes;
 
-      if (ret != 0)
+          sink.probe_only = !EDGE_FORMATS[fmt].is_pcm;
+          sink.riff_checked = 0; /* each session has its own first frame */
+
+          syslog(LOG_INFO, "[%s] trying output format: %s%s\n", TAG,
+                 EDGE_FORMATS[fmt].format,
+                 EDGE_FORMATS[fmt].is_pcm ? "" : " (probe only, not played)");
+
+          ret = edge_stream_segment(p, seg, &sink, EDGE_FORMATS[fmt].format);
+
+          if (sink.pcm_bytes > before)
+            {
+              if (fmt != s_format_index)
+                {
+                  syslog(LOG_INFO, "[%s] using output format: %s\n", TAG,
+                         EDGE_FORMATS[fmt].format);
+                  s_format_index = fmt;
+                }
+
+              delivered = 1;
+              break;
+            }
+
+          if (sink.probe_bytes > 0)
+            {
+              /* Definitive diagnosis: the service synthesises, but only in a
+               * codec this device cannot play. */
+              syslog(LOG_ERR,
+                     "[%s] service answered only with %s (%zu bytes): this "
+                     "endpoint refuses PCM output, an MP3/Opus decoder would be "
+                     "needed\n",
+                     TAG, EDGE_FORMATS[fmt].format, sink.probe_bytes);
+              break;
+            }
+
+          syslog(LOG_WARNING, "[%s] format %s produced no audio (rc=%d)\n", TAG,
+                 EDGE_FORMATS[fmt].format, ret);
+        }
+
+      if (!delivered)
         {
           /* Audio already delivered is not replayed: the fallback chain must
            * not speak the same sentence twice. */

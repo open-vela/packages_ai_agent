@@ -1059,7 +1059,7 @@ int voice_channel_speak(const char* text)
     /* Try streaming TTS first (callback per chunk).  The device is opened
      * with the rate of the *active* backend; voice_tts_speak_stream()
      * resamples if a fallback backend produces a different rate (the
-     * Volcengine WS stream is 24kHz, Volcengine HTTP and Edge are 16kHz). */
+     * Volcengine HTTP one-shot is 16kHz, the WS stream and Edge are 24kHz). */
     unsigned int tts_rate = voice_tts_get_sample_rate();
 
     syslog(LOG_INFO, "[%s] speak: playback %u Hz, backend '%s'\n", TAG,
