@@ -32,13 +32,45 @@
 #endif
 
 #if defined(CONFIG_UORB) && defined(CONFIG_FITNESS_ALGO)
+#include <poll.h>
+
+/* 读一次话题。**必须先等一个新的更新再 copy**: 刚 subscribe 时 copy 会拿不到
+ * 数据(返回 -EAGAIN), 这就是 get_heartrate 一直报 sensor not available 的原因 ——
+ * 话题其实存在(/dev/uorb/algo_heartrate0), 发布端 100Hz。
+ * 这里 poll 最多 ~500ms (50 x 10ms) 等一次更新, 失败时打日志说明原因。 */
 static int orb_read_once(const struct orb_metadata *meta, void *buf)
 {
-    int fd = orb_subscribe(meta);
-    if (fd < 0) return -1;
-    int ret = orb_copy(meta, fd, buf);
+    struct pollfd pfd;
+    int fd;
+    int ret = -1;
+    int i;
+
+    fd = orb_subscribe(meta);
+    if (fd < 0) {
+        syslog(LOG_WARNING, "[health] orb_subscribe(%s) failed: %d\n",
+               meta->o_name, fd);
+        return -1;
+    }
+
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    for (i = 0; i < 50; i++) {
+        ret = poll(&pfd, 1, 10);
+        if (ret > 0) {
+            ret = orb_copy(meta, fd, buf);
+            if (ret == 0) break;
+        }
+    }
+
+    if (ret != 0) {
+        syslog(LOG_WARNING, "[health] no update on %s after 500ms (ret=%d)\n",
+               meta->o_name, ret);
+    }
+
     orb_unsubscribe(fd);
-    return ret;
+    return (ret == 0) ? 0 : -1;
 }
 #endif
 
