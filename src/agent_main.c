@@ -608,6 +608,24 @@ int ai_agent_main(int argc, char* argv[])
     /* ── Phase 1: Core infrastructure ──────────────────────── */
     {
         int rc;
+
+        /* 板载音频设备开机自注册 (采集 pcm0c / 播放 pcm0p)。实现在参赛仓
+         * app/ai_agent/audio/ 里, 与 audio_setup 命令共享同一份代码;
+         * 重复注册只返回错误, 不影响启动 —— 这样产品镜像不再依赖手工
+         * 执行 audio_setup, 语音链路(采集/播放/TTS)开机即可用。 */
+#if defined(CONFIG_EXAMPLES_AUDIO_SETUP) || defined(CONFIG_EXAMPLES_AUDIO_SETUP_TX)
+        extern int sf32lb52_audcodec_register(void);
+        extern int sf32lb52_audio_tx_register(void);
+#  ifdef CONFIG_EXAMPLES_AUDIO_SETUP
+        rc = sf32lb52_audcodec_register();
+        BOOT_LOG_RC(&t0, "P1", "audcodec_register(capture)", rc);
+#  endif
+#  ifdef CONFIG_EXAMPLES_AUDIO_SETUP_TX
+        rc = sf32lb52_audio_tx_register();
+        BOOT_LOG_RC(&t0, "P1", "audio_tx_register(playback)", rc);
+#  endif
+#endif
+
         rc = config_store_init();
         BOOT_LOG_RC(&t0, "P1", "config_store_init", rc);
 
