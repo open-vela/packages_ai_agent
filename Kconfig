@@ -93,6 +93,23 @@ config EXAMPLES_AI_AGENT_VELA_SHELL_DENY
 
 endchoice
 
+config AI_AGENT_SPEAK_WS_REPLIES
+	bool "Speak WebSocket (phone app) replies aloud"
+	default n
+	---help---
+		Route replies that go to the phone app through the TTS + playback chain
+		so the watch says its answers out loud, using the same cooldown as the
+		voice channel.
+
+config AI_AGENT_BOOT_CHIME
+	bool "Play a short boot chime (speaker self-test)"
+	default y
+	---help---
+		Plays three short rising tones through the verified playback path
+		(media_player -> /dev/audio/pcm0p -> AUDPRC -> AUDCODEC DAC -> PA) right
+		after the audio devices are registered, so the speaker can be confirmed
+		audible without touching the serial console.
+
 config AI_AGENT_LVGL_UI
 	bool "Enable LVGL UI channel"
 	default n

@@ -457,6 +457,15 @@ static void* outbound_dispatch_task(void* arg)
             }
         } else if (strcmp(msg.channel, AGENT_CHAN_WEBSOCKET) == 0) {
             ws_server_send(msg.chat_id, msg.content, msg.from_local);
+#ifdef CONFIG_AI_AGENT_SPEAK_WS_REPLIES
+            /* 手机 App 提问 -> 手表把回答念出来。用异步版本: 派发线程绝不阻塞 */
+            {
+                extern int voice_channel_speak_async(const char* text);
+                if (voice_channel_speak_async(msg.content) != 0) {
+                    syslog(LOG_WARNING, "[%s] speak(ws) dispatch failed\n", TAG);
+                }
+            }
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
             /* 手机侧对话同样上手表小云：写进历史环与桌宠页文本层，
              * 用户在桌面时还会被自动带到桌宠页（与 cli 通道一致） */
@@ -624,6 +633,14 @@ int ai_agent_main(int argc, char* argv[])
         rc = sf32lb52_audio_tx_register();
         BOOT_LOG_RC(&t0, "P1", "audio_tx_register(playback)", rc);
 #  endif
+#endif
+
+#ifdef CONFIG_AI_AGENT_BOOT_CHIME
+        /* 开机三声短音: 不依赖串口控制台的"喇叭自检" (实现见 voice/boot_chime.c) */
+        {
+            extern int agent_boot_chime(void);
+            (void)agent_boot_chime();
+        }
 #endif
 
         rc = config_store_init();

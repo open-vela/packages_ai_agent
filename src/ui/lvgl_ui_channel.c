@@ -884,12 +884,14 @@ int lvgl_ui_channel_send(const char *text)
     /* emotion follows the reply content */
     emotion = emotion_from_text(text);
     if (emotion == PET_EMOTION_SPEAKING) {
-        /* TTS is blocking; the pet "speaks" while it plays */
+        /* TTS 会阻塞数秒~数十秒(网络+解码+播放), 绝不能占住 LVGL 线程 ——
+         * 之前这里同步调用导致\"屏幕卡死\"。改为后台线程念, UI 只负责表情,
+         * 并用既有定时器自动回落 idle (不做跨线程 LVGL 调用)。 */
         pet_display_set_emotion(PET_EMOTION_SPEAKING);
-        if (voice_channel_speak(text) != 0) {
-            syslog(LOG_WARNING, "[%s] voice_channel_speak failed\n", UI_TAG);
+        pet_back_idle_after(4000);
+        if (voice_channel_speak_async(text) != 0) {
+            syslog(LOG_WARNING, "[%s] speak async dispatch failed\n", UI_TAG);
         }
-        pet_display_set_emotion(PET_EMOTION_IDLE);
     } else {
         pet_display_set_emotion(emotion);
         pet_back_idle_after(1500);

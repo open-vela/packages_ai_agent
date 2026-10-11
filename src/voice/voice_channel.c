@@ -994,6 +994,42 @@ static void tts_strip_markdown(char* s)
     *w = '\0';
 }
 
+/* 后台线程里念一句话。TTS 要走网络+解码+播放, 正常也要几秒到几十秒, 绝不能
+ * 占住 UI 线程或 agent 的派发线程 —— 之前的\"屏幕卡死\"就是同步调用造成的。
+ * 返回 0 表示线程已派出(不代表念成功, 失败只记日志)。 */
+static void* speak_thread(void* arg)
+{
+    char* text = (char*)arg;
+    int ret = voice_channel_speak(text);
+    if (ret != 0) {
+        syslog(LOG_WARNING, "[%s] async speak failed: %d\n", TAG, ret);
+    }
+    free(text);
+    return NULL;
+}
+
+int voice_channel_speak_async(const char* text)
+{
+    pthread_t th;
+    char* copy;
+
+    if (!text || text[0] == '\0') {
+        return -EINVAL;
+    }
+
+    copy = strdup(text);
+    if (!copy) {
+        return -ENOMEM;
+    }
+
+    if (pthread_create(&th, NULL, speak_thread, copy) != 0) {
+        free(copy);
+        return -EIO;
+    }
+    pthread_detach(th);
+    return 0;
+}
+
 int voice_channel_speak(const char* text)
 {
     if (!text || text[0] == '\0') {

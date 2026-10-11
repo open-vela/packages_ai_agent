@@ -77,6 +77,7 @@
 #include "agent_config.h"
 #include "infra/config_store.h"
 #include "infra/http_proxy.h"
+#include "voice/edge_mp3.h"
 #include "voice/voice_tts.h"
 
 #include "mbedtls/base64.h"
@@ -117,27 +118,31 @@ static const char* TAG = "edge_tts";
 
 /* Output formats tried in order until one of them produces audio.
  *
- * See the comment next to AGENT_EDGE_TTS_FORMAT in agent_config.h: the Edge
- * read-aloud endpoint answers 101 and starts a turn for formats it cannot
- * synthesise, then closes the socket without a single Path:audio frame - which
- * is exactly what raw-16khz-16bit-mono-pcm did on hardware.  The rungs below
- * are all 24 kHz, matching the Volcengine WS stream, so no rate conversion is
- * needed when Edge takes over from it.
+ * The Edge read-aloud endpoint refuses PCM outright: on hardware it answered
+ * the first rung with WS close 1007 "Unsupported Edge output format:
+ * raw-24khz-16bit-mono-pcm." (and the same for riff-24khz).  Only MP3 works,
+ * so that rung is decoded on the device with minimp3 (see edge_mp3.c) and the
+ * decoded 24 kHz PCM goes to the normal playback path - no rate conversion,
+ * because 24 kHz is what the Volcengine WS stream uses too.
  *
- * The last rung is a probe: its bytes are counted but never played.  If only
- * that one answers, the service refuses PCM on this endpoint and an MP3/Opus
- * decoder would be required. */
+ * MP3 comes first. Measured on hardware (2026-10-11): this endpoint rejects
+ * both PCM rungs with WS close 1007 'Unsupported Edge output format', and each
+ * rejected rung costs a full TLS+WS round trip (~2 s on the BT-PAN link), so
+ * trying PCM first made the first sentence take 24 s. The two PCM rungs are
+ * kept behind MP3 so they are still probed if Microsoft ever re-enables raw
+ * output -- by then the MP3 rung will have failed and the cached rung index
+ * moves on. */
 typedef struct
 {
   const char* format;
-  int is_pcm;
+  int is_mp3; /* 1 = decode with minimp3, 0 = raw PCM */
 } edge_format_t;
 
 static const edge_format_t EDGE_FORMATS[] =
 {
-  { AGENT_EDGE_TTS_FORMAT, 1 },
-  { AGENT_EDGE_TTS_FORMAT_FALLBACK, 1 },
-  { AGENT_EDGE_TTS_FORMAT_PROBE, 0 },
+  { AGENT_EDGE_TTS_FORMAT_MP3, 1 },      /* the one it does serve (measured) */
+  { AGENT_EDGE_TTS_FORMAT, 0 },          /* raw-24khz PCM  (service: 1007) */
+  { AGENT_EDGE_TTS_FORMAT_FALLBACK, 0 }, /* riff-24khz PCM (service: 1007) */
 };
 
 #define EDGE_NFORMATS ((int)(sizeof(EDGE_FORMATS) / sizeof(EDGE_FORMATS[0])))
@@ -1241,14 +1246,14 @@ typedef struct
 {
   voice_tts_chunk_cb cb;
   void* user_data;
-  size_t pcm_bytes;   /* bytes that were (or would have been) playable */
-  size_t probe_bytes; /* bytes from a probe-only format */
+  size_t pcm_bytes; /* PCM handed to the caller (decoded when the rung is MP3) */
+  size_t mp3_bytes; /* MP3 bytes fed to the decoder (mp3 rung only) */
   int riff_checked;
-  int probe_only; /* current format is not PCM: count, never deliver */
+  edge_mp3_t* mp3; /* set while the MP3 rung is running */
 } edge_sink_t;
 
-/* Any bytes at all (playable or probe) mean the turn produced audio. */
-#define EDGE_SINK_GOT_AUDIO(s) (((s)->pcm_bytes + (s)->probe_bytes) > 0)
+/* Any payload bytes at all mean the turn produced audio. */
+#define EDGE_SINK_GOT_AUDIO(s) (((s)->pcm_bytes + (s)->mp3_bytes) > 0)
 
 static void edge_sink_pcm(edge_sink_t* sink, const unsigned char* pcm,
                           size_t len)
@@ -1278,16 +1283,38 @@ static void edge_sink_pcm(edge_sink_t* sink, const unsigned char* pcm,
       return;
     }
 
-  if (sink->probe_only)
+  sink->pcm_bytes += len;
+  sink->cb(pcm, len, 0, sink->user_data);
+}
+
+/* Decoded MP3 output: same contract as the raw PCM rungs. */
+static void edge_sink_decoded(const unsigned char* pcm, size_t len,
+                              void* user_data)
+{
+  edge_sink_t* sink = (edge_sink_t*)user_data;
+
+  if (!pcm || len == 0)
     {
-      /* Diagnostic rung: the service answered, but with a codec the device
-       * cannot play.  Count the bytes and keep them away from the speaker. */
-      sink->probe_bytes += len;
       return;
     }
 
   sink->pcm_bytes += len;
   sink->cb(pcm, len, 0, sink->user_data);
+}
+
+/* One Path:audio payload: either raw PCM (the raw and riff rungs) or MP3
+ * that the minimp3 wrapper turns into PCM (the mp3 rung). */
+static void edge_sink_audio(edge_sink_t* sink, const unsigned char* data,
+                            size_t len)
+{
+  if (sink->mp3)
+    {
+      sink->mp3_bytes += len;
+      edge_mp3_feed(sink->mp3, data, len);
+      return;
+    }
+
+  edge_sink_pcm(sink, data, len);
 }
 
 static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
@@ -1414,12 +1441,12 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
               continue;
             }
 
-          if (s_debug && sink->pcm_bytes == 0 && sink->probe_bytes == 0)
+          if (s_debug && !EDGE_SINK_GOT_AUDIO(sink))
             {
               edge_dump("< audio hdr", buf + 2, hdr_len);
             }
 
-          edge_sink_pcm(sink, payload, flen - hdr_len - 2);
+          edge_sink_audio(sink, payload, flen - hdr_len - 2);
 
           if (EDGE_SINK_GOT_AUDIO(sink))
             {
@@ -1690,20 +1717,50 @@ int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
       int delivered = 0;
 
       /* Format ladder: the endpoint answers 101 and starts a turn even for
-       * output formats it will not synthesise, then closes without audio, so
-       * the only reliable probe is "did any Path:audio frame arrive". */
+       * output formats it refuses (it then closes with 1007), so the only
+       * reliable probe is "did any Path:audio frame arrive". */
       for (fmt = s_format_index; fmt < EDGE_NFORMATS; fmt++)
         {
           size_t before = sink.pcm_bytes;
+          size_t mp3_in = 0;
 
-          sink.probe_only = !EDGE_FORMATS[fmt].is_pcm;
           sink.riff_checked = 0; /* each session has its own first frame */
+
+          if (EDGE_FORMATS[fmt].is_mp3)
+            {
+              sink.mp3 = edge_mp3_open(edge_sink_decoded, &sink);
+              if (!sink.mp3)
+                {
+                  syslog(LOG_ERR, "[%s] no memory for the MP3 decoder\n", TAG);
+                  break;
+                }
+            }
+          else
+            {
+              sink.mp3 = NULL;
+            }
 
           syslog(LOG_INFO, "[%s] trying output format: %s%s\n", TAG,
                  EDGE_FORMATS[fmt].format,
-                 EDGE_FORMATS[fmt].is_pcm ? "" : " (probe only, not played)");
+                 EDGE_FORMATS[fmt].is_mp3 ? " (decoded with minimp3)" : "");
 
           ret = edge_stream_segment(p, seg, &sink, EDGE_FORMATS[fmt].format);
+
+          if (sink.mp3)
+            {
+              mp3_in = edge_mp3_input_bytes(sink.mp3);
+
+              syslog(LOG_INFO,
+                     "[%s] mp3: %zu bytes in -> %zu PCM bytes out (%zu frames, "
+                     "%d Hz, %.2f:1)\n",
+                     TAG, mp3_in, edge_mp3_pcm_bytes(sink.mp3),
+                     edge_mp3_frames(sink.mp3), edge_mp3_sample_rate(sink.mp3),
+                     mp3_in ? (double)edge_mp3_pcm_bytes(sink.mp3) / (double)mp3_in
+                            : 0.0);
+
+              edge_mp3_close(sink.mp3);
+              sink.mp3 = NULL;
+            }
 
           if (sink.pcm_bytes > before)
             {
@@ -1715,18 +1772,6 @@ int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
                 }
 
               delivered = 1;
-              break;
-            }
-
-          if (sink.probe_bytes > 0)
-            {
-              /* Definitive diagnosis: the service synthesises, but only in a
-               * codec this device cannot play. */
-              syslog(LOG_ERR,
-                     "[%s] service answered only with %s (%zu bytes): this "
-                     "endpoint refuses PCM output, an MP3/Opus decoder would be "
-                     "needed\n",
-                     TAG, EDGE_FORMATS[fmt].format, sink.probe_bytes);
               break;
             }
 

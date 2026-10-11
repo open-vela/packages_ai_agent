@@ -25,6 +25,33 @@
 #include <stdio.h>
 #include <string.h>
 
+/* 让手表念一句话 —— 端到端验证 TTS(Edge/火山) -> 播放设备 -> 喇叭。
+ * 放在 agent CLI 里而不是 NSH: agent 常驻持有 stdin, NSH 命令会被
+ * \"Unknown command\" 吃掉(vella> 抢输入), 从 CLI 触发 100% 可靠。 */
+void cmd_voice_speak(int argc, char** argv)
+{
+    char text[256];
+    int i;
+    int ret;
+
+    if (argc < 2) {
+        printf("Usage: speak <text...>\n");
+        return;
+    }
+
+    memset(text, 0, sizeof(text));
+    for (i = 1; i < argc; i++) {
+        strncat(text, argv[i], sizeof(text) - strlen(text) - 1);
+        if (i < argc - 1) {
+            strncat(text, " ", sizeof(text) - strlen(text) - 1);
+        }
+    }
+
+    printf("[speak] \"%s\"\n", text);
+    ret = voice_channel_speak(text);
+    printf("[speak] %s (ret=%d)\n", (ret == 0) ? "OK" : "FAILED", ret);
+}
+
 void cmd_set_volc_key(int argc, char** argv)
 {
     if (argc < 2) {

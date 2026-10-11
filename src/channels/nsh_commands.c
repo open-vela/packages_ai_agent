@@ -127,6 +127,7 @@ static void cmd_help(void)
         "  restart              - Restart the device\n"
         "  quit                 - Exit agent\n"
         "  set_mqtt <broker> [client_id] - Set MQTT broker (host:port)\n"
+        "  speak <text...>              - Make the watch say this text\n"
         "  set_volc_key <api_key>       - Set Doubao voice API key\n"
         "  set_volc_asr <id> <tok> <cluster> - Set ASR credentials\n"
         "  set_volc_speaker <id>  - Set TTS voice (e.g. zh_female_cancan)\n"
@@ -994,6 +995,8 @@ static void* cli_thread(void* arg)
             break;
         } else if (strcmp(cmd, "set_mqtt") == 0)
             cmd_set_mqtt(argc, argv);
+        else if (strcmp(cmd, "speak") == 0)
+            cmd_voice_speak(argc, argv);
         else if (strcmp(cmd, "set_volc_key") == 0)
             cmd_set_volc_key(argc, argv);
         else if (strcmp(cmd, "set_volc_asr") == 0)

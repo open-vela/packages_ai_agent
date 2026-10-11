@@ -16,6 +16,7 @@
 
 #pragma once
 
+void cmd_voice_speak(int argc, char** argv);
 void cmd_set_volc_key(int argc, char** argv);
 void cmd_set_volc_speaker(int argc, char** argv);
 void cmd_set_edge_voice(int argc, char** argv);

@@ -439,21 +439,18 @@
 
 /* Output formats, tried in order by src/voice/edge_tts.c.
  *
- * The Edge read-aloud endpoint only serves a subset of the Azure formats:
- * every client that enumerates it enables the 24 kHz MP3s plus webm/opus and
- * leaves the raw/riff PCM entries commented out ("Only a few of the possible
- * formats are accepted" - msedge-tts dist/Output.js).  raw-16khz-16bit-mono-pcm
- * is in no accepted list, and on hardware the service opened the turn
- * (Path:response) and then closed it without one audio frame.
+ * On hardware the endpoint refused both PCM rungs outright - WS close 1007
+ * "Unsupported Edge output format: raw-24khz-16bit-mono-pcm." - and only
+ * synthesised the MP3 one.  So the MP3 rung is decoded on the device
+ * (minimp3, see src/voice/edge_mp3.c) and the PCM rungs stay in front only
+ * because they would start working again if Microsoft re-enabled raw output.
  *
- * Every rung is 24 kHz, which is also what the rest of the pipeline uses
- * (Volcengine WS), so the Edge fallback needs no resampling at all. */
+ * Everything is 24 kHz, which is what the rest of the pipeline uses
+ * (Volcengine WS), so no rate conversion happens when Edge takes over. */
 #define AGENT_EDGE_TTS_FORMAT "raw-24khz-16bit-mono-pcm"
 #define AGENT_EDGE_TTS_FORMAT_FALLBACK "riff-24khz-16bit-mono-pcm"
-/* Probe only, never played: if this rung answers while the PCM rungs do not,
- * the endpoint refuses to emit PCM here and the device would need an MP3/Opus
- * decoder (libmad/opus exist in the tree but are disabled in this defconfig). */
-#define AGENT_EDGE_TTS_FORMAT_PROBE "audio-24khz-48kbitrate-mono-mp3"
+/* 24 kHz, 48 kbps mono MP3: decoded by minimp3 to the same 24 kHz PCM. */
+#define AGENT_EDGE_TTS_FORMAT_MP3 "audio-24khz-48kbitrate-mono-mp3"
 #define AGENT_EDGE_TTS_SAMPLE_RATE 24000
 #define AGENT_EDGE_DEFAULT_VOICE "zh-CN-XiaoxiaoNeural"
 #define AGENT_EDGE_MAX_TEXT_SEGMENT 4096 /* bytes per SSML request (edge-tts) */

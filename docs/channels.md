@@ -112,12 +112,17 @@ vela> voice_test_asr /data/agent/tts_out.pcm
 | 后端 | 凭证 | 音频格式 | 说明 |
 |---|---|---|---|
 | `volcengine`（默认） | `volc_appkey`+`volc_token`（WS）/ `volc_api_key`（HTTP） | 24kHz（WS）/ 16kHz（HTTP） | 豆包语音合成 |
-| `edge` | **不需要** | 24kHz 裸 PCM（格式阶梯：raw-24k → riff-24k → mp3 探测） | Microsoft Edge 在线朗读（非官方接口） |
+| `edge` | **不需要** | 24kHz MP3 → 设备端 minimp3 解码成 24kHz 裸 PCM | Microsoft Edge 在线朗读（非官方接口） |
 
 `voice_tts_speak_stream()` 的回退顺序：**当前激活后端 → 火山 WS → 火山 HTTP → Edge**，
 只有全部失败才返回错误，每一步失败都有 syslog 说明。播放设备按“激活后端”的采样率打开
 （`voice_tts_get_sample_rate()`），回退后端采样率不同时由 `voice_tts.c` 内的线性插值
 重采样补齐（16kHz ↔ 24kHz）。Edge 与火山 WS 同为 24kHz，接管时无需重采样。
+
+Edge 端点的格式阶梯（真机确认它只肯输出 MP3，PCM 档会被 close 1007 拒绝）：
+`raw-24khz-16bit-mono-pcm` → `riff-24khz-16bit-mono-pcm` → `audio-24khz-48kbitrate-mono-mp3`，
+最后一档由 `src/voice/edge_mp3.c`（minimp3，CC0-1.0，见 `src/voice/thirdparty/`）流式解码成
+PCM 后走同一条播放链路，命中档会缓存，后续语句不再重试前两档。
 
 ```bash
 # 强制使用 Edge（免凭证）后端
