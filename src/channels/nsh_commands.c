@@ -134,8 +134,10 @@ static void cmd_help(void)
         "  voice_stop             - Stop voice channel\n"
         "  voice_test_tts <text> [out.pcm] - Test TTS synthesis\n"
         "  voice_test_asr <file>  - Test ASR recognition\n"
-        "  set_voice_tts <name>   - Switch TTS backend\n"
+        "  set_voice_tts <name>   - Switch TTS backend (volcengine|edge)\n"
         "  set_voice_asr <name>   - Switch ASR backend\n"
+        "  set_edge_voice <id>    - Set Edge TTS voice (default "
+        AGENT_EDGE_DEFAULT_VOICE ")\n"
         "  set_weixin_token <tok> - Set WeChat bot token\n"
         "  weixin_login           - QR code login to WeChat\n"
         "  router_status          - Show LLM router status\n"
@@ -1010,6 +1012,8 @@ static void* cli_thread(void* arg)
             cmd_set_voice_tts(argc, argv);
         else if (strcmp(cmd, "set_voice_asr") == 0)
             cmd_set_voice_asr(argc, argv);
+        else if (strcmp(cmd, "set_edge_voice") == 0)
+            cmd_set_edge_voice(argc, argv);
         else if (strcmp(cmd, "set_weixin_token") == 0)
             cmd_set_weixin_token(argc, argv);
         else if (strcmp(cmd, "weixin_login") == 0)

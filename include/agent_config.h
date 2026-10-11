@@ -413,6 +413,41 @@
 /* WebSocket TTS output sample rate (big-model voices output 24kHz) */
 #define AGENT_TTS_WS_SAMPLE_RATE 24000
 
+/* ── Edge TTS (free fallback, no credentials) ───────────────────
+ * Microsoft Edge "read aloud" online synthesis, used as the last resort
+ * when the Volcengine backends are unavailable (not granted / no key).
+ * Unofficial API; protocol taken from the edge-tts project:
+ *   https://github.com/rany2/edge-tts  (constants.py / communicate.py / drm.py)
+ * The endpoint needs no account, only a Sec-MS-GEC token derived from the
+ * wall clock (see src/voice/edge_tts.c). */
+#define AGENT_EDGE_TTS_HOST "speech.platform.bing.com"
+#define AGENT_EDGE_TTS_PORT "443"
+#define AGENT_EDGE_TTS_PATH \
+    "/consumer/speech/synthesize/readaloud/edge/v1"
+#define AGENT_EDGE_TTS_TRUSTED_TOKEN "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+/* Chromium version advertised by the current edge-tts client.  The service
+ * rejects tokens generated for retired client versions, so keep this in
+ * sync with SEC_MS_GEC_VERSION in edge-tts constants.py. */
+#define AGENT_EDGE_TTS_SEC_MS_GEC_VERSION "1-143.0.3650.75"
+#define AGENT_EDGE_TTS_CHROME_MAJOR "143"
+#define AGENT_EDGE_TTS_USER_AGENT                                         \
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"        \
+    " (KHTML, like Gecko) Chrome/" AGENT_EDGE_TTS_CHROME_MAJOR            \
+    ".0.0.0 Safari/537.36 Edg/" AGENT_EDGE_TTS_CHROME_MAJOR ".0.0.0"
+#define AGENT_EDGE_TTS_ORIGIN \
+    "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
+
+/* Raw headerless PCM, no MP3 decode on the device.  16 kHz mono 16-bit is
+ * also the capture rate; the playback path resamples if it was opened for
+ * the 24 kHz Volcengine stream (voice_tts.c installs that shim). */
+#define AGENT_EDGE_TTS_FORMAT "raw-16khz-16bit-mono-pcm"
+#define AGENT_EDGE_TTS_SAMPLE_RATE 16000
+#define AGENT_EDGE_DEFAULT_VOICE "zh-CN-XiaoxiaoNeural"
+#define AGENT_EDGE_MAX_TEXT_SEGMENT 4096 /* bytes per SSML request (edge-tts) */
+
+/* Config store keys (all optional — the backend works with zero config) */
+#define AGENT_CFG_KEY_EDGE_VOICE "edge_voice"
+
 /* ── Tool Guard (security) ──────────────────────────────────── */
 #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)
 #define AGENT_TOOL_RATE_LIMIT_WINDOW_SEC 60

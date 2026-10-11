@@ -27,6 +27,7 @@
 #include "voice/audio_capture.h"
 #include "voice/audio_playback.h"
 #include "voice/voice_asr.h"
+#include "voice/edge_tts.h"
 #include "voice/voice_tts.h"
 #include "voice/volc_asr.h"
 #include "voice/volc_tts.h"
@@ -602,6 +603,10 @@ int voice_channel_init(void)
 
     if (!s_backends_registered) {
         volc_tts_register();
+        /* Edge is the free, credential-less last resort of the TTS fallback
+         * chain; it is registered after volc so it never becomes the default
+         * backend (voice_tts_register() keeps the first one). */
+        edge_tts_register();
         volc_asr_register();
         s_backends_registered = 1;
     }
@@ -1051,10 +1056,18 @@ int voice_channel_speak(const char* text)
         syslog(LOG_INFO, "[%s] LLM latency: %ldms\n", TAG, llm_ms);
     }
 
-    /* Try streaming TTS first (callback per chunk) */
+    /* Try streaming TTS first (callback per chunk).  The device is opened
+     * with the rate of the *active* backend; voice_tts_speak_stream()
+     * resamples if a fallback backend produces a different rate (the
+     * Volcengine WS stream is 24kHz, Volcengine HTTP and Edge are 16kHz). */
+    unsigned int tts_rate = voice_tts_get_sample_rate();
+
+    syslog(LOG_INFO, "[%s] speak: playback %u Hz, backend '%s'\n", TAG,
+        tts_rate, voice_tts_get_backend() ? voice_tts_get_backend() : "none");
+
     audio_playback_t* pb = audio_playback_open(
         AGENT_AUDIO_PLAYBACK_DEV,
-        AGENT_TTS_WS_SAMPLE_RATE,
+        tts_rate,
         AGENT_VOICE_CHANNELS,
         AGENT_VOICE_BITS);
 

@@ -45,6 +45,18 @@ void cmd_set_volc_speaker(int argc, char** argv)
     printf("TTS speaker set to: %s\n", argv[1]);
 }
 
+void cmd_set_edge_voice(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_edge_voice <short_name>\n");
+        printf("  default: %s, e.g. zh-CN-YunxiNeural, zh-CN-YunyangNeural\n",
+            AGENT_EDGE_DEFAULT_VOICE);
+        return;
+    }
+    claw_config_set(AGENT_CFG_KEY_EDGE_VOICE, argv[1]);
+    printf("Edge TTS voice set to: %s\n", argv[1]);
+}
+
 void cmd_set_volc_asr(int argc, char** argv)
 {
     if (argc < 4) {
