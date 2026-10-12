@@ -66,7 +66,15 @@ static cJSON *load_json(void)
     if (sz <= 0) { fclose(f); return cJSON_CreateObject(); }
 
     char *buf = (char *)malloc((size_t)(sz + 1));
-    if (!buf) { fclose(f); return cJSON_CreateObject(); }
+    if (!buf) {
+        fclose(f);
+        /* OOM is *not* an empty config: returning an object here would make
+         * the next claw_config_set()/config_del() rewrite the file from just
+         * that key and silently drop everything else. */
+        syslog(LOG_ERR, "[%s] out of memory reading %s (%ld bytes)\n",
+               TAG, AGENT_CONFIG_FILE, (long)sz);
+        return NULL;
+    }
 
     size_t n = fread(buf, 1, (size_t)sz, f);
     buf[n] = '\0';
@@ -78,13 +86,13 @@ static cJSON *load_json(void)
         return root;
     }
 
-    /* Parse failure used to be silent, and the next claw_config_set()
-     * would then merge into an empty object and save - wiping every other
-     * key in the file. Make it loud. */
-    syslog(LOG_ERR, "[%s] %s is not valid JSON (%ld bytes); "
-           "starting from an empty object\n",
+    /* A parse failure used to return an empty object, and the next
+     * claw_config_set() then merged into it and saved - wiping every other
+     * key in the file. Fail the load instead; the callers below refuse to
+     * write when they get NULL, so a corrupt file stays as it is. */
+    syslog(LOG_ERR, "[%s] %s is not valid JSON (%ld bytes)\n",
            TAG, AGENT_CONFIG_FILE, (long)sz);
-    return cJSON_CreateObject();
+    return NULL;
 }
 
 #define AGENT_CONFIG_TMP AGENT_CONFIG_FILE ".tmp"
@@ -164,6 +172,10 @@ int claw_config_set(const char *key, const char *value)
 {
     pthread_mutex_lock(&s_lock);
     cJSON *root = load_json();
+    if (!root) {
+        pthread_mutex_unlock(&s_lock);
+        return ERROR;
+    }
     cJSON_DeleteItemFromObject(root, key);
     cJSON_AddStringToObject(root, key, value);
     int ret = save_json(root);
@@ -176,6 +188,10 @@ int config_del(const char *key)
 {
     pthread_mutex_lock(&s_lock);
     cJSON *root = load_json();
+    if (!root) {
+        pthread_mutex_unlock(&s_lock);
+        return ERROR;
+    }
     cJSON_DeleteItemFromObject(root, key);
     int ret = save_json(root);
     cJSON_Delete(root);

@@ -1016,7 +1016,9 @@ static void tts_strip_markdown(char* s)
  * worker 常驻到进程结束(不 join、不退出)：退出路径上没有它要保存的状态，
  * 停机时随进程一起消失即可，避免引入 teardown 顺序问题。 */
 #define SPEAK_QUEUE_DEPTH 2
-#define SPEAK_WORKER_STACK 24576 /* >=24KB: Edge 路径的 TLS + minimp3 都在这里跑 */
+/* 16KB(NuttX 默认): Edge 路径(TLS + minimp3)本来就在默认栈上出过声; 24KB 只从
+ * 只有 ~70KB 的 SRAM 堆里永久多拿 8KB, 并不是挂死的原因(审查结论)。 */
+#define SPEAK_WORKER_STACK CONFIG_PTHREAD_STACK_DEFAULT
 
 static struct {
     pthread_mutex_t lock;
@@ -1065,15 +1067,22 @@ static void* speak_worker(void* arg)
     return NULL;
 }
 
-/* 调用于 s_speak_q.lock 持有期间。 */
-static int speak_worker_ensure_started_locked(void)
+/* 不再要求持锁调用: pthread_create 是重活(申请栈 + TCB), 之前它跑在
+ * s_speak_q.lock 里 = 锁内做重活, 会让已经在排队的说话请求一起卡住。 */
+static int speak_worker_ensure_started(void)
 {
     pthread_attr_t attr;
     int ret;
 
+    pthread_mutex_lock(&s_speak_q.lock);
     if (s_speak_q.started) {
+        pthread_mutex_unlock(&s_speak_q.lock);
         return 0;
     }
+    /* 先在锁内置"创建中", 让并发的调用方(UI 线程 / agent 线程)只建一个
+     * worker; 创建失败时再回滚。 */
+    s_speak_q.started = 1;
+    pthread_mutex_unlock(&s_speak_q.lock);
 
     pthread_attr_init(&attr);
     /* 显式栈: Edge 路径在这条线程里跑 TLS 握手 + minimp3, 不能靠默认值。 */
@@ -1082,11 +1091,13 @@ static int speak_worker_ensure_started_locked(void)
     pthread_attr_destroy(&attr);
 
     if (ret != 0) {
+        pthread_mutex_lock(&s_speak_q.lock);
+        s_speak_q.started = 0;
+        pthread_mutex_unlock(&s_speak_q.lock);
         syslog(LOG_ERR, "[%s] speak worker create failed: %d\n", TAG, ret);
         return -EIO;
     }
 
-    s_speak_q.started = 1;
     syslog(LOG_INFO, "[%s] speak worker started (stack=%d, queue=%d)\n",
         TAG, SPEAK_WORKER_STACK, SPEAK_QUEUE_DEPTH);
     return 0;
@@ -1107,13 +1118,13 @@ int voice_channel_speak_async(const char* text)
         return -ENOMEM;
     }
 
-    pthread_mutex_lock(&s_speak_q.lock);
-
-    if (speak_worker_ensure_started_locked() != 0) {
-        pthread_mutex_unlock(&s_speak_q.lock);
+    /* 建 worker 在锁外做(见 speak_worker_ensure_started), 成功后再入队。 */
+    if (speak_worker_ensure_started() != 0) {
         free(copy);
         return -EIO;
     }
+
+    pthread_mutex_lock(&s_speak_q.lock);
 
     if (s_speak_q.count >= SPEAK_QUEUE_DEPTH) {
         /* 队列满: 丢最旧、留最新 —— 用户关心的是最新那句话。 */

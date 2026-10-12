@@ -254,7 +254,16 @@ static double edge_pcm_seconds(size_t pcm_bytes)
  * on a flaky BT-PAN link; EDGE_SHORT_DELIVERY_RATIO catches a turn that broke
  * off later but still before half of the sentence. */
 #define EDGE_MIN_DELIVERED_SECS 0.3
-#define EDGE_SHORT_DELIVERY_RATIO 0.5
+
+/* TCP 接收缓冲上限(字节): 见 edge_tls_connect() 里的说明 —— 压小突发,
+ * 规避 LCPU 邮箱 ring 在大流量下的字节丢失。取 4KB: .config 里
+ * CONFIG_IOB_NBUFFERS=64, 16KB 的接收窗口比整个 IOB 池还大, 会把 BT-PAN
+ * 数据路径一起饿死, 反而加重它本想修的抖动。 */
+#define EDGE_TCP_RCVBUF_BYTES 4096
+/* 0.7: 真机实测链路抖动时交付 8.64s/14.3s = 60%, 用 0.5 不会重试 ✗。
+ * 代价: 阈值放宽后每条被截断的长句会多花约一次合成的等待(十几秒),
+ * 但换回完整语音; 短句(常见)基本不受影响。 */
+#define EDGE_SHORT_DELIVERY_RATIO 0.7
 
 /* speech.config payload.  sentenceBoundaryEnabled is "true" and
  * wordBoundaryEnabled is "false" - the reference defaults; the trailing CRLF
@@ -550,9 +559,22 @@ static int edge_tls_connect(edge_tls_t* ctx, const char* host,
 
   if (ctx->net.fd >= 0)
     {
+      int rcvbuf = EDGE_TCP_RCVBUF_BYTES;
+
       tv.tv_sec = EDGE_RECV_TIMEOUT_FIRST_MS / 1000;
       tv.tv_usec = 0;
       setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+      /* 限流: 本板蓝牙走 LCPU 邮箱 ring, 大突发会触发 ring 读指针回写竞争
+       * (见 vendor/.../sf32lb52_bth4.c:40-48), 实测表现为 `drop invalid h4`
+       * → TCP 停摆 → 我们这边 recv 超时 → 音频被截断。把接收窗口压小后,
+       * 数据以更小的突发到达, 给 LCPU/HCPU 之间的搬运留出余量。 */
+      if (setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf,
+                     sizeof(rcvbuf)) < 0)
+        {
+          syslog(LOG_WARNING, "[%s] SO_RCVBUF=%d failed: %d\n", TAG,
+                 rcvbuf, errno);
+        }
     }
 
   ret = mbedtls_ssl_config_defaults(&ctx->cfg, MBEDTLS_SSL_IS_CLIENT,
