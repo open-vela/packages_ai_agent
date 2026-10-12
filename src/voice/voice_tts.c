@@ -16,6 +16,7 @@
 
 #include "voice/voice_tts.h"
 #include "voice/edge_tts.h"
+#include "voice/minimax_tts.h"
 #include "voice/volc_tts.h"
 #include "agent_config.h"
 
@@ -303,7 +304,7 @@ int voice_tts_speak_stream(const char* text,
     voice_tts_chunk_cb cb,
     void* user_data)
 {
-    int ret;
+    int ret = -EIO;
     unsigned int play_rate;
 
     if (!s_active) {
@@ -318,6 +319,14 @@ int voice_tts_speak_stream(const char* text,
     /* Rate the caller's playback device was opened with. */
     play_rate = voice_tts_get_sample_rate();
 
+    /* Fallback order: the active backend, then Edge (free) -> MiniMax (paid,
+     * the only provider whose key works on this board) -> Volcengine
+     * (appid+token never granted; the V3 HTTP key is rejected with
+     * 45000030).  Edge therefore runs before the paid backend, and the dead
+     * Volcengine rungs sit behind both.  Each step is skipped when the active
+     * backend is already that backend, so nothing is tried twice in one
+     * call. */
+
     /* 1) Whatever backend is active, if it can stream natively. */
     if (s_active->synthesize_stream) {
         ret = tts_run_stream(s_active->synthesize_stream, text, cb, user_data,
@@ -331,8 +340,36 @@ int voice_tts_speak_stream(const char* text,
             TAG, s_active->name, ret);
     }
 
-    /* 2) Volcengine WebSocket streaming (classic appid+token interface).
-     *    Skipped when step 1 already ran it. */
+    /* 2) Microsoft Edge online TTS - free, no credentials. */
+    if (s_active->synthesize_stream != edge_tts_synthesize_stream) {
+        ret = tts_run_stream(edge_tts_synthesize_stream, text, cb, user_data,
+            AGENT_EDGE_TTS_SAMPLE_RATE, play_rate);
+
+        if (ret == 0) {
+            return 0;
+        }
+
+        syslog(LOG_WARNING, "[%s] edge stream failed (%d), trying MiniMax TTS\n",
+            TAG, ret);
+    }
+
+    /* 3) MiniMax T2A v2 (HTTPS, Bearer key from tts_api_key/api_key).
+     *    Skipped when step 1 already ran it, i.e. when it is the active
+     *    backend. */
+    if (s_active->synthesize_stream != minimax_tts_synthesize_stream) {
+        ret = tts_run_stream(minimax_tts_synthesize_stream, text, cb,
+            user_data, AGENT_MINIMAX_TTS_SAMPLE_RATE, play_rate);
+
+        if (ret == 0) {
+            return 0;
+        }
+
+        syslog(LOG_WARNING,
+            "[%s] minimax stream failed (%d), trying Volcengine TTS\n",
+            TAG, ret);
+    }
+
+    /* 4) Volcengine WebSocket streaming (classic appid+token interface). */
     if (s_active->synthesize_stream != volc_tts_ws_synthesize_stream) {
         ret = tts_run_stream(volc_tts_ws_synthesize_stream, text, cb,
             user_data, AGENT_TTS_WS_SAMPLE_RATE, play_rate);
@@ -345,11 +382,13 @@ int voice_tts_speak_stream(const char* text,
             TAG, ret);
     }
 
-    /* 3) Active backend's one-shot synthesize (Volcengine V3 HTTP, needs only
+    /* 5) Active backend's one-shot synthesize (Volcengine V3 HTTP, needs only
      *    an API key).  Backends whose one-shot path is the same transport as
-     *    their streaming path (Edge) are skipped here - step 4 covers them. */
+     *    their streaming path (Edge, MiniMax) are skipped here - steps 2/3
+     *    cover them. */
     if (s_active->synthesize
-        && s_active->synthesize_stream != edge_tts_synthesize_stream) {
+        && s_active->synthesize_stream != edge_tts_synthesize_stream
+        && s_active->synthesize_stream != minimax_tts_synthesize_stream) {
         unsigned char* buf = malloc(AGENT_VOICE_PCM_BUF_SIZE);
 
         if (!buf) {
@@ -368,23 +407,8 @@ int voice_tts_speak_stream(const char* text,
         }
 
         free(buf);
-        syslog(LOG_WARNING, "[%s] HTTP TTS failed (%d), trying Edge TTS\n",
-            TAG, ret);
     }
 
-    /* 4) Microsoft Edge online TTS - free, no credentials. */
-    if (s_active->synthesize_stream != edge_tts_synthesize_stream) {
-        ret = tts_run_stream(edge_tts_synthesize_stream, text, cb, user_data,
-            AGENT_EDGE_TTS_SAMPLE_RATE, play_rate);
-
-        if (ret == 0) {
-            return 0;
-        }
-
-        syslog(LOG_ERR, "[%s] all TTS backends failed (edge: %d)\n", TAG, ret);
-        return ret;
-    }
-
-    syslog(LOG_ERR, "[%s] all TTS backends failed\n", TAG);
-    return -EIO;
+    syslog(LOG_ERR, "[%s] all TTS backends failed (%d)\n", TAG, ret);
+    return ret != 0 ? ret : -EIO;
 }

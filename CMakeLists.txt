@@ -64,6 +64,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/volc_tts_ws.c
     src/voice/edge_tts.c
     src/voice/edge_mp3.c
+    src/voice/minimax_tts.c
     src/voice/volc_asr.c
     src/voice/voice_tts.c
     src/voice/voice_asr.c

@@ -467,6 +467,47 @@
  * Missing / non-numeric / out-of-range values fall back to rung 0. */
 #define AGENT_CFG_KEY_EDGE_FMT "edge_fmt"
 
+/* ── MiniMax T2A v2 (speech synthesis) ─────────────────────────
+ * Paid backend, placed between the free Edge endpoint and the
+ * Volcengine backends in the fallback chain (src/voice/voice_tts.c).
+ * It is the only TTS provider whose credentials are known to work on
+ * this board (the same MiniMax key the LLM uses via api.minimaxi.com).
+ *
+ * Protocol source of truth (read 2026-10-12):
+ *   https://platform.minimax.cn/docs/api-reference/speech-t2a-http
+ *   https://platform.minimax.io/docs/api-reference/speech-t2a-http
+ *   https://platform.minimax.cn/docs/guides/speech-t2a-websocket  (接入地址)
+ *   https://platform.minimaxi.com/docs/faq/system-voice-id        (系统音色)
+ *   https://platform.minimaxi.com/docs/api-reference/errorcode    (错误码)
+ * See src/voice/minimax_tts.c for the verified request/response shape. */
+#define AGENT_MINIMAX_TTS_HOST "api.minimaxi.com"
+#define AGENT_MINIMAX_TTS_PORT "443"
+#define AGENT_MINIMAX_TTS_PATH "/v1/t2a_v2"
+#define AGENT_MINIMAX_TTS_USER_AGENT "vela-ai-agent/1.0"
+/* speech-02-turbo: the fastest of the t2a_v2 model enum, meant for voice
+ * chat; speech-2.8/2.6-turbo and speech-01-turbo are interchangeable via the
+ * "minimax_tts_model" config key. */
+#define AGENT_MINIMAX_TTS_DEFAULT_MODEL "speech-02-turbo"
+/* female-shaonv (少女音色) - Mandarin female voice from the system voice
+ * list; override with the "minimax_tts_voice" config key. */
+#define AGENT_MINIMAX_TTS_DEFAULT_VOICE "female-shaonv"
+/* 24 kHz matches AGENT_TTS_WS_SAMPLE_RATE and the Edge backend, so the
+ * playback device (opened at the active backend's rate, 24 kHz for the
+ * Volcengine default) needs no resampling when MiniMax takes over.
+ * MP3 at 64 kbps keeps the (hex encoded, twice the size) response small. */
+#define AGENT_MINIMAX_TTS_SAMPLE_RATE 24000
+#define AGENT_MINIMAX_TTS_BITRATE 64000
+#define AGENT_MINIMAX_TTS_MAX_TEXT 2000 /* bytes of UTF-8 sent in one request */
+
+/* Config store keys.  The API key is read from "tts_api_key" first and falls
+ * back to "api_key" (the MiniMax key the LLM already uses); everything else
+ * is optional.  AGENT_CFG_KEY_TTS_API_KEY is also honoured by other
+ * backends that take a bearer-style key. */
+#define AGENT_CFG_KEY_TTS_API_KEY "tts_api_key"
+#define AGENT_CFG_KEY_MINIMAX_VOICE "minimax_tts_voice"
+#define AGENT_CFG_KEY_MINIMAX_MODEL "minimax_tts_model"
+#define AGENT_CFG_KEY_MINIMAX_HOST "minimax_tts_host"
+
 /* ── Tool Guard (security) ──────────────────────────────────── */
 #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)
 #define AGENT_TOOL_RATE_LIMIT_WINDOW_SEC 60

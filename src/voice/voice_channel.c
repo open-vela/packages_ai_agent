@@ -28,6 +28,7 @@
 #include "voice/audio_playback.h"
 #include "voice/voice_asr.h"
 #include "voice/edge_tts.h"
+#include "voice/minimax_tts.h"
 #include "voice/voice_tts.h"
 #include "voice/volc_asr.h"
 #include "voice/volc_tts.h"
@@ -611,10 +612,13 @@ int voice_channel_init(void)
 
     if (!s_backends_registered) {
         volc_tts_register();
-        /* Edge is the free, credential-less last resort of the TTS fallback
-         * chain; it is registered after volc so it never becomes the default
-         * backend (voice_tts_register() keeps the first one). */
+        /* Edge and MiniMax are registered after volc so neither becomes the
+         * default backend (voice_tts_register() keeps the first one): Edge is
+         * free but currently answers 403, MiniMax is the paid provider whose
+         * key does work here.  The order they are tried in is decided by
+         * voice_tts_speak_stream(), not by this list. */
         edge_tts_register();
+        minimax_tts_register();
         volc_asr_register();
         s_backends_registered = 1;
     }
