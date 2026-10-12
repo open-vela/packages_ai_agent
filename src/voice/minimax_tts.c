@@ -121,6 +121,7 @@ static const char* TAG = "minimax_tts";
 #define MM_VOICE_MAX 64
 #define MM_MODEL_MAX 48
 #define MM_HOST_MAX 96
+#define MM_BACKEND_JSON_MAX 1024 /* raw llm_backend_0 config value */
 
 /* ── TLS transport (same pattern as edge_tts.c's edge_tls_*) ───── */
 
@@ -1274,6 +1275,13 @@ static char* mm_build_request(const char* text, const char* model,
 
 /* ── Config ──────────────────────────────────────────────────── */
 
+/* Flat config key holding the LLM router's backend 0 blob, e.g.
+ * {"host":"...","api_key":"sk-..."} (written by llm_router.c and
+ * api_handler.c).  Only backend 0 is consulted here: it is the rung this
+ * board has always managed to write. */
+
+#define MM_CFG_KEY_LLM_BACKEND_0 "llm_backend_0"
+
 typedef struct
 {
   char key[MM_KEY_MAX];
@@ -1292,17 +1300,78 @@ static void mm_cfg_str(const char* cfg_key, char* dst, size_t cap,
     }
 }
 
+/* Last key rung: the copy stored inside the llm_backend_0 blob.  This
+ * board's nsh console is line buffered at ~64 characters, so the ~60
+ * character MiniMax key cannot be typed into the flat config - but the
+ * llm_backend_0 value (itself a JSON string) was written over HTTP and
+ * carries the very same key.  Returns the source name, or NULL when the
+ * key is absent, empty, or the blob does not parse: never a hard failure. */
+
+static const char* mm_key_from_backend(char* dst, size_t cap)
+{
+  char json[MM_BACKEND_JSON_MAX];
+  cJSON* obj;
+  cJSON* item;
+  const char* source = NULL;
+
+  if (claw_config_get(MM_CFG_KEY_LLM_BACKEND_0, json, sizeof(json)) != OK)
+    {
+      return NULL;
+    }
+
+  obj = cJSON_Parse(json);
+
+  if (obj == NULL)
+    {
+      syslog(LOG_WARNING, "[%s] %s is not valid JSON, key not taken from it\n",
+             TAG, MM_CFG_KEY_LLM_BACKEND_0);
+      return NULL;
+    }
+
+  item = cJSON_GetObjectItem(obj, AGENT_CFG_KEY_API_KEY);
+
+  if (cJSON_IsString(item) && item->valuestring[0] != '\0')
+    {
+      strncpy(dst, item->valuestring, cap - 1);
+      dst[cap - 1] = '\0';
+      source = MM_CFG_KEY_LLM_BACKEND_0;
+    }
+
+  cJSON_Delete(obj);
+  return source;
+}
+
 static void mm_load_config(mm_cfg_t* cfg)
 {
+  const char* source = NULL;
+
   memset(cfg, 0, sizeof(*cfg));
 
   /* Key order: the TTS specific key first, then the MiniMax key the LLM
-   * already uses (both are the same account key on this device). */
+   * already uses (both are the same account key on this device), then the
+   * copy inside llm_backend_0 - the only rung that survives the ~64
+   * character nsh line buffer.  The first non-empty value wins. */
   if (claw_config_get(AGENT_CFG_KEY_TTS_API_KEY, cfg->key, sizeof(cfg->key))
-        != OK
-      || cfg->key[0] == '\0')
+        == OK
+      && cfg->key[0] != '\0')
     {
-      claw_config_get(AGENT_CFG_KEY_API_KEY, cfg->key, sizeof(cfg->key));
+      source = AGENT_CFG_KEY_TTS_API_KEY;
+    }
+  else if (claw_config_get(AGENT_CFG_KEY_API_KEY, cfg->key,
+                           sizeof(cfg->key)) == OK
+           && cfg->key[0] != '\0')
+    {
+      source = AGENT_CFG_KEY_API_KEY;
+    }
+  else
+    {
+      source = mm_key_from_backend(cfg->key, sizeof(cfg->key));
+    }
+
+  if (source != NULL)
+    {
+      /* The key itself is never logged. */
+      syslog(LOG_INFO, "[%s] key source: %s\n", TAG, source);
     }
 
   mm_cfg_str(AGENT_CFG_KEY_MINIMAX_VOICE, cfg->voice, sizeof(cfg->voice),

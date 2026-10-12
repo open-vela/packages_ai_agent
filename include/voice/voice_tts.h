@@ -87,7 +87,7 @@ int voice_tts_speak(const char *text,
 
 /* Synthesize text with streaming callback. Each decoded PCM chunk
  * is delivered via cb as it arrives from the TTS server.  Fallback chain:
- * active backend -> Edge -> MiniMax T2A v2 -> Volcengine WebSocket ->
+ * active backend -> MiniMax T2A v2 -> Edge -> Volcengine WebSocket ->
  * Volcengine HTTP.
  * Returns 0 on success, negative errno when every backend failed. */
 int voice_tts_speak_stream(const char *text,

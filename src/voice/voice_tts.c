@@ -319,13 +319,14 @@ int voice_tts_speak_stream(const char* text,
     /* Rate the caller's playback device was opened with. */
     play_rate = voice_tts_get_sample_rate();
 
-    /* Fallback order: the active backend, then Edge (free) -> MiniMax (paid,
-     * the only provider whose key works on this board) -> Volcengine
-     * (appid+token never granted; the V3 HTTP key is rejected with
-     * 45000030).  Edge therefore runs before the paid backend, and the dead
-     * Volcengine rungs sit behind both.  Each step is skipped when the active
-     * backend is already that backend, so nothing is tried twice in one
-     * call. */
+    /* Fallback order: the active backend, then MiniMax (paid, the only
+     * provider whose key works on this board) -> Edge (free but answering
+     * 403 on every call, which used to cost a ~43 s stall per sentence
+     * before a usable backend was reached) -> Volcengine (appid+token never
+     * granted; the V3 HTTP key is rejected with 45000030).  Each step is
+     * skipped when the active backend is already that backend, so nothing is
+     * tried twice in one call, and a backend that already produced PCM stops
+     * the chain. */
 
     /* 1) Whatever backend is active, if it can stream natively. */
     if (s_active->synthesize_stream) {
@@ -340,22 +341,9 @@ int voice_tts_speak_stream(const char* text,
             TAG, s_active->name, ret);
     }
 
-    /* 2) Microsoft Edge online TTS - free, no credentials. */
-    if (s_active->synthesize_stream != edge_tts_synthesize_stream) {
-        ret = tts_run_stream(edge_tts_synthesize_stream, text, cb, user_data,
-            AGENT_EDGE_TTS_SAMPLE_RATE, play_rate);
-
-        if (ret == 0) {
-            return 0;
-        }
-
-        syslog(LOG_WARNING, "[%s] edge stream failed (%d), trying MiniMax TTS\n",
-            TAG, ret);
-    }
-
-    /* 3) MiniMax T2A v2 (HTTPS, Bearer key from tts_api_key/api_key).
-     *    Skipped when step 1 already ran it, i.e. when it is the active
-     *    backend. */
+    /* 2) MiniMax T2A v2 (HTTPS, Bearer key from tts_api_key/api_key/
+     *    llm_backend_0).  Skipped when step 1 already ran it, i.e. when it
+     *    is the active backend. */
     if (s_active->synthesize_stream != minimax_tts_synthesize_stream) {
         ret = tts_run_stream(minimax_tts_synthesize_stream, text, cb,
             user_data, AGENT_MINIMAX_TTS_SAMPLE_RATE, play_rate);
@@ -364,8 +352,22 @@ int voice_tts_speak_stream(const char* text,
             return 0;
         }
 
+        syslog(LOG_WARNING, "[%s] minimax stream failed (%d), trying Edge TTS\n",
+            TAG, ret);
+    }
+
+    /* 3) Microsoft Edge online TTS - free, no credentials (currently 403 on
+     *    every call). */
+    if (s_active->synthesize_stream != edge_tts_synthesize_stream) {
+        ret = tts_run_stream(edge_tts_synthesize_stream, text, cb, user_data,
+            AGENT_EDGE_TTS_SAMPLE_RATE, play_rate);
+
+        if (ret == 0) {
+            return 0;
+        }
+
         syslog(LOG_WARNING,
-            "[%s] minimax stream failed (%d), trying Volcengine TTS\n",
+            "[%s] edge stream failed (%d), trying Volcengine TTS\n",
             TAG, ret);
     }
 
