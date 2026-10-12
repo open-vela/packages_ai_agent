@@ -114,6 +114,10 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     # hr_monitor: simulated heart-rate walk (scenario 3); threshold routes
     # back into pet_care_hr_report.
     list(APPEND AGENT_SRCS src/health/hr_monitor.c)
+    # hr_measure: one-shot "测心率" measurement behind the pet page button.
+    # Owns its own worker thread; drives the real sensor through the existing
+    # hr_sensor CLI path (task_spawn) and renders via lvgl_ui_post.
+    list(APPEND AGENT_SRCS src/health/hr_measure.c)
     list(APPEND AGENT_SRCS src/ui/launcher_page.c)
     list(APPEND AGENT_SRCS src/ui/about_page.c)
     list(APPEND AGENT_SRCS src/ui/pet_page.c)

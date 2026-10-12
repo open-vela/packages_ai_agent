@@ -68,6 +68,21 @@ void pet_page_update_response(const char *text);
 void pet_page_update_status(const char *text);
 
 /**
+ * After @a delay_ms, restore the AI text layer to the time greeting.
+ *
+ * Used by callers that overwrite the text layer with a temporary message
+ * (one-shot heart-rate measurement, P1b): the greeting comes back by itself
+ * so the page does not stay stuck on a stale result. Reuses the same
+ * one-shot lv_timer pattern as the cloud tap reply.
+ *
+ * Must be called on the LVGL thread (it creates an lv_timer). Non-LVGL
+ * callers reach it through lvgl_ui_post().
+ *
+ * @param delay_ms Delay before the greeting is restored
+ */
+void pet_page_schedule_greeting_restore(uint32_t delay_ms);
+
+/**
  * Delete the pet page and free resources
  *
  * Stops animations and destroys the page container.

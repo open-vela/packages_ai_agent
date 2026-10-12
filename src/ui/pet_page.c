@@ -32,6 +32,7 @@
 #include "pet_page.h"
 #include "lvgl_ui_channel.h"
 #include "pet_care.h"
+#include "health/hr_measure.h"
 
 /****************************************************************************
  * Private Data
@@ -76,6 +77,7 @@ static lv_timer_t *s_greet_timer;  /* restores the greeting after tap */
 
 /* Forward declarations */
 static void greeting_build(char *buf, size_t len);
+static void on_hr_measure_clicked(lv_event_t *e);
 
 /****************************************************************************
  * Cloud drawing
@@ -308,6 +310,50 @@ static void greet_restore_timer_cb(lv_timer_t *timer)
 }
 
 /**
+ * Public: schedule the greeting restore (LVGL thread only).
+ *
+ * Shared by the cloud tap reply and by the one-shot heart-rate measurement,
+ * which overwrites the same text layer with progress and result lines.
+ */
+void pet_page_schedule_greeting_restore(uint32_t delay_ms)
+{
+    if (ai_text_label == NULL)
+    {
+        return; /* page already gone: nothing to restore */
+    }
+    if (s_greet_timer != NULL)
+    {
+        lv_timer_delete(s_greet_timer);
+    }
+    s_greet_timer = lv_timer_create(greet_restore_timer_cb, delay_ms, NULL);
+}
+
+/**
+ * 「测心率」按钮：起一次单次测量
+ *
+ * 这里只做两件事 —— 复位空闲关怀计时（防止测量中被「空闲关怀」气泡打断），
+ * 然后把活儿交给 hr_measure_start()。它内部只创建一个 worker 线程就返回，
+ * 8~15s 的采集/轮询/上屏全部在那个线程里跑，本回调（LVGL render 线程）
+ * 绝不阻塞。测量进行中重复点击会被单飞挡掉（返回 -EBUSY）。
+ */
+static void on_hr_measure_clicked(lv_event_t *e)
+{
+    int ret;
+
+    (void)e;
+    printf("[PetPage] HR measure button clicked\n");
+
+    /* 触摸活动：复位空闲关怀计时，测量期间别让桌宠主动开口抢文本层 */
+    pet_care_note_activity();
+
+    ret = hr_measure_start();
+    if (ret != 0)
+    {
+        printf("[PetPage] hr_measure_start -> %d (ignored)\n", ret);
+    }
+}
+
+/**
  * Cloud tapped: playful reply
  */
 static void on_cloud_clicked(lv_event_t *e)
@@ -438,6 +484,8 @@ lv_obj_t *pet_page_create(void)
     lv_obj_t *back_label;
     lv_obj_t *hist_btn;
     lv_obj_t *hist_label;
+    lv_obj_t *hr_btn;    /* 「测心率」药丸按钮 */
+    lv_obj_t *hr_label;
     lv_obj_t *row3;      /* layer 3: cloud */
     char greeting[64];
     int full_w;
@@ -507,6 +555,29 @@ lv_obj_t *pet_page_create(void)
     lv_obj_set_style_text_font(hist_label, &ui_font_sans_24, 0);
     lv_obj_set_style_text_color(hist_label, lv_color_hex(0x2b2b2b), 0);
     lv_obj_center(hist_label);
+
+    /* ── 第一层与第二层之间：「测心率」药丸按钮，居中 160x56 ── */
+    hr_btn = lv_btn_create(pet_page_container);
+    lv_obj_set_size(hr_btn, 160, 56);
+    lv_obj_set_style_radius(hr_btn, 28, 0); /* 胶囊形：半径 = 高度一半 */
+    lv_obj_set_style_bg_color(hr_btn, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_bg_opa(hr_btn, LV_OPA_50, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(hr_btn, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(hr_btn, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(hr_btn, 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(hr_btn, 0, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_margin_top(hr_btn, 12, 0);
+    /* 父容器是 COLUMN flex + align CENTER，水平居中由布局给出 */
+    lv_obj_add_event_cb(hr_btn, on_hr_measure_clicked, LV_EVENT_CLICKED, NULL);
+
+    hr_label = lv_label_create(hr_btn);
+    /* 测心率 */
+    lv_label_set_text(hr_label,
+                      "\xe6\xb5\x8b\xe5\xbf\x83\xe7\x8e\x87");
+    /* 中文字形必须用 cjk_18：ui_font_sans_24 是 117 字形子集，新中文会渲染成方块 */
+    lv_obj_set_style_text_font(hr_label, &ui_font_cjk_18, 0);
+    lv_obj_set_style_text_color(hr_label, lv_color_hex(0x2b2b2b), 0);
+    lv_obj_center(hr_label);
 
     /* ── 第二层：AI 返回的文字（默认按时段问候） ── */
     greeting_build(greeting, sizeof(greeting));
