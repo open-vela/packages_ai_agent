@@ -18,6 +18,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "pet_display.h"
 
@@ -67,6 +68,17 @@ void lvgl_ui_enter_pet_stage(void);
  * @return 0 成功，负值表示错误
  */
 int lvgl_ui_channel_send(const char* text);
+
+/**
+ * 同 lvgl_ui_channel_send()，但由调用方给出消息类别 (AGENT_MSG_KIND_*)。
+ * 只有 AGENT_MSG_KIND_FINAL 才触发 TTS：状态语/错误语仍然渲染气泡与表情
+ * （显示与播报解耦），但不会被念出来 (P2a)。
+ *
+ * @param text  UTF-8 文本，Agent 回复内容
+ * @param kind  AGENT_MSG_KIND_FINAL / STATUS / ERROR
+ * @return 0 成功，负值表示错误
+ */
+int lvgl_ui_channel_send_kind(const char* text, uint8_t kind);
 
 /**
  * 发送 Agent 气泡但不触发 TTS。供 render 线程内的主动关怀使用，

@@ -150,6 +150,112 @@ static const edge_format_t EDGE_FORMATS[] =
 /* Rung that produced audio last time; later segments start there. */
 static int s_format_index;
 
+/* P2d: the winning rung is persisted in the config store so a reboot does not
+ * re-probe it.  The probe order is "cached rung first, then the rest of the
+ * table" (the ladder below wraps around), so a stale cached rung can never
+ * wedge synthesis the way a strictly-suffix ladder would. */
+static int s_format_loaded;
+
+static void edge_format_load(void)
+{
+  char v[8];
+  int idx = 0;
+
+  s_format_loaded = 1;
+
+  if (claw_config_get(AGENT_CFG_KEY_EDGE_FMT, v, sizeof(v)) == OK
+      && v[0] != '\0')
+    {
+      idx = atoi(v);
+
+      if (idx < 0 || idx >= EDGE_NFORMATS)
+        {
+          syslog(LOG_WARNING,
+                 "[%s] %s=%d out of range 0..%d, falling back to 0\n", TAG,
+                 AGENT_CFG_KEY_EDGE_FMT, idx, EDGE_NFORMATS - 1);
+          idx = 0;
+        }
+      else
+        {
+          syslog(LOG_INFO, "[%s] cached output format index %d (%s)\n", TAG,
+                 idx, EDGE_FORMATS[idx].format);
+        }
+    }
+
+  s_format_index = idx;
+}
+
+static void edge_format_save(int idx)
+{
+  char v[8];
+
+  if (idx < 0 || idx >= EDGE_NFORMATS || !s_format_loaded)
+    {
+      return;
+    }
+
+  snprintf(v, sizeof(v), "%d", idx);
+
+  if (claw_config_set(AGENT_CFG_KEY_EDGE_FMT, v) != OK)
+    {
+      syslog(LOG_WARNING, "[%s] cannot persist %s=%d\n", TAG,
+             AGENT_CFG_KEY_EDGE_FMT, idx);
+      return;
+    }
+
+  syslog(LOG_INFO, "[%s] output format index %d (%s) persisted as %s\n", TAG,
+         idx, EDGE_FORMATS[idx].format, AGENT_CFG_KEY_EDGE_FMT);
+}
+
+/* Expected spoken duration of a text, used only as a sanity bound by the
+ * truncation check (P2c).  Measured on this device: the zh-CN neural voices
+ * run at ~3.5 Han characters per second; ASCII is counted at ~12 characters
+ * per second (about 150 wpm) so an English sentence is not mistaken for a
+ * truncated Chinese one.  Never a hard limit - a wrong estimate only costs one
+ * extra synthesis attempt. */
+#define EDGE_CJK_CHARS_PER_SEC 3.5
+#define EDGE_ASCII_CHARS_PER_SEC 12.0
+
+static double edge_expected_seconds(const char* text)
+{
+  const unsigned char* p = (const unsigned char*)text;
+  size_t han = 0;
+  size_t ascii = 0;
+
+  for (; p && *p; p++)
+    {
+      if (*p < 0x80)
+        {
+          if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            {
+              ascii++;
+            }
+        }
+      else if ((*p & 0xC0) != 0x80)
+        {
+          /* Lead byte of a multi-byte character (Han or full-width
+           * punctuation); UTF-8 continuation bytes are not counted. */
+          han++;
+        }
+    }
+
+  return (double)han / EDGE_CJK_CHARS_PER_SEC
+    + (double)ascii / EDGE_ASCII_CHARS_PER_SEC;
+}
+
+/* PCM handed to the caller -> seconds of speech (all rungs are 24 kHz mono
+ * 16-bit, the MP3 one after minimp3 decoding). */
+static double edge_pcm_seconds(size_t pcm_bytes)
+{
+  return (double)pcm_bytes / 2.0 / (double)AGENT_EDGE_TTS_SAMPLE_RATE;
+}
+
+/* P2c thresholds.  EDGE_MIN_DELIVERED_SECS is the "0.12s and done" case seen
+ * on a flaky BT-PAN link; EDGE_SHORT_DELIVERY_RATIO catches a turn that broke
+ * off later but still before half of the sentence. */
+#define EDGE_MIN_DELIVERED_SECS 0.3
+#define EDGE_SHORT_DELIVERY_RATIO 0.5
+
 /* speech.config payload.  sentenceBoundaryEnabled is "true" and
  * wordBoundaryEnabled is "false" - the reference defaults; the trailing CRLF
  * is in the reference too.  Metadata frames are ignored on receive. */
@@ -1249,6 +1355,7 @@ typedef struct
   size_t pcm_bytes; /* PCM handed to the caller (decoded when the rung is MP3) */
   size_t mp3_bytes; /* MP3 bytes fed to the decoder (mp3 rung only) */
   int riff_checked;
+  int truncated; /* P2c: audio started but Path:turn.end never arrived */
   edge_mp3_t* mp3; /* set while the MP3 rung is running */
 } edge_sink_t;
 
@@ -1340,9 +1447,12 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
         {
           if (ret == -ETIMEDOUT)
             {
-              /* Silence after audio started usually means the turn is over
-               * and turn.end was lost; report success so the caller does not
-               * replay the sentence through the next backend. */
+              /* Silence after audio started is either the end of the turn
+               * (turn.end lost) or a BT-PAN stall.  P2c: it must NOT be
+               * reported as success - that is how a 0.12s fragment used to
+               * pass for a finished sentence and never got retried.  Probe a
+               * few extra timeouts, then mark the turn truncated (-EPIPE) and
+               * let the caller compare delivered vs expected duration. */
               if (EDGE_SINK_GOT_AUDIO(sink)
                   && ++consecutive_timeouts < EDGE_MAX_CONSEC_TIMEOUTS)
                 {
@@ -1353,16 +1463,24 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
 
               if (EDGE_SINK_GOT_AUDIO(sink))
                 {
+                  sink->truncated = 1;
                   syslog(LOG_WARNING,
-                         "[%s] no turn.end after %zu PCM bytes, assuming end\n",
-                         TAG, sink->pcm_bytes);
+                         "[%s] no turn.end after %zu PCM bytes (%.2fs), "
+                         "truncated\n",
+                         TAG, sink->pcm_bytes,
+                         edge_pcm_seconds(sink->pcm_bytes));
+                  err = -EPIPE;
                   break;
                 }
             }
           else if (ret == -ECONNRESET && EDGE_SINK_GOT_AUDIO(sink))
             {
-              syslog(LOG_INFO, "[%s] peer closed after %zu PCM bytes\n", TAG,
-                     sink->pcm_bytes);
+              sink->truncated = 1;
+              syslog(LOG_WARNING,
+                     "[%s] peer closed after %zu PCM bytes (%.2fs), truncated\n",
+                     TAG, sink->pcm_bytes,
+                     edge_pcm_seconds(sink->pcm_bytes));
+              err = -EPIPE;
               break;
             }
 
@@ -1394,6 +1512,14 @@ static int edge_recv_loop(edge_tls_t* ctx, edge_sink_t* sink)
           else
             {
               syslog(LOG_WARNING, "[%s] server closed the WebSocket\n", TAG);
+            }
+
+          /* P2c: a close after audio without turn.end is a truncation too
+           * (e.g. the service aborted mid-turn). */
+          if (EDGE_SINK_GOT_AUDIO(sink))
+            {
+              sink->truncated = 1;
+              err = -EPIPE;
             }
 
           edge_dump("< close", buf, flen);
@@ -1683,53 +1809,54 @@ static int edge_tts_init(void)
              s_debug ? "on" : "off");
     }
 
-  syslog(LOG_INFO, "[%s] voice: %s, format: %s\n", TAG, s_voice,
-         EDGE_FORMATS[s_format_index].format);
+  /* P2d: 命中过的输出格式从 config store 读回，开机第一句不用再重新探测
+   * (每次被拒的探测是一次完整 TLS+WS 往返，BT-PAN 上约 2s)。 */
+  if (!s_format_loaded)
+    {
+      edge_format_load();
+    }
+
+  syslog(LOG_INFO, "[%s] voice: %s, format: %s (index %d)\n", TAG, s_voice,
+         EDGE_FORMATS[s_format_index].format, s_format_index);
   return 0;
 }
 
-int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
-                               void* user_data)
+/* ── One full synthesis pass ─────────────────────────────────── */
+
+/* Segment the text and walk the format ladder until every segment produced
+ * audio (or the pass gave up).  sink->pcm_bytes accumulates what the caller
+ * callback actually received, which is what the retry logic below judges. */
+static int edge_synthesize_pass(const char* text, edge_sink_t* sink)
 {
-  edge_sink_t sink;
-  const char* p;
-  size_t remaining;
+  const char* p = text;
+  size_t remaining = strlen(text);
   int ret = 0;
-
-  if (!text || !cb)
-    {
-      return -EINVAL;
-    }
-
-  edge_tts_init();
-
-  memset(&sink, 0, sizeof(sink));
-  sink.cb = cb;
-  sink.user_data = user_data;
-
-  p = text;
-  remaining = strlen(text);
 
   while (remaining > 0)
     {
       size_t seg = edge_segment_len(p, remaining);
-      int fmt;
+      int k;
       int delivered = 0;
 
-      /* Format ladder: the endpoint answers 101 and starts a turn even for
-       * output formats it refuses (it then closes with 1007), so the only
-       * reliable probe is "did any Path:audio frame arrive". */
-      for (fmt = s_format_index; fmt < EDGE_NFORMATS; fmt++)
+      /* Format ladder: start at the cached rung, then wrap around the table.
+       * The endpoint answers 101 and starts a turn even for output formats it
+       * refuses (it then closes with 1007), so the only reliable probe is
+       * "did any Path:audio frame arrive".  The wrap-around matters now that
+       * the cached rung is persisted (P2d): a stale cache must not be able to
+       * wedge synthesis forever. */
+      for (k = 0; k < EDGE_NFORMATS; k++)
         {
-          size_t before = sink.pcm_bytes;
+          int fmt = (s_format_index + k) % EDGE_NFORMATS;
+          size_t before = sink->pcm_bytes;
           size_t mp3_in = 0;
 
-          sink.riff_checked = 0; /* each session has its own first frame */
+          sink->riff_checked = 0; /* each session has its own first frame */
+          sink->truncated = 0;
 
           if (EDGE_FORMATS[fmt].is_mp3)
             {
-              sink.mp3 = edge_mp3_open(edge_sink_decoded, &sink);
-              if (!sink.mp3)
+              sink->mp3 = edge_mp3_open(edge_sink_decoded, sink);
+              if (!sink->mp3)
                 {
                   syslog(LOG_ERR, "[%s] no memory for the MP3 decoder\n", TAG);
                   break;
@@ -1737,38 +1864,39 @@ int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
             }
           else
             {
-              sink.mp3 = NULL;
+              sink->mp3 = NULL;
             }
 
           syslog(LOG_INFO, "[%s] trying output format: %s%s\n", TAG,
                  EDGE_FORMATS[fmt].format,
                  EDGE_FORMATS[fmt].is_mp3 ? " (decoded with minimp3)" : "");
 
-          ret = edge_stream_segment(p, seg, &sink, EDGE_FORMATS[fmt].format);
+          ret = edge_stream_segment(p, seg, sink, EDGE_FORMATS[fmt].format);
 
-          if (sink.mp3)
+          if (sink->mp3)
             {
-              mp3_in = edge_mp3_input_bytes(sink.mp3);
+              mp3_in = edge_mp3_input_bytes(sink->mp3);
 
               syslog(LOG_INFO,
                      "[%s] mp3: %zu bytes in -> %zu PCM bytes out (%zu frames, "
                      "%d Hz, %.2f:1)\n",
-                     TAG, mp3_in, edge_mp3_pcm_bytes(sink.mp3),
-                     edge_mp3_frames(sink.mp3), edge_mp3_sample_rate(sink.mp3),
-                     mp3_in ? (double)edge_mp3_pcm_bytes(sink.mp3) / (double)mp3_in
+                     TAG, mp3_in, edge_mp3_pcm_bytes(sink->mp3),
+                     edge_mp3_frames(sink->mp3), edge_mp3_sample_rate(sink->mp3),
+                     mp3_in ? (double)edge_mp3_pcm_bytes(sink->mp3) / (double)mp3_in
                             : 0.0);
 
-              edge_mp3_close(sink.mp3);
-              sink.mp3 = NULL;
+              edge_mp3_close(sink->mp3);
+              sink->mp3 = NULL;
             }
 
-          if (sink.pcm_bytes > before)
+          if (sink->pcm_bytes > before)
             {
               if (fmt != s_format_index)
                 {
                   syslog(LOG_INFO, "[%s] using output format: %s\n", TAG,
                          EDGE_FORMATS[fmt].format);
                   s_format_index = fmt;
+                  edge_format_save(fmt); /* P2d: survive a reboot */
                 }
 
               delivered = 1;
@@ -1783,12 +1911,12 @@ int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
         {
           /* Audio already delivered is not replayed: the fallback chain must
            * not speak the same sentence twice. */
-          if (sink.pcm_bytes > 0)
+          if (sink->pcm_bytes > 0)
             {
               syslog(LOG_WARNING,
                      "[%s] segment failed (%d) after %zu PCM bytes, keeping "
                      "partial audio\n",
-                     TAG, ret, sink.pcm_bytes);
+                     TAG, ret, sink->pcm_bytes);
               break;
             }
 
@@ -1807,7 +1935,97 @@ int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
         }
     }
 
-  if (sink.pcm_bytes == 0)
+  return ret;
+}
+
+int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
+                               void* user_data)
+{
+  edge_sink_t sink;
+  size_t total_bytes;
+  double expected;
+  double delivered_s;
+  int ret;
+
+  if (!text || !cb)
+    {
+      return -EINVAL;
+    }
+
+  edge_tts_init();
+
+  expected = edge_expected_seconds(text);
+
+  memset(&sink, 0, sizeof(sink));
+  sink.cb = cb;
+  sink.user_data = user_data;
+
+  ret = edge_synthesize_pass(text, &sink);
+
+  total_bytes = sink.pcm_bytes;
+  delivered_s = edge_pcm_seconds(total_bytes);
+
+  syslog(LOG_INFO,
+         "[%s] pass 1: delivered %.2fs / ~%.2fs expected (%zu PCM bytes, "
+         "rc=%d, truncated=%d)\n",
+         TAG, delivered_s, expected, total_bytes, ret, sink.truncated);
+
+  /* P2c: 交付 PCM 时长 vs 文本预期时长。BT-PAN 抖动时音频常常只出来一小截
+   * 就断了(旧代码把它当"合成成功"返回)，用户听到半句话且永不重试。
+   * 判据: 有音频但 <0.3s，或不到预期时长的一半 -> 重试 1 次。
+   * 完全不交付(delivered==0)不在这里重试: 那是彻底失败，交给 voice_tts 的
+   * 后端回退链，避免在这里白等一个来回。
+   * 注意: 重试会把整句重新合成，已经播出去的那一小段会再响一次 —— 这是
+   * "重试一次"的代价，日志里显式说明。 */
+  if (total_bytes > 0
+      && (delivered_s < EDGE_MIN_DELIVERED_SECS
+          || (expected > 0.0
+              && delivered_s < expected * EDGE_SHORT_DELIVERY_RATIO)))
+    {
+      edge_sink_t retry_sink;
+      int retry_ret;
+
+      syslog(LOG_WARNING,
+             "[%s] short delivery: %.2fs of ~%.2fs expected (truncated=%d, "
+             "rc=%d) - retrying once into a fresh stream; audio already played "
+             "may repeat\n",
+             TAG, delivered_s, expected, sink.truncated, ret);
+
+      memset(&retry_sink, 0, sizeof(retry_sink));
+      retry_sink.cb = cb;
+      retry_sink.user_data = user_data;
+
+      retry_ret = edge_synthesize_pass(text, &retry_sink);
+      total_bytes += retry_sink.pcm_bytes;
+
+      syslog(LOG_INFO,
+             "[%s] pass 2: delivered %.2fs (%zu PCM bytes, rc=%d, "
+             "truncated=%d), total %.2fs / ~%.2fs expected\n",
+             TAG, edge_pcm_seconds(retry_sink.pcm_bytes), retry_sink.pcm_bytes,
+             retry_ret, retry_sink.truncated, edge_pcm_seconds(total_bytes),
+             expected);
+
+      if (retry_sink.pcm_bytes > 0)
+        {
+          ret = retry_ret;
+        }
+
+      if (retry_sink.pcm_bytes == 0 || retry_sink.truncated
+          || edge_pcm_seconds(total_bytes) < EDGE_MIN_DELIVERED_SECS
+          || (expected > 0.0
+              && edge_pcm_seconds(total_bytes)
+                   < expected * EDGE_SHORT_DELIVERY_RATIO))
+        {
+          /* 仍失败: 尽力交付已有音频(不返回错误，否则 voice_tts 会用下一个
+           * 后端把同一句再念一遍)。 */
+          syslog(LOG_WARNING,
+                 "[%s] still short after the retry: %.2fs of ~%.2fs expected - "
+                 "delivering what arrived\n",
+                 TAG, edge_pcm_seconds(total_bytes), expected);
+        }
+    }
+
+  if (total_bytes == 0)
     {
       syslog(LOG_ERR, "[%s] no audio received\n", TAG);
       return ret != 0 ? ret : -EPROTO;
@@ -1815,10 +2033,10 @@ int edge_tts_synthesize_stream(const char* text, voice_tts_chunk_cb cb,
 
   cb(NULL, 0, 1, user_data);
 
-  syslog(LOG_INFO, "[%s] delivered %zu PCM bytes (%.1fs @ %d Hz)\n", TAG,
-         sink.pcm_bytes,
-         (double)sink.pcm_bytes / 2.0 / AGENT_EDGE_TTS_SAMPLE_RATE,
-         AGENT_EDGE_TTS_SAMPLE_RATE);
+  syslog(LOG_INFO,
+         "[%s] delivered %zu PCM bytes (%.1fs @ %d Hz, expected ~%.1fs)\n", TAG,
+         total_bytes, edge_pcm_seconds(total_bytes), AGENT_EDGE_TTS_SAMPLE_RATE,
+         expected);
   return 0;
 }
 

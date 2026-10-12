@@ -27,6 +27,8 @@
 
 #include <pthread.h>
 
+#include "lvgl_ui_channel.h" /* own prototypes (lvgl_ui_post, send_kind) */
+#include "core/message_bus.h" /* AGENT_MSG_KIND_* (P2a) */
 #include "voice/voice_channel.h"
 #include "pet_display.h"
 #include "pet_page.h"
@@ -873,6 +875,11 @@ int lvgl_ui_channel_send_silent(const char *text, pet_emotion_t emotion)
 
 int lvgl_ui_channel_send(const char *text)
 {
+    return lvgl_ui_channel_send_kind(text, AGENT_MSG_KIND_FINAL);
+}
+
+int lvgl_ui_channel_send_kind(const char *text, uint8_t kind)
+{
     pet_emotion_t emotion;
     int ret;
 
@@ -883,6 +890,17 @@ int lvgl_ui_channel_send(const char *text)
 
     /* emotion follows the reply content */
     emotion = emotion_from_text(text);
+
+    /* P2a: 只有最终回答出声。状态语/错误语照旧上屏(气泡+历史)，但不进 TTS:
+     * 显示了不等于要念，这是显示与播报的解耦点。 */
+    if (kind != AGENT_MSG_KIND_FINAL) {
+        pet_display_set_emotion(emotion == PET_EMOTION_SPEAKING
+            ? PET_EMOTION_THINKING : emotion);
+        pet_back_idle_after(1500);
+        syslog(LOG_INFO, "[%s] no TTS for kind=%u\n", UI_TAG, (unsigned)kind);
+        return 0;
+    }
+
     if (emotion == PET_EMOTION_SPEAKING) {
         /* TTS 会阻塞数秒~数十秒(网络+解码+播放), 绝不能占住 LVGL 线程 ——
          * 之前这里同步调用导致\"屏幕卡死\"。改为后台线程念, UI 只负责表情,

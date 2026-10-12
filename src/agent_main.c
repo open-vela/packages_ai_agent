@@ -458,12 +458,19 @@ static void* outbound_dispatch_task(void* arg)
         } else if (strcmp(msg.channel, AGENT_CHAN_WEBSOCKET) == 0) {
             ws_server_send(msg.chat_id, msg.content, msg.from_local);
 #ifdef CONFIG_AI_AGENT_SPEAK_WS_REPLIES
-            /* 手机 App 提问 -> 手表把回答念出来。用异步版本: 派发线程绝不阻塞 */
-            {
+            /* 手机 App 提问 -> 手表把回答念出来。用异步版本: 派发线程绝不阻塞。
+             * P2a: 只念最终回答 (kind=FINAL)。状态语("正在思考中...")与错误语
+             * 也会走这条 outbound 通道，以前它们同样被念出来 —— 现在按 kind
+             * 过滤，源头上保证只有答案出声。 */
+            if (msg.kind == AGENT_MSG_KIND_FINAL) {
                 extern int voice_channel_speak_async(const char* text);
                 if (voice_channel_speak_async(msg.content) != 0) {
                     syslog(LOG_WARNING, "[%s] speak(ws) dispatch failed\n", TAG);
                 }
+            } else {
+                syslog(LOG_INFO,
+                    "[%s] speak(ws) skipped: kind=%u (not a final answer)\n",
+                    TAG, (unsigned)msg.kind);
             }
 #endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
@@ -492,7 +499,9 @@ static void* outbound_dispatch_task(void* arg)
             }
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         } else if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) == 0) {
-            int uret = lvgl_ui_channel_send(msg.content);
+            /* P2a: 把消息类别一起交给 UI 通道 —— 气泡照旧显示(状态语/错误语
+             * 都上屏)，但只有 FINAL 才触发 TTS。显示与播报解耦。 */
+            int uret = lvgl_ui_channel_send_kind(msg.content, msg.kind);
             if (uret != 0) {
                 syslog(LOG_ERR, "[%s] lvgl_ui_channel_send failed: %d\n", TAG, uret);
             }
@@ -527,6 +536,16 @@ static void* outbound_dispatch_task(void* arg)
             fflush(stdout);
             pthread_mutex_unlock(&g_stdout_lock);
             syslog(LOG_INFO, "[agent] [Agent]: %s\n", msg.content);
+#ifdef CONFIG_AI_AGENT_SPEAK_WS_REPLIES
+            /* P2e: 控制台 ask 的回答也念出来(方便演示/验收)。与 WS 同一开关,
+             * 同样只念最终回答; 用异步版本, 绝不阻塞派发线程。 */
+            if (msg.kind == AGENT_MSG_KIND_FINAL) {
+                extern int voice_channel_speak_async(const char* text);
+                if (voice_channel_speak_async(msg.content) != 0) {
+                    syslog(LOG_WARNING, "[%s] speak(cli) dispatch failed\n", TAG);
+                }
+            }
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
             /* Mirror into the chat ring so the pet page history window shows
              * console conversations too; this channel renders no bubble. */

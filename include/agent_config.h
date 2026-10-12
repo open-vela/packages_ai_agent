@@ -459,6 +459,13 @@
 #define AGENT_CFG_KEY_EDGE_VOICE "edge_voice"
 /* "0" turns off the Edge wire dump (default: on). */
 #define AGENT_CFG_KEY_EDGE_DEBUG "edge_debug"
+/* Index into EDGE_FORMATS of the output rung that last produced audio, e.g.
+ * "0" = audio-24khz-48kbitrate-mono-mp3.  Written by edge_tts.c when the rung
+ * changes, read back at init so the first sentence after power-on does not pay
+ * for re-probing the formats the service already rejected (each rejected probe
+ * is a full TLS+WS round trip, ~2s on BT-PAN, ~4s before the first sound).
+ * Missing / non-numeric / out-of-range values fall back to rung 0. */
+#define AGENT_CFG_KEY_EDGE_FMT "edge_fmt"
 
 /* ── Tool Guard (security) ──────────────────────────────────── */
 #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)

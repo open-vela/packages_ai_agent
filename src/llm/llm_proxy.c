@@ -526,6 +526,9 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
         agent_msg_t notify;
         memset(&notify, 0, sizeof(notify));
         strncpy(notify.channel, "cli", sizeof(notify.channel) - 1);
+        /* 错误提示：不是回答，禁止进 TTS (P2a)。cli 通道当前不出声，这里
+         * 打标是为了将来分享 speak 路径时行为仍然正确。 */
+        notify.kind = AGENT_MSG_KIND_ERROR;
         notify.content = strdup("网络请求失败，请检查蓝牙连接");
         if (notify.content) {
             if (message_bus_push_outbound(&notify) != OK) {

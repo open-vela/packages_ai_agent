@@ -554,6 +554,14 @@ static void* asr_and_dispatch(void* arg)
 
 /* ── TTS streaming callback ──────────────────────────────── */
 
+/* 这三个量是跨线程共享的静态量，保持原样(P2b 未改动语义)：
+ *   s_tts_start / s_tts_first_chunk —— 只在 voice_channel_speak() 内部与它
+ *     自己的回调 tts_stream_cb() 里读写，而 voice_channel_speak() 全程持有
+ *     s_voice.speak_lock，且 P2b 之后异步路径只有一个 worker 线程，因此写入
+ *     者唯一、读写都在锁内，没有新增竞态。
+ *   s_asr_done_ts —— 由录音线程(ASR 完成处)写、由 speak 起头读一次，用来
+ *     打 "LLM latency" 日志；这是改动前就有的良性竞态(8 字节 timespec 的
+ *     非原子读，最坏情况是日志里一个偏掉的毫秒数)，不属于本次修复范围。 */
 static struct timespec s_tts_start;
 static int s_tts_first_chunk;
 static struct timespec s_asr_done_ts;
@@ -994,24 +1002,101 @@ static void tts_strip_markdown(char* s)
     *w = '\0';
 }
 
+/* ── 异步播报: 一个常驻 worker + 有界队列 (P2b) ──────────────
+ *
+ * 旧实现每收到一句就 pthread_create + detach：没有队列、没有深度上限，
+ * 也没有显式栈属性 —— 而 Edge 后端要在这条线程里跑 mbedtls TLS 握手 +
+ * minimp3 解码，默认栈大小是听天由命。现在：
+ *   - worker 只在第一次需要时创建，之后复用；
+ *   - 队列深 2，"满则丢最旧、留最新"，与 voice_channel_speak() 里
+ *     "新答案打断旧答案"的语义一致(手机上连问两句不会积压一串旧答案，
+ *     也不会出现两个 speak 同时抢播放设备)；
+ *   - worker 显式 setstacksize(见 SPEAK_WORKER_STACK)。
+ *
+ * worker 常驻到进程结束(不 join、不退出)：退出路径上没有它要保存的状态，
+ * 停机时随进程一起消失即可，避免引入 teardown 顺序问题。 */
+#define SPEAK_QUEUE_DEPTH 2
+#define SPEAK_WORKER_STACK 24576 /* >=24KB: Edge 路径的 TLS + minimp3 都在这里跑 */
+
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    char* slots[SPEAK_QUEUE_DEPTH]; /* slots[0] 最旧, slots[count-1] 最新 */
+    int count;
+    pthread_t thread;
+    int started;
+} s_speak_q = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+};
+
 /* 后台线程里念一句话。TTS 要走网络+解码+播放, 正常也要几秒到几十秒, 绝不能
- * 占住 UI 线程或 agent 的派发线程 —— 之前的\"屏幕卡死\"就是同步调用造成的。
- * 返回 0 表示线程已派出(不代表念成功, 失败只记日志)。 */
-static void* speak_thread(void* arg)
+ * 占住 UI 线程或 agent 的派发线程 —— 之前的"屏幕卡死"就是同步调用造成的。 */
+static void* speak_worker(void* arg)
 {
-    char* text = (char*)arg;
-    int ret = voice_channel_speak(text);
-    if (ret != 0) {
-        syslog(LOG_WARNING, "[%s] async speak failed: %d\n", TAG, ret);
+    (void)arg;
+
+    for (;;) {
+        char* text;
+        int ret;
+        int i;
+
+        pthread_mutex_lock(&s_speak_q.lock);
+        while (s_speak_q.count == 0) {
+            pthread_cond_wait(&s_speak_q.cond, &s_speak_q.lock);
+        }
+        /* FIFO 出队(队列本身只有 1~2 项, 直接搬数组) */
+        text = s_speak_q.slots[0];
+        for (i = 1; i < s_speak_q.count; i++) {
+            s_speak_q.slots[i - 1] = s_speak_q.slots[i];
+        }
+        s_speak_q.count--;
+        pthread_mutex_unlock(&s_speak_q.lock);
+
+        /* voice_channel_speak() 自己会打断上一句正在播的 TTS, 因此即使
+         * 队列里排了两句, 也只会听到最新那句(与旧行为一致)。 */
+        ret = voice_channel_speak(text);
+        if (ret != 0) {
+            syslog(LOG_WARNING, "[%s] async speak failed: %d\n", TAG, ret);
+        }
+        free(text);
     }
-    free(text);
+
     return NULL;
 }
 
+/* 调用于 s_speak_q.lock 持有期间。 */
+static int speak_worker_ensure_started_locked(void)
+{
+    pthread_attr_t attr;
+    int ret;
+
+    if (s_speak_q.started) {
+        return 0;
+    }
+
+    pthread_attr_init(&attr);
+    /* 显式栈: Edge 路径在这条线程里跑 TLS 握手 + minimp3, 不能靠默认值。 */
+    pthread_attr_setstacksize(&attr, SPEAK_WORKER_STACK);
+    ret = pthread_create(&s_speak_q.thread, &attr, speak_worker, NULL);
+    pthread_attr_destroy(&attr);
+
+    if (ret != 0) {
+        syslog(LOG_ERR, "[%s] speak worker create failed: %d\n", TAG, ret);
+        return -EIO;
+    }
+
+    s_speak_q.started = 1;
+    syslog(LOG_INFO, "[%s] speak worker started (stack=%d, queue=%d)\n",
+        TAG, SPEAK_WORKER_STACK, SPEAK_QUEUE_DEPTH);
+    return 0;
+}
+
+/* 返回 0 表示文本已入队(不代表念成功, 失败只记日志)。 */
 int voice_channel_speak_async(const char* text)
 {
-    pthread_t th;
     char* copy;
+    int i;
 
     if (!text || text[0] == '\0') {
         return -EINVAL;
@@ -1022,11 +1107,27 @@ int voice_channel_speak_async(const char* text)
         return -ENOMEM;
     }
 
-    if (pthread_create(&th, NULL, speak_thread, copy) != 0) {
+    pthread_mutex_lock(&s_speak_q.lock);
+
+    if (speak_worker_ensure_started_locked() != 0) {
+        pthread_mutex_unlock(&s_speak_q.lock);
         free(copy);
         return -EIO;
     }
-    pthread_detach(th);
+
+    if (s_speak_q.count >= SPEAK_QUEUE_DEPTH) {
+        /* 队列满: 丢最旧、留最新 —— 用户关心的是最新那句话。 */
+        syslog(LOG_INFO, "[%s] speak queue full, dropping oldest\n", TAG);
+        free(s_speak_q.slots[0]);
+        for (i = 1; i < s_speak_q.count; i++) {
+            s_speak_q.slots[i - 1] = s_speak_q.slots[i];
+        }
+        s_speak_q.count--;
+    }
+
+    s_speak_q.slots[s_speak_q.count++] = copy;
+    pthread_cond_signal(&s_speak_q.cond);
+    pthread_mutex_unlock(&s_speak_q.lock);
     return 0;
 }
 

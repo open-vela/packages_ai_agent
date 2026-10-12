@@ -40,8 +40,11 @@ int voice_channel_stop_with_text(char *text_out, size_t text_cap);
 /* Synthesize text and play back (called from outbound dispatcher). */
 int voice_channel_speak(const char *text);
 
-/* Same, but on a detached background thread: never blocks the caller (UI or
- * the outbound dispatcher). Returns 0 once the thread is dispatched. */
+/* Same, but on a persistent background worker: never blocks the caller (UI or
+ * the outbound dispatcher).  The text is queued into a depth-2 drop-oldest
+ * queue (a newer answer always wins), the worker thread is created once with
+ * an explicit >=24KB stack and reused.  Returns 0 once the text is queued --
+ * 0 does NOT mean the utterance was spoken. */
 int voice_channel_speak_async(const char *text);
 
 /* Test TTS: synthesize text, save PCM to file. */

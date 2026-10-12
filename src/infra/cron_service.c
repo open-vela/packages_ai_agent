@@ -355,6 +355,8 @@ static void cron_fire_job(cron_job_t* job, time_t now)
             memset(&notify, 0, sizeof(notify));
             strncpy(notify.channel, job->channel, sizeof(notify.channel) - 1);
             strncpy(notify.chat_id, job->chat_id, sizeof(notify.chat_id) - 1);
+            /* 定时提醒是用户要听的内容（voice 通道会念），显式标 FINAL。 */
+            notify.kind = AGENT_MSG_KIND_FINAL;
             notify.content = strdup(job->message);
             if (notify.content) {
                 if (message_bus_push_outbound(&notify) != OK) {
@@ -368,6 +370,7 @@ static void cron_fire_job(cron_job_t* job, time_t now)
         memset(&msg, 0, sizeof(msg));
         strncpy(msg.channel, job->channel, sizeof(msg.channel) - 1);
         strncpy(msg.chat_id, job->chat_id, sizeof(msg.chat_id) - 1);
+        msg.kind = AGENT_MSG_KIND_FINAL; /* 提醒 = 要念给用户听的内容 */
         msg.content = strdup(job->message);
 
         if (msg.content) {

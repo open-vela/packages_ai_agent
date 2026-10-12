@@ -861,6 +861,8 @@ static void dispatch_response(const agent_msg_t* msg,
             sizeof(out.chat_id) - 1);
         out.content = final_text;
         out.from_local = s_answer_from_local;
+        /* 真正的回答：只有这一类允许被念出来 (P2a)。 */
+        out.kind = AGENT_MSG_KIND_FINAL;
         if (message_bus_push_outbound(&out) != OK) {
             free(final_text);
         }
@@ -872,6 +874,8 @@ static void dispatch_response(const agent_msg_t* msg,
         strncpy(out.chat_id, msg->chat_id,
             sizeof(out.chat_id) - 1);
         out.content = strdup("Sorry, I encountered an error.");
+        /* 错误提示不是回答：上屏/上手机，但绝不进 TTS。 */
+        out.kind = AGENT_MSG_KIND_ERROR;
         if (out.content) {
             if (message_bus_push_outbound(&out) != OK) {
                 free(out.content);
@@ -894,7 +898,9 @@ static const char* s_working_phrases[] = {
 
 /* Send a "working" status message on the first iteration.
  * Skip for feishu (has its own typing indicator) and voice
- * (TTS synthesis of a status phrase wastes time and memory). */
+ * (TTS synthesis of a status phrase wastes time and memory).
+ * P2a: 状态语仍然上屏(手机页的"typing"提示 / 手表气泡), 只是不念 ——
+ * 靠下面的 kind=STATUS 标记过滤 TTS, 不靠把通道塞进这个跳过名单。 */
 static void send_working_status(const agent_msg_t* msg, int iteration)
 {
     if (iteration != 0) {
@@ -913,6 +919,8 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
 
     strncpy(status.channel, msg->channel, sizeof(status.channel) - 1);
     strncpy(status.chat_id, msg->chat_id, sizeof(status.chat_id) - 1);
+    /* 进度语，不是回答：speak 侧只认 FINAL (P2a)。 */
+    status.kind = AGENT_MSG_KIND_STATUS;
     status.content = strdup(
         s_working_phrases[(unsigned)rand() % WORKING_PHRASE_COUNT]);
     if (status.content) {
@@ -1533,6 +1541,8 @@ static void* agent_loop_task(void* arg)
             strncpy(out.chat_id, msg.chat_id,
                 sizeof(out.chat_id) - 1);
             out.content = strdup("系统内存不足，请稍后再试。");
+            /* 低内存提示不是回答：只说给屏幕听 (P2a)。 */
+            out.kind = AGENT_MSG_KIND_ERROR;
             if (out.content) {
                 if (message_bus_push_outbound(&out) != OK) {
                     free(out.content);
@@ -1575,6 +1585,8 @@ static void* agent_loop_task(void* arg)
              * involved, so label them 本地 rather than letting them inherit
              * the default 云端. */
             out.from_local = true;
+            /* 端侧快通道的答复同样是要念给用户听的最终回答。 */
+            out.kind = AGENT_MSG_KIND_FINAL;
             if (message_bus_push_outbound(&out) != OK) {
                 free(reply);
             }
