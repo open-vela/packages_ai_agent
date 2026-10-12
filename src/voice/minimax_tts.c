@@ -1341,6 +1341,21 @@ static const char* mm_key_from_backend(char* dst, size_t cap)
   return source;
 }
 
+/* Optional, git-ignored local header that carries the MiniMax key compiled
+ * into this image (the fourth rung in mm_load_config() below).  It exists
+ * only in a developer tree that generated it from .v3_work/.llm_key; a
+ * clean checkout has no such header and the "" fallback below keeps the
+ * config-only behaviour.  The key itself is never logged. */
+
+#if defined(__has_include)
+#  if __has_include("voice/minimax_tts_key_local.h")
+#    include "voice/minimax_tts_key_local.h"
+#  endif
+#endif
+#ifndef MINIMAX_TTS_KEY_LOCAL
+#  define MINIMAX_TTS_KEY_LOCAL ""
+#endif
+
 static void mm_load_config(mm_cfg_t* cfg)
 {
   const char* source = NULL;
@@ -1349,8 +1364,9 @@ static void mm_load_config(mm_cfg_t* cfg)
 
   /* Key order: the TTS specific key first, then the MiniMax key the LLM
    * already uses (both are the same account key on this device), then the
-   * copy inside llm_backend_0 - the only rung that survives the ~64
-   * character nsh line buffer.  The first non-empty value wins. */
+   * copy inside llm_backend_0 - the only config rung that survives the ~64
+   * character nsh line buffer - and finally the key compiled into the image
+   * by the fourth rung below.  The first non-empty value wins. */
   if (claw_config_get(AGENT_CFG_KEY_TTS_API_KEY, cfg->key, sizeof(cfg->key))
         == OK
       && cfg->key[0] != '\0')
@@ -1366,6 +1382,20 @@ static void mm_load_config(mm_cfg_t* cfg)
   else
     {
       source = mm_key_from_backend(cfg->key, sizeof(cfg->key));
+
+      /* Fourth and last rung: the key compiled into the image, used only
+       * when all three config rungs above came back empty.  This board's
+       * nsh console cannot carry the ~125 character key past its ~64
+       * character line buffer, so for a local image the key arrives in
+       * .rodata instead.  A clean checkout has an empty constant here and
+       * falls through to the original "no API key" path below. */
+
+      if (source == NULL && MINIMAX_TTS_KEY_LOCAL[0] != '\0')
+        {
+          strncpy(cfg->key, MINIMAX_TTS_KEY_LOCAL, sizeof(cfg->key) - 1);
+          cfg->key[sizeof(cfg->key) - 1] = '\0';
+          source = "build-time constant";
+        }
     }
 
   if (source != NULL)

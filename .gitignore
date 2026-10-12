@@ -50,3 +50,9 @@ logs/*
 
 # Kconfig backup
 Kconfig.orig
+
+# ── Local build-time secret (generated, never committed) ──────
+# Written from .v3_work/.llm_key into the ai_agent include tree so the
+# MiniMax TTS key can be compiled into a local image.  It is absent from a
+# clean checkout, and mm_load_config() falls back safely when it is missing.
+include/voice/minimax_tts_key_local.h
