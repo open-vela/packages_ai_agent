@@ -1895,3 +1895,147 @@ int minimax_tts_register(void)
 {
   return voice_tts_register(&s_minimax_tts_ops);
 }
+
+/****************************************************************************
+ * 供 voice/minimax_asr.c 复用 (见 include/voice/minimax_tts.h 的说明)
+ ****************************************************************************/
+
+int minimax_get_api_key(char* out, size_t cap)
+{
+  mm_cfg_t cfg;
+
+  if (out == NULL || cap == 0)
+    {
+      return -EINVAL;
+    }
+
+  out[0] = '\0';
+
+  mm_load_config(&cfg);
+
+  if (cfg.key[0] == '\0')
+    {
+      return -ENOENT;
+    }
+
+  strlcpy(out, cfg.key, cap);
+  return 0;
+}
+
+int minimax_https_post(const char* path, const char* content_type,
+                       const char* api_key,
+                       const unsigned char* body, size_t body_len,
+                       char* resp, size_t resp_cap, int timeout_ms)
+{
+  mm_tls_t tls;
+  mm_reader_t rd;
+  char hdr[512];
+  int tls_open = 0;
+  int status = 0;
+  size_t got = 0;
+  int n;
+  int ret;
+
+  if (path == NULL || content_type == NULL || api_key == NULL
+      || body == NULL || body_len == 0 || resp == NULL || resp_cap < 2
+      || timeout_ms <= 0)
+    {
+      return -EINVAL;
+    }
+
+  memset(&tls, 0, sizeof(tls));
+  memset(&rd, 0, sizeof(rd));
+  resp[0] = '\0';
+
+  ret = mm_tls_connect(&tls, AGENT_MINIMAX_TTS_HOST, AGENT_MINIMAX_TTS_PORT,
+                       timeout_ms);
+  if (ret != 0)
+    {
+      syslog(LOG_ERR, "[minimax_https] connect failed: %d\n", ret);
+      goto out;
+    }
+
+  tls_open = 1;
+
+  n = snprintf(hdr, sizeof(hdr),
+               "POST %s HTTP/1.1\r\n"
+               "Host: %s\r\n"
+               "Content-Type: %s\r\n"
+               "Accept: application/json\r\n"
+               "Content-Length: %zu\r\n"
+               "Connection: close\r\n"
+               "User-Agent: " AGENT_MINIMAX_TTS_USER_AGENT "\r\n"
+               "Authorization: Bearer ",
+               path, AGENT_MINIMAX_TTS_HOST, content_type, body_len);
+
+  if (n <= 0 || n >= (int)sizeof(hdr))
+    {
+      ret = -EOVERFLOW;
+      goto out;
+    }
+
+  /* key 单独写, 免得 ~125 字符的 key 撑爆上面的 header 缓冲 */
+  ret = mm_tls_write_all(&tls, (const unsigned char*)hdr, (size_t)n);
+  if (ret == 0)
+    {
+      ret = mm_tls_write_all(&tls, (const unsigned char*)api_key,
+                             strlen(api_key));
+    }
+
+  if (ret == 0)
+    {
+      ret = mm_tls_write_all(&tls, (const unsigned char*)"\r\n\r\n", 4);
+    }
+
+  if (ret == 0)
+    {
+      ret = mm_tls_write_all(&tls, body, body_len);
+    }
+
+  if (ret != 0)
+    {
+      syslog(LOG_ERR, "[minimax_https] send failed: %d\n", ret);
+      goto out;
+    }
+
+  rd.raw = mm_tls_raw;
+  rd.raw_ctx = &tls;
+
+  ret = mm_read_response_head(&rd, &status);
+  if (ret != 0)
+    {
+      syslog(LOG_ERR, "[minimax_https] no response head: %d\n", ret);
+      goto out;
+    }
+
+  if (status != 200)
+    {
+      syslog(LOG_ERR, "[minimax_https] HTTP %d\n", status);
+      ret = (status == 401 || status == 403) ? -EACCES : -EIO;
+      goto out;
+    }
+
+  /* JSON 响应很小, 一次读满即可; 读不满也不算错, 交给调用者解析 */
+  while (got < resp_cap - 1)
+    {
+      n = mm_reader_read(&rd, (unsigned char*)resp + got,
+                         resp_cap - 1 - got);
+      if (n <= 0)
+        {
+          break;
+        }
+
+      got += (size_t)n;
+    }
+
+  resp[got] = '\0';
+  ret = 0;
+
+out:
+  if (tls_open)
+    {
+      mm_tls_free(&tls);
+    }
+
+  return ret;
+}

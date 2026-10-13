@@ -31,6 +31,7 @@
 #include "voice/minimax_tts.h"
 #include "voice/voice_tts.h"
 #include "voice/volc_asr.h"
+#include "voice/minimax_asr.h"
 #include "voice/volc_tts.h"
 
 #include <ctype.h>
@@ -619,7 +620,12 @@ int voice_channel_init(void)
          * voice_tts_speak_stream(), not by this list. */
         edge_tts_register();
         minimax_tts_register();
-        volc_asr_register();
+        /* 2026-10-14: ASR 改用 MiniMax (同一个账号 / 同一个 key / 同一条
+         * 真机验证过的 HTTPS 通道), 见 voice/minimax_asr.c。
+         * 火山后端仍留在源码里, 需要时把下面这行换回 volc_asr_register()
+         * 即可 —— 但注意火山还额外需要 app_id/token/cluster 三个凭证,
+         * 而本机 config 里从来没配过。 */
+        minimax_asr_register();
         s_backends_registered = 1;
     }
 

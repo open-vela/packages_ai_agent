@@ -51,6 +51,27 @@ int minimax_tts_synthesize_stream(const char *text,
                                   voice_tts_chunk_cb cb,
                                   void *user_data);
 
+/* ── 供 voice/minimax_asr.c 复用（同一个账号同一个 key，同一套 TLS 通道） ──
+ *
+ * minimax_get_api_key(): 按 TTS 完全相同的顺序取 key
+ *   ("tts_api_key" → "api_key" → llm_backend_0 → 编译进镜像的本地 key)，
+ *   四道都不是空才返回 0。ASR 与 TTS 必须用同一条链，否则会出现
+ *   "能说话但不能识别"这种最难查的分裂状态。
+ *
+ * minimax_https_post(): 对 AGENT_MINIMAX_TTS_HOST 发一个 POST，复用本文件
+ *   已经真机验证过的 mm_tls_*(代理隧道 + mbedtls + 超时) 与
+ *   mm_read_response_head/mm_reader_read(自动处理 Content-Length 与 chunked)。
+ *   path / content_type 由调用者给（ASR 是 /v1/speech_to_text +
+ *   multipart/form-data）。响应体写入 resp 并 NUL 结尾。
+ *   返回 0 表示 HTTP 2xx 且响应体已读入；否则负 errno
+ *   (-EACCES 401/403、-EIO 其它状态码、-ETIMEDOUT/-EPROTO 传输层)。 */
+int minimax_get_api_key(char *out, size_t cap);
+
+int minimax_https_post(const char *path, const char *content_type,
+                       const char *api_key,
+                       const unsigned char *body, size_t body_len,
+                       char *resp, size_t resp_cap, int timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif
