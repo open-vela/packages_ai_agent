@@ -21,9 +21,12 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <syslog.h>
+#include <sys/ioctl.h>
 
 #include <nuttx/sched.h>
+#include <nuttx/timers/watchdog.h>
 
 #include "infra/hangwatch.h"
 
@@ -38,12 +41,26 @@
 #define HW_STACK        3072
 #define HW_NSTATES      16      /* tstate_t 的桶数(只用低 4 位, 足够) */
 
+/* ── 硬件看门狗(硬复位兜底) ────────────────────────────────────────────────
+ * 真机出现过"整个调度器停摆"的冻屏([alive] 只打出 watchdog started 一行就
+ * 再无输出, 说明连定时器唤醒都不再发生) —— 那种情况下软件无自救可能, 只能
+ * 靠独立看门狗把 SoC 复位。这里喂狗的是本线程(1s 一次), 超时给 20s:
+ * 系统正常时余量 20 倍; 真冻死时 20s 后自动重启, 不必人工拔插。
+ *
+ * 注意: 必须**先 SETTIMEOUT 再 START** —— 驱动的 sf32lb_start() 在
+ * priv->timeout==0 时会用 CONFIG_SF32LB_IWDG_DEFTIMOUT(=2.5s) 兜底,
+ * 顺序反了就会以 2.5s 超时启动, 正常启动过程都可能被复位。 */
+#define HW_WDT_ENABLE      1
+#define HW_WDT_TIMEOUT_MS  20000
+#define HW_WDT_DEVPATH     "/dev/watchdog0"
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
 
 static volatile uint32_t g_ui_tick;      /* LVGL 任务心跳(1Hz) */
 static volatile bool     g_hw_running;
+static int               g_wdt_fd = -1;  /* /dev/watchdog0, <0 = 未启用 */
 
 /****************************************************************************
  * Public Functions
@@ -115,6 +132,41 @@ static void hw_dump_tasks(FAR const char *why)
   syslog(LOG_INFO, "[stall] ---- %d tasks ----\n", s.dumped);
 }
 
+/* 打开并启动硬件看门狗。失败只告警不致命(冻屏取证仍可用)。 */
+
+static void hw_wdt_arm(void)
+{
+#if HW_WDT_ENABLE
+  g_wdt_fd = open(HW_WDT_DEVPATH, O_RDWR);
+  if (g_wdt_fd < 0)
+    {
+      syslog(LOG_WARNING, "[alive] %s open failed: %d (no auto-reboot)\n",
+             HW_WDT_DEVPATH, errno);
+      return;
+    }
+
+  if (ioctl(g_wdt_fd, WDIOC_SETTIMEOUT, (unsigned long)HW_WDT_TIMEOUT_MS) < 0)
+    {
+      syslog(LOG_WARNING, "[alive] WDIOC_SETTIMEOUT(%d) failed: %d\n",
+             HW_WDT_TIMEOUT_MS, errno);
+      close(g_wdt_fd);
+      g_wdt_fd = -1;
+      return;
+    }
+
+  if (ioctl(g_wdt_fd, WDIOC_START, 0) < 0)
+    {
+      syslog(LOG_WARNING, "[alive] WDIOC_START failed: %d\n", errno);
+      close(g_wdt_fd);
+      g_wdt_fd = -1;
+      return;
+    }
+
+  syslog(LOG_INFO, "[alive] hardware watchdog armed (%dms, fed 1Hz)\n",
+         HW_WDT_TIMEOUT_MS);
+#endif
+}
+
 static void *hw_thread(FAR void *arg)
 {
   struct hw_scan_s s;
@@ -133,6 +185,7 @@ static void *hw_thread(FAR void *arg)
   ui_seen = g_ui_tick;
 
   syslog(LOG_INFO, "[alive] watchdog started (ui_stall>%dms)\n", HW_STALL_MS);
+  hw_wdt_arm();
 
   while (g_hw_running)
     {
@@ -141,6 +194,13 @@ static void *hw_thread(FAR void *arg)
       bool stall;
 
       usleep(HW_POLL_MS * 1000);
+
+      /* 喂狗: 本线程活着 == 调度器还能唤醒我们 => 系统没冻死。
+       * 放在循环最前面: 只要这一拍被调度到就先续命, 再做取证打印。 */
+      if (g_wdt_fd >= 0)
+        {
+          (void)ioctl(g_wdt_fd, WDIOC_KEEPALIVE, 0);
+        }
 
       now   = hw_now_ms();
       ui_now = g_ui_tick;
