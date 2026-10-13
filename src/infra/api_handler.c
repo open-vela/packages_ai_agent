@@ -284,6 +284,7 @@ static bool handle_config_put(int fd, const char* body)
 
     /* Collect backend field updates */
     bool backend_dirty = false;
+    int  write_failures = 0;
     char backend_json[1024] = { 0 };
     claw_config_get("llm_backend_0", backend_json, sizeof(backend_json));
     cJSON* backend_obj = cJSON_Parse(backend_json);
@@ -318,10 +319,14 @@ static bool handle_config_put(int fd, const char* body)
             cJSON_AddStringToObject(backend_obj, backend_field, item->valuestring);
             backend_dirty = true;
             /* Also write flat key so config_show can display it */
-            claw_config_set(item->string, item->valuestring);
+            if (claw_config_set(item->string, item->valuestring) != OK) {
+                write_failures++;
+            }
         } else {
             /* Flat config key */
-            claw_config_set(item->string, item->valuestring);
+            if (claw_config_set(item->string, item->valuestring) != OK) {
+                write_failures++;
+            }
         }
     }
 
@@ -329,8 +334,12 @@ static bool handle_config_put(int fd, const char* body)
     if (backend_dirty) {
         char* bstr = cJSON_PrintUnformatted(backend_obj);
         if (bstr) {
-            claw_config_set("llm_backend_0", bstr);
+            if (claw_config_set("llm_backend_0", bstr) != OK) {
+                write_failures++;
+            }
             free(bstr);
+        } else {
+            write_failures++;
         }
         /* Reload LLM router so changes take effect immediately */
         llm_router_init();
@@ -338,6 +347,21 @@ static bool handle_config_put(int fd, const char* body)
 
     cJSON_Delete(backend_obj);
     cJSON_Delete(req);
+
+    /* Report persistence honestly. This used to answer 200 {"ok":true}
+     * unconditionally, so a client configuring the device over HTTP saw
+     * success even when nothing had been written (out of space, read-only
+     * fs, ...) - the failure mode that leaves "No available backend" after
+     * a restart with no visible error anywhere. */
+    if (write_failures > 0) {
+        char err[96];
+        snprintf(err, sizeof(err),
+                 "{\"error\":\"%d key(s) could not be persisted\"}",
+                 write_failures);
+        send_response(fd, 500, err);
+        return true;
+    }
+
     send_response(fd, 200, "{\"ok\":true}");
     return true;
 }

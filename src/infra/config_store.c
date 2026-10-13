@@ -54,9 +54,48 @@ static int mkdirs(const char *path)
     return OK;
 }
 
-static cJSON *load_json(void)
+/* 解析失败日志的限流状态。
+ *
+ * 背景: 真机上 config.json 被手工 echo 写坏后, 每次 claw_config_get() 都
+ * 走一遍 load_json(), 于是同一句 "is not valid JSON (367 bytes)" 刷了几十
+ * 行 —— 配置被读的次数远多于它被写的次数 (llm_proxy / network_manager /
+ * tool_guard / ... 各自 init 时都要读若干 key)。
+ *
+ * 规则: 同一份坏文件只报一次; 内容变了 (长度不同) 或成功解析过一次之后再坏,
+ * 都重新报一次。这样"坏了"这件事一定看得见, 但不会刷屏。
+ * 状态只被 s_lock 保护下的路径访问, 不需要额外加锁。 */
+static long s_bad_json_last_size = -1;
+static int  s_bad_json_suppressed = 0;
+
+static void report_bad_json(long sz)
+{
+    if (s_bad_json_last_size == sz) {
+        /* 同一份坏文件: 只累加计数, 不再打日志 */
+        s_bad_json_suppressed++;
+        return;
+    }
+
+    if (s_bad_json_suppressed > 0) {
+        syslog(LOG_ERR,
+               "[%s] %s is not valid JSON (%ld bytes); %d further identical "
+               "read(s) were suppressed\n",
+               TAG, AGENT_CONFIG_FILE, sz, s_bad_json_suppressed);
+    } else {
+        syslog(LOG_ERR, "[%s] %s is not valid JSON (%ld bytes)\n",
+               TAG, AGENT_CONFIG_FILE, sz);
+    }
+
+    s_bad_json_last_size = sz;
+    s_bad_json_suppressed = 0;
+}
+
+/* bad_json: 非 NULL 时, 由本函数写入失败原因 —— true 表示"文件内容不是
+ * 合法 JSON", false 表示"读不出来/内存不足"。调用方要区分这两种失败才能
+ * 安全地决定能不能把文件挪走: OOM 时文件是好的, 挪走就是丢数据。 */
+static cJSON *load_json_ex(bool *bad_json)
 {
     FILE *f = fopen(AGENT_CONFIG_FILE, "r");
+    if (bad_json) *bad_json = false;
     if (!f) return cJSON_CreateObject();
 
     fseek(f, 0, SEEK_END);
@@ -83,16 +122,28 @@ static cJSON *load_json(void)
     cJSON *root = cJSON_Parse(buf);
     free(buf);
     if (root) {
+        /* 解析成功: 复位限流状态, 下次再坏时重新报一次 */
+        s_bad_json_last_size = -1;
+        s_bad_json_suppressed = 0;
         return root;
     }
 
     /* A parse failure used to return an empty object, and the next
      * claw_config_set() then merged into it and saved - wiping every other
      * key in the file. Fail the load instead; the callers below refuse to
-     * write when they get NULL, so a corrupt file stays as it is. */
-    syslog(LOG_ERR, "[%s] %s is not valid JSON (%ld bytes)\n",
-           TAG, AGENT_CONFIG_FILE, (long)sz);
+     * write when they get NULL, so a corrupt file stays as it is.
+     *
+     * 关键: 这里**只读不写** —— 坏文件原样留在盘上, 既不会被空对象覆盖,
+     * 也不会被"修好"(那样会丢掉用户还能手工救回来的内容)。日志走限流,
+     * 见 report_bad_json()。 */
+    report_bad_json((long)sz);
+    if (bad_json) *bad_json = true;
     return NULL;
+}
+
+static cJSON *load_json(void)
+{
+    return load_json_ex(NULL);
 }
 
 #define AGENT_CONFIG_TMP AGENT_CONFIG_FILE ".tmp"
@@ -140,6 +191,60 @@ static int save_json(cJSON *root)
     return OK;
 }
 
+/* load_json() for the **write** paths.
+ *
+ * A corrupt config.json used to be a dead end: load_json() returns NULL, so
+ * claw_config_set() / config_del() refuse to write (that part is right — a
+ * partial rewrite of a *valid* file would drop every other key). But the
+ * file being unparseable also meant no key could ever be set again: the user
+ * had to find a serial console and run config_reset before set_llm would
+ * stick, which is exactly the situation where the console is already taken
+ * over by the agent CLI.
+ *
+ * So: on the write path, quarantine the corrupt file (rename, never delete —
+ * the bytes are still there for post-mortem) and start from a clean object.
+ * A valid file is never touched by this: it takes the normal load_json()
+ * path and keeps the read-modify-write guarantee.
+ *
+ * Returns NULL only on OOM / rename failure; callers then refuse to write. */
+#define AGENT_CONFIG_BAD AGENT_CONFIG_FILE ".bad"
+
+static cJSON *load_json_for_write(void)
+{
+    bool bad_json = false;
+    cJSON *root = load_json_ex(&bad_json);
+
+    if (root != NULL) {
+        return root;
+    }
+
+    if (!bad_json) {
+        /* OOM 或读不出来: 文件本身可能是好的, 绝不能挪走 —— 挪走就是
+         * 丢掉用户仅剩的配置。让写操作失败, 保持原文件原样。 */
+        return NULL;
+    }
+
+    if (rename(AGENT_CONFIG_FILE, AGENT_CONFIG_BAD) != 0) {
+        syslog(LOG_ERR,
+               "[%s] %s is corrupt and could not be quarantined to %s: %d; "
+               "refusing to write\n",
+               TAG, AGENT_CONFIG_FILE, AGENT_CONFIG_BAD, errno);
+        return NULL;
+    }
+
+    syslog(LOG_WARNING,
+           "[%s] %s was corrupt; moved aside to %s and starting a fresh "
+           "config (previous bytes preserved for inspection)\n",
+           TAG, AGENT_CONFIG_FILE, AGENT_CONFIG_BAD);
+
+    /* The corrupt file is gone from the config path: reset the rate-limit
+     * state so a future corruption is reported immediately. */
+    s_bad_json_last_size = -1;
+    s_bad_json_suppressed = 0;
+
+    return cJSON_CreateObject();
+}
+
 /* ── public API ──────────────────────────────────────────────── */
 
 int config_store_init(void)
@@ -171,7 +276,7 @@ int claw_config_get(const char *key, char *buf, size_t buf_size)
 int claw_config_set(const char *key, const char *value)
 {
     pthread_mutex_lock(&s_lock);
-    cJSON *root = load_json();
+    cJSON *root = load_json_for_write();
     if (!root) {
         pthread_mutex_unlock(&s_lock);
         return ERROR;
@@ -187,7 +292,7 @@ int claw_config_set(const char *key, const char *value)
 int config_del(const char *key)
 {
     pthread_mutex_lock(&s_lock);
-    cJSON *root = load_json();
+    cJSON *root = load_json_for_write();
     if (!root) {
         pthread_mutex_unlock(&s_lock);
         return ERROR;
