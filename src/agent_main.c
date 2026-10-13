@@ -46,6 +46,7 @@
 #endif
 #include "channels/ws_server.h"
 #include "infra/heartbeat.h"
+#include "infra/hangwatch.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 #include "core/memory_store.h"
@@ -673,7 +674,10 @@ int ai_agent_main(int argc, char* argv[])
          * 位置要求两件事都已就绪: audcodec_register 跑过 (上面 P1 开头,
          * 否则 open 得自己补注册) 且 config_store_init 建过 AGENT_DATA_DIR
          * (否则 PCM 落盘路径的目录还不存在, 只能拿到统计、拿不到文件)。 */
-        rc = mic_selfcheck_start_async();
+        /* 2026-10-13 临时关闭(单变量排障): 开机探针是未真机验证的新变量,
+         * 先关掉以隔离"挂死"的来源。ask 路径(麦克风自检)不受影响, 仍可手动触发。
+         * rc = mic_selfcheck_start_async(); */
+        rc = 0; (void)rc;
         BOOT_LOG_RC(&t0, "P1", "mic_selfcheck_start_async", rc);
 
         rc = message_bus_init();
@@ -859,6 +863,12 @@ int ai_agent_main(int argc, char* argv[])
     {
         int rc = nsh_commands_start();
         BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
+    }
+
+    /* ── Phase 7: 冻屏取证看门狗(独立线程, 只观察不抢锁) ── */
+    {
+        int rc = hangwatch_start();
+        BOOT_LOG_RC(&t0, "P7", "hangwatch_start", rc);
     }
 
     syslog(LOG_INFO, "[%s] [boot +%ldms] AI Agent ready. Type 'help' in NSH for commands.\n",

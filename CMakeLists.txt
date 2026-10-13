@@ -36,6 +36,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/infra/network_manager.c
     src/infra/cron_service.c
     src/infra/heartbeat.c
+    src/infra/hangwatch.c
     src/channels/nsh_commands.c
     src/channels/cmd_llm.c
     src/channels/cmd_voice.c

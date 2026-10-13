@@ -19,6 +19,7 @@
 #include "pet_page.h"
 #include "settings_page.h"
 #include "about_page.h"
+#include "infra/hangwatch.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -150,6 +151,10 @@ static void time_update_cb(lv_timer_t *timer)
     int day_key;
 
     (void)timer;
+
+    /* 看门狗心跳: 本回调跑在 LVGL 任务里, 它停了就是 UI 卡死 (见 hangwatch.h) */
+    hangwatch_ui_tick();
+
     if (s_time_label == NULL) {
         return;
     }

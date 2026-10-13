@@ -340,17 +340,18 @@ static void on_hr_measure_clicked(lv_event_t *e)
 {
     int ret;
 
-    (void)e;
-    printf("[PetPage] HR measure button clicked\n");
+    /* 无条件打印(含事件码): 以后真机上"点了没反应"时, 这一行就能区分
+     * "事件根本没到 LVGL" 与 "事件到了但启动失败" —— 之前排查这个问题时,
+     * 就是因为拿不到这条日志而在触摸/布局上绕了很久。 */
+    printf("[PetPage] HR measure button: code=%d target=%p\n",
+           (int)lv_event_get_code(e), (void *)lv_event_get_target(e));
 
     /* 触摸活动：复位空闲关怀计时，测量期间别让桌宠主动开口抢文本层 */
     pet_care_note_activity();
 
     ret = hr_measure_start();
-    if (ret != 0)
-    {
-        printf("[PetPage] hr_measure_start -> %d (ignored)\n", ret);
-    }
+    printf("[PetPage] hr_measure_start -> %d%s\n", ret,
+           ret == 0 ? "" : " (ignored)");
 }
 
 /**
