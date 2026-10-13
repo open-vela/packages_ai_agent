@@ -24,8 +24,12 @@
 extern "C" {
 #endif
 
-/* 硬上限：到点无论有没有结果都停采集并报失败 */
-#define HR_MEASURE_MAX_S        15
+/* 硬上限：到点无论有没有结果都停采集并报失败。
+ * 2026-10-13: 15 -> 30 —— 真机实测算法从 start 到第一次 gate=ok 需要约 35s
+ * (滤波器/DC 建立 + env 包络从启动瞬态衰减 + 3 个 RR + 连续确认),
+ * 15s 窗口下「测心率」按钮**必然**以 timeout 收场(真机 22:41 已复现:
+ * 倒计时走完没有数字, 日志 [hr_measure] failed: timeout, no data)。 */
+#define HR_MEASURE_MAX_S        30
 /* 已经出过数据之后，连续多久没有新更新就提前放弃 */
 #define HR_MEASURE_STALL_MS     3000
 /* 结果上屏后多久恢复时段问候语 */

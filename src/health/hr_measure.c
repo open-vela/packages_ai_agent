@@ -259,9 +259,14 @@ static int hr_sensor_cmd(const char *name, const char *cmd, int wait_ms,
                          int *exitcode)
 {
     posix_spawnattr_t attr;
-    FAR char * const argv[3] = { (FAR char *)"hr_sensor",
-                                 (FAR char *)cmd,
-                                 NULL };
+    /* 只给真正的参数, 不要把程序名写进来 —— NuttX 的 nxtask_setup_stackargs()
+     * (sched/task/task_setup.c:538, 由 task_init.c:134 调用) 会自己用 name 填 argv[0],
+     * 并把这里传入的数组整体接在后面。写成 {name, cmd, NULL} 会得到
+     * argc=3 / argv[0]=name / argv[1]=name / argv[2]=cmd, 于是 hr_sensor 的
+     * `cmd = (argc > 1) ? argv[1] : "status"` 取到的是程序名, 匹配不上任何子命令,
+     * 打印用法后立即退出 —— 真机表现就是: 按钮点了、倒计时在跑、但采集从未启动
+     * (没有红光/没有 bpm/15s 超时)。 */
+    FAR char * const argv[2] = { (FAR char *)cmd, NULL };
     hr_reap_slot_t *slot;
     pid_t pid;
     int ret;
