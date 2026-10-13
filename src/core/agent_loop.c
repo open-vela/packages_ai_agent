@@ -28,6 +28,7 @@
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
+#include "health/mic_selfcheck.h" /* 麦克风自检 (ask 麦克风自检) */
 #include "infra/network_manager.h"
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
@@ -341,6 +342,9 @@ static const char* kw_time[]       = { "几点了", "什么时间", "what time",
 static const char* kw_battery[]    = { "电量多少", "电池电量", "battery", NULL };
 static const char* kw_heartrate[]  = { "心率多少", "heart rate", "心率是多", NULL };
 static const char* kw_steps[]      = { "走了多少步", "今天走了多少", "steps", "步数", NULL };
+static const char* kw_micself[]    = { "麦克风自检", "麦克风检测", "麦克风测试",
+                                        "话筒自检", "mic check", "mic test",
+                                        "microphone test", NULL };
 static const char* kw_pause[]      = { "暂停音乐", "暂停播放", "pause music", NULL };
 static const char* kw_stop[]       = { "停止播放", "停止音乐", "stop music", NULL };
 static const char* kw_resume[]     = { "继续播放", "resume", NULL };
@@ -356,8 +360,62 @@ static const nl_intent_t s_intents[] = {
     { NULL,         NULL,               NULL,  0    },
 };
 
+/* 麦克风自检 (特殊分支, 不进 s_intents 表):
+ *
+ * 表驱动的快通道只能把工具的原始 JSON 当回复交出去 —— get_heartrate 之类
+ * 就是那样 ({...})。麦克风自检要的是一句人能读、能被 TTS 念出来的结论,
+ * 所以在这里显式调用: 跑一次自检 -> 中文结论 -> 上屏/播报 -> 同时作为
+ * 控制台回复返回。
+ *
+ * 为什么必须走本地快通道而不是 LLM 工具: 这正是云端 "No available backend"
+ * 时最需要跑的诊断; 而且它本来就是设备侧的事, 没有理由绕一圈模型。
+ *
+ * 采集 3 秒是阻塞的, 但这条线程是 agent loop 自己的 worker, 不碰 LVGL
+ * render 线程 (lvgl_ui_channel_send_kind 只投递)。 */
+static char* handle_mic_selfcheck_fast_path(const char* text)
+{
+    mic_selfcheck_result_t r;
+    char report[192];
+    char* reply;
+
+    if (!contains_any(text, kw_micself)) {
+        return NULL;
+    }
+
+    mic_selfcheck_run(&r, true);
+    mic_selfcheck_report(&r, report, sizeof(report));
+
+    s_fast_path_count++;
+    syslog(LOG_INFO,
+        "[%s] NL fast path: mic_selfcheck (fast=%d llm=%d) verdict=%s "
+        "rms=%.1f peak=%d distinct=%u gain=%d\n",
+        TAG, s_fast_path_count, s_llm_path_count,
+        r.mic_ok ? "mic OK" : "mic NO-RESPONSE",
+        r.rms, (int)r.peak, (unsigned)r.distinct,
+        r.gain_known ? r.adc_gain_db : 0);
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    /* 结论上屏 + 表情 + (FINAL) 语音播报, 与 hr_measure 的报喜路径一致 */
+    {
+        extern int lvgl_ui_channel_send_kind(const char* text, uint8_t kind);
+        (void)lvgl_ui_channel_send_kind(report, AGENT_MSG_KIND_FINAL);
+    }
+#endif
+
+    reply = strdup(report);
+    return reply;
+}
+
 static char* handle_nl_fast_path(const char* text)
 {
+    /* 麦克风自检先看: 它的关键词不进 s_intents 表, 需要自定义回复文案 */
+    {
+        char* mic = handle_mic_selfcheck_fast_path(text);
+        if (mic) {
+            return mic;
+        }
+    }
+
     /* Table-driven: scan intents, first match wins */
     for (int i = 0; s_intents[i].keywords; i++) {
         if (contains_any(text, s_intents[i].keywords)) {

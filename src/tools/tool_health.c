@@ -22,6 +22,9 @@
 
 #include "cJSON.h"
 
+/* 麦克风自检 (health/mic_selfcheck.c): 工具层只做 JSON 转手 */
+#include "health/mic_selfcheck.h"
+
 #if defined(CONFIG_UORB) && defined(CONFIG_FITNESS_ALGO)
 #include <uORB/uORB.h>
 #if __has_include(<fitness/algo_heartrate.h>) && __has_include(<fitness/algo_pedometer.h>)
@@ -121,4 +124,19 @@ int tool_get_steps_execute(const char *input_json, char *output, size_t output_s
     snprintf(output, output_size, "{\"error\":\"fitness topics not available\"}");
     return ERROR;
 #endif
+}
+
+
+/* ── Microphone self test ────────────────────────────────────────
+ *
+ * "ask 麦克风自检" 的落点。实现在 health/mic_selfcheck.c, 这里只做
+ * JSON 转手 —— 采集本身 3 秒阻塞, 工具在 agent 的 worker 线程上跑,
+ * 不占 LVGL render 线程。
+ */
+
+int tool_mic_selfcheck_execute(const char *input_json, char *output,
+                               size_t output_size)
+{
+    (void)input_json;
+    return mic_selfcheck_run_json(output, output_size);
 }

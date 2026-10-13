@@ -377,6 +377,17 @@ int tool_registry_init(void)
         "Get step count and step frequency.",
         tool_get_steps_execute);
 
+    /* 麦克风自检: 录 3 秒 PCM 并判定 mic OK / mic NO-RESPONSE。
+     * 设备节点没注册时自己补注册, 所以不依赖 audio_setup 有没有跑过。 */
+    REGISTER_TOOL_NO_PARAMS(
+        "mic_selfcheck",
+        "Record 3s from the microphone and diagnose whether the mic responds "
+        "to sound. Prints RMS, peak, distinct sample values, exact 0 / -1 "
+        "share, longest {0,-1} run and the current ADC gain in dB. Verdict is "
+        "mic OK or mic NO-RESPONSE. Use when the user asks to test/check the "
+        "microphone (麦克风自检).",
+        tool_mic_selfcheck_execute);
+
     /* Device control tools */
     REGISTER_TOOL(
         "vibrate",

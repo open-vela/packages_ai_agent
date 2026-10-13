@@ -19,3 +19,7 @@
 
 int tool_get_heartrate_execute(const char *input_json, char *output, size_t output_size);
 int tool_get_steps_execute(const char *input_json, char *output, size_t output_size);
+
+/* 麦克风自检: 录 3 秒 PCM 并给出 mic OK / mic NO-RESPONSE 结论。
+ * 实现在 src/health/mic_selfcheck.c (与 hr_measure.c 同目录)。 */
+int tool_mic_selfcheck_execute(const char *input_json, char *output, size_t output_size);

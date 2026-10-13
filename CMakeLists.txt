@@ -54,6 +54,10 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_shell.c
     src/tools/tool_system.c
     src/tools/tool_health.c
+    # mic_selfcheck: "ask 麦克风自检" 的诊断后端 + 开机自检探针。
+    # 采集序列照抄 contest 仓 audio_rec_test_main.c; 放 health/ 与
+    # hr_measure.c 同目录, 两者都是"设备侧自检服务 + 上屏结论"。
+    src/health/mic_selfcheck.c
     src/tools/tool_control.c
     src/tools/tool_media.c
     src/tools/tool_proxyquickapp.c

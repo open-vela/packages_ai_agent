@@ -72,6 +72,8 @@ CSRCS += src/tools/tool_vision.c
 CSRCS += src/tools/tool_shell.c
 CSRCS += src/tools/tool_system.c
 CSRCS += src/tools/tool_health.c
+# mic_selfcheck: "ask 麦克风自检" 的诊断后端 + 开机自检探针 (与 CMakeLists 对齐)
+CSRCS += src/health/mic_selfcheck.c
 CSRCS += src/tools/tool_control.c
 CSRCS += src/tools/tool_media.c
 CSRCS += src/tools/tool_proxyquickapp.c

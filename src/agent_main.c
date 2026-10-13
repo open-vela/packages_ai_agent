@@ -50,6 +50,7 @@
 #include "llm/llm_router.h"
 #include "core/memory_store.h"
 #include "core/session_mgr.h"
+#include "health/mic_selfcheck.h" /* 开机麦克风自检探针 */
 #ifdef CONFIG_AI_AGENT_MQTT
 #include "channels/mqtt_channel.h"
 #endif
@@ -664,6 +665,16 @@ int ai_agent_main(int argc, char* argv[])
 
         rc = config_store_init();
         BOOT_LOG_RC(&t0, "P1", "config_store_init", rc);
+
+        /* 开机麦克风自检 (异步): 录 3 秒 PCM 并打出 "麦克风自检：RMS ... 结论：..."
+         * 这一行, 于是每次开机都有一条 mic 结论, 不依赖串口能不能敲
+         * audio_rec_test, 也不依赖 ask。worker 线程里跑, 不堵启动。
+         *
+         * 位置要求两件事都已就绪: audcodec_register 跑过 (上面 P1 开头,
+         * 否则 open 得自己补注册) 且 config_store_init 建过 AGENT_DATA_DIR
+         * (否则 PCM 落盘路径的目录还不存在, 只能拿到统计、拿不到文件)。 */
+        rc = mic_selfcheck_start_async();
+        BOOT_LOG_RC(&t0, "P1", "mic_selfcheck_start_async", rc);
 
         rc = message_bus_init();
         BOOT_LOG_RC(&t0, "P1", "message_bus_init", rc);
