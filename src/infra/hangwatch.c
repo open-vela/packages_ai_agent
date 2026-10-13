@@ -41,6 +41,13 @@
 #define HW_STACK        3072
 #define HW_NSTATES      16      /* tstate_t 的桶数(只用低 4 位, 足够) */
 
+/* 看门狗线程优先级: **必须高于系统里所有任务**, 否则真机那种"某个高优先级任务
+ * 一直自旋"的冻屏会把看门狗一起饿死, 现场永远拿不到。
+ * 真机 ps 实测的优先级分布: hpwork=224, audcodec_rx=120, sysworkq=110,
+ * bt_service_ 与 bt_client_ 都是 103, bluetoothd/ai_agent/nsh=100, 其余 3~60。
+ * 取 240(上限 255)压过全部; 本线程只 sleep+syslog+nxsched_foreach, 不会霸占 CPU。 */
+#define HW_PRIO        240
+
 /* ── 硬件看门狗(硬复位兜底) ────────────────────────────────────────────────
  * 真机出现过"整个调度器停摆"的冻屏([alive] 只打出 watchdog started 一行就
  * 再无输出, 说明连定时器唤醒都不再发生) —— 那种情况下软件无自救可能, 只能
@@ -195,13 +202,6 @@ static void *hw_thread(FAR void *arg)
 
       usleep(HW_POLL_MS * 1000);
 
-      /* 喂狗: 本线程活着 == 调度器还能唤醒我们 => 系统没冻死。
-       * 放在循环最前面: 只要这一拍被调度到就先续命, 再做取证打印。 */
-      if (g_wdt_fd >= 0)
-        {
-          (void)ioctl(g_wdt_fd, WDIOC_KEEPALIVE, 0);
-        }
-
       now   = hw_now_ms();
       ui_now = g_ui_tick;
 
@@ -213,6 +213,17 @@ static void *hw_thread(FAR void *arg)
 
       ui_stuck_ms = now - last_ui_change;
       stall = (ui_stuck_ms >= HW_STALL_MS);
+
+      /* ---- 喂狗: **只在系统被证明还活着时喂** ----
+       * 本线程优先级(240)高于系统里所有任务, 所以"我还能跑"并不等于"系统还活着"
+       * —— 恰恰在最想救的场景(某个高优先级任务自旋/整机停摆)里, 只有我还能跑。
+       * 因此判据用 UI 心跳而不是"我自己被调度到": UI 心跳停 > HW_STALL_MS 就
+       * **停止喂狗**, 让硬件看门狗在 HW_WDT_TIMEOUT_MS 后把 SoC 复位。
+       * (若这里改成无条件喂, 高优先级反而会让硬件看门狗永远不触发。) */
+      if (g_wdt_fd >= 0 && !stall)
+        {
+          (void)ioctl(g_wdt_fd, WDIOC_KEEPALIVE, 0);
+        }
 
       /* ---- [alive]: 周期性心跳 + 任务状态直方图 ----
        * 直方图的 key 是 tstate_t 的数值, 映射见 nuttx/include/nuttx/sched.h
@@ -275,9 +286,10 @@ static void *hw_thread(FAR void *arg)
 
 int hangwatch_start(void)
 {
-  pthread_attr_t attr;
-  pthread_t      tid;
-  int            ret;
+  pthread_attr_t     attr;
+  struct sched_param param;
+  pthread_t          tid;
+  int                ret;
 
   if (g_hw_running)
     {
@@ -289,6 +301,13 @@ int hangwatch_start(void)
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, HW_STACK);
 
+  /* 显式调度: 不吃父线程(ai_agent, 优先级 100)的继承值。 */
+  memset(&param, 0, sizeof(param));
+  param.sched_priority = HW_PRIO;
+  pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+  pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+  pthread_attr_setschedparam(&attr, &param);
+
   ret = pthread_create(&tid, &attr, hw_thread, NULL);
   pthread_attr_destroy(&attr);
 
@@ -298,6 +317,9 @@ int hangwatch_start(void)
       syslog(LOG_ERR, "[alive] watchdog pthread_create failed: %d\n", ret);
       return ret;
     }
+
+  /* 名字要在 detach 之前设: ps 里能一眼认出是哪个线程(否则全是 "ai_agent") */
+  (void)pthread_setname_np(tid, "hangwatch");
 
   ret = pthread_detach(tid);
   if (ret != 0)
