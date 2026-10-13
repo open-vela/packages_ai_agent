@@ -436,6 +436,10 @@ static void hr_measure_worker(void)
     bool started = false;
 
     s_state = HR_ST_STARTING;
+    /* 只统计本轮: s_last_bpm 是文件级 static, 不清的话失败信息里的
+     * "last bpm=" 会带上**上一轮的旧值**, 真机排查时被它误导过
+     * (看到 last bpm=171 以为本轮收到过数据, 其实一次都没收到)。 */
+    s_last_bpm = 0;
 
     /* ── 1) 起采集（既有 CLI 路径） ─────────────────────────────── */
     rc = hr_sensor_cmd("hr_start", "start", HR_START_WAIT_MS, &exitcode);
@@ -451,7 +455,22 @@ static void hr_measure_worker(void)
     }
     started = true;
 
-    /* ── 2) 订阅（在 start 之后：话题由采集线程 advertise） ──────── */
+    /* ── 2) 订阅（在 start 之后：话题由采集线程 advertise） ────────
+     *
+     * ★ 先 unlink 掉上一轮遗留的主题节点(2026-10-13 真机定位的根因):
+     *   NuttX 的 uORB 仿真是 sensor 框架, /dev/uorb/<name><inst> 只注册一次、
+     *   **不会被自动删除**; 而 SNIOC_SET_BUFFER_NUMBER 只在
+     *   !circbuf_is_init(&upper->buffer) 时才生效
+     *   (nuttx/drivers/sensors/sensor.c:1054), 也就是第一个 advertiser 之后
+     *   该节点的环形缓冲配置就固化了。
+     *   真机症状: **只有开机后第一次测心率能出数**, 之后每次都是
+     *   "[hr_measure] failed: timeout, no data (last bpm=<上一轮的旧值>)",
+     *   而同一时刻算法侧明明 gate=ok q=100 bpm=83 并且在逐秒发布。
+     *   unlink 之后 orb_subscribe 会重新 SNIOC_REGISTER 一个全新节点, 采集线程
+     *   随后的 advertise 再 open() 复用同一节点 —— 与"第一次"路径完全一致。
+     * 失败无所谓(节点本来就不存在时会返回错误), 所以忽略返回值。 */
+    (void)orb_unlink(ORB_ID(algo_heartrate));
+
     fd = orb_subscribe(ORB_ID(algo_heartrate));
     if (fd < 0) {
         printf("[hr_measure] orb_subscribe failed: %d\n", fd);
