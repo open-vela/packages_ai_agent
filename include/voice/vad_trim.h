@@ -41,8 +41,9 @@ typedef struct
   int            head;                /* 环形写位置(帧) */
   int            count;
   long           noise;               /* 底噪估计(平均绝对幅度) */
-  long           calib_sum;           /* 开头的标定期累加 */
+  long           calib_min;           /* 标定期的最小帧能量(取最小而非均值) */
   int            calib_n;
+  int            calib_skip;          /* 跳过的启动瞬态帧数 */
   int            calib_done;
   int            in_speech;
   int            above_run;

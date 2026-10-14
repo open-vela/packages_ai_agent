@@ -877,6 +877,17 @@ int voice_channel_start(void)
     return 0;
 }
 
+int voice_channel_is_recording(void)
+{
+    int rec;
+
+    pthread_mutex_lock(&s_voice.lock);
+    rec = (s_voice.state == VOICE_RECORDING);
+    pthread_mutex_unlock(&s_voice.lock);
+
+    return rec;
+}
+
 int voice_channel_stop(void)
 {
     pthread_mutex_lock(&s_voice.lock);

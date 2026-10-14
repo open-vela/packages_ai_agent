@@ -30,6 +30,7 @@
 #include <nuttx/input/buttons.h>
 
 #include "key_input.h"
+#include "voice/voice_channel.h"
 #include "launcher_page.h"
 #include "pet_page.h"
 #include "lvgl_ui_channel.h"
@@ -45,8 +46,12 @@
 /* Bit positions come from the board header (BUTTON_KEY2 = 0, KEY1 = 1).
  * Repeated here so this file does not have to pull in board internals. */
 
-#define KEY_BIT_KEY2   (1 << 0)   /* PA11 - ask the model */
+#define KEY_BIT_KEY2   (1 << 0)   /* PA11 - 短按说话, 长按问模型 */
 #define KEY_BIT_KEY1   (1 << 1)   /* PA34 - open the pet page */
+
+/* KEY2 按住的时长达到这里算**长按**(问模型演示); 短按则是语音。
+ * 1.5s 足够区分, 又不会让"长按"等太久。 */
+#define KEY_LONG_MS    1500
 
 /* Two presses closer together than this are treated as contact bounce. */
 
@@ -143,6 +148,23 @@ static void key_action_open_pet(void)
     lvgl_ui_post(key_open_pet_cb, NULL);
 }
 
+/* KEY2 短按: 开始/结束语音。
+ *
+ * 按下不必一直按住 —— 开始之后由 VAD **自动断句**收尾(见 voice/vad_trim.c),
+ * 所以正常用法就是"按一下, 说一句, 什么都不用管"。
+ * 再按一下是提前结束(想中止当前这句时用)。
+ * 之前 KEY2 独占的"问模型"演示挪到了**长按**。 */
+static void key_action_voice_toggle(void)
+{
+    if (voice_channel_is_recording()) {
+        syslog(LOG_INFO, "[%s] KEY2: stop voice\n", TAG);
+        voice_channel_stop();
+    } else {
+        syslog(LOG_INFO, "[%s] KEY2: start voice\n", TAG);
+        voice_channel_start();
+    }
+}
+
 static void key_action_ask_model(void)
 {
     agent_msg_t msg = { 0 };
@@ -195,6 +217,11 @@ static uint32_t key_now_ms(void)
     return (uint32_t)(ts.tv_sec * 1000U + ts.tv_nsec / 1000000U);
 }
 
+/* KEY2 的长按判定状态 */
+static bool     s_key2_down;
+static bool     s_key2_long_fired;
+static uint32_t s_key2_press_ms;
+
 static void *key_monitor_thread(void *arg)
 {
     struct pollfd fds[1];
@@ -239,30 +266,52 @@ static void *key_monitor_thread(void *arg)
         }
 
         nbytes = read(fd, &sample, sizeof(sample));
-        if (nbytes != (ssize_t)sizeof(sample)) {
-            continue;
+
+        if (nbytes == (ssize_t)sizeof(sample)) {
+            btn_buttonset_t released;
+
+            pressed  = sample & ~last;
+            released = ~sample & last;
+            last = sample;
+
+            /* KEY2: 按下只记时间, **动作等松开时再定** —— 因为要先分清
+             * 短按(语音)还是长按(问模型)。 */
+            if (pressed & KEY_BIT_KEY2) {
+                s_key2_down       = true;
+                s_key2_long_fired = false;
+                s_key2_press_ms   = key_now_ms();
+            }
+
+            if (released & KEY_BIT_KEY2) {
+                s_key2_down = false;
+
+                if (!s_key2_long_fired &&
+                    key_now_ms() - last_event_ms >= KEY_DEBOUNCE_MS) {
+                    last_event_ms = key_now_ms();
+                    pet_care_note_activity();
+                    key_action_voice_toggle();
+                }
+            }
+
+            if (pressed & KEY_BIT_KEY1) {
+                if (key_now_ms() - last_event_ms >= KEY_DEBOUNCE_MS) {
+                    last_event_ms = key_now_ms();
+                    /* 任何按键都算用户活动：复位空闲关怀计时（闹钟 pending
+                     * 时 note_activity 内部按唤醒确认处理） */
+                    pet_care_note_activity();
+                    key_action_open_pet();
+                }
+            }
         }
 
-        pressed = sample & ~last;
-        last = sample;
-        if (pressed == 0) {
-            continue;
-        }
-
-        if (key_now_ms() - last_event_ms < KEY_DEBOUNCE_MS) {
-            continue;
-        }
-        last_event_ms = key_now_ms();
-
-        /* 任何按键都算用户活动：复位空闲关怀计时（闹钟 pending 时
-         * note_activity 内部按唤醒确认处理） */
-        pet_care_note_activity();
-
-        if (pressed & KEY_BIT_KEY1) {
-            key_action_open_pet();
-        }
-
-        if (pressed & KEY_BIT_KEY2) {
+        /* 长按判定：poll 超时(KEY_POLL_MS)也会走到这里, 所以每秒至少查一次,
+         * 按满 KEY_LONG_MS 就触发, 不必等松开。 */
+        if (s_key2_down && !s_key2_long_fired &&
+            key_now_ms() - s_key2_press_ms >= KEY_LONG_MS) {
+            s_key2_long_fired = true;
+            last_event_ms = key_now_ms();
+            pet_care_note_activity();
+            syslog(LOG_INFO, "[%s] KEY2: long press -> ask model\n", TAG);
             key_action_ask_model();
         }
     }

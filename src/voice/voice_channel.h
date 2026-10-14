@@ -31,6 +31,9 @@ int voice_channel_start(void);
 /* Stop an active voice session. */
 int voice_channel_stop(void);
 
+/* 是否正在录音 (1=是)。给物理按键做"按一下开始/再按一下结束"用。 */
+int voice_channel_is_recording(void);
+
 /* Stop recording and return ASR text to caller (does NOT push inbound).
  * text_out: buffer to receive ASR text, text_cap: buffer capacity.
  * Returns 0 on success, negative errno on failure.

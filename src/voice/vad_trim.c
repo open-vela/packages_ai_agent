@@ -47,7 +47,9 @@
 #define VAD_NOISE_SHIFT     5            /* EMA: alpha = 1/32 */
 #define VAD_NOISE_INIT      200          /* 标定没跑完时的临时值(几乎用不到) */
 #define VAD_NOISE_MIN       8            /* 防止底噪被压到 0 后疯狂触发 */
-#define VAD_CALIB_FRAMES    15           /* 开头 300ms 专门用来标定底噪 */
+#define VAD_CALIB_FRAMES    15           /* 标定用的帧数(300ms) */
+#define VAD_CALIB_SKIP      5            /* 先跳过 100ms 启动瞬态再开始标定 */
+#define VAD_NOISE_MAX       6000         /* 底噪封顶, 免得标定坏了直接废掉 VAD */
 #define VAD_MIN_UTTER_FRAMES 15          /* 至少 300ms 语音才算"一句话", 防咳嗽误触发 */
 
 /* ★ 判"说完"的静音时长必须**明显长于**裁剪用的后滚(VAD_POSTROLL_FRAMES=500ms)。
@@ -132,24 +134,43 @@ static void vad_process_frame(vad_trim_t* v, const short* f, vad_emit_fn emit,
    * 同时做一次粗野值剔除, 免得标定期正好在说话把底噪抬上去。 */
   if (!v->calib_done)
     {
-      if (v->calib_n == 0 || e * v->calib_n <= v->calib_sum * VAD_ON_NUM)
+      /* 先丢掉开头若干帧: 真机实测录音刚启动时音频通路会出现**满量程**
+       * (peak=32768) 的爆音。拿它去标定, 底噪会被抬到 14068, 阈值乘 3 之后
+       * 再也没有任何一帧能触发 —— VAD 直接失效, 而且失效得毫无声息。 */
+      if (v->calib_skip < VAD_CALIB_SKIP)
         {
-          v->calib_sum += e;
-          v->calib_n++;
+          v->calib_skip++;
+          vad_preroll_push(v, f);
+          return;
         }
 
+      /* 取**最小**而非均值: 底噪应该代表"最安静时的背景", 均值会被夹杂的
+       * 说话/噪声抬高。 */
+      if (v->calib_n == 0 || e < v->calib_min)
+        {
+          v->calib_min = e;
+        }
+
+      v->calib_n++;
       vad_preroll_push(v, f);
 
       if (v->calib_n >= VAD_CALIB_FRAMES)
         {
-          v->noise = v->calib_sum / v->calib_n;
+          v->noise = v->calib_min;
+
           if (v->noise < VAD_NOISE_MIN)
             {
               v->noise = VAD_NOISE_MIN;
             }
 
+          if (v->noise > VAD_NOISE_MAX)
+            {
+              v->noise = VAD_NOISE_MAX;
+            }
+
           v->calib_done = 1;
-          syslog(LOG_INFO, "[%s] noise floor calibrated: %ld (%d frames)\n",
+          syslog(LOG_INFO,
+                 "[%s] noise floor calibrated: %ld (min of %d frames)\n",
                  VAD_TAG, v->noise, v->calib_n);
         }
 
