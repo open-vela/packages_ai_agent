@@ -31,6 +31,7 @@
 
 #include "voice/voice_asr.h"
 #include "voice/minimax_tts.h"
+#include "voice/opus_ogg.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -52,6 +53,11 @@
  * 正常一次测量只有 3~30s, 这道闸只是防止把整块堆吃光。 */
 #define MM_ASR_MAX_PCM    (60u * 16000u * 2u)
 #define MM_ASR_WAV_HDR    44u
+
+/* 16kbps: 4 秒语音约 8KB, 而蓝牙 PAN 上行实测 4.6~4.9KB/s => 约 1.7 秒传完。
+ * 官方文档明确"mono 16kHz 的 opus 精度不受影响", 主机上也实测过: 16kbps 的
+ * Ogg Opus 识别结果与原 WAV **一字不差**。 */
+#define MM_ASR_OPUS_BPS   16000
 
 static char s_key[MM_ASR_KEY_MAX];
 static int  s_ready;
@@ -106,7 +112,11 @@ static int mm_asr_init(void)
 static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
                             char* text_out, size_t text_cap)
 {
-  unsigned char  wav[MM_ASR_WAV_HDR];
+  unsigned char* payload = NULL;       /* 要上传的"文件": Ogg Opus 或 WAV */
+  size_t         payload_len = 0;
+  int            payload_owned = 0;    /* 1 = payload 是 malloc 的, 需要 free */
+  const char*    mime = "audio/wav";
+  const char*    fname = "a.wav";
   unsigned char* body = NULL;
   char*          resp = NULL;
   size_t         body_cap;
@@ -141,11 +151,57 @@ static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
       return -E2BIG;
     }
 
-  mm_asr_wav_header(wav, (unsigned long)pcm_len);
+  /* ── 第一步: 准备要上传的"文件" ──────────────────────────────────────
+   * 优先 Ogg Opus: 蓝牙 PAN 上行的结构上限约 12KB/s, 而 16kHz/16bit 原始 PCM
+   * 是 32KB/s —— 4 秒语音要传 26 秒; Opus 16kbps 只要约 8KB, 约 1.7 秒。
+   * **必须带 Ogg 容器**: 实测 MiniMax 拒绝无容器的裸 Opus 码流, 稳定返回
+   * HTTP 400 "Invalid data found when processing input" (换 .ogg 后缀也一样,
+   * 它看内容不看扩展名)。
+   * 编码失败就回退到原来的 WAV 路径, 保证功能不中断。 */
+  {
+    unsigned char* ogg = NULL;
+    size_t         ogg_len = 0;
 
-  /* multipart 体 = 前言 + model 段 + file 段(44B WAV 头 + PCM) + 结束行。
-   * 512 的余量足够装下所有 boundary/CRLF 与段头。 */
-  body_cap = pcm_len + MM_ASR_WAV_HDR + 512u;
+    ret = opus_ogg_encode(pcm_data, pcm_len, MM_ASR_OPUS_BPS,
+                          &ogg, &ogg_len);
+    if (ret == 0 && ogg != NULL && ogg_len > 0)
+      {
+        payload = ogg;
+        payload_len = ogg_len;
+        payload_owned = 1;
+        mime = "audio/ogg";
+        fname = "a.ogg";
+      }
+    else
+      {
+        syslog(LOG_ERR, "[%s] opus encode failed (%d), fallback to wav\n",
+               MM_ASR_TAG, ret);
+        ret = 0;
+      }
+  }
+
+  if (payload == NULL)
+    {
+      unsigned char wav[MM_ASR_WAV_HDR];
+
+      mm_asr_wav_header(wav, (unsigned long)pcm_len);
+      payload = (unsigned char*)malloc(MM_ASR_WAV_HDR + pcm_len);
+      if (payload == NULL)
+        {
+          ret = -ENOMEM;
+          goto out;
+        }
+
+      memcpy(payload, wav, MM_ASR_WAV_HDR);
+      memcpy(payload + MM_ASR_WAV_HDR, pcm_data, pcm_len);
+      payload_len = MM_ASR_WAV_HDR + pcm_len;
+      payload_owned = 1;
+      mime = "audio/wav";
+      fname = "a.wav";
+    }
+
+  /* ── 第二步: 组 multipart ───────────────────────────────────────────── */
+  body_cap = payload_len + 1024u;
   body = (unsigned char*)malloc(body_cap);
   resp = (char*)malloc(MM_ASR_RESP_MAX);
 
@@ -162,21 +218,20 @@ static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
                MM_ASR_MODEL "\r\n"
                "--" MM_ASR_BOUNDARY "\r\n"
                "Content-Disposition: form-data; name=\"file\"; "
-               "filename=\"a.wav\"\r\n"
-               "Content-Type: audio/wav\r\n"
-               "\r\n");
+               "filename=\"%s\"\r\n"
+               "Content-Type: %s\r\n"
+               "\r\n",
+               fname, mime);
 
-  if (n <= 0 || (size_t)n + MM_ASR_WAV_HDR + pcm_len + 8u > body_cap)
+  if (n <= 0 || (size_t)n + payload_len + 8u > body_cap)
     {
       ret = -EOVERFLOW;
       goto out;
     }
 
   off = (size_t)n;
-  memcpy(body + off, wav, MM_ASR_WAV_HDR);
-  off += MM_ASR_WAV_HDR;
-  memcpy(body + off, pcm_data, pcm_len);
-  off += pcm_len;
+  memcpy(body + off, payload, payload_len);
+  off += payload_len;
 
   n = snprintf((char*)body + off, body_cap - off,
                "\r\n--" MM_ASR_BOUNDARY "--\r\n");
@@ -188,9 +243,11 @@ static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
 
   off += (size_t)n;
 
-  syslog(LOG_INFO, "[%s] POST %s: pcm=%u bytes (%.1fs), body=%u bytes\n",
+  syslog(LOG_INFO,
+         "[%s] POST %s: pcm=%u bytes (%.1fs) -> %s %u bytes, body=%u bytes\n",
          MM_ASR_TAG, MM_ASR_PATH, (unsigned)pcm_len,
-         (double)pcm_len / 32000.0, (unsigned)off);
+         (double)pcm_len / 32000.0, mime, (unsigned)payload_len,
+         (unsigned)off);
 
   ret = minimax_https_post(MM_ASR_PATH,
                            "multipart/form-data; boundary=" MM_ASR_BOUNDARY,
@@ -250,6 +307,12 @@ out:
 
   free(body);
   free(resp);
+
+  if (payload_owned)
+    {
+      free(payload);
+    }
+
   return ret;
 }
 

@@ -512,7 +512,11 @@ static void* recording_thread(void* arg)
 
 /* ── ASR worker thread ──────────────────────────────────── */
 
-#define ASR_THREAD_STACK (24 * 1024)
+/* 24KB -> 64KB (2026-10-14): 识别前要先做 Opus 编码, 而 libopus 的
+ * opus_encode() 栈开销很大 —— 真机上用 16KB 栈跑它直接栈溢出硬 fault
+ * (backtrace 落在 celt_encode_with_ec)。本板 PSRAM 有 7MB 空闲, 任务栈从
+ * 堆里分配, 64KB 毫无压力。 */
+#define ASR_THREAD_STACK (64 * 1024)
 
 static void* asr_and_dispatch(void* arg)
 {

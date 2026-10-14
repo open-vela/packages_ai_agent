@@ -71,6 +71,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/edge_mp3.c
     src/voice/minimax_tts.c
     src/voice/minimax_asr.c
+    src/voice/opus_ogg.c
     src/voice/volc_asr.c
     src/voice/voice_tts.c
     src/voice/voice_asr.c
@@ -245,6 +246,14 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   set(AGENT_DEPENDS mqttc)
   set(AGENT_DEFS "")
+
+  # libopus: 语音识别上传前的编码(见 src/voice/opus_ogg.c)。
+  # 必要性是实测出来的: 蓝牙 PAN 上行结构上限约 12KB/s, 而 16kHz/16bit 原始
+  # PCM 是 32KB/s, 不压缩根本传不上去。用 DEPENDS 让 apps 侧也链接它 ——
+  # opus_ogg.c 内部有 CONFIG_LIB_OPUS 守卫, 没开时不编真实现, 自动回退 WAV。
+  if(CONFIG_LIB_OPUS)
+    list(APPEND AGENT_DEPENDS libopus)
+  endif()
 
   if(CONFIG_TFLITEMICRO)
     # On-device language model.  The sources and the model data stay in the
