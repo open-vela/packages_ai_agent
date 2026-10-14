@@ -39,6 +39,18 @@ typedef struct voice_asr_ops {
 
     /* Release resources held by the backend. */
     void (*deinit)(void);
+
+    /* ── 可选的流式接口 ────────────────────────────────────────────────
+     * 后端若支持"边采集边处理", 就由采集线程逐块把 PCM 送进来(stream_send),
+     * 而不是等录完再一次性交给 recognize()。MiniMax 用它做**边录边编码**
+     * (见 minimax_asr.c): complexity=0 实测 2.05x 实时, 跟得上采集,
+     * 于是录完时只剩上传, 省掉整段 2 秒的编码等待。
+     * 四个回调要么都给、要么都不给。stream_open 返回 NULL 表示本次不可用,
+     * 调用方会回退到 recognize() 的批量路径。 */
+    void *(*stream_open)(void);
+    int   (*stream_send)(void *s, const unsigned char *pcm, size_t len);
+    int   (*stream_finish)(void *s, char *text_out, size_t text_cap);
+    void  (*stream_abort)(void *s);
 } voice_asr_ops_t;
 
 /* Register an ASR backend. Multiple backends can be registered. */

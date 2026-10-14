@@ -356,7 +356,11 @@
 /* ── Voice Channel (Doubao ASR/TTS) ─────────────────────────── */
 #define AGENT_CHAN_VOICE "voice"
 
-#define AGENT_VOICE_STACK (16 * 1024)
+/* 16KB -> 64KB (2026-10-14): 采集线程现在还要做 **Opus 编码**(边录边编码,
+ * 见 voice/minimax_asr.c 的流式回调)。libopus 的 opus_encode() 栈开销很大 ——
+ * 真机上用 16KB 栈跑它直接栈溢出硬 fault(backtrace 落在 celt_encode_with_ec)。
+ * 本板 PSRAM 有 7MB 空闲, 任务栈从堆里分配, 64KB 毫无压力。 */
+#define AGENT_VOICE_STACK (64 * 1024)
 #define AGENT_VOICE_PRIO 50
 
 /* Doubao TTS V3 API endpoint (HTTP Chunked, x-api-key auth) */

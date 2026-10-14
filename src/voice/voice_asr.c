@@ -100,34 +100,67 @@ int voice_asr_recognize(const unsigned char* pcm_data,
     return s_active->recognize(pcm_data, pcm_len, text_out, text_cap);
 }
 
-/* ── Streaming ASR (delegates to volc_asr streaming API) ─────── */
+/* ── Streaming ASR ───────────────────────────────────────────────
+ * 优先用后端自己的流式回调(voice_asr_ops_t 的 stream_*)。火山用的是另一套
+ * WebSocket 流式接口(volc_asr_stream_*), 作为兼容路径保留。 */
 
 struct voice_asr_stream {
-    volc_asr_stream_t* inner;
+    void* inner;        /* 后端自己的会话对象 */
+    int is_volc;        /* 1 = inner 是 volc_asr_stream_t* */
 };
 
 voice_asr_stream_t* voice_asr_stream_open(void)
 {
+    voice_asr_stream_t* s;
+    void* inner;
+
     if (!s_active) {
         syslog(LOG_ERR, "[%s] No ASR backend for streaming\n", TAG);
         return NULL;
     }
 
-    volc_asr_stream_t* inner = volc_asr_stream_open();
+    if (s_active->stream_open != NULL) {
+        inner = s_active->stream_open();
 
-    if (!inner) {
-        return NULL;
+        if (!inner) {
+            return NULL;
+        }
+
+        s = calloc(1, sizeof(*s));
+        if (!s) {
+            if (s_active->stream_abort) {
+                s_active->stream_abort(inner);
+            }
+            return NULL;
+        }
+
+        s->inner = inner;
+        s->is_volc = 0;
+        return s;
     }
 
-    voice_asr_stream_t* s = calloc(1, sizeof(*s));
+    /* 兼容路径: 火山后端的流式实现是独立的一套 API */
+    if (strcmp(s_active->name, "volcengine") == 0) {
+        volc_asr_stream_t* v = volc_asr_stream_open();
 
-    if (!s) {
-        volc_asr_stream_abort(inner);
-        return NULL;
+        if (!v) {
+            return NULL;
+        }
+
+        s = calloc(1, sizeof(*s));
+        if (!s) {
+            volc_asr_stream_abort(v);
+            return NULL;
+        }
+
+        s->inner = v;
+        s->is_volc = 1;
+        return s;
     }
 
-    s->inner = inner;
-    return s;
+    syslog(LOG_WARNING, "[%s] backend '%s' has no streaming interface\n",
+        TAG, s_active->name);
+    return NULL;
 }
 
 int voice_asr_stream_send(voice_asr_stream_t* s,
@@ -137,19 +170,36 @@ int voice_asr_stream_send(voice_asr_stream_t* s,
         return -EINVAL;
     }
 
-    return volc_asr_stream_send(s->inner, pcm, len);
+    if (s->is_volc) {
+        return volc_asr_stream_send((volc_asr_stream_t*)s->inner, pcm, len);
+    }
+
+    if (s_active == NULL || s_active->stream_send == NULL) {
+        return -ENOSYS;
+    }
+
+    return s_active->stream_send(s->inner, pcm, len);
 }
 
 int voice_asr_stream_finish(voice_asr_stream_t* s,
     char* text_out, size_t text_cap)
 {
+    int ret;
+
     if (!s) {
         return -EINVAL;
     }
 
-    int ret = volc_asr_stream_finish(s->inner, text_out, text_cap);
+    if (s->is_volc) {
+        ret = volc_asr_stream_finish((volc_asr_stream_t*)s->inner,
+            text_out, text_cap);
+        /* inner 已被 volc_asr_stream_finish 释放 */
+    } else if (s_active != NULL && s_active->stream_finish != NULL) {
+        ret = s_active->stream_finish(s->inner, text_out, text_cap);
+    } else {
+        ret = -ENOSYS;
+    }
 
-    /* s->inner is freed by volc_asr_stream_finish */
     free(s);
     return ret;
 }
@@ -160,6 +210,16 @@ void voice_asr_stream_abort(voice_asr_stream_t* s)
         return;
     }
 
-    volc_asr_stream_abort(s->inner);
+    if (!s->inner) {
+        free(s);
+        return;
+    }
+
+    if (s->is_volc) {
+        volc_asr_stream_abort((volc_asr_stream_t*)s->inner);
+    } else if (s_active != NULL && s_active->stream_abort != NULL) {
+        s_active->stream_abort(s->inner);
+    }
+
     free(s);
 }

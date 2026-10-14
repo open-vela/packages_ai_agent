@@ -15,7 +15,7 @@
  */
 
 /****************************************************************************
- * Ogg Opus 封装 (编码 + 容器)
+ * Ogg Opus 封装 (编码 + 容器), 支持批量与增量两种用法
  *
  * 算法先在主机上用 Python 从零实现并对着 MiniMax ASR 验证通过(返回 200 且
  * 识别文字完全正确、体积与 ffmpeg 产物几乎一致), 再原样移植到这里。
@@ -43,16 +43,13 @@
 #define OG_FRAME          320            /* 20ms @16kHz */
 #define OG_PRESKIP        312            /* 与 ffmpeg 一致, 单位是 48kHz 采样 */
 #define OG_SERIAL         0x5A5A1234u
-/* 20ms @16kbps 的包平均约 40 字节, VBR 尖峰也就两三倍; 512 足够,
- * 真超了 opus_encode 会返回 OPUS_BUFFER_TOO_SMALL 而不是溢出。 */
 #define OG_MAX_PKT        512
-#define OG_PKTS_PER_PAGE  50             /* 每页最多 50 包(远小于段表 255 上限) */
+#define OG_PKTS_PER_PAGE  50             /* 每页最多 50 包(段表上限 255, 安全) */
 
 /* 编码复杂度: 真机实测(16kHz, 4.096 秒音频)
  *   complexity 10 -> 6 秒 (0.68x 实时)
  *   complexity 0  -> 2 秒 (2.05x 实时)
- * 当前这条路径是"录完再编", 不要求实时, 但 c0 已经够用且余量最大;
- * 若以后要"边录边编", c0 的 2 倍余量正是前提。想提质量可以往上调。 */
+ * 走增量路径时这个值是硬约束: 必须 >= 1x 实时才跟得上采集, c0 有 2 倍余量。 */
 #define OG_COMPLEXITY     0
 
 /* ── Ogg 用的 CRC32 ────────────────────────────────────────────────────────
@@ -99,24 +96,31 @@ static unsigned int og_crc(const unsigned char* buf, size_t len)
   return c;
 }
 
-/* ── 页组装 ────────────────────────────────────────────────────────────── */
+/* ── 会话状态 ──────────────────────────────────────────────────────────── */
 
-struct og_ctx
+struct opus_ogg_enc
 {
-  unsigned char* out;
+  OpusEncoder*   enc;
+
+  unsigned char* out;                  /* Ogg 累积缓冲, 按需增长 */
   size_t         cap;
   size_t         len;
-  unsigned int   seq;
-  unsigned long long granule;                 /* 48kHz 采样累计 */
+  unsigned int   seq;                  /* 页序号 */
+  unsigned long long granule;          /* 48kHz 采样计数(含 preskip) */
+
   const unsigned char* pkt[OG_PKTS_PER_PAGE];
   size_t         plen[OG_PKTS_PER_PAGE];
   int            npkt;
 
-  /* ★ 每个包必须**拷贝**着存下来。og_add() 只记录指针, 而调用方每帧都把
-   *   opus_encode() 写回同一个 pkt 缓冲 —— 直接存指针的话, 等攒够一页再落页
-   *   时所有指针都指向最后一帧, 整页数据全错(真机表现: 上传成功、HTTP 200,
-   *   但识别结果为空字符串)。 */
+  /* ★ 每个包必须**拷贝**着存下来。og_add_packet() 只记录指针, 而调用方每帧
+   *   都把 opus_encode() 写回同一个 pktbuf —— 直接存指针的话, 等攒够一页
+   *   再落页时所有指针都指向最后一帧, 整页数据全错。
+   *   真机表现极具迷惑性: 编码"成功"、体积正常、HTTP 200, 但 text="" 空串。 */
   unsigned char* stage;
+  unsigned char* pktbuf;
+
+  unsigned char  pend[OG_FRAME * 2];   /* 未凑满一帧的残余字节 */
+  size_t         pend_len;
 };
 
 static void og_le32(unsigned char* p, unsigned int v)
@@ -127,24 +131,24 @@ static void og_le32(unsigned char* p, unsigned int v)
   p[3] = (unsigned char)((v >> 24) & 0xff);
 }
 
-/* 把当前积攒的包封成一页写进 ctx->out, hdr_type: 0x02=BOS 0x04=EOS */
-static int og_flush(struct og_ctx* c, int hdr_type)
+/* 把当前积攒的包封成一页追加到 e->out。hdr_type: 0x02=BOS 0x04=EOS */
+static int og_flush_page(struct opus_ogg_enc* e, int hdr_type)
 {
-  unsigned char seg[255];
-  size_t        body = 0;
-  size_t        need;
-  size_t        i;
-  int           ns = 0;
+  unsigned char  seg[255];
+  size_t         body = 0;
+  size_t         need;
+  size_t         i;
+  int            ns = 0;
   unsigned char* p;
 
-  if (c->npkt == 0)
+  if (e->npkt == 0)
     {
       return 0;
     }
 
-  for (i = 0; i < (size_t)c->npkt; i++)
+  for (i = 0; i < (size_t)e->npkt; i++)
     {
-      size_t n = c->plen[i];
+      size_t n = e->plen[i];
 
       while (n >= 255)
         {
@@ -153,21 +157,38 @@ static int og_flush(struct og_ctx* c, int hdr_type)
         }
 
       seg[ns++] = (unsigned char)n;
-      body += c->plen[i];
+      body += e->plen[i];
     }
 
   need = 27u + (size_t)ns + body;
-  if (c->len + need > c->cap)
+
+  if (e->len + need > e->cap)
     {
-      return -ENOSPC;
+      size_t         ncap = e->cap ? e->cap : 8192u;
+      unsigned char* n;
+
+      while (ncap < e->len + need)
+        {
+          ncap *= 2u;
+        }
+
+      n = (unsigned char*)realloc(e->out, ncap);
+      if (n == NULL)
+        {
+          return -ENOMEM;
+        }
+
+      e->out = n;
+      e->cap = ncap;
     }
 
-  p = c->out + c->len;
+  p = e->out + e->len;
   memcpy(p, "OggS", 4);
   p[4] = 0;                                   /* version */
   p[5] = (unsigned char)hdr_type;
+
   {
-    unsigned long long g = c->granule;
+    unsigned long long g = e->granule;
     int k;
 
     for (k = 0; k < 8; k++)
@@ -177,7 +198,7 @@ static int og_flush(struct og_ctx* c, int hdr_type)
   }
 
   og_le32(p + 14, OG_SERIAL);
-  og_le32(p + 18, c->seq++);
+  og_le32(p + 18, e->seq++);
   og_le32(p + 22, 0);                         /* CRC 先置 0 */
   p[26] = (unsigned char)ns;
   memcpy(p + 27, seg, (size_t)ns);
@@ -185,25 +206,25 @@ static int og_flush(struct og_ctx* c, int hdr_type)
   {
     unsigned char* d = p + 27 + ns;
 
-    for (i = 0; i < (size_t)c->npkt; i++)
+    for (i = 0; i < (size_t)e->npkt; i++)
       {
-        memcpy(d, c->pkt[i], c->plen[i]);
-        d += c->plen[i];
+        memcpy(d, e->pkt[i], e->plen[i]);
+        d += e->plen[i];
       }
   }
 
   og_le32(p + 22, og_crc(p, need));
-  c->len += need;
-  c->npkt = 0;
+  e->len += need;
+  e->npkt = 0;
   return 0;
 }
 
-static int og_add(struct og_ctx* c, const unsigned char* pkt, size_t len,
-                  int granule_ticks)
+static int og_add_packet(struct opus_ogg_enc* e, const unsigned char* pkt,
+                         size_t len, int granule_ticks)
 {
-  if (c->npkt >= OG_PKTS_PER_PAGE)
+  if (e->npkt >= OG_PKTS_PER_PAGE)
     {
-      int ret = og_flush(c, 0);
+      int ret = og_flush_page(e, 0);
 
       if (ret != 0)
         {
@@ -211,19 +232,33 @@ static int og_add(struct og_ctx* c, const unsigned char* pkt, size_t len,
         }
     }
 
-  /* 拷进 staging 区, 不能只存指针(见 struct og_ctx 里的说明) */
-  memcpy(c->stage + (size_t)c->npkt * OG_MAX_PKT, pkt, len);
-  c->pkt[c->npkt] = c->stage + (size_t)c->npkt * OG_MAX_PKT;
-  c->plen[c->npkt] = len;
-  c->npkt++;
-  c->granule += (unsigned long long)granule_ticks;
+  memcpy(e->stage + (size_t)e->npkt * OG_MAX_PKT, pkt, len);
+  e->pkt[e->npkt] = e->stage + (size_t)e->npkt * OG_MAX_PKT;
+  e->plen[e->npkt] = len;
+  e->npkt++;
+  e->granule += (unsigned long long)granule_ticks;
   return 0;
+}
+
+/* 把 e->pend 里的整整一帧(320 样本)编码并入页 */
+static int og_encode_frame(struct opus_ogg_enc* e)
+{
+  int got = opus_encode(e->enc, (const opus_int16*)(const void*)e->pend,
+                        OG_FRAME, e->pktbuf, OG_MAX_PKT);
+
+  if (got < 0)
+    {
+      syslog(LOG_ERR, "[%s] opus_encode failed: %d\n", TAG, got);
+      return -EIO;
+    }
+
+  /* granule 以 48kHz 计, 而输入是 16kHz => x3 */
+  return og_add_packet(e, e->pktbuf, (size_t)got, OG_FRAME * 3);
 }
 
 /* ── 对外接口 ──────────────────────────────────────────────────────────── */
 
-int opus_ogg_encode(const void* pcm, size_t pcm_bytes, int bitrate_bps,
-                    unsigned char** out, size_t* out_len)
+opus_ogg_enc_t* opus_ogg_begin(int bitrate_bps)
 {
   static const unsigned char head[19] =
   {
@@ -236,7 +271,6 @@ int opus_ogg_encode(const void* pcm, size_t pcm_bytes, int bitrate_bps,
     0x00                    /* mapping family */
   };
 
-  /* OpusTags: magic + vendor 长度 + vendor + comment 数 */
   static const unsigned char tags[20] =
   {
     'O', 'p', 'u', 's', 'T', 'a', 'g', 's',
@@ -245,19 +279,169 @@ int opus_ogg_encode(const void* pcm, size_t pcm_bytes, int bitrate_bps,
     0, 0, 0, 0              /* comment count = 0 */
   };
 
-  OpusEncoder*          enc = NULL;
-  struct og_ctx         ctx;
-  unsigned char*        buf = NULL;
-  unsigned char*        pkt = NULL;
-  const unsigned char*  s = (const unsigned char*)pcm;
-  size_t                samples;
-  size_t                off;
-  size_t                nominal;
-  int                   err = OPUS_OK;
-  int                   ret;
+  struct opus_ogg_enc* e;
+  int                  err = OPUS_OK;
 
-  if (pcm == NULL || pcm_bytes == 0 || out == NULL || out_len == NULL ||
-      bitrate_bps <= 0)
+  if (bitrate_bps <= 0)
+    {
+      return NULL;
+    }
+
+  og_crc_init();
+
+  e = (struct opus_ogg_enc*)calloc(1, sizeof(*e));
+  if (e == NULL)
+    {
+      return NULL;
+    }
+
+  e->enc = opus_encoder_create(OG_RATE, 1, OPUS_APPLICATION_VOIP, &err);
+  if (e->enc == NULL || err != OPUS_OK)
+    {
+      syslog(LOG_ERR, "[%s] encoder_create failed: %d\n", TAG, err);
+      opus_ogg_abort(e);
+      return NULL;
+    }
+
+  (void)opus_encoder_ctl(e->enc, OPUS_SET_BITRATE(bitrate_bps));
+  (void)opus_encoder_ctl(e->enc, OPUS_SET_COMPLEXITY(OG_COMPLEXITY));
+  (void)opus_encoder_ctl(e->enc, OPUS_SET_VBR(1));
+
+  e->stage = (unsigned char*)malloc((size_t)OG_PKTS_PER_PAGE * OG_MAX_PKT);
+  e->pktbuf = (unsigned char*)malloc(OG_MAX_PKT);
+
+  if (e->stage == NULL || e->pktbuf == NULL)
+    {
+      opus_ogg_abort(e);
+      return NULL;
+    }
+
+  /* 两个头页的 granule 必须是 0 */
+  e->granule = 0;
+
+  if (og_add_packet(e, head, sizeof(head), 0) != 0 ||
+      og_flush_page(e, 0x02) != 0 ||
+      og_add_packet(e, tags, sizeof(tags), 0) != 0 ||
+      og_flush_page(e, 0x00) != 0)
+    {
+      opus_ogg_abort(e);
+      return NULL;
+    }
+
+  /* 音频页的 granule 从 preskip 起算 */
+  e->granule = OG_PRESKIP;
+  return e;
+}
+
+int opus_ogg_feed(opus_ogg_enc_t* e, const void* pcm, size_t bytes)
+{
+  const unsigned char* p = (const unsigned char*)pcm;
+  size_t               i = 0;
+
+  if (e == NULL || (pcm == NULL && bytes > 0))
+    {
+      return -EINVAL;
+    }
+
+  while (i < bytes)
+    {
+      size_t need = (size_t)(OG_FRAME * 2) - e->pend_len;
+      size_t take = (bytes - i) < need ? (bytes - i) : need;
+      int    ret;
+
+      memcpy(e->pend + e->pend_len, p + i, take);
+      e->pend_len += take;
+      i += take;
+
+      if (e->pend_len == (size_t)(OG_FRAME * 2))
+        {
+          ret = og_encode_frame(e);
+          if (ret != 0)
+            {
+              return ret;
+            }
+
+          e->pend_len = 0;
+        }
+    }
+
+  return 0;
+}
+
+int opus_ogg_finish(opus_ogg_enc_t* e, unsigned char** out, size_t* out_len)
+{
+  int ret;
+
+  if (e == NULL || out == NULL || out_len == NULL)
+    {
+      opus_ogg_abort(e);
+      return -EINVAL;
+    }
+
+  *out = NULL;
+  *out_len = 0;
+
+  /* 最后一帧不足 20ms: 先补到偶数字节, 再补零 */
+  if (e->pend_len > 0)
+    {
+      if ((e->pend_len & 1u) != 0)
+        {
+          e->pend[e->pend_len++] = 0;
+        }
+
+      memset(e->pend + e->pend_len, 0,
+             (size_t)(OG_FRAME * 2) - e->pend_len);
+
+      ret = og_encode_frame(e);
+      if (ret != 0)
+        {
+          opus_ogg_abort(e);
+          return ret;
+        }
+    }
+
+  ret = og_flush_page(e, 0x04);                 /* 末页打 EOS */
+  if (ret != 0)
+    {
+      opus_ogg_abort(e);
+      return ret;
+    }
+
+  syslog(LOG_INFO, "[%s] encoded %u Ogg Opus bytes\n", TAG,
+         (unsigned)e->len);
+
+  *out = e->out;
+  *out_len = e->len;
+  e->out = NULL;                                /* 所有权交给调用者 */
+  opus_ogg_abort(e);
+  return 0;
+}
+
+void opus_ogg_abort(opus_ogg_enc_t* e)
+{
+  if (e == NULL)
+    {
+      return;
+    }
+
+  if (e->enc != NULL)
+    {
+      opus_encoder_destroy(e->enc);
+    }
+
+  free(e->stage);
+  free(e->pktbuf);
+  free(e->out);
+  free(e);
+}
+
+int opus_ogg_encode(const void* pcm, size_t pcm_bytes, int bitrate_bps,
+                    unsigned char** out, size_t* out_len)
+{
+  opus_ogg_enc_t* e;
+  int             ret;
+
+  if (pcm == NULL || pcm_bytes == 0 || out == NULL || out_len == NULL)
     {
       return -EINVAL;
     }
@@ -265,152 +449,54 @@ int opus_ogg_encode(const void* pcm, size_t pcm_bytes, int bitrate_bps,
   *out = NULL;
   *out_len = 0;
 
-  samples = pcm_bytes / 2u;
-  if (samples == 0)
+  e = opus_ogg_begin(bitrate_bps);
+  if (e == NULL)
     {
-      return -EINVAL;
+      return -ENOMEM;
     }
 
-  og_crc_init();
-
-  /* 名义码率 x2 再加容器与 VBR 尖峰的余量 */
-  nominal = (size_t)((double)samples / (double)OG_RATE
-                     * (double)bitrate_bps / 8.0);
-  ctx.cap = nominal * 2u + 8192u;
-  ctx.out = (unsigned char*)malloc(ctx.cap);
-  pkt = (unsigned char*)malloc(OG_MAX_PKT);
-  ctx.stage = (unsigned char*)malloc((size_t)OG_PKTS_PER_PAGE * OG_MAX_PKT);
-
-  if (ctx.out == NULL || pkt == NULL || ctx.stage == NULL)
-    {
-      ret = -ENOMEM;
-      goto out;
-    }
-
-  ctx.len = 0;
-  ctx.seq = 0;
-  ctx.npkt = 0;
-
-  /* Opus 的 granule 是"含 preskip 的 48kHz 采样计数", 所以从 preskip 起算;
-   * 中间页与末页都按 原型(Python, 已对着 MiniMax 验证过) 的算法给值。 */
-  ctx.granule = OG_PRESKIP;
-
-  enc = opus_encoder_create(OG_RATE, 1, OPUS_APPLICATION_VOIP, &err);
-  if (enc == NULL || err != OPUS_OK)
-    {
-      syslog(LOG_ERR, "[%s] encoder_create failed: %d\n", TAG, err);
-      ret = -EIO;
-      goto out;
-    }
-
-  (void)opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate_bps));
-  (void)opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(OG_COMPLEXITY));
-  (void)opus_encoder_ctl(enc, OPUS_SET_VBR(1));
-
-  /* BOS 页(OpusHead) 与 OpusTags 页: granule 都是 0 */
-  {
-    struct og_ctx h;
-
-    memset(&h, 0, sizeof(h));
-    h.out = ctx.out;
-    h.cap = ctx.cap;
-    h.pkt[0] = head;
-    h.plen[0] = sizeof(head);
-    h.npkt = 1;
-    ret = og_flush(&h, 0x02);
-    if (ret != 0)
-      {
-        goto out;
-      }
-
-    ctx.len = h.len;
-    ctx.seq = h.seq;
-
-    memset(&h, 0, sizeof(h));
-    h.out = ctx.out;
-    h.cap = ctx.cap;
-    h.len = ctx.len;
-    h.seq = ctx.seq;
-    h.pkt[0] = tags;
-    h.plen[0] = sizeof(tags);
-    h.npkt = 1;
-    ret = og_flush(&h, 0x00);
-    if (ret != 0)
-      {
-        goto out;
-      }
-
-    ctx.len = h.len;
-    ctx.seq = h.seq;
-  }
-
-  /* 逐帧编码。最后一帧不足 320 点时补零。 */
-  {
-    short frame[OG_FRAME];
-
-    for (off = 0; off < samples; off += OG_FRAME)
-      {
-        size_t n = samples - off;
-        int    got;
-
-        if (n > OG_FRAME)
-          {
-            n = OG_FRAME;
-          }
-
-        memcpy(frame, s + off * 2u, n * 2u);
-        if (n < OG_FRAME)
-          {
-            memset(frame + n, 0, (OG_FRAME - n) * 2u);
-          }
-
-        got = opus_encode(enc, frame, OG_FRAME, pkt, OG_MAX_PKT);
-        if (got < 0)
-          {
-            syslog(LOG_ERR, "[%s] opus_encode failed: %d\n", TAG, got);
-            ret = -EIO;
-            goto out;
-          }
-
-        /* granule 以 48kHz 计, 而输入是 16kHz => x3 */
-        ret = og_add(&ctx, pkt, (size_t)got, OG_FRAME * 3);
-        if (ret != 0)
-          {
-            goto out;
-          }
-      }
-  }
-
-  ret = og_flush(&ctx, 0x04);                 /* 末页打 EOS */
+  ret = opus_ogg_feed(e, pcm, pcm_bytes);
   if (ret != 0)
     {
-      goto out;
+      opus_ogg_abort(e);
+      return ret;
     }
 
-  syslog(LOG_INFO, "[%s] %u PCM bytes -> %u Ogg Opus bytes (%d bps)\n",
-         TAG, (unsigned)pcm_bytes, (unsigned)ctx.len, bitrate_bps);
-
-  *out = ctx.out;
-  *out_len = ctx.len;
-  ctx.out = NULL;
-  ret = 0;
-
-out:
-  if (enc != NULL)
-    {
-      opus_encoder_destroy(enc);
-    }
-
-  free(pkt);
-  free(ctx.stage);
-  free(ctx.out);
-  return ret;
+  return opus_ogg_finish(e, out, out_len);
 }
 
 #else  /* !CONFIG_LIB_OPUS */
 
-/* 没开 libopus 时返回 -ENOSYS: 调用者(minimax_asr.c)会自动回退到
+/* 没开 libopus 时全部返回失败: 调用者(minimax_asr.c)会自动回退到
  * "原始 PCM + WAV 头"的老路径, 功能不中断, 只是上传量大得多。 */
+
+opus_ogg_enc_t* opus_ogg_begin(int bitrate_bps)
+{
+  (void)bitrate_bps;
+  return NULL;
+}
+
+int opus_ogg_feed(opus_ogg_enc_t* e, const void* pcm, size_t bytes)
+{
+  (void)e;
+  (void)pcm;
+  (void)bytes;
+  return -ENOSYS;
+}
+
+int opus_ogg_finish(opus_ogg_enc_t* e, unsigned char** out, size_t* out_len)
+{
+  (void)e;
+  (void)out;
+  (void)out_len;
+  return -ENOSYS;
+}
+
+void opus_ogg_abort(opus_ogg_enc_t* e)
+{
+  (void)e;
+}
+
 int opus_ogg_encode(const void* pcm, size_t pcm_bytes, int bitrate_bps,
                     unsigned char** out, size_t* out_len)
 {

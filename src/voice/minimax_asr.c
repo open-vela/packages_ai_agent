@@ -109,22 +109,19 @@ static int mm_asr_init(void)
   return 0;
 }
 
+static int mm_asr_post_payload(const unsigned char* payload,
+                               size_t payload_len, const char* mime,
+                               const char* fname, char* text_out,
+                               size_t text_cap);
+
 static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
                             char* text_out, size_t text_cap)
 {
   unsigned char* payload = NULL;       /* 要上传的"文件": Ogg Opus 或 WAV */
   size_t         payload_len = 0;
-  int            payload_owned = 0;    /* 1 = payload 是 malloc 的, 需要 free */
   const char*    mime = "audio/wav";
   const char*    fname = "a.wav";
-  unsigned char* body = NULL;
-  char*          resp = NULL;
-  size_t         body_cap;
-  size_t         off;
-  int            n;
   int            ret;
-  cJSON*         root = NULL;
-  cJSON*         item;
 
   if (text_out == NULL || text_cap == 0)
     {
@@ -168,9 +165,12 @@ static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
       {
         payload = ogg;
         payload_len = ogg_len;
-        payload_owned = 1;
         mime = "audio/ogg";
         fname = "a.ogg";
+        syslog(LOG_INFO,
+               "[%s] pcm=%u bytes (%.1fs) -> Ogg Opus %u bytes\n",
+               MM_ASR_TAG, (unsigned)pcm_len, (double)pcm_len / 32000.0,
+               (unsigned)ogg_len);
       }
     else
       {
@@ -188,27 +188,60 @@ static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
       payload = (unsigned char*)malloc(MM_ASR_WAV_HDR + pcm_len);
       if (payload == NULL)
         {
-          ret = -ENOMEM;
-          goto out;
+          return -ENOMEM;
         }
 
       memcpy(payload, wav, MM_ASR_WAV_HDR);
       memcpy(payload + MM_ASR_WAV_HDR, pcm_data, pcm_len);
       payload_len = MM_ASR_WAV_HDR + pcm_len;
-      payload_owned = 1;
       mime = "audio/wav";
       fname = "a.wav";
     }
 
-  /* ── 第二步: 组 multipart ───────────────────────────────────────────── */
+  ret = mm_asr_post_payload(payload, payload_len, mime, fname,
+                            text_out, text_cap);
+  free(payload);
+  return ret;
+}
+
+/* 把已经准备好的"文件"(Ogg Opus 或 WAV)组 multipart 传上去并解析回文字。
+ * 批量识别与流式识别两条路径共用。 */
+static int mm_asr_post_payload(const unsigned char* payload, size_t payload_len,
+                               const char* mime, const char* fname,
+                               char* text_out, size_t text_cap)
+{
+  unsigned char* body;
+  char*          resp;
+  size_t         body_cap;
+  size_t         off;
+  int            n;
+  int            ret;
+  cJSON*         root = NULL;
+  cJSON*         item;
+
+  if (payload == NULL || payload_len == 0 || mime == NULL || fname == NULL ||
+      text_out == NULL || text_cap == 0)
+    {
+      return -EINVAL;
+    }
+
+  text_out[0] = '\0';
+
+  /* 懒初始化: 注册时不联网, 第一次真正要识别才取 key */
+  if (!s_ready && mm_asr_init() != 0)
+    {
+      return -ENOENT;
+    }
+
   body_cap = payload_len + 1024u;
   body = (unsigned char*)malloc(body_cap);
   resp = (char*)malloc(MM_ASR_RESP_MAX);
 
   if (body == NULL || resp == NULL)
     {
-      ret = -ENOMEM;
-      goto out;
+      free(body);
+      free(resp);
+      return -ENOMEM;
     }
 
   n = snprintf((char*)body, body_cap,
@@ -243,10 +276,8 @@ static int mm_asr_recognize(const unsigned char* pcm_data, size_t pcm_len,
 
   off += (size_t)n;
 
-  syslog(LOG_INFO,
-         "[%s] POST %s: pcm=%u bytes (%.1fs) -> %s %u bytes, body=%u bytes\n",
-         MM_ASR_TAG, MM_ASR_PATH, (unsigned)pcm_len,
-         (double)pcm_len / 32000.0, mime, (unsigned)payload_len,
+  syslog(LOG_INFO, "[%s] POST %s: %s %u bytes, body=%u bytes\n",
+         MM_ASR_TAG, MM_ASR_PATH, mime, (unsigned)payload_len,
          (unsigned)off);
 
   ret = minimax_https_post(MM_ASR_PATH,
@@ -307,18 +338,64 @@ out:
 
   free(body);
   free(resp);
+  return ret;
+}
 
-  if (payload_owned)
+/* ── 流式: 边采集边编码 ────────────────────────────────────────────────
+ * 采集线程每收到一块 PCM 就 stream_send() 进来, 这里立刻编成 Opus 入 Ogg。
+ * complexity=0 实测 2.05x 实时, 有 2 倍余量跟得上采集, 录完时只剩上传,
+ * 省掉批量路径那整段约 2 秒的编码等待。
+ * MiniMax 的 ASR 是**文件式**的(不支持音频侧流式输入, 官方也建议客户端做
+ * VAD 伪流式), 所以"流"只到设备侧的编码为止, 上传仍在 finish 里一次完成。 */
+
+static void* mm_asr_stream_open(void)
+{
+  if (!s_ready && mm_asr_init() != 0)
     {
-      free(payload);
+      return NULL;
     }
 
+  return opus_ogg_begin(MM_ASR_OPUS_BPS);
+}
+
+static int mm_asr_stream_send(void* s, const unsigned char* pcm, size_t len)
+{
+  return opus_ogg_feed((opus_ogg_enc_t*)s, pcm, len);
+}
+
+static int mm_asr_stream_finish(void* s, char* text_out, size_t text_cap)
+{
+  unsigned char* ogg = NULL;
+  size_t         ogg_len = 0;
+  int            ret;
+
+  ret = opus_ogg_finish((opus_ogg_enc_t*)s, &ogg, &ogg_len);
+  if (ret != 0 || ogg == NULL || ogg_len == 0)
+    {
+      syslog(LOG_ERR, "[%s] stream finish failed: %d\n", MM_ASR_TAG, ret);
+      free(ogg);
+      return ret != 0 ? ret : -EIO;
+    }
+
+  ret = mm_asr_post_payload(ogg, ogg_len, "audio/ogg", "a.ogg",
+                            text_out, text_cap);
+  free(ogg);
   return ret;
+}
+
+static void mm_asr_stream_abort(void* s)
+{
+  opus_ogg_abort((opus_ogg_enc_t*)s);
 }
 
 static const voice_asr_ops_t s_minimax_asr_ops =
 {
   .name = "minimax",
+  /* 流式: 让采集线程边录边编码 (见本文件上面的说明) */
+  .stream_open = mm_asr_stream_open,
+  .stream_send = mm_asr_stream_send,
+  .stream_finish = mm_asr_stream_finish,
+  .stream_abort = mm_asr_stream_abort,
   .init = mm_asr_init,
   .recognize = mm_asr_recognize,
   .deinit = NULL,
