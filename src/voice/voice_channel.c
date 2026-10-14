@@ -494,6 +494,20 @@ static void* recording_thread(void* arg)
     //     syslog(LOG_INFO, "[%s] PCM dump saved to /data/cap_dump.pcm\n", TAG);
     // }
 
+    /* ★ 在本线程(采集线程, 栈已抬到 64KB)把最后不足一帧的残余编掉再交出去。
+     *   绝不能留给 voice_channel_stop 里的 voice_asr_stream_finish() —— 那个
+     *   函数跑在**调用者的线程**上, 真机上是 16KB 栈的 vela CLI 线程, 在里面
+     *   调 opus_encode 会直接栈溢出硬 fault(backtrace 落在 silk_Encode,
+     *   2026-10-14 真机踩到, 板子随即被看门狗复位)。 */
+    if (stream != NULL) {
+        int fret = voice_asr_stream_end_input(stream);
+
+        if (fret != 0) {
+            syslog(LOG_WARNING,
+                "[%s] stream end_input failed: %d\n", TAG, fret);
+        }
+    }
+
     pthread_mutex_lock(&s_voice.lock);
     s_voice.asr_stream = stream;
 

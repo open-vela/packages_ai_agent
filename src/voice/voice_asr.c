@@ -181,6 +181,20 @@ int voice_asr_stream_send(voice_asr_stream_t* s,
     return s_active->stream_send(s->inner, pcm, len);
 }
 
+int voice_asr_stream_end_input(voice_asr_stream_t* s)
+{
+    if (!s || !s->inner || s->is_volc) {
+        /* 火山那套是 WebSocket 流式, 收尾语义不同, 不需要这一步 */
+        return 0;
+    }
+
+    if (s_active == NULL || s_active->stream_end_input == NULL) {
+        return 0;
+    }
+
+    return s_active->stream_end_input(s->inner);
+}
+
 int voice_asr_stream_finish(voice_asr_stream_t* s,
     char* text_out, size_t text_cap)
 {

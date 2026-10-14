@@ -51,6 +51,12 @@ typedef struct voice_asr_ops {
     int   (*stream_send)(void *s, const unsigned char *pcm, size_t len);
     int   (*stream_finish)(void *s, char *text_out, size_t text_cap);
     void  (*stream_abort)(void *s);
+
+    /* 可选: 声明"输入到此为止", 把最后不足一帧的残余处理掉。
+     * ★ 必须由**采集线程**(栈够大的那个)在收流之前调用 —— 真机上这一步会跑
+     *   编码器, 而 voice_asr_stream_finish() 是在调用者的线程里执行的,
+     *   那个栈可能只有 16KB(vela CLI 线程), 直接把 silk_Encode 撑爆成硬 fault。 */
+    int   (*stream_end_input)(void *s);
 } voice_asr_ops_t;
 
 /* Register an ASR backend. Multiple backends can be registered. */
@@ -80,6 +86,10 @@ voice_asr_stream_t *voice_asr_stream_open(void);
 /* Send one PCM chunk to the streaming session. */
 int voice_asr_stream_send(voice_asr_stream_t *s,
                           const unsigned char *pcm, size_t len);
+
+/* 声明输入结束: 处理掉最后不足一帧的残余(会跑编码器, 见 ops 里的说明)。
+ * 幂等。应由采集线程在收流前调用, 不要留着让 finish 去做。 */
+int voice_asr_stream_end_input(voice_asr_stream_t *s);
 
 /* Finish streaming, get final text, and free the session. */
 int voice_asr_stream_finish(voice_asr_stream_t *s,

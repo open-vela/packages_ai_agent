@@ -383,6 +383,14 @@ static int mm_asr_stream_finish(void* s, char* text_out, size_t text_cap)
   return ret;
 }
 
+/* 由采集线程(64KB 栈)调用: 把最后不足 20ms 的残余补零编掉。
+ * 不放在 finish 里做是因为 finish 跑在调用者的线程上(真机是 16KB 的 CLI
+ * 线程), 在那里调 opus_encode 会栈溢出硬 fault。 */
+static int mm_asr_stream_end_input(void* s)
+{
+  return opus_ogg_end_input((opus_ogg_enc_t*)s);
+}
+
 static void mm_asr_stream_abort(void* s)
 {
   opus_ogg_abort((opus_ogg_enc_t*)s);
@@ -396,6 +404,7 @@ static const voice_asr_ops_t s_minimax_asr_ops =
   .stream_send = mm_asr_stream_send,
   .stream_finish = mm_asr_stream_finish,
   .stream_abort = mm_asr_stream_abort,
+  .stream_end_input = mm_asr_stream_end_input,
   .init = mm_asr_init,
   .recognize = mm_asr_recognize,
   .deinit = NULL,

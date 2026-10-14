@@ -52,9 +52,21 @@ opus_ogg_enc_t* opus_ogg_begin(int bitrate_bps);
  * 返回 0 或负 errno。 */
 int opus_ogg_feed(opus_ogg_enc_t* e, const void* pcm, size_t bytes);
 
-/* 收尾(补零对齐最后一帧、打 EOS 页), 交出完整的 Ogg 文件。
+/* 声明"输入到此为止": 把最后不足 20ms 的残余补零编掉, 之后 pend 清零。
+ * 幂等, 可以重复调用。
+ *
+ * ★ 为什么要单独一个函数: 这一步会调 opus_encode(), 而它的栈开销很大。
+ *   finish() 是在**调用者的线程**里跑的 —— 真机上 voice_stop 由 vela CLI
+ *   线程处理, 那个栈只有 16KB(AGENT_CLI_STACK), 于是 silk_Encode 直接栈
+ *   溢出硬 fault。所以约定: **由采集线程(64KB 栈)在收流前调本函数**,
+ *   finish() 里就再也不做任何编码 —— 它对任何调用栈都安全。 */
+int opus_ogg_end_input(opus_ogg_enc_t* e);
+
+/* 收尾(打 EOS 页), 交出完整的 Ogg 文件。
  * 成功返回 0, *out 为 malloc 的缓冲(调用者 free), *out_len 为长度。
- * 注意: 调用后 e 即被释放, 不要再用。 */
+ * 注意: 调用后 e 即被释放, 不要再用。
+ * 本函数**不做编码**(见 opus_ogg_end_input 的说明); 若还有残余帧,
+ * 说明调用者没先调 end_input, 残余会被丢弃并打一条警告。 */
 int opus_ogg_finish(opus_ogg_enc_t* e, unsigned char** out, size_t* out_len);
 
 /* 放弃会话(不产出任何东西), 并释放 e。 */

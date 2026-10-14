@@ -368,6 +368,39 @@ int opus_ogg_feed(opus_ogg_enc_t* e, const void* pcm, size_t bytes)
   return 0;
 }
 
+int opus_ogg_end_input(opus_ogg_enc_t* e)
+{
+  if (e == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (e->pend_len == 0)
+    {
+      return 0;
+    }
+
+  /* 补到偶数字节再补零, 凑成完整一帧编掉 */
+  if ((e->pend_len & 1u) != 0)
+    {
+      e->pend[e->pend_len++] = 0;
+    }
+
+  memset(e->pend + e->pend_len, 0, (size_t)(OG_FRAME * 2) - e->pend_len);
+
+  {
+    int ret = og_encode_frame(e);
+
+    if (ret != 0)
+      {
+        return ret;
+      }
+  }
+
+  e->pend_len = 0;
+  return 0;
+}
+
 int opus_ogg_finish(opus_ogg_enc_t* e, unsigned char** out, size_t* out_len)
 {
   int ret;
@@ -381,23 +414,15 @@ int opus_ogg_finish(opus_ogg_enc_t* e, unsigned char** out, size_t* out_len)
   *out = NULL;
   *out_len = 0;
 
-  /* 最后一帧不足 20ms: 先补到偶数字节, 再补零 */
   if (e->pend_len > 0)
     {
-      if ((e->pend_len & 1u) != 0)
-        {
-          e->pend[e->pend_len++] = 0;
-        }
-
-      memset(e->pend + e->pend_len, 0,
-             (size_t)(OG_FRAME * 2) - e->pend_len);
-
-      ret = og_encode_frame(e);
-      if (ret != 0)
-        {
-          opus_ogg_abort(e);
-          return ret;
-        }
+      /* 调用者没先调 end_input。这里**故意不编码**: 本函数可能跑在很小的栈上
+       * (真机上 voice_stop 就在 16KB 的 CLI 线程里), 一编码就栈溢出。
+       * 丢弃的不足 20ms, 对识别无影响。 */
+      syslog(LOG_WARNING,
+             "[%s] %u trailing bytes dropped (call end_input first)\n",
+             TAG, (unsigned)e->pend_len);
+      e->pend_len = 0;
     }
 
   ret = og_flush_page(e, 0x04);                 /* 末页打 EOS */
