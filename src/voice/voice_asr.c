@@ -181,6 +181,19 @@ int voice_asr_stream_send(voice_asr_stream_t* s,
     return s_active->stream_send(s->inner, pcm, len);
 }
 
+int voice_asr_stream_utterance_done(voice_asr_stream_t* s)
+{
+    if (!s || !s->inner || s->is_volc) {
+        return 0;
+    }
+
+    if (s_active == NULL || s_active->stream_utterance_done == NULL) {
+        return 0;
+    }
+
+    return s_active->stream_utterance_done(s->inner);
+}
+
 int voice_asr_stream_end_input(voice_asr_stream_t* s)
 {
     if (!s || !s->inner || s->is_volc) {

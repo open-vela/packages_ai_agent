@@ -48,6 +48,16 @@
 #define VAD_NOISE_INIT      200          /* 标定没跑完时的临时值(几乎用不到) */
 #define VAD_NOISE_MIN       8            /* 防止底噪被压到 0 后疯狂触发 */
 #define VAD_CALIB_FRAMES    15           /* 开头 300ms 专门用来标定底噪 */
+#define VAD_MIN_UTTER_FRAMES 15          /* 至少 300ms 语音才算"一句话", 防咳嗽误触发 */
+
+/* ★ 判"说完"的静音时长必须**明显长于**裁剪用的后滚(VAD_POSTROLL_FRAMES=500ms)。
+ *   两者是不同的事:
+ *     · 后滚 500ms —— 修剪时尾部留多少静音, 短一点无所谓;
+ *     · 收尾 1.2s  —— 多久没声音才算"这个人说完了"。
+ *   真机 2026-10-14 踩到: 两件事都用 500ms, 而说话人在「小云手表」和
+ *   「现在几点了」之间自然停顿了一下 -> VAD 以为说完了 -> 只放行 0.8 秒
+ *   -> 识别结果为空串。 */
+#define VAD_ENDPOINT_FRAMES  60          /* 1.2s 连续静音才算说完 */
 
 /* ★ 教训(真机 2026-10-14): 底噪**不能拍脑袋给初值**。
  *   第一版把初值写成 200, 而实际环境帧能量远高于 3x200, 于是第一帧就被判成
@@ -154,6 +164,28 @@ static void vad_process_frame(vad_trim_t* v, const short* f, vad_emit_fn emit,
   thr = v->noise * VAD_ON_NUM;
   loud = (e > thr);
 
+  /* 连续静音计数: 与 in_speech 无关地跟踪, 因为"说完"的判据要在
+   * 退出语音态之后仍然继续累计(见 VAD_ENDPOINT_FRAMES 的说明)。 */
+  if (loud)
+    {
+      v->silence_run = 0;
+    }
+  else
+    {
+      v->silence_run++;
+
+      if (v->silence_run >= VAD_ENDPOINT_FRAMES && !v->done &&
+          v->utter_frames >= VAD_MIN_UTTER_FRAMES)
+        {
+          v->done = 1;
+          syslog(LOG_INFO,
+                 "[%s] utterance done: %lu frames (%.1fs speech, %.1fs silence)\n",
+                 VAD_TAG, v->utter_frames,
+                 (double)v->utter_frames * 0.02,
+                 (double)v->silence_run * 0.02);
+        }
+    }
+
   if (!v->in_speech)
     {
       /* 静音期: 底噪慢速跟踪 */
@@ -172,6 +204,11 @@ static void vad_process_frame(vad_trim_t* v, const short* f, vad_emit_fn emit,
               /* 起说: 把预滚补发出去, 第一个音素不能丢 */
               v->in_speech = 1;
               v->below_run = 0;
+              v->done = 0;                    /* 新的一句开始, 清掉粘滞 */
+              v->silence_run = 0;
+              /* ★ 必须在 flush 之前取 count —— flush 内部会把它清零。
+               *   本句帧数 = 即将补发的预滚帧 + 当前这一帧。 */
+              v->utter_frames = (unsigned long)v->count + 1;
               vad_preroll_flush(v, emit, user);
               vad_emit_frame(v, f, emit, user);
             }
@@ -192,6 +229,7 @@ static void vad_process_frame(vad_trim_t* v, const short* f, vad_emit_fn emit,
 
   /* 语音中: 一律放行; 连续静音够久才认为说完 */
   vad_emit_frame(v, f, emit, user);
+  v->utter_frames++;
 
   if (loud)
     {
@@ -203,6 +241,8 @@ static void vad_process_frame(vad_trim_t* v, const short* f, vad_emit_fn emit,
 
       if (v->below_run >= VAD_POSTROLL_FRAMES)
         {
+          /* 后滚期满: 退出语音态(只影响"是否继续放行"), 但**不清零
+           * utter_frames** —— "说完"的判据还要用它, 见 VAD_ENDPOINT_FRAMES。 */
           v->in_speech = 0;
           v->above_run = 0;
           v->below_run = 0;
@@ -231,6 +271,11 @@ void vad_trim_feed(vad_trim_t* v, const short* pcm, size_t samples,
           v->pend_len = 0;
         }
     }
+}
+
+int vad_trim_utterance_done(vad_trim_t* v)
+{
+  return (v != NULL) ? v->done : 0;
 }
 
 int vad_trim_finish(vad_trim_t* v)

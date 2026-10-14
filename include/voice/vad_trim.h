@@ -50,6 +50,9 @@ typedef struct
   unsigned long  emitted;             /* 放行的帧数(20ms/帧) */
   unsigned long  dropped;             /* 丢弃的帧数 */
   long           e_max;               /* 见过的最大帧能量(用于标定阈值) */
+  unsigned long  utter_frames;        /* 本句话已放行的帧数 */
+  int            silence_run;         /* 距最后一个"响"帧的连续静音帧数 */
+  int            done;                /* 1 = 一句话已说完(粘滞, 见下) */
 
   short          pend[320];           /* 不足一帧的残余 */
   size_t         pend_len;            /* 采样数 */
@@ -67,6 +70,12 @@ void vad_trim_feed(vad_trim_t* v, const short* pcm, size_t samples,
 /* 收尾: 处理残余(不足一帧的按静音处理, 不强行放行)。
  * 返回 1 表示整段里**一帧都没放行**(全静音), 调用方据此告警。 */
 int vad_trim_finish(vad_trim_t* v);
+
+/* 「一句话说完了」—— 用于**自动断句**(不用手动停录)。
+ * 判定: 之前确实起说过, 且已连续静音够久(后滚期满)退出语音态。
+ * 要求本句放行帧数 >= VAD_MIN_UTTER_FRAMES(300ms), 免得一声咳嗽就收尾。
+ * 粘滞: 返回 1 后一直返回 1, 直到开始下一句。 */
+int vad_trim_utterance_done(vad_trim_t* v);
 
 #ifdef __cplusplus
 }

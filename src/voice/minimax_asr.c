@@ -470,6 +470,14 @@ static int mm_asr_stream_end_input(void* s)
   return st ? opus_ogg_end_input(st->enc) : -EINVAL;
 }
 
+/* 自动断句: VAD 判定"一句话说完了"就返回 1, 采集线程据此自动收尾。 */
+static int mm_asr_stream_utterance_done(void* s)
+{
+  struct mm_asr_stream_s* st = (struct mm_asr_stream_s*)s;
+
+  return st ? vad_trim_utterance_done(&st->vad) : 0;
+}
+
 static void mm_asr_stream_abort(void* s)
 {
   struct mm_asr_stream_s* st = (struct mm_asr_stream_s*)s;
@@ -492,6 +500,7 @@ static const voice_asr_ops_t s_minimax_asr_ops =
   .stream_finish = mm_asr_stream_finish,
   .stream_abort = mm_asr_stream_abort,
   .stream_end_input = mm_asr_stream_end_input,
+  .stream_utterance_done = mm_asr_stream_utterance_done,
   .init = mm_asr_init,
   .recognize = mm_asr_recognize,
   .deinit = NULL,

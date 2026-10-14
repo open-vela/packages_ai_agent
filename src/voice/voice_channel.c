@@ -220,11 +220,53 @@ static struct {
     volatile int tts_abort; /* set to 1 to stop active TTS playback */
     audio_playback_t* tts_pb; /* active TTS playback handle (or NULL) */
     pthread_mutex_t speak_lock; /* serialize concurrent speak calls */
+    int auto_pending; /* 采集线程因自动断句退出, 等监督线程收尾 */
 } s_voice = {
     .state = VOICE_IDLE,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .speak_lock = PTHREAD_MUTEX_INITIALIZER,
 };
+
+/* ── 自动断句的收尾监督线程 ────────────────────────────────────────────
+ *
+ * 为什么需要单独一个线程: 采集线程发现"一句话说完了"之后**不能自己收尾** ——
+ * 收尾的 voice_channel_stop() 里有 pthread_join(rec_thread, ...), 也就是
+ * 线程 join 自己, 会直接死锁。所以让采集线程叫醒这个监督线程去调 stop。
+ * 它平时就睡在信号量上, 不占 CPU。 */
+static sem_t s_auto_stop_sem;
+static int   s_auto_stop_started;
+
+static void* auto_stop_thread(void* arg)
+{
+    (void)arg;
+
+    for (;;) {
+        int pending;
+
+        if (sem_wait(&s_auto_stop_sem) != 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        pthread_mutex_lock(&s_voice.lock);
+        pending = s_voice.auto_pending;
+        s_voice.auto_pending = 0;
+        pthread_mutex_unlock(&s_voice.lock);
+
+        /* 不是自动断句触发的(或状态已经变了)就忽略 */
+        if (!pending) {
+            continue;
+        }
+
+        syslog(LOG_INFO, "[%s] auto-stop: speech ended, finishing\n", TAG);
+        printf("Voice: speech ended, finishing...\n");
+        voice_channel_stop();
+    }
+
+    return NULL;
+}
 
 /* ── File-based helpers (kept for QEMU test commands) ──── */
 
@@ -378,6 +420,7 @@ static void* recording_thread(void* arg)
     (void)arg;
     unsigned char chunk[AGENT_ASR_CHUNK_SIZE];
     int need_fallback = 0;
+    int auto_stopped = 0;      /* 因自动断句而结束录制 */
     /* 注: 排查音频质量时曾在这里临时加过"把采集到的原始 PCM 落盘"的诊断,
      * 配合 pcm-audio 技能的 audio_analyzer.py 用。两条经验留在这里备查:
      *   1) **落 tmpfs(/tmp), 绝不落 /data** —— /data 在 NOR flash 上, 而代码
@@ -484,6 +527,17 @@ static void* recording_thread(void* arg)
 
         process_audio_chunk(&stream, chunk, (size_t)n,
             &need_fallback, &total_bytes_sent);
+
+        /* 自动断句: VAD 判定"这一句说完了"就主动结束录制。
+         * 收尾不在这里做 —— 见 auto_stop_thread 上面的说明(join 自己会死锁)。 */
+        if (stream != NULL &&
+            voice_asr_stream_utterance_done(stream)) {
+            syslog(LOG_INFO,
+                "[%s] auto-stop: utterance done after %d chunks\n",
+                TAG, chunk_count);
+            auto_stopped = 1;
+            break;
+        }
     }
 
 #ifdef CONFIG_AI_AGENT_AUDIO_PREPROCESS
@@ -515,9 +569,20 @@ static void* recording_thread(void* arg)
     pthread_mutex_unlock(&s_voice.lock);
 
     syslog(LOG_INFO,
-        "[%s] recording thread exit: %d chunks, %zu read, %zu sent%s\n",
+        "[%s] recording thread exit: %d chunks, %zu read, %zu sent%s%s\n",
         TAG, chunk_count, total_bytes_read, total_bytes_sent,
-        abnormal_exit ? " (abnormal)" : "");
+        abnormal_exit ? " (abnormal)" : "",
+        auto_stopped ? " (auto-stop)" : "");
+
+    /* 自动断句: 叫醒监督线程去走 voice_channel_stop()。放在最后,
+     * 保证 stream 已经存进 s_voice.asr_stream。 */
+    if (auto_stopped) {
+        pthread_mutex_lock(&s_voice.lock);
+        s_voice.auto_pending = 1;
+        pthread_mutex_unlock(&s_voice.lock);
+        sem_post(&s_auto_stop_sem);
+    }
+
     return NULL;
 }
 
@@ -624,6 +689,28 @@ int voice_channel_init(void)
     s_voice.asr_stream = NULL;
     s_voice.tts_abort = 0;
     s_voice.tts_pb = NULL;
+    s_voice.auto_pending = 0;
+
+    /* 自动断句的收尾监督线程 (起一次即可) */
+    if (!s_auto_stop_started) {
+        s_auto_stop_started = 1;
+        sem_init(&s_auto_stop_sem, 0, 0);
+
+        pthread_attr_t ast;
+        pthread_attr_init(&ast);
+        pthread_attr_setstacksize(&ast, 16 * 1024);
+
+        pthread_t th;
+        if (pthread_create(&th, &ast, auto_stop_thread, NULL) == 0) {
+            pthread_detach(th);
+            syslog(LOG_INFO,
+                "[%s] auto-stop supervisor started\n", TAG);
+        } else {
+            syslog(LOG_ERR, "[%s] auto-stop supervisor failed\n", TAG);
+        }
+
+        pthread_attr_destroy(&ast);
+    }
     sem_init(&s_voice.rec_ready, 0, 0);
 
     if (!s_backends_registered) {
