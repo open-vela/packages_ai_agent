@@ -1989,7 +1989,29 @@ int minimax_https_post(const char* path, const char* content_type,
 
   if (ret == 0)
     {
+      /* 这里是"上行吞吐"最直接的测量点: 从 body 的第一个字节写到最后一个。
+       * 蓝牙 PAN 的上行决定语音能不能实时上传(16kHz/16bit 原始 PCM 需要
+       * 32KB/s), 所以留一条固定格式、可 grep 的日志:
+       *   [minimax_https] upload: <bytes> bytes in <ms> ms = <KB/s> KB/s
+       * 改动前后用同样的 payload 对比即可。 */
+      struct timespec t0;
+      struct timespec t1;
+
+      clock_gettime(CLOCK_MONOTONIC, &t0);
       ret = mm_tls_write_all(&tls, body, body_len);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+
+      if (ret == 0)
+        {
+          double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0
+                      + (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+
+          syslog(LOG_INFO,
+                 "[minimax_https] upload: %u bytes in %.0f ms = %.1f KB/s\n",
+                 (unsigned)body_len, ms,
+                 ms > 0.0 ? ((double)body_len / 1024.0) / (ms / 1000.0)
+                          : 0.0);
+        }
     }
 
   if (ret != 0)
