@@ -32,6 +32,7 @@
 #include "voice/voice_asr.h"
 #include "voice/minimax_tts.h"
 #include "voice/opus_ogg.h"
+#include "voice/vad_trim.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -348,28 +349,104 @@ out:
  * MiniMax 的 ASR 是**文件式**的(不支持音频侧流式输入, 官方也建议客户端做
  * VAD 伪流式), 所以"流"只到设备侧的编码为止, 上传仍在 finish 里一次完成。 */
 
+/* 流式会话 = Opus 编码器 + VAD。
+ * VAD 只把"有语音"的帧放行给编码器, 首尾静音直接丢掉 —— 真机上说话人只说了
+ * 3 秒却录了 22 秒, 送给识别引擎的音频 85% 是噪声, 上传量也从约 6KB 涨到 42KB。
+ * 只裁首尾, 中间一律放行(中间一裁会切断词间停顿, 反而伤识别), 详见 vad_trim.c。 */
+struct mm_asr_stream_s
+{
+  opus_ogg_enc_t* enc;
+  vad_trim_t      vad;
+  int             err;          /* 回调里没法返回错误, 先记在这儿 */
+};
+
+static void mm_asr_emit(void* user, const short* frame, size_t samples)
+{
+  struct mm_asr_stream_s* st = (struct mm_asr_stream_s*)user;
+
+  if (st->err == 0)
+    {
+      st->err = opus_ogg_feed(st->enc, frame, samples * sizeof(short));
+    }
+}
+
 static void* mm_asr_stream_open(void)
 {
+  struct mm_asr_stream_s* st;
+
   if (!s_ready && mm_asr_init() != 0)
     {
       return NULL;
     }
 
-  return opus_ogg_begin(MM_ASR_OPUS_BPS);
+  st = (struct mm_asr_stream_s*)calloc(1, sizeof(*st));
+  if (st == NULL)
+    {
+      return NULL;
+    }
+
+  st->enc = opus_ogg_begin(MM_ASR_OPUS_BPS);
+  if (st->enc == NULL)
+    {
+      free(st);
+      return NULL;
+    }
+
+  vad_trim_init(&st->vad);
+  return st;
 }
 
 static int mm_asr_stream_send(void* s, const unsigned char* pcm, size_t len)
 {
-  return opus_ogg_feed((opus_ogg_enc_t*)s, pcm, len);
+  struct mm_asr_stream_s* st = (struct mm_asr_stream_s*)s;
+
+  if (st == NULL || st->enc == NULL || pcm == NULL)
+    {
+      return -EINVAL;
+    }
+
+  st->err = 0;
+  vad_trim_feed(&st->vad, (const short*)(const void*)pcm, len / 2,
+                mm_asr_emit, st);
+  return st->err;
 }
 
 static int mm_asr_stream_finish(void* s, char* text_out, size_t text_cap)
 {
+  struct mm_asr_stream_s* st = (struct mm_asr_stream_s*)s;
   unsigned char* ogg = NULL;
   size_t         ogg_len = 0;
   int            ret;
 
-  ret = opus_ogg_finish((opus_ogg_enc_t*)s, &ogg, &ogg_len);
+  if (st == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (vad_trim_finish(&st->vad) != 0)
+    {
+      /* 全段没有语音: 不上传。传一个只有头页的空 Ogg 上去, 服务端会直接拒掉
+       * (真机 2026-10-14 实测: request failed -5), 白费一次往返。 */
+      syslog(LOG_WARNING, "[%s] no speech detected, skip upload\n",
+             MM_ASR_TAG);
+      opus_ogg_abort(st->enc);
+      free(st);
+
+      if (text_out != NULL && text_cap > 0)
+        {
+          text_out[0] = 0;
+        }
+
+      return -ENODATA;
+    }
+
+  syslog(LOG_INFO, "[%s] VAD: kept %lu frames, dropped %lu (%.1fs speech)\n",
+         MM_ASR_TAG, st->vad.emitted, st->vad.dropped,
+         (double)st->vad.emitted * 0.02);
+
+  ret = opus_ogg_finish(st->enc, &ogg, &ogg_len);
+  free(st);
+
   if (ret != 0 || ogg == NULL || ogg_len == 0)
     {
       syslog(LOG_ERR, "[%s] stream finish failed: %d\n", MM_ASR_TAG, ret);
@@ -388,12 +465,22 @@ static int mm_asr_stream_finish(void* s, char* text_out, size_t text_cap)
  * 线程), 在那里调 opus_encode 会栈溢出硬 fault。 */
 static int mm_asr_stream_end_input(void* s)
 {
-  return opus_ogg_end_input((opus_ogg_enc_t*)s);
+  struct mm_asr_stream_s* st = (struct mm_asr_stream_s*)s;
+
+  return st ? opus_ogg_end_input(st->enc) : -EINVAL;
 }
 
 static void mm_asr_stream_abort(void* s)
 {
-  opus_ogg_abort((opus_ogg_enc_t*)s);
+  struct mm_asr_stream_s* st = (struct mm_asr_stream_s*)s;
+
+  if (st == NULL)
+    {
+      return;
+    }
+
+  opus_ogg_abort(st->enc);
+  free(st);
 }
 
 static const voice_asr_ops_t s_minimax_asr_ops =

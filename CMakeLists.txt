@@ -72,6 +72,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/minimax_tts.c
     src/voice/minimax_asr.c
     src/voice/opus_ogg.c
+    src/voice/vad_trim.c
     src/voice/pcm_media_recorder.c
     src/voice/volc_asr.c
     src/voice/voice_tts.c

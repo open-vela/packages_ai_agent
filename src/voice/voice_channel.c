@@ -378,7 +378,14 @@ static void* recording_thread(void* arg)
     (void)arg;
     unsigned char chunk[AGENT_ASR_CHUNK_SIZE];
     int need_fallback = 0;
-    // int dump_fd = -1;
+    /* 注: 排查音频质量时曾在这里临时加过"把采集到的原始 PCM 落盘"的诊断,
+     * 配合 pcm-audio 技能的 audio_analyzer.py 用。两条经验留在这里备查:
+     *   1) **落 tmpfs(/tmp), 绝不落 /data** —— /data 在 NOR flash 上, 而代码
+     *      是 XIP 从同一片 NOR 执行的; 边录音边以 32KB/s 写 flash 会长时间
+     *      占住 flash 控制器, 真机上录制十几秒后**无 fault dump 静默复位**。
+     *   2) 要留**最后 N 秒**(环形缓冲), 不是开头 N 秒 —— 说话人通常在按
+     *      "停录"之前才开口, 留开头往往只抓到环境声。
+     * 诊断完即删: 正常固件不该每次录音都写文件。 */
     size_t total_bytes_read = 0;
     size_t total_bytes_sent = 0;
     int chunk_count = 0;
@@ -453,11 +460,6 @@ static void* recording_thread(void* arg)
         total_bytes_read += (size_t)n;
         chunk_count++;
 
-        /* Dump raw PCM to file */
-        // if (dump_fd >= 0) {
-        //     write(dump_fd, chunk, (size_t)n);
-        // }
-
         /* Log audio level for first few chunks and periodically
          * to diagnose silence vs actual speech from QEMU mic. */
         if (chunk_count <= 3 || chunk_count % 50 == 0) {
@@ -489,11 +491,6 @@ static void* recording_thread(void* arg)
 #endif
 
     /* Store stream handle for voice_channel_stop to finish */
-    // if (dump_fd >= 0) {
-    //     close(dump_fd);
-    //     syslog(LOG_INFO, "[%s] PCM dump saved to /data/cap_dump.pcm\n", TAG);
-    // }
-
     /* ★ 在本线程(采集线程, 栈已抬到 64KB)把最后不足一帧的残余编掉再交出去。
      *   绝不能留给 voice_channel_stop 里的 voice_asr_stream_finish() —— 那个
      *   函数跑在**调用者的线程**上, 真机上是 16KB 栈的 vela CLI 线程, 在里面
