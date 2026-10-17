@@ -12,7 +12,9 @@ velaclaw_client_t* velaclaw_client_open(const char* name);
 void velaclaw_client_close(velaclaw_client_t* c);
 
 /* Queue one ask.  Only one callback may be outstanding: issuing a second
- * ask before the first reply arrives replaces the callback.  The reply
+ * ask before the first reply or timeout returns -EBUSY. Local requests are
+ * independent sessions with unique reply IDs; expired/duplicate replies are
+ * discarded. timeout_ms <= 0 uses 300 seconds.  The reply
  * callback runs on the agent's outbound dispatch thread, so it must not
  * block or call back into the agent. */
 int velaclaw_ask(velaclaw_client_t* c,

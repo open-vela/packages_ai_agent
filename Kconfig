@@ -22,6 +22,8 @@
 config EXAMPLES_AI_AGENT_VELA
 	tristate "Vela AI Agent"
 	default n
+	select SCHED_HAVE_PARENT if SYSTEM_POPEN
+	select SCHED_CHILD_STATUS if SYSTEM_POPEN
 	---help---
 		Enable the AI Agent ported to Vela/NuttX.
 		Requires network connectivity and mbedTLS.

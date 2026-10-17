@@ -39,7 +39,9 @@ static const char *TAG = "tool_files";
 #define MAX_FILE_SIZE (32 * 1024)
 
 /* VelaGuard reports/alarms live outside AGENT_DATA_DIR but on the same /data mount. */
+#ifndef VG_DATA_ROOT
 #define VG_DATA_ROOT "/data/velaguard"
+#endif
 
 static bool path_under_resolved_root(const char *resolved, const char *logical_root)
 {
@@ -100,35 +102,48 @@ static bool path_has_prefix(const char *path, const char *prefix)
  * Uses realpath() to resolve symlinks, preventing symlink escape attacks.
  * Falls back to raw path check if the file does not yet exist.
  */
+static bool resolve_target(const char *path, char *resolved)
+{
+    char parent[PATH_MAX];
+    char base[PATH_MAX];
+    if (!path || strlen(path) >= sizeof(parent)) return false;
+    if (realpath(path, resolved)) return true;
+    strcpy(parent, path);
+    for (;;) {
+        char *slash = strrchr(parent, '/');
+        const char *tail;
+        if (!slash) {
+            if (!realpath(".", base)) return false;
+            return snprintf(resolved, PATH_MAX, "%s/%s", base, path) < PATH_MAX;
+        }
+        *slash = 0;
+        tail = path + (slash - parent);
+        if (realpath(parent[0] ? parent : "/", base))
+            return snprintf(resolved, PATH_MAX, "%s%s", base, tail) < PATH_MAX;
+    }
+}
+
 static bool validate_path(const char *path)
 {
-    if (!path) {
-        return false;
-    }
-
-    /* Reject explicit traversal components */
-    if (strstr(path, "..") != NULL) {
-        return false;
-    }
-
-    if (!logical_path_allowed(path)) {
-        return false;
-    }
-
-    /* Resolve symlinks (/data -> /mnt/emmc/data) and verify physical path. */
     char resolved[PATH_MAX];
+    if (!path || strstr(path, "..") || !logical_path_allowed(path)) return false;
+    /* A missing file can still have a parent symlink out of the sandbox. */
+    return resolve_target(path, resolved) &&
+        (path_under_resolved_root(resolved, AGENT_DATA_DIR) ||
+         path_under_resolved_root(resolved, VG_DATA_ROOT));
+}
 
-    if (realpath(path, resolved) != NULL) {
-        if (!path_under_resolved_root(resolved, AGENT_DATA_DIR)
-            && !path_under_resolved_root(resolved, VG_DATA_ROOT)) {
-            syslog(LOG_WARNING,
-                   "[%s] Path escaped allowed data dirs via symlink: %s -> %s\n",
-                   TAG, path, resolved);
-            return false;
-        }
-    }
+static bool under_path(const char *path, const char *root)
+{
+    char resolved[PATH_MAX];
+    return path_has_prefix(path, root) ||
+        (resolve_target(path, resolved) && path_under_resolved_root(resolved, root));
+}
 
-    return true;
+static bool is_read_protected(const char *path)
+{
+    return under_path(path, AGENT_CONFIG_DIR) ||
+           under_path(path, VG_DATA_ROOT "/provision");
 }
 
 /* Files that the LLM must not overwrite via write_file / edit_file.
@@ -142,25 +157,23 @@ static const char *s_protected_files[] = {
      * missing or fails validation.  Keeping it out of write_file's reach is
      * what makes that fallback trustworthy, so the rule lives here and not
      * only in the skill wording. */
-    "/data/velaguard/reports/runtime-report.md",
+    VG_DATA_ROOT "/reports/runtime-report.md",
     NULL
 };
 
 static bool is_write_protected(const char *path)
 {
     char resolved[PATH_MAX];
-    const char *check = path;
-
-    if (realpath(path, resolved) != NULL) {
-        check = resolved;
-    }
-
+    if (under_path(path, AGENT_CONFIG_DIR)) return true;
+    if (!resolve_target(path, resolved)) return true;
+    if (under_path(path, VG_DATA_ROOT) &&
+        !path_under_resolved_root(resolved, VG_DATA_ROOT "/reports")) return true;
     for (int i = 0; s_protected_files[i]; i++) {
-        if (strcmp(check, s_protected_files[i]) == 0) {
-            return true;
-        }
+        char protected_path[PATH_MAX];
+        if (!strcmp(path, s_protected_files[i]) ||
+            (resolve_target(s_protected_files[i], protected_path) &&
+             !strcmp(resolved, protected_path))) return true;
     }
-
     return false;
 }
 /**
@@ -195,6 +208,7 @@ static void ensure_parent_dirs(const char *path)
 
 int tool_read_file_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");
@@ -206,6 +220,12 @@ int tool_read_file_execute(const char *input_json, char *output, size_t output_s
         snprintf(output, output_size,
                  "Error: path must be under %s/ or %s/ and must not contain '..'",
                  AGENT_DATA_DIR, VG_DATA_ROOT);
+        cJSON_Delete(root);
+        return ERROR;
+    }
+
+    if (is_read_protected(path)) {
+        snprintf(output, output_size, "Error: protected configuration");
         cJSON_Delete(root);
         return ERROR;
     }
@@ -233,6 +253,7 @@ int tool_read_file_execute(const char *input_json, char *output, size_t output_s
 
 int tool_write_file_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");
@@ -292,6 +313,7 @@ int tool_write_file_execute(const char *input_json, char *output, size_t output_
 
 int tool_edit_file_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");
@@ -399,6 +421,7 @@ static size_t list_dir_recursive(const char *dir_path, const char *prefix,
                                   char *output, size_t output_size, size_t off,
                                   int *count, int depth)
 {
+    if (output_size == 0 || off >= output_size - 1) return off;
     if (depth > 4) return off;  /* prevent infinite recursion */
 
     DIR *dir = opendir(dir_path);
@@ -417,11 +440,23 @@ static size_t list_dir_recursive(const char *dir_path, const char *prefix,
 
         struct stat st;
         if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-            off += snprintf(output + off, output_size - off, "%s/\n", full_path);
+            int n = snprintf(output + off, output_size - off, "%s/\n", full_path);
+            if (n < 0 || (size_t)n >= output_size - off) {
+                output[off] = 0;
+                syslog(LOG_WARNING, "[%s] directory output truncated\n", TAG);
+                break;
+            }
+            off += (size_t)n;
             (*count)++;
             off = list_dir_recursive(full_path, prefix, output, output_size, off, count, depth + 1);
         } else {
-            off += snprintf(output + off, output_size - off, "%s\n", full_path);
+            int n = snprintf(output + off, output_size - off, "%s\n", full_path);
+            if (n < 0 || (size_t)n >= output_size - off) {
+                output[off] = 0;
+                syslog(LOG_WARNING, "[%s] directory output truncated\n", TAG);
+                break;
+            }
+            off += (size_t)n;
             (*count)++;
         }
     }
@@ -431,6 +466,7 @@ static size_t list_dir_recursive(const char *dir_path, const char *prefix,
 
 int tool_list_dir_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     const char *prefix = NULL;
     if (root) {

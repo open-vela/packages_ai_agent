@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <stdio.h>
+#include <time.h>
 
 #include "core/agent_loop.h"
 #include "core/message_bus.h"
@@ -29,38 +31,41 @@ struct velaclaw_client_s {
     int reply_status;
     void (*async_cb)(int, const char*, void*);
     void* async_cookie;
+    char pending_id[64];
+    uint32_t serial;
+    uint32_t started_ms;
+    uint32_t timeout_ms;
+    bool active;
 };
 
 static struct velaclaw_client_s* g_client_instance;
 
+static uint32_t client_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
 static void tap_callback(const agent_msg_t* msg, void* cookie)
 {
-    struct velaclaw_client_s* c = (struct velaclaw_client_s*)cookie;
-    if (!c) {
-        return;
-    }
-
+    struct velaclaw_client_s* c = cookie;
+    if (!c || !msg || msg->is_progress) return;
     pthread_mutex_lock(&c->mtx);
-
-    if (c->async_cb) {
-        /* Async mode: invoke user callback directly */
-        void (*cb)(int, const char*, void*) = c->async_cb;
-        void* ck = c->async_cookie;
-        c->async_cb = NULL;
-        c->async_cookie = NULL;
+    /* An old round can reply after its caller timed out and submitted a new
+     * one. Correlate the bus reply, not just the current callback slot. */
+    if (!c->active || strcmp(msg->chat_id, c->pending_id) != 0) {
         pthread_mutex_unlock(&c->mtx);
-
-        cb(0, msg->content, ck);
         return;
     }
-
-    /* Sync mode: store reply and signal */
-    free(c->reply_text);
-    c->reply_text = msg->content ? strdup(msg->content) : NULL;
-    c->reply_status = 0;
+    void (*cb)(int, const char*, void*) = c->async_cb;
+    void* ck = c->async_cookie;
+    bool expired = client_now_ms() - c->started_ms >= c->timeout_ms;
+    c->active = false;
+    c->async_cb = NULL;
+    c->async_cookie = NULL;
     pthread_mutex_unlock(&c->mtx);
-
-    sem_post(&c->reply_sem);
+    if (cb && !expired) cb(0, msg->content, ck);
 }
 
 velaclaw_client_t* velaclaw_client_open(const char* name)
@@ -68,13 +73,6 @@ velaclaw_client_t* velaclaw_client_open(const char* name)
     if (g_client_instance) {
         return g_client_instance;
     }
-
-    /* Check if message_bus is alive by trying a dummy operation */
-    agent_msg_t probe = { 0 };
-    strncpy(probe.channel, "__probe__", sizeof(probe.channel) - 1);
-
-    /* We can't easily probe, so just assume agent is running if
-     * mbus_tap_register succeeds (it uses the same global state) */
 
     struct velaclaw_client_s* c = calloc(1, sizeof(*c));
     if (!c) {
@@ -146,30 +144,39 @@ int velaclaw_ask(velaclaw_client_t* c,
         return -EINVAL;
     }
 
-    /* Set up async callback */
+    agent_msg_t msg = {0};
+    msg.content = strdup(req->text);
+    if (!msg.content) return -ENOMEM;
     pthread_mutex_lock(&c->mtx);
+    uint32_t now = client_now_ms();
+    if (c->active && now - c->started_ms < c->timeout_ms) {
+        pthread_mutex_unlock(&c->mtx);
+        free(msg.content);
+        return -EBUSY;
+    }
+    c->serial++;
+    snprintf(c->pending_id, sizeof(c->pending_id), "%s:%u",
+             c->app_id, (unsigned)c->serial);
+    c->started_ms = now;
+    c->timeout_ms = req->timeout_ms > 0 ? (uint32_t)req->timeout_ms : 300000u;
+    c->active = true;
     c->async_cb = cb;
     c->async_cookie = cookie;
+    strcpy(msg.channel, CLIENT_CHANNEL);
+    strcpy(msg.chat_id, c->pending_id);
     pthread_mutex_unlock(&c->mtx);
-
-    /* Push message to agent inbound queue */
-    agent_msg_t msg = { 0 };
-    strncpy(msg.channel, CLIENT_CHANNEL, sizeof(msg.channel) - 1);
-    strncpy(msg.chat_id, c->app_id, sizeof(msg.chat_id) - 1);
-    msg.content = strdup(req->text);
-    if (!msg.content) {
-        return -ENOMEM;
-    }
 
     int ret = message_bus_push_inbound(&msg);
     if (ret != OK) {
         free(msg.content);
         pthread_mutex_lock(&c->mtx);
-        c->async_cb = NULL;
-        c->async_cookie = NULL;
+        if (!strcmp(c->pending_id, msg.chat_id)) {
+            c->active = false;
+            c->async_cb = NULL;
+            c->async_cookie = NULL;
+        }
         pthread_mutex_unlock(&c->mtx);
         return -EIO;
     }
-
     return 0;
 }

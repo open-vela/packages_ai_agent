@@ -15,6 +15,7 @@
  */
 
 #include "tools/tool_shell.h"
+#include "tools/tool_shell_runner.h"
 #include "agent_config.h"
 #include "agent_compat.h"
 
@@ -27,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/wait.h>
+#include <stdarg.h>
 
 #include "cJSON.h"
 
@@ -34,6 +36,23 @@ static const char *TAG = "shell";
 
 #define SHELL_OUTPUT_MAX  4096
 #define SHELL_CMD_MAX     256
+
+static size_t shell_append(char *out, size_t cap, size_t off,
+                            const char *fmt, ...)
+{
+    if (!cap) return 0;
+    if (off >= cap - 1) { out[cap - 1] = 0; return cap - 1; }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - off) {
+        out[off] = 0;
+        syslog(LOG_WARNING, "[%s] metadata output truncated at %zu/%zu\n", TAG, off, cap);
+        return cap - 1;
+    }
+    return off + (size_t)n;
+}
 
 /* Commands that are too dangerous to run from LLM */
 #if AGENT_SHELL_SECURITY == AGENT_SHELL_SECURITY_ALLOWLIST
@@ -113,7 +132,11 @@ static const struct {
     const char *name;
     const char *subcmd;
 } s_vg_readonly[] = {
+#ifdef CONFIG_VG_HMI
+    { "vgmodbus",   ""       }, /* Operational AI reads snapshots, not the bus. */
+#else
     { "vgmodbus",   NULL     },
+#endif
     { "vgstats",    "dump"   },
     { "vgruntime",  "dump"   },
     { "vgcfg",      "dump"   },
@@ -209,6 +232,19 @@ static int is_blocked(const char *cmd)
         return 0;
     }
 
+#ifdef CONFIG_VG_HMI
+    /* Product shell tools only expose metadata. File operations use the
+     * guarded file tools; general utilities could bypass their path policy. */
+    static const char *metadata[] = {
+        "free", "ps", "df", "uptime", "uname", "date", "heap_info",
+        "net_status", "router_status", NULL
+    };
+    bool metadata_ok = false;
+    for (int k = 0; metadata[k]; k++)
+        if (!strcmp(name, metadata[k])) metadata_ok = true;
+    if (!metadata_ok) return 1;
+#endif
+
     /* Check whitelist first */
     for (int k = 0; s_allowed[k]; k++) {
         if (strcmp(name, s_allowed[k]) == 0)
@@ -254,12 +290,12 @@ static int builtin_ps(char *output, size_t output_size)
     if (!d) return ERROR;
 
     size_t off = 0;
-    off += snprintf(output + off, output_size - off,
+    off = shell_append(output, output_size, off,
                     "%-6s %-4s %-8s %-20s %s\n",
                     "PID", "PRI", "STACK", "STATUS", "NAME");
 
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && off < output_size - 128) {
+    while ((ent = readdir(d)) != NULL && off < output_size && output_size - off > 128) {
         /* Only numeric dirs are PIDs */
         if (ent->d_name[0] < '0' || ent->d_name[0] > '9')
             continue;
@@ -267,12 +303,12 @@ static int builtin_ps(char *output, size_t output_size)
         char path[128];
         char buf[512] = {0};
 
-        snprintf(path, sizeof(path), "/proc/%s/status", ent->d_name);
+        snprintf(path, sizeof(path), "/proc/%.32s/status", ent->d_name);
         if (read_proc_file(path, buf, sizeof(buf)) > 0) {
             /* Trim trailing newline */
             char *nl = strchr(buf, '\n');
             if (nl) *nl = '\0';
-            off += snprintf(output + off, output_size - off,
+            off = shell_append(output, output_size, off,
                             "%-6s %s\n", ent->d_name, buf);
         }
     }
@@ -285,7 +321,7 @@ static int builtin_df(char *output, size_t output_size)
 {
     static const char *mounts[] = { "/", "/tmp", "/data", NULL };
     size_t off = 0;
-    off += snprintf(output + off, output_size - off,
+    off = shell_append(output, output_size, off,
                     "%-12s %12s %12s %12s\n",
                     "Filesystem", "Total", "Used", "Free");
 
@@ -295,7 +331,7 @@ static int builtin_df(char *output, size_t output_size)
             unsigned long total = (unsigned long)sfs.f_blocks * sfs.f_bsize;
             unsigned long avail = (unsigned long)sfs.f_bavail * sfs.f_bsize;
             unsigned long used  = total - avail;
-            off += snprintf(output + off, output_size - off,
+            off = shell_append(output, output_size, off,
                             "%-12s %10luKB %10luKB %10luKB\n",
                             mounts[i], total / 1024, used / 1024, avail / 1024);
         }
@@ -390,36 +426,16 @@ static int builtin_dmesg(char *output, size_t output_size)
     return OK;
 }
 
-/* Built-in command via popen — execute a whitelisted command and capture output */
+/* Bounded command capture; keep a failure visible even when stdout exists. */
 static int builtin_popen_cmd(const char *cmd, char *output, size_t output_size)
 {
-#ifdef CONFIG_SYSTEM_POPEN
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        snprintf(output, output_size,
-                 "Failed to execute: %s (%s)", cmd, strerror(errno));
-        return ERROR;
+    int rc = tool_shell_run(cmd, output, output_size, 10000);
+    if (rc) {
+        syslog(LOG_WARNING, "[%s] command failed rc=%d (10s limit)\n", TAG, rc);
+        /* A timeout is actionable even when the command printed a prefix. */
+        snprintf(output, output_size, "Command failed: %s (%d)", strerror(-rc), rc);
     }
-
-    size_t n = fread(output, 1, output_size - 1, fp);
-    output[n] = '\0';
-    int status = pclose(fp);
-    /* NuttX pclose often returns -1 for NSH builtins even with stdout. */
-    if (n > 0) {
-        return OK;
-    }
-    if (status != 0) {
-        snprintf(output, output_size,
-                 "Command failed with exit code %d", WEXITSTATUS(status));
-        return ERROR;
-    }
-
-    return OK;
-#else
-    (void)cmd;
-    snprintf(output, output_size, "popen not available (enable CONFIG_SYSTEM_POPEN)");
-    return ERROR;
-#endif
+    return rc == 0 ? OK : ERROR;
 }
 
 /* Built-in "ls" — list directory (with path restriction) */
@@ -450,8 +466,8 @@ static int builtin_ls(const char *path, char *output, size_t output_size)
 
     size_t off = 0;
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && off < output_size - 64) {
-        off += snprintf(output + off, output_size - off, "%s\n", ent->d_name);
+    while ((ent = readdir(d)) != NULL && off < output_size && output_size - off > 64) {
+        off = shell_append(output, output_size, off, "%s\n", ent->d_name);
     }
     closedir(d);
     if (off == 0)
@@ -461,6 +477,7 @@ static int builtin_ls(const char *path, char *output, size_t output_size)
 
 int tool_run_shell_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     const char *command = NULL;
 
     cJSON *root = cJSON_Parse(input_json);
@@ -531,43 +548,7 @@ int tool_run_shell_execute(const char *input_json, char *output, size_t output_s
     } else if (strncmp(command, "am ", 3) == 0 || strcmp(command, "am") == 0) {
         ret = builtin_popen_cmd(command, cmd_buf, SHELL_OUTPUT_MAX);
     } else {
-#ifdef CONFIG_SYSTEM_POPEN
-        /* Execute via popen() - available when CONFIG_SYSTEM_POPEN is enabled.
-         * Command has already passed security checks (is_blocked). */
-        FILE *fp = popen(command, "r");
-        if (fp) {
-            size_t n = fread(cmd_buf, 1, SHELL_OUTPUT_MAX - 1, fp);
-            cmd_buf[n] = '\0';
-            int status = pclose(fp);
-            /* NuttX popen/waitpid often returns -1 for NSH builtins even
-             * when stdout is valid; treat captured output as success. */
-            if (n > 0) {
-                ret = OK;
-            } else {
-                ret = (status == 0) ? OK : ERROR;
-            }
-            if (ret != OK) {
-                snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                         "Command failed with exit code %d",
-                         WEXITSTATUS(status));
-            }
-            syslog(LOG_INFO, "[%s] popen(%s) exit=%d, %zu bytes\n",
-                   TAG, command, status, n);
-        } else {
-            syslog(LOG_ERR, "[%s] popen(%s) failed: %s\n",
-                   TAG, command, strerror(errno));
-            snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                     "Failed to execute: %s (%s)", command, strerror(errno));
-            ret = ERROR;
-        }
-#else
-        /* popen() not available - only builtin commands work */
-        syslog(LOG_WARNING, "[%s] Unsupported command: %s\n", TAG, command);
-        snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                 "Unsupported command: %s (enable CONFIG_SYSTEM_POPEN for external commands)",
-                 command);
-        ret = ERROR;
-#endif
+        ret = builtin_popen_cmd(command, cmd_buf, SHELL_OUTPUT_MAX);
     }
 
     cJSON_Delete(root);
@@ -592,6 +573,12 @@ int tool_run_shell_execute(const char *input_json, char *output, size_t output_s
             return ERROR;
         }
 
+        if (strlen(json_str) >= output_size) {
+            free(json_str);
+            syslog(LOG_WARNING, "[%s] structured output exceeds %zu bytes\n", TAG, output_size);
+            snprintf(output, output_size, "{\"exit_code\":1,\"error\":\"output too large\"}");
+            return ERROR;
+        }
         strncpy(output, json_str, output_size - 1);
         output[output_size - 1] = '\0';
         free(json_str);

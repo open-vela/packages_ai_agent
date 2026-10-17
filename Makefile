@@ -70,6 +70,7 @@ CSRCS += src/tools/tool_feishu_doc.c
 CSRCS += src/tools/tool_feishu_chat.c
 CSRCS += src/tools/tool_vision.c
 CSRCS += src/tools/tool_shell.c
+CSRCS += src/tools/tool_shell_runner.c
 CSRCS += src/tools/tool_system.c
 CSRCS += src/tools/tool_health.c
 CSRCS += src/tools/tool_control.c

@@ -50,6 +50,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_feishu_chat.c
     src/tools/tool_vision.c
     src/tools/tool_shell.c
+    src/tools/tool_shell_runner.c
     src/tools/tool_system.c
     src/tools/tool_health.c
     src/tools/tool_control.c

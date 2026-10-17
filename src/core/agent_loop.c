@@ -932,6 +932,7 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
     }
 
     agent_msg_t status = { 0 };
+    status.is_progress = true;
 
     strncpy(status.channel, msg->channel, sizeof(status.channel) - 1);
     strncpy(status.chat_id, msg->chat_id, sizeof(status.chat_id) - 1);
