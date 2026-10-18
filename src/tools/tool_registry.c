@@ -149,6 +149,14 @@ void tool_registry_register_provider(const char* name,
 
 static void register_tool(const agent_tool_t* tool)
 {
+#ifdef CONFIG_VG_HMI
+    if (!tool_guard_is_enabled(tool->name)) {
+        syslog(LOG_INFO, "[%s] Product policy hides tool: %s\n",
+            TAG, tool->name);
+        return;
+    }
+#endif
+
     if (s_tool_count >= MAX_TOOLS) {
         syslog(LOG_ERR, "[%s] Tool registry full\n", TAG);
         return;

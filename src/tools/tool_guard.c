@@ -71,6 +71,33 @@ static pthread_mutex_t s_guard_mtx = PTHREAD_MUTEX_INITIALIZER;
 #define GUARD_KEY_PREFIX "tool_enabled_"
 #define GUARD_KEY_BUF    64
 
+#ifdef CONFIG_VG_HMI
+/* VelaGuard exposes only the tools used by its Skills and board-driven
+ * rounds.  This is a hard ceiling: runtime config may disable an allowed
+ * tool, but it cannot opt an unrelated builtin back in. */
+
+static bool vg_product_tool_allowed(const char *tool_name)
+{
+    static const char *const allowed[] = {
+        "read_file",
+        "write_file",
+        "get_current_time",
+        "run_shell",
+        "vg_point_read",
+        "vg_run_report",
+        NULL
+    };
+
+    for (int i = 0; allowed[i] != NULL; i++) {
+        if (strcmp(tool_name, allowed[i]) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+#endif
+
 /* ── Sensitive field names to redact in logs ───────────────── */
 
 static const char *s_redact_keys[] = {
@@ -256,6 +283,16 @@ bool tool_guard_is_enabled(const char *tool_name)
 {
     char key[GUARD_KEY_BUF];
     char val[8];
+
+    if (tool_name == NULL || tool_name[0] == '\0') {
+        return false;
+    }
+
+#ifdef CONFIG_VG_HMI
+    if (!vg_product_tool_allowed(tool_name)) {
+        return false;
+    }
+#endif
 
     int n = snprintf(key, sizeof(key), "%s%s",
                      GUARD_KEY_PREFIX, tool_name);
