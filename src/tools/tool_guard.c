@@ -102,7 +102,9 @@ static int find_sensitive_index(const char *name)
     return -1;
 }
 
-static bool check_rate_limit(int idx)
+static void record_rate(int idx);
+
+static bool check_and_reserve_rate(int idx)
 {
     rate_state_t *rs = &s_rate[idx];
     time_t now = time(NULL);
@@ -118,7 +120,11 @@ static bool check_rate_limit(int idx)
         }
     }
 
-    return rs->count >= AGENT_TOOL_RATE_LIMIT_MAX_CALLS;
+    if (rs->count >= AGENT_TOOL_RATE_LIMIT_MAX_CALLS)
+        return false;
+
+    record_rate(idx);
+    return true;
 }
 
 static void record_rate(int idx)
@@ -217,10 +223,10 @@ tool_guard_result_t tool_guard_check(const char *tool_name,
         int idx = find_sensitive_index(tool_name);
         if (idx >= 0) {
             pthread_mutex_lock(&s_guard_mtx);
-            bool limited = check_rate_limit(idx);
+            bool reserved = check_and_reserve_rate(idx);
             pthread_mutex_unlock(&s_guard_mtx);
 
-            if (limited) {
+            if (!reserved) {
                 syslog(LOG_WARNING,
                        "[%s] Tool '%s' rate limited "
                        "(%d calls in %ds window)\n",
@@ -233,18 +239,6 @@ tool_guard_result_t tool_guard_check(const char *tool_name,
     }
 
     return GUARD_ALLOW;
-}
-
-void tool_guard_record_call(const char *tool_name)
-{
-    int idx = find_sensitive_index(tool_name);
-    if (idx < 0) {
-        return;
-    }
-
-    pthread_mutex_lock(&s_guard_mtx);
-    record_rate(idx);
-    pthread_mutex_unlock(&s_guard_mtx);
 }
 
 int tool_guard_set_enabled(const char *tool_name, bool enabled)

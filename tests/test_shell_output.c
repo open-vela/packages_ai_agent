@@ -30,6 +30,13 @@ int main(void)
         snprintf(json, sizeof(json), "{\"command\":\"%s\"}", blocked[i]);
         assert(tool_run_shell_execute(json, out, sizeof(out)) == ERROR);
     }
+    assert(is_blocked("date -s 'Oct 18 20:00:00 2026'"));
+    assert(is_blocked("date -sOct 18 20:00:00 2026"));
+    assert(is_blocked("date -u -sOct 18 20:00:00 2026"));
+    assert(!is_blocked("date"));
+    assert(!is_blocked("date -u"));
+    assert(!is_blocked("date +%s"));
+    assert(!is_blocked("date -u +%s"));
     puts("test_shell_output: OK (exact canaries, metadata bounds, product allowlist)");
     return 0;
 }

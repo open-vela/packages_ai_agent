@@ -42,13 +42,13 @@ typedef enum {
 int  tool_guard_init(void);
 void tool_guard_cleanup(void);
 
-/* Check if a tool call should be allowed. Call before execution. */
+/* Check if a tool call should be allowed.  For a sensitive tool, an allowed
+ * result atomically reserves one rate-limit slot before execution, so calls
+ * that later fail still count and concurrent callers cannot pass the limit.
+ */
 tool_guard_result_t tool_guard_check(const char *tool_name,
                                      const char *input_json,
                                      size_t input_len);
-
-/* Record a completed tool call (for rate limiting). */
-void tool_guard_record_call(const char *tool_name);
 
 /* Runtime enable/disable a tool via config store. */
 int  tool_guard_set_enabled(const char *tool_name, bool enabled);

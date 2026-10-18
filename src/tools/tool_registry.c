@@ -629,9 +629,6 @@ int tool_registry_execute(const char *name, const char *input_json,
         if (strcmp(s_tools[i].name, name) == 0) {
             syslog(LOG_INFO, "[%s] Executing tool: %s\n", TAG, name);
             int ret = s_tools[i].execute(input_json, output, output_size);
-            if (ret == OK) {
-                tool_guard_record_call(name);
-            }
             audit_tool_call(name, input_json, ret);
             return ret;
         }
@@ -641,7 +638,6 @@ int tool_registry_execute(const char *name, const char *input_json,
 #ifdef CONFIG_AI_AGENT_MCP
     if (mcp_bridge_execute(name, input_json, output, output_size) == OK) {
         syslog(LOG_INFO, "[%s] Executed MCP tool: %s\n", TAG, name);
-        tool_guard_record_call(name);
         audit_tool_call(name, input_json, OK);
         return OK;
     }
@@ -656,7 +652,6 @@ int tool_registry_execute(const char *name, const char *input_json,
         if (ret == OK) {
             syslog(LOG_INFO, "[%s] Executed %s tool: %s\n",
                    TAG, s_providers[p].name, name);
-            tool_guard_record_call(name);
             audit_tool_call(name, input_json, OK);
             return OK;
         }

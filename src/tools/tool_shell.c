@@ -159,6 +159,32 @@ static bool has_shell_meta(const char *cmd)
 }
 #endif
 
+/* date is in the metadata allowlist, but its -s option changes the realtime
+ * clock.  Keep the read-only forms and reject every other argument shape.
+ * The gate must decide this from C, not from what the model happens to emit.
+ */
+
+#if AGENT_SHELL_SECURITY == AGENT_SHELL_SECURITY_ALLOWLIST
+static bool date_args_read_only(const char *args)
+{
+    while (*args == ' ')
+        args++;
+
+    if (strncmp(args, "-u", 2) == 0 &&
+        (args[2] == '\0' || args[2] == ' ')) {
+        args += 2;
+        while (*args == ' ')
+            args++;
+    }
+
+    if (*args == '\0')
+        return true;
+
+    /* A format operand starts with '+'.  It cannot select the setter path. */
+    return *args == '+';
+}
+#endif
+
 static int is_blocked(const char *cmd)
 {
 #if AGENT_SHELL_SECURITY == AGENT_SHELL_SECURITY_DENY
@@ -209,6 +235,9 @@ static int is_blocked(const char *cmd)
     /* Strip path prefix: /bin/rm -> rm, /usr/bin/dd -> dd */
     const char *basename = strrchr(first, '/');
     const char *name = basename ? basename + 1 : first;
+
+    if (strcmp(name, "date") == 0)
+        return date_args_read_only(cmd + i) ? 0 : 1;
 
     /* VelaGuard: the agent may read board state, never change it. */
     for (int k = 0; s_vg_readonly[k].name; k++) {
