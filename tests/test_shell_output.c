@@ -35,13 +35,17 @@ int main(void)
     assert(is_blocked("date -u -sOct 18 20:00:00 2026"));
     assert(is_blocked("date +%s -s 'Oct 18 20:00:00 2026'"));
     assert(is_blocked("date -u +%s -s 'Oct 18 20:00:00 2026'"));
+    assert(is_blocked("date +%s\t-s 'Oct 18 20:00:00 2026'"));
     assert(is_blocked("date +%s extra"));
     assert(is_blocked("date -u +%s extra"));
     assert(is_blocked("date -u -u"));
     assert(is_blocked("date +"));
     assert(!is_blocked("date"));
+    assert(!is_blocked("date   "));
     assert(!is_blocked("date -u"));
+    assert(!is_blocked("date -u   "));
     assert(!is_blocked("date +%s"));
+    assert(!is_blocked("date +%s   "));
     assert(!is_blocked("date -u +%s"));
     puts("test_shell_output: OK (exact canaries, metadata bounds, product allowlist)");
     return 0;

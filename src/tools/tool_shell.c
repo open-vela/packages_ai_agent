@@ -165,23 +165,48 @@ static bool has_shell_meta(const char *cmd)
  */
 
 #if AGENT_SHELL_SECURITY == AGENT_SHELL_SECURITY_ALLOWLIST
-static bool date_args_read_only(const char *args)
+static bool date_arg_space(char c)
 {
-    while (*args == ' ')
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+           c == '\v' || c == '\f';
+}
+
+static const char *date_skip_spaces(const char *args)
+{
+    while (date_arg_space(*args))
         args++;
 
+    return args;
+}
+
+static bool date_args_read_only(const char *args)
+{
+    args = date_skip_spaces(args);
+
     if (strncmp(args, "-u", 2) == 0 &&
-        (args[2] == '\0' || args[2] == ' ')) {
+        (args[2] == '\0' || date_arg_space(args[2]))) {
         args += 2;
-        while (*args == ' ')
-            args++;
+        args = date_skip_spaces(args);
     }
 
     if (*args == '\0')
         return true;
 
-    /* A format operand starts with '+'.  It cannot select the setter path. */
-    return *args == '+';
+    if (*args != '+')
+        return false;
+
+    args++;
+    if (*args == '\0' || date_arg_space(*args))
+        return false;
+
+    while (*args != '\0' && !date_arg_space(*args))
+        args++;
+
+    /* A format is one operand.  Options after it remain options to a backend
+     * that scans past the first non-option, so the C gate must reject them
+     * before execution. */
+
+    return *date_skip_spaces(args) == '\0';
 }
 #endif
 
