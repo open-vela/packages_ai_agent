@@ -29,9 +29,11 @@
 #include <string.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "cJSON.h"
 
 static const char *TAG = "tool_files";
@@ -285,9 +287,18 @@ int tool_write_file_execute(const char *input_json, char *output, size_t output_
 
     ensure_parent_dirs(path);
 
-    FILE *f = fopen(path, "w");
-    if (!f) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (fd < 0) {
         snprintf(output, output_size, "Error: cannot open file for writing: %s (errno=%d)", path, errno);
+        cJSON_Delete(root);
+        return ERROR;
+    }
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        int err = errno;
+        close(fd);
+        snprintf(output, output_size, "Error: cannot open file stream: %s (errno=%d)", path, err);
         cJSON_Delete(root);
         return ERROR;
     }

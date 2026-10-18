@@ -33,6 +33,14 @@ int main(void)
     assert(write_path("data/velaguard/reports/runtime-report.md") < 0);
     assert(!symlink("../config", "volume/velaguard/reports/alias"));
     assert(write_path("data/velaguard/reports/alias/points.json") < 0);
+    assert(!symlink("../../../outside-vg-output",
+                    "volume/velaguard/reports/dangling-outside"));
+    assert(write_path("data/velaguard/reports/dangling-outside") < 0);
+    assert(access("outside-vg-output", F_OK) != 0);
+    assert(!symlink("../config/planted.json",
+                    "volume/velaguard/reports/dangling-protected"));
+    assert(write_path("data/velaguard/reports/dangling-protected") < 0);
+    assert(access("volume/velaguard/config/planted.json", F_OK) != 0);
     assert(!symlink("/tmp", "volume/agent/memory/escape"));
     assert(write_path("data/agent/memory/escape/nonexistent-vg-output") < 0);
     char out[256];
@@ -49,6 +57,8 @@ int main(void)
     unlink("volume/agent/config/config.json");
     unlink("volume/agent/memory/escape"); unlink("volume/agent/memory/test.md");
     unlink("volume/velaguard/reports/alias");
+    unlink("volume/velaguard/reports/dangling-outside");
+    unlink("volume/velaguard/reports/dangling-protected");
     unlink("volume/velaguard/config/points.json");
     unlink("volume/velaguard/reports/runtime-report.md");
     unlink("volume/velaguard/reports/daily-test.md");
@@ -56,6 +66,6 @@ int main(void)
     rmdir("volume/velaguard/config"); rmdir("volume/velaguard/reports");
     rmdir("volume/velaguard"); unlink("data"); rmdir("volume");
     assert(!chdir("/tmp")); assert(!rmdir(root));
-    puts("test_file_policy: OK (symlink, missing target, config, firmware facts, allowed report)");
+    puts("test_file_policy: OK (symlink, dangling target, config, firmware facts, allowed report)");
     return 0;
 }
