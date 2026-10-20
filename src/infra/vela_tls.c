@@ -15,6 +15,7 @@
  */
 
 #include "infra/vela_tls.h"
+#include "infra/http_body.h"
 #include "infra/http_proxy.h"
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -110,25 +111,6 @@ static size_t decode_chunked(char* buf, size_t len)
     }
 
     return (size_t)(dst - buf);
-}
-
-/* Check whether the raw accumulated body ends with the chunked
- * terminator ("...\r\n0\r\n\r\n", or "0\r\n\r\n" for an empty body).
- * Without this check the read loop below blocks on keep-alive
- * connections until the server closes them (~60s idle timeout),
- * tripping the agent's 60s LLM watchdog. */
-static int chunked_end_seen(const char* buf, size_t len)
-{
-    static const char term_empty[] = "0\r\n\r\n";
-    static const char term_last[] = "\r\n0\r\n\r\n";
-    size_t n1 = sizeof(term_empty) - 1; /* 5 */
-    size_t n2 = sizeof(term_last) - 1;  /* 7 */
-
-    if (len >= n2 && memcmp(buf + len - n2, term_last, n2) == 0)
-        return 1;
-    if (len >= n1 && memcmp(buf + len - n1, term_empty, n1) == 0)
-        return 1;
-    return 0;
 }
 
 /* ── TLS context ─────────────────────────────────────────────── */
@@ -721,26 +703,44 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     memcpy(resp_buf, body_start, copy);
     resp_pos = copy;
 
-    /* Keep reading body */
-    if (!eof) {
-        while (resp_pos < resp_cap - 1) {
-            if (content_length >= 0 && (long)resp_pos >= content_length)
-                break;
-            if (chunked && chunked_end_seen(resp_buf, resp_pos))
-                break;
-            ret = mbedtls_ssl_read(&ctx->ssl,
-                (unsigned char*)(resp_buf + resp_pos),
-                resp_cap - 1 - resp_pos);
-            if (ret > 0) {
-                resp_pos += (size_t)ret;
-                if (chunked && chunked_end_seen(resp_buf, resp_pos))
-                    break;
-            } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-                break;
-            } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
-                break;
-            }
+    /* Keep reading body.
+     *
+     * The end condition depends on how the response is framed.  Before this
+     * only Content-Length was honoured, so a chunked reply on a keep-alive
+     * connection kept reading after its terminating chunk until the socket
+     * timed out.  vela_http_body_complete() applies RFC 9112 6.3: chunked
+     * ends at the zero chunk, Content-Length ends at its count, and an
+     * unframed reply ends when the peer closes.
+     *
+     * Completeness is tested before every read, including the first, because
+     * the initial fragment copied above may already hold the whole body.  A
+     * read issued after that would wait for bytes that will never arrive. */
+
+    while (!eof && resp_pos < resp_cap - 1) {
+        if (vela_http_body_complete(chunked, content_length, resp_pos,
+                resp_buf)) {
+            break;
         }
+        ret = mbedtls_ssl_read(&ctx->ssl,
+            (unsigned char*)(resp_buf + resp_pos),
+            resp_cap - 1 - resp_pos);
+        if (ret > 0) {
+            resp_pos += (size_t)ret;
+        } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            break;
+        } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
+            break;
+        }
+    }
+
+    if (vela_http_body_unframed(chunked, content_length) && !eof) {
+        /* No length information: the wait can only end by the peer closing
+         * or by the socket timeout.  Name it, so an inflated body_ms on such
+         * a reply is not read as slow generation. */
+
+        syslog(LOG_WARNING,
+            "[%s] response has neither Content-Length nor chunked framing; "
+            "body end depends on the peer closing\n", TAG);
     }
 
     resp_buf[resp_pos] = '\0';
@@ -1171,17 +1171,22 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
     memcpy(resp_buf, body_start, copy);
     resp_pos = copy;
 
-    /* Keep reading body */
-    if (!eof) {
-        while (resp_pos < resp_cap - 1) {
-            if (content_length >= 0 && (long)resp_pos >= content_length)
-                break;
-            ssize_t n = read(fd, resp_buf + resp_pos, resp_cap - 1 - resp_pos);
-            if (n <= 0)
-                break;
-            resp_pos += (size_t)n;
+    /* Keep reading body, with the same framing rules as the TLS path. */
+
+    while (!eof && resp_pos < resp_cap - 1) {
+        if (vela_http_body_complete(chunked, content_length, resp_pos,
+                resp_buf)) {
+            break;
         }
+
+        ssize_t n = read(fd, resp_buf + resp_pos, resp_cap - 1 - resp_pos);
+        if (n <= 0) {
+            break;
+        }
+
+        resp_pos += (size_t)n;
     }
+
     resp_buf[resp_pos] = '\0';
     free(raw);
     close(fd);
