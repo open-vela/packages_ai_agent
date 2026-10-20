@@ -589,6 +589,13 @@ static int tls_write_request(tls_ctx_t* ctx,
  */
 #define TLS_RAW_BUF_SIZE 8192  /* 8KB: enough for HTTP headers + initial body */
 
+/* Receive progress: a gap at or above this many milliseconds between reads is
+ * recorded, up to VELA_TLS_PROGRESS_MAX entries.  Below the gap limit the
+ * reply is arriving steadily and needs no per-read trace. */
+
+#define VELA_TLS_PROGRESS_GAP_MS 1000
+#define VELA_TLS_PROGRESS_MAX    8
+
 /* Number of static raw buffers — at most 2, scaled to pool size.
  * Each buffer is 8KB; pool=1 uses 1 buffer, pool>=2 uses 2. */
 #define TLS_RAW_BUF_COUNT (CONN_POOL_SIZE < 2 ? 1 : 2)
@@ -641,6 +648,16 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     int eof = 0;
     int ret;
     bool first_byte_seen = false;
+
+    /* Receive progress.  A reply that delivers its body in one or two reads
+     * leaves gaps at zero and prints nothing. */
+
+    uint32_t last_read_ms = t0;
+    uint32_t first_read_ms = 0;
+    int gaps = 0;
+    int32_t progress_gap[VELA_TLS_PROGRESS_MAX];
+    uint32_t progress_at[VELA_TLS_PROGRESS_MAX];
+    uint32_t progress_bytes[VELA_TLS_PROGRESS_MAX];
 
     /* Read until we have the full header (double CRLF) or buffer full */
     while (!eof && raw_len < TLS_RAW_BUF_SIZE - 1) {
@@ -747,10 +764,67 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
             resp_cap - 1 - resp_pos);
         if (ret > 0) {
             resp_pos += (size_t)ret;
+
+            /* Receive progress for slow replies.
+             *
+             * A body that takes minutes can be arriving steadily, arriving in
+             * bursts after long silences, or already complete while the caller
+             * waits on something else.  Reporting cumulative bytes with the
+             * gap since the previous read separates those without logging any
+             * content.  Only replies that pass the threshold are traced, so a
+             * normal round stays quiet. */
+
+            uint32_t now = agent_mono_ms();
+
+            if (gaps == 0 && first_read_ms == 0) {
+                first_read_ms = now;
+            }
+
+            /* Idle is measured from the previous read inside this loop, not
+             * from t0.  On the first iteration last_read_ms is still t0, so
+             * the initial server wait would be counted twice: once as ttfb
+             * and again as a body gap.  Seed it at the first byte instead. */
+
+            if (last_read_ms == t0) {
+                last_read_ms = now;
+            }
+
+            int32_t idle = agent_elapsed_ms(last_read_ms, now);
+
+            if (idle >= VELA_TLS_PROGRESS_GAP_MS) {
+                if (gaps < VELA_TLS_PROGRESS_MAX) {
+                    progress_gap[gaps] = idle;
+                    progress_at[gaps] = agent_elapsed_ms(t0, now);
+                    progress_bytes[gaps] = (uint32_t)resp_pos;
+                }
+                gaps++;
+            }
+
+            last_read_ms = now;
         } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
             break;
         } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
             break;
+        }
+    }
+
+    /* One line per slow reply.  deltas says how many gaps were seen, which
+     * can exceed the stored entries; the entries are the worst ones seen
+     * first, so a truncated list still shows the shape of the wait. */
+
+    if (timing != NULL && gaps > 0) {
+        int shown = gaps < VELA_TLS_PROGRESS_MAX ? gaps : VELA_TLS_PROGRESS_MAX;
+
+        syslog(LOG_INFO,
+            "[%s] body progress: gaps=%d first_read=%ldms total=%u bytes\n",
+            TAG, gaps,
+            (long)agent_elapsed_ms(t0, first_read_ms), (unsigned)resp_pos);
+
+        for (int i = 0; i < shown; i++) {
+            syslog(LOG_INFO,
+                "[%s] body gap %d: idle=%ldms at=%ums bytes=%u\n",
+                TAG, i + 1, (long)progress_gap[i], (unsigned)progress_at[i],
+                (unsigned)progress_bytes[i]);
         }
     }
 

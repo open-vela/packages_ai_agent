@@ -71,6 +71,7 @@ typedef struct {
     int http_rc; /* raw transport return value */
     int http_status; /* parsed HTTP status, 0 when unknown */
     uint32_t req_bytes; /* serialized request size */
+    uint32_t resp_bytes; /* HTTP body bytes received */
     uint16_t attempt; /* 1-based attempt within this LLM call */
 
     bool reused; /* request ran on a pooled connection */

@@ -49,6 +49,7 @@ void agent_timing_reset(agent_llm_timing_t* t)
     t->http_rc = 0;
     t->http_status = 0;
     t->req_bytes = 0;
+    t->resp_bytes = 0;
     t->attempt = 1;
 
     /* Fused is a property of how the phase is measured, not of whether it
@@ -78,7 +79,8 @@ void agent_timing_no_transport(agent_llm_timing_t* t)
 #define TIMING_HTTP_FMT \
     "iter=%d attempt=%u reused=%u proxy=%u dns_tcp=%s%s setup=%s tls=%s " \
     "send=%s ttfb=%s body=%s pool=%s build=%s parse=%s " \
-    "http=%s backoff=%s total=%s req=%lu rc=%d status=%d parse_ok=%u"
+    "http=%s backoff=%s total=%s req=%lu resp=%lu rc=%d status=%d " \
+    "parse_ok=%u"
 
 #define TIMING_HTTP_ARGS(t, iteration, pool, dns, setup, tls, send, ttfb, \
     body, build, parse, http, total, backoff) \
@@ -97,7 +99,8 @@ void agent_timing_no_transport(agent_llm_timing_t* t)
         na_or_ms((http), sizeof(http), (t)->http_total_ms), \
         na_or_ms((backoff), sizeof(backoff), (t)->backoff_ms), \
         na_or_ms((total), sizeof(total), (t)->llm_total_ms), \
-        (unsigned long)(t)->req_bytes, (t)->http_rc, (t)->http_status, \
+        (unsigned long)(t)->req_bytes, (unsigned long)(t)->resp_bytes, \
+        (t)->http_rc, (t)->http_status, \
         (t)->parse_ok ? 1u : 0u
 
 int agent_timing_format_http(char* buf, size_t cap, int iteration,

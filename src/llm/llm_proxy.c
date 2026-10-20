@@ -898,6 +898,11 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     free(post_data);
 
+    /* Size of the reply as it arrived, before any parsing.  This is what the
+     * body phase waited for; the parsed counters below say what was in it. */
+
+    timing->resp_bytes = (uint32_t)rb.len;
+
     /* Parsing is timed from here, so it excludes the request build and the
      * network wait and can be compared with them directly. */
 
@@ -1051,6 +1056,36 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
     if (out_timing != NULL) {
         *out_timing = local;
+    }
+
+    /* Response composition.
+     *
+     * A body that takes minutes to arrive says nothing by itself about what
+     * is inside it.  These counters split the bytes by the part of the reply
+     * they belong to (visible text, reasoning, tool-call arguments), and put
+     * them next to the server's own token counts, so an oversized reply can
+     * be attributed instead of guessed at.  Sizes only: no content is logged.
+     */
+
+    {
+        size_t reasoning_bytes = resp->reasoning_content
+            ? strlen(resp->reasoning_content) : 0;
+        size_t tool_arg_bytes = 0;
+
+        for (int i = 0; i < resp->call_count; i++) {
+            if (resp->calls[i].input != NULL) {
+                tool_arg_bytes += resp->calls[i].input_len;
+            }
+        }
+
+        syslog(LOG_INFO,
+            "[%s] Resp bytes=%u text=%u reasoning=%u toolargs=%u calls=%d "
+            "finish=%s tokens=%d/%d/%d\n",
+            TAG, (unsigned)timing->resp_bytes, (unsigned)resp->text_len,
+            (unsigned)reasoning_bytes, (unsigned)tool_arg_bytes,
+            resp->call_count,
+            resp->tool_use ? "tool_calls" : "end_turn",
+            resp->prompt_tokens, resp->completion_tokens, resp->total_tokens);
     }
 
     syslog(LOG_INFO,
