@@ -832,7 +832,10 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     /* Fix the moment the request body was ready.  Retries must report the
      * same build cost; taking it from mark again later would fold the
-     * previous HTTP call into it. */
+     * previous HTTP call into it.  mark has not moved since call_t0 on this
+     * path, so it is advanced here rather than measured against itself. */
+
+    mark = agent_mono_ms();
 
     uint32_t build_ms = agent_elapsed_ms(call_t0, mark);
 
