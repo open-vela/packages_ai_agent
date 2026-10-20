@@ -30,6 +30,7 @@
 #include "infra/cron_service.h"
 #include "infra/heartbeat.h"
 #include "llm/llm_proxy.h"
+#include "llm/llm_cache.h"
 #ifdef CONFIG_AI_AGENT_MCP
 #include "tools/mcp_client.h"
 #endif
@@ -118,6 +119,8 @@ static void cmd_help(void)
         "  config_show          - Show current configuration\n"
         "  config_reset         - Clear all runtime config\n"
         "  ask <text>           - Chat with AI Agent\n"
+        "  point_shortcut [on|off] - Single-point reply shortcut (default off; not saved)\n"
+        "  cache_clear          - Drop cached LLM replies\n"
         "  heartbeat_trigger    - Manually trigger heartbeat check\n"
         "  cron_start           - Start cron scheduler\n"
 #ifdef CONFIG_AI_AGENT_NODE
@@ -1010,6 +1013,13 @@ static void* cli_thread(void* arg)
             }
             printf("point shortcut: %s\n",
                 agent_point_reply_enabled() ? "on" : "off");
+        } else if (strcmp(cmd, "cache_clear") == 0) {
+            /* The response cache replays a reply without calling the model.
+             * Measurements that count requests need it empty, and a value
+             * answer cached a minute ago is stale by definition. */
+
+            llm_cache_cleanup();
+            printf("LLM response cache cleared.\n");
         } else if (strcmp(cmd, "set_mqtt") == 0)
             cmd_set_mqtt(argc, argv);
         else if (strcmp(cmd, "set_volc_key") == 0)

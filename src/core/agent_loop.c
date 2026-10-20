@@ -400,16 +400,27 @@ static void add_tool_result_messages(cJSON* messages,
 
 /* ── Fast path counters ─────────────────────────────────── */
 
-/* A/B switch for the single-point reply shortcut.  Default on; the NSH
- * command "point_shortcut off" disables it so the same firmware can measure
- * both arms without a reflash.  Not persisted: a reboot restores the
- * default, so a measured regression cannot outlive the test. */
+/* A/B switch for the single-point reply shortcut.  Default off: the shortcut
+ * is an experiment and stays out of the production path until the board
+ * measurement shows it gains time without losing correctness.  The NSH
+ * command "point_shortcut on" enables it for a measurement run.  Not
+ * persisted: a reboot restores the default, so a test setting cannot
+ * outlive the experiment. */
 
-static volatile bool s_point_reply_disabled = false;
+static volatile bool s_point_reply_disabled = true;
 
 void agent_point_reply_set_enabled(bool enabled)
 {
     s_point_reply_disabled = !enabled;
+
+    /* Both arms receive the same user message, so a response cached under
+     * one arm would be replayed verbatim under the other and hide the effect
+     * under test.  The cache also bypasses the model completely, which turns
+     * a two-request round into a zero-request one.  Dropping it on every
+     * switch keeps each measured round honest. */
+
+    llm_cache_cleanup();
+
     syslog(LOG_INFO, "[%s] point reply shortcut %s\n", TAG,
         enabled ? "enabled" : "disabled");
 }
@@ -1139,6 +1150,12 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     int last_total_tokens = 0;
     bool watchdog_fired = false;
     bool tool_break = false;
+
+    /* Set when the reply was rendered from a live sample.  Such a reply
+     * carries a value and an age that were true at render time; replaying it
+     * from the response cache minutes later would state an old reading as
+     * the current one. */
+    bool reply_from_sample = false;
     VG_HEAP_SCAN("react_enter");
 
     /* Router: select and apply best backend before first LLM call.
@@ -1432,14 +1449,28 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
              * file-op branch and only fires on that exact shape. */
 
             if (strcmp(resp.calls[0].name, "vg_point_read") == 0
-                && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0
-                && !s_point_reply_disabled) {
-                char* direct = vg_point_reply_from_tool_output(tool_output);
+                && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
+                if (s_point_reply_disabled) {
+                    syslog(LOG_INFO,
+                        "[%s] Point shortcut skipped: switched off\n", TAG);
+                } else {
+                    vg_point_reply_verdict_t verdict = VG_POINT_REPLY_HIT;
+                    char* direct = vg_point_reply_render(tool_output,
+                        msg->content, &verdict);
 
-                if (direct != NULL) {
-                    final_text = direct;
-                    llm_response_free(&resp);
-                    break;
+                    /* One line per round, hit or not: the miss reason is the
+                     * only way to tell a correct fall-through from a
+                     * shortcut that never fires. */
+
+                    syslog(LOG_INFO, "[%s] Point shortcut: %s\n", TAG,
+                        vg_point_reply_verdict_name(verdict));
+
+                    if (direct != NULL) {
+                        final_text = direct;
+                        reply_from_sample = true;
+                        llm_response_free(&resp);
+                        break;
+                    }
                 }
             }
 
@@ -1536,8 +1567,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
 
 send_reply:
-    /* Cache store: save simple query responses for future reuse */
-    if (final_text && msg->content
+    /* Cache store: save simple query responses for future reuse.  A reply
+     * built from a live sample is excluded: the cache TTL is minutes and the
+     * sample age is seconds, so a hit would present a stale reading as the
+     * current value. */
+    if (final_text && msg->content && !reply_from_sample
         && complexity == LLM_COMPLEXITY_SIMPLE
         && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
         llm_cache_put(msg->content, strlen(msg->content), final_text);

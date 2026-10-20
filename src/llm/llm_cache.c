@@ -195,6 +195,10 @@ void llm_cache_cleanup(void)
     for (int i = 0; i < LLM_CACHE_SLOTS; i++) {
         free(s_slots[i].response);
         s_slots[i].response = NULL;
+        s_slots[i].hash = 0;
+        s_slots[i].ts = 0;
+        s_slots[i].hits = 0;
+        s_slots[i].tokens = 0;
     }
     pthread_mutex_unlock(&s_cache_lock);
 }

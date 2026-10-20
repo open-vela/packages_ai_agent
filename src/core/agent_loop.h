@@ -34,19 +34,20 @@ int agent_loop_start(void);
 /** Start agent_loop once; safe to call after late Wi-Fi connect. */
 int agent_loop_ensure_started(void);
 bool agent_loop_is_running(void);
-#ifdef CONFIG_VG_HMI
-void agent_loop_request_start(void);
-
 /**
  * A/B switch for the single-point reply shortcut.
  *
- * When enabled (the default), a lone vg_point_read that resolved to one
- * point is answered from the tool output instead of a second model call.
- * Disabling restores the previous two-request behaviour for measurement.
- * Not persisted.
+ * A lone vg_point_read that resolved to one point, from a question that only
+ * asks for the current value, is answered from the tool output instead of a
+ * second model call.  Off by default; "point_shortcut on" enables it for a
+ * measurement run.  Switching also clears the response cache, because a
+ * cached reply would be replayed under both arms.  Not persisted.
  */
 void agent_point_reply_set_enabled(bool enabled);
 bool agent_point_reply_enabled(void);
+
+#ifdef CONFIG_VG_HMI
+void agent_loop_request_start(void);
 bool agent_loop_is_requested(void);
 #endif
 
