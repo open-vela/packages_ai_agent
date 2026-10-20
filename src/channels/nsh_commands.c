@@ -1000,6 +1000,16 @@ static void* cli_thread(void* arg)
         else if (strcmp(cmd, "quit") == 0) {
             cmd_quit();
             break;
+        } else if (strcmp(cmd, "point_shortcut") == 0) {
+            /* Measurement switch: on/off, or no argument to report.  Kept
+             * out of persisted config so a test setting cannot survive a
+             * reboot and quietly change production behaviour. */
+
+            if (argc >= 2) {
+                agent_point_reply_set_enabled(strcmp(argv[1], "on") == 0);
+            }
+            printf("point shortcut: %s\n",
+                agent_point_reply_enabled() ? "on" : "off");
         } else if (strcmp(cmd, "set_mqtt") == 0)
             cmd_set_mqtt(argc, argv);
         else if (strcmp(cmd, "set_volc_key") == 0)

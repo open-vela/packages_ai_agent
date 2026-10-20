@@ -47,6 +47,7 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/mqttc/MQTT-C/include
 CSRCS += src/core/message_bus.c
 CSRCS += src/core/message_bus_tap.c
 CSRCS += src/core/agent_loop.c
+CSRCS += src/core/point_reply.c
 CSRCS += src/core/agent_trace.c
 CSRCS += src/core/context_builder.c
 CSRCS += src/core/memory_store.c

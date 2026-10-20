@@ -19,6 +19,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/core/message_bus.c
     src/core/message_bus_tap.c
     src/core/agent_loop.c
+    src/core/point_reply.c
     src/core/agent_trace.c
     src/core/context_builder.c
     src/core/memory_store.c

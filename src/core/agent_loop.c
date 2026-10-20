@@ -25,6 +25,7 @@
 #include "core/agent_loop.h"
 #include "core/agent_mem.h"
 #include "core/agent_trace.h"
+#include "core/point_reply.h"
 #include "infra/agent_timing.h"
 #include "core/context_builder.h"
 #include "core/message_bus.h"
@@ -224,6 +225,18 @@ static void trace_tool_done(void* ctx, int iteration, const char* name,
     agent_trace_tool((agent_trace_t*)ctx, iteration, name, ms, out_bytes, ok);
 }
 
+/* ── Deterministic single-point reply ──────────────────────── */
+
+/* A question like "what is the UPS load" costs two LLM round-trips: one to
+ * pick vg_point_read and one to restate the number the tool already
+ * returned.  The second call exists only to reword a value that is already
+ * decided, and it carries the same multi-second server wait as the first.
+ *
+ * The rendering lives in core/point_reply.c so the host test can exercise
+ * every shape without linking the agent loop.  It returns NULL for anything
+ * that needs wording rather than echoing, and this caller then leaves the
+ * reply to the model as before. */
+
 /* Add one role:"tool" message per tool result (OpenAI format).
  * When call_count > 1, all tools run in parallel threads.
  * Uses memory pool for parallel buffers, with heap fallback.
@@ -386,6 +399,25 @@ static void add_tool_result_messages(cJSON* messages,
 }
 
 /* ── Fast path counters ─────────────────────────────────── */
+
+/* A/B switch for the single-point reply shortcut.  Default on; the NSH
+ * command "point_shortcut off" disables it so the same firmware can measure
+ * both arms without a reflash.  Not persisted: a reboot restores the
+ * default, so a measured regression cannot outlive the test. */
+
+static volatile bool s_point_reply_disabled = false;
+
+void agent_point_reply_set_enabled(bool enabled)
+{
+    s_point_reply_disabled = !enabled;
+    syslog(LOG_INFO, "[%s] point reply shortcut %s\n", TAG,
+        enabled ? "enabled" : "disabled");
+}
+
+bool agent_point_reply_enabled(void)
+{
+    return !s_point_reply_disabled;
+}
 
 static int s_fast_path_count = 0;
 static int s_llm_path_count = 0;
@@ -1394,6 +1426,23 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
          * the LLM to aggregate results (and tool_output would be stale
          * from a prior iteration if we allowed call_count > 1 here). */
         if (resp.call_count == 1) {
+            /* A single vg_point_read that resolved to one point needs no
+             * second round-trip: the tool output already carries the name,
+             * value, unit, age and online state.  This is checked before the
+             * file-op branch and only fires on that exact shape. */
+
+            if (strcmp(resp.calls[0].name, "vg_point_read") == 0
+                && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0
+                && !s_point_reply_disabled) {
+                char* direct = vg_point_reply_from_tool_output(tool_output);
+
+                if (direct != NULL) {
+                    final_text = direct;
+                    llm_response_free(&resp);
+                    break;
+                }
+            }
+
             bool all_local = true;
             for (int i = 0; i < resp.call_count; i++) {
                 if (strcmp(resp.calls[i].name, "read_file") != 0
