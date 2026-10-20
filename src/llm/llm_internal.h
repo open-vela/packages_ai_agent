@@ -32,6 +32,7 @@
 #include "cJSON.h"
 #include "agent_compat.h"
 #include "agent_config.h"
+#include "infra/agent_timing.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,7 +53,7 @@ void resp_buf_free(resp_buf_t* rb);
 /* ── HTTP call (routes through direct or proxy path) ──────── */
 
 int llm_http_call(const char* post_data, resp_buf_t* rb,
-    int* out_status);
+    int* out_status, agent_llm_timing_t* timing);
 
 /* ── Config snapshot helpers ──────────────────────────────── */
 

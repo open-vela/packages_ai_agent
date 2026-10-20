@@ -73,10 +73,18 @@ typedef struct {
 
 void llm_response_free(llm_response_t* resp);
 
+/**
+ * One tool-calling chat round-trip (with 429 retries).
+ *
+ * @param out_timing  Optional.  Receives the phases of the last attempt and
+ *                    the totals for the whole call.  Reset internally, so
+ *                    the caller may hand over uninitialised storage.
+ */
 int llm_chat_tools(const char* system_prompt,
     cJSON* messages,
     const char* tools_json,
-    llm_response_t* resp);
+    llm_response_t* resp,
+    agent_llm_timing_t* out_timing);
 
 bool llm_proxy_echo_reasoning(void);
 

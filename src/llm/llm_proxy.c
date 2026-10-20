@@ -352,7 +352,7 @@ const char* model_name_for_api(const char* model, const char* host)
 
 /* Direct path via vela_tls */
 static int llm_http_direct(const char* post_data, resp_buf_t* rb,
-    int* out_status)
+    int* out_status, agent_llm_timing_t* timing)
 {
     /* Snapshot config under lock */
     char api_key[128], llm_host[128], llm_path[128], llm_port[8], model[64];
@@ -403,11 +403,19 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
         /* Call the request API rather than the post_json wrapper: the wrapper
          * discards the body length, and without it a reply that filled the
          * buffer is indistinguishable from a complete one. */
-        status = vela_https_request(llm_host, llm_port, "POST", llm_path, hdrs,
-            post_data, strlen(post_data), rb->data, raw_cap, &body_len);
+        status = vela_https_request_timed(llm_host, llm_port, "POST", llm_path,
+            hdrs, post_data, strlen(post_data), rb->data, raw_cap, &body_len,
+            timing);
     } else {
         status = vela_http_post_json(llm_host, llm_port, llm_path, hdrs, post_data,
             rb->data, raw_cap);
+        if (timing != NULL) {
+            /* The plain-HTTP helper has no phase hooks; it is used for
+             * intranet endpoints only, never the MiMo path.  Say the phases
+             * are unknown rather than borrowing the TLS ones. */
+
+            agent_timing_no_transport(timing);
+        }
     }
 
     if (status < 0) {
@@ -435,8 +443,17 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
 
 /* Proxy path via CONNECT tunnel */
 static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
-    int* out_status)
+    int* out_status, agent_llm_timing_t* timing)
 {
+    if (timing != NULL) {
+        /* proxy_conn_* hides the tunnel, the handshake and the read loop
+         * behind one opaque API, so only the total is measurable.  The
+         * caller's llm_total_ms still brackets this call. */
+
+        timing->proxy = true;
+        agent_timing_no_transport(timing);
+    }
+
     /* Snapshot config under lock */
     char api_key[128], llm_host[128], llm_path[128], llm_port[8], model[64];
     pthread_mutex_lock(&s_llm_lock);
@@ -527,7 +544,7 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
 }
 
 int llm_http_call(const char* post_data, resp_buf_t* rb,
-    int* out_status)
+    int* out_status, agent_llm_timing_t* timing)
 {
     /* For plain HTTP endpoints (port != 443), always use direct path.
      * The proxy does CONNECT + TLS which fails on non-TLS endpoints.
@@ -537,6 +554,10 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
     pthread_mutex_lock(&s_llm_lock);
     use_tls = (strcmp(s_llm_port, "443") == 0);
     pthread_mutex_unlock(&s_llm_lock);
+
+    /* timing, when present, describes one attempt.  The caller fills in
+     * backoff_ms and attempt before each call, so nothing is overwritten
+     * here except what this attempt itself measured. */
 
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
     int retry_max = network_get_retry_max();
@@ -556,9 +577,9 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
         }
 
         if (use_tls && http_proxy_is_enabled()) {
-            ret = llm_http_via_proxy(post_data, rb, out_status);
+            ret = llm_http_via_proxy(post_data, rb, out_status, timing);
         } else {
-            ret = llm_http_direct(post_data, rb, out_status);
+            ret = llm_http_direct(post_data, rb, out_status, timing);
         }
 
         if (ret == OK) {
@@ -585,8 +606,8 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
     return ERROR;
 #else
     if (use_tls && http_proxy_is_enabled())
-        return llm_http_via_proxy(post_data, rb, out_status);
-    return llm_http_direct(post_data, rb, out_status);
+        return llm_http_via_proxy(post_data, rb, out_status, timing);
+    return llm_http_direct(post_data, rb, out_status, timing);
 #endif
 }
 
@@ -683,7 +704,7 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 
         rb.len = 0;
         status = 0;
-        err = llm_http_call(post_data, &rb, &status);
+        err = llm_http_call(post_data, &rb, &status, NULL);
 
         if (err != OK) {
             resp_buf_free(&rb);
@@ -732,8 +753,20 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 
 
 int llm_chat_tools(const char* system_prompt, cJSON* messages,
-    const char* tools_json, llm_response_t* resp)
+    const char* tools_json, llm_response_t* resp,
+    agent_llm_timing_t* out_timing)
 {
+    /* Local timing always exists so the code paths stay identical whether or
+     * not the caller asked for it.  out_timing is a one-time copy at the end:
+     * there is no shared state and no allocation. */
+
+    agent_llm_timing_t local;
+    agent_llm_timing_t* timing = &local;
+    uint32_t call_t0 = agent_mono_ms();
+    uint32_t mark = call_t0;
+
+    agent_timing_reset(timing);
+
     memset(resp, 0, sizeof(*resp));
 
     /* Snapshot config under lock */
@@ -748,6 +781,10 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     pthread_mutex_unlock(&s_llm_lock);
 
     if (api_key[0] == '\0') {
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -785,8 +822,22 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     cJSON_Delete(body);
     if (!post_data) {
+        timing->build_ms = agent_lap_ms(&mark);
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
+
+    /* Fix the moment the request body was ready.  Retries must report the
+     * same build cost; taking it from mark again later would fold the
+     * previous HTTP call into it. */
+
+    uint32_t build_ms = agent_elapsed_ms(call_t0, mark);
+
+    timing->build_ms = build_ms;
+    timing->req_bytes = (uint32_t)strlen(post_data);
 
     syslog(LOG_INFO,
         "[%s] OpenAI API with tools (model: %s, %d bytes)\n",
@@ -797,21 +848,41 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     int err = ERROR;
     int retry;
 
+    /* Only the last attempt's transport phases are kept; backoff_ms and
+     * attempt say how many tries it took to get there.  Attempts are not
+     * summed because the phases would no longer add up to one request. */
+
     for (retry = 0; retry <= AGENT_LLM_MAX_RETRIES; retry++) {
+        unsigned int delay = 0;
+
         if (retry > 0) {
-            unsigned int delay = AGENT_LLM_RETRY_BASE_SEC << (retry - 1);
+            delay = AGENT_LLM_RETRY_BASE_SEC << (retry - 1);
             syslog(LOG_WARNING, "[%s] Rate limited (429), retry %d/%d after %us\n",
                 TAG, retry, AGENT_LLM_MAX_RETRIES, delay);
             sleep(delay);
         }
 
+        agent_timing_reset(timing);
+        timing->build_ms = build_ms;
+        timing->req_bytes = (uint32_t)strlen(post_data);
+        timing->backoff_ms = (int32_t)(delay * 1000u);
+        timing->attempt = (uint16_t)(retry + 1);
+
         rb.len = 0;
         status = 0;
-        err = llm_http_call(post_data, &rb, &status);
+        mark = agent_mono_ms();
+        err = llm_http_call(post_data, &rb, &status, timing);
+        timing->http_total_ms = agent_elapsed_ms(mark, agent_mono_ms());
+        timing->http_rc = err;
+        timing->http_status = status;
 
         if (err != OK) {
+            timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
             resp_buf_free(&rb);
             free(post_data);
+            if (out_timing != NULL) {
+                *out_timing = local;
+            }
             return err;
         }
 
@@ -824,10 +895,20 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     free(post_data);
 
+    /* Parsing is timed from here, so it excludes the request build and the
+     * network wait and can be compared with them directly. */
+
+    mark = agent_mono_ms();
+
     if (status != 200) {
         syslog(LOG_ERR, "[%s] API error %d: %.500s\n", TAG, status,
             rb.data ? rb.data : "");
+        timing->parse_ms = agent_lap_ms(&mark);
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
         resp_buf_free(&rb);
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -836,6 +917,12 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     resp_buf_free(&rb);
     if (!root) {
         syslog(LOG_ERR, "[%s] Failed to parse API JSON\n", TAG);
+        timing->parse_ms = agent_lap_ms(&mark);
+        timing->parse_ok = false;
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -844,6 +931,12 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     if (!choices || !cJSON_IsArray(choices) || !choices->child) {
         cJSON_Delete(root);
+        timing->parse_ms = agent_lap_ms(&mark);
+        timing->parse_ok = false;
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -949,6 +1042,13 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     parse_ns_xml_tool_calls(resp);
 
     cJSON_Delete(root);
+
+    timing->parse_ms = agent_lap_ms(&mark);
+    timing->parse_ok = true;
+    timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+    if (out_timing != NULL) {
+        *out_timing = local;
+    }
 
     syslog(LOG_INFO,
         "[%s] Response: %d bytes text, %d tool calls, finish=%s\n",

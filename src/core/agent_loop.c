@@ -25,6 +25,7 @@
 #include "core/agent_loop.h"
 #include "core/agent_mem.h"
 #include "core/agent_trace.h"
+#include "infra/agent_timing.h"
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
@@ -191,6 +192,8 @@ typedef struct {
     char* output;
     size_t output_size;
     bool from_pool;
+    uint32_t start_ms; /* monotonic, set by the worker when it starts */
+    int32_t elapsed_ms; /* AGENT_T_NA until the worker finishes */
     char channel[16];
     char chat_id[64];
 } tool_task_t;
@@ -202,39 +205,67 @@ static void* tool_exec_thread(void* arg)
     t->output[0] = '\0';
     char* patched = inject_cron_context(
         t->call->name, t->call->input, t->channel, t->chat_id);
+    t->start_ms = agent_mono_ms();
     agent_tool_exec_streamed(t->call->name,
         patched ? patched : t->call->input,
         t->output, t->output_size);
+    t->elapsed_ms = agent_elapsed_ms(t->start_ms, agent_mono_ms());
     free(patched);
-    syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n",
-        TAG, t->call->name, (int)strlen(t->output));
+    syslog(LOG_INFO, "[%s] Tool %s result: %d bytes, %ld ms\n",
+        TAG, t->call->name, (int)strlen(t->output), (long)t->elapsed_ms);
     return NULL;
+}
+
+/* Adapter from the per-tool callback to the structured trace. */
+
+static void trace_tool_done(void* ctx, int iteration, const char* name,
+    uint32_t ms, size_t out_bytes, bool ok)
+{
+    agent_trace_tool((agent_trace_t*)ctx, iteration, name, ms, out_bytes, ok);
 }
 
 /* Add one role:"tool" message per tool result (OpenAI format).
  * When call_count > 1, all tools run in parallel threads.
- * Uses memory pool for parallel buffers, with heap fallback. */
+ * Uses memory pool for parallel buffers, with heap fallback.
+ *
+ * Each result is reported through on_tool() so the trace can record the real
+ * tool time.  Before this, the only number near a tool name was the LLM call
+ * time, which made a 97 s model response look like a 97 s tool. */
+
+typedef void (*tool_done_fn)(void* ctx, int iteration, const char* name,
+    uint32_t ms, size_t out_bytes, bool ok);
+
 static void add_tool_result_messages(cJSON* messages,
     const llm_response_t* resp, char* tool_output,
     size_t tool_output_size, const char* msg_channel,
-    const char* msg_chat_id)
+    const char* msg_chat_id, int iteration, tool_done_fn on_tool, void* ctx)
 {
     int n = resp->call_count;
 
     if (n == 1) {
         const llm_tool_call_t* call = &resp->calls[0];
+        uint32_t t0;
+        int32_t tool_ms;
 
         syslog(LOG_INFO, "[%s] Tool call: %s args=%.500s\n", TAG,
             call->name, call->input ? call->input : "(null)");
         tool_output[0] = '\0';
         char* patched = inject_cron_context(
             call->name, call->input, msg_channel, msg_chat_id);
+        t0 = agent_mono_ms();
         agent_tool_exec_streamed(call->name,
             patched ? patched : call->input,
             tool_output, tool_output_size);
+        tool_ms = agent_elapsed_ms(t0, agent_mono_ms());
         free(patched);
-        syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n", TAG,
-            call->name, (int)strlen(tool_output));
+        syslog(LOG_INFO, "[%s] Tool %s result: %d bytes, %ld ms\n", TAG,
+            call->name, (int)strlen(tool_output), (long)tool_ms);
+
+        if (on_tool != NULL) {
+            on_tool(ctx, iteration, call->name,
+                tool_ms == AGENT_T_NA ? 0u : (uint32_t)tool_ms,
+                strlen(tool_output), true);
+        }
 
         cJSON* result_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(result_msg, "role", "tool");
@@ -256,6 +287,7 @@ static void add_tool_result_messages(cJSON* messages,
             sizeof(tasks[i].channel) - 1);
         strncpy(tasks[i].chat_id, msg_chat_id ? msg_chat_id : "",
             sizeof(tasks[i].chat_id) - 1);
+        tasks[i].elapsed_ms = AGENT_T_NA;
 
         char* buf = s_pool_ready
             ? agent_pool_acquire(&s_tool_pool)
@@ -272,6 +304,7 @@ static void add_tool_result_messages(cJSON* messages,
 
         if (!tasks[i].output) {
             threads[i] = 0;
+            tasks[i].elapsed_ms = AGENT_T_NA;
             continue;
         }
 
@@ -329,6 +362,19 @@ static void add_tool_result_messages(cJSON* messages,
                     ? tasks[i].output
                     : "{}");
             cJSON_AddItemToArray(messages, result_msg);
+
+            /* Parallel rounds run one thread per call, so wall time and CPU
+             * time differ; report each tool's own span and let the reader
+             * compare them instead of summing. */
+
+            if (on_tool != NULL) {
+                on_tool(ctx, iteration, resp->calls[i].name,
+                    tasks[i].elapsed_ms == AGENT_T_NA
+                        ? 0u
+                        : (uint32_t)tasks[i].elapsed_ms,
+                    tasks[i].output ? strlen(tasks[i].output) : 0u,
+                    tasks[i].elapsed_ms != AGENT_T_NA);
+            }
         }
 
         if (tasks[i].from_pool) {
@@ -851,7 +897,7 @@ static char* force_finish_reply(const char* system_prompt,
     char* result = NULL;
     struct timespec t0, t1;
     mono_now(&t0);
-    int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+    int err = llm_chat_tools(system_prompt, messages, NULL, &resp, NULL);
     mono_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
@@ -1022,7 +1068,7 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
     char* result = NULL;
     struct timespec t0, t1;
     mono_now(&t0);
-    int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+    int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp, NULL);
     mono_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
@@ -1101,11 +1147,26 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         llm_response_t resp;
         struct timespec tv_start, tv_end;
+        agent_llm_timing_t timing;
         VG_HEAP_SCAN("before_llm");
         mono_now(&tv_start);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp,
+            &timing);
         mono_now(&tv_end);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+
+        /* Per-attempt phase breakdown.  The old trace line put this number
+         * next to tool=, which read as if the tool took 97 s when it was the
+         * LLM call; the tool is timed separately below. */
+
+        {
+            char line[512];
+
+            if (agent_timing_format_http(line, sizeof(line), iteration,
+                    &timing) > 0) {
+                agent_trace_log(&trace, "http", line);
+            }
+        }
 
         /* Router failover: on LLM call failure, try next backend */
         if (err != OK && router_idx >= 0) {
@@ -1122,9 +1183,22 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 llm_response_free(&resp);
                 mono_now(&tv_start);
                 err = llm_chat_tools(sys_prompt, messages,
-                    tools_json, &resp);
+                    tools_json, &resp, &timing);
                 mono_now(&tv_end);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+
+                /* The failover attempt replaces the first one in the
+                 * breakdown: they are alternatives, not parts of one
+                 * request, and summing them would overstate the wait. */
+
+                {
+                    char line[512];
+
+                    if (agent_timing_format_http(line, sizeof(line),
+                            iteration, &timing) > 0) {
+                        agent_trace_log(&trace, "http", line);
+                    }
+                }
             }
         }
 
@@ -1222,9 +1296,18 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
                     mono_now(&tv_start);
                     err = llm_chat_tools(sys_prompt, messages,
-                        tools_json, &resp);
+                        tools_json, &resp, &timing);
                     mono_now(&tv_end);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+
+                    {
+                        char line[512];
+
+                        if (agent_timing_format_http(line, sizeof(line),
+                                iteration, &timing) > 0) {
+                            agent_trace_log(&trace, "http", line);
+                        }
+                    }
 
                     /* Watchdog check on cascade retry */
                     if (llm_call_timed_out(latency_ms)) {
@@ -1287,7 +1370,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         if (should_break) {
             add_assistant_message(messages, &resp);
             add_tool_result_messages(messages, &resp, tool_output,
-                tool_size, msg->channel, msg->chat_id);
+                tool_size, msg->channel, msg->chat_id, iteration,
+                trace_tool_done, &trace);
             llm_response_free(&resp);
             tool_break = true;
             break;
@@ -1296,7 +1380,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         add_assistant_message(messages, &resp);
         VG_HEAP_SCAN("asst_added");
         add_tool_result_messages(messages, &resp, tool_output,
-            tool_size, msg->channel, msg->chat_id);
+            tool_size, msg->channel, msg->chat_id, iteration,
+            trace_tool_done, &trace);
         VG_HEAP_SCAN("tools_done");
 
         /* Local tool shortcut: if the single tool in this round is a

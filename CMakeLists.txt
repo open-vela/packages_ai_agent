@@ -30,6 +30,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/llm/llm_router.c
     src/llm/llm_cache.c
     src/infra/http_proxy.c
+    src/infra/agent_timing.c
     src/infra/vela_tls.c
     src/infra/config_store.c
     src/infra/network_manager.c

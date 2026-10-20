@@ -15,6 +15,7 @@
  */
 
 #include "core/agent_trace.h"
+#include "infra/agent_timing.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +64,7 @@ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
 
     t->status = AGENT_TRACE_RUNNING;
     t->backend_idx = -1;
+    t->start_mono_ms = agent_mono_ms();
 
     syslog(LOG_INFO,
         "[%s:%s] BEGIN chat=%s chan=%s",
@@ -88,20 +90,39 @@ void agent_trace_step(agent_trace_t* t, int iteration,
         t->backend_idx);
 }
 
+void agent_trace_tool(agent_trace_t* t, int iteration, const char* tool_name,
+    uint32_t ms, size_t output_bytes, bool ok)
+{
+    t->total_tool_ms += ms;
+
+    syslog(LOG_INFO,
+        "[%s:%s] tool_iter=%d tool=%s tool_ms=%u out=%u ok=%u",
+        TAG, t->run_id, iteration,
+        (tool_name && tool_name[0]) ? tool_name : "(none)",
+        (unsigned)ms, (unsigned)output_bytes, ok ? 1u : 0u);
+}
+
+void agent_trace_log(agent_trace_t* t, const char* kind, const char* text)
+{
+    syslog(LOG_INFO, "[%s:%s] %s %s",
+        TAG, t->run_id, kind ? kind : "-", text ? text : "");
+}
+
 void agent_trace_end(agent_trace_t* t, int status)
 {
-    struct timeval tv;
-
-    gettimeofday(&tv, NULL);
     t->status = status;
 
-    uint32_t elapsed = (uint32_t)tv.tv_sec - t->start_ts;
+    /* Monotonic, so an SNTP correction during the round cannot stretch or
+     * shrink the summary.  The user-visible wall time still comes from the
+     * board round layer, which brackets accept to reply. */
+
+    int32_t elapsed = agent_elapsed_ms(t->start_mono_ms, agent_mono_ms());
 
     syslog(LOG_INFO,
         "[%s:%s] END status=%s iters=%d tools=%d "
-        "llm_ms=%u elapsed=%us backend=%d",
+        "llm_ms=%u tool_ms=%u elapsed_ms=%ld backend=%d",
         TAG, t->run_id, status_str(status),
         t->iteration + 1, t->total_tool_calls,
-        (unsigned)t->total_latency_ms, (unsigned)elapsed,
-        t->backend_idx);
+        (unsigned)t->total_latency_ms, (unsigned)t->total_tool_ms,
+        (long)elapsed, t->backend_idx);
 }

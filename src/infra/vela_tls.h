@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "agent_timing.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -71,6 +73,32 @@ int vela_https_request(
     size_t            resp_cap,
     size_t           *out_body_len  /* optional: actual body bytes written, or NULL */
 );
+
+/**
+ * Same request, with per-phase timing.
+ *
+ * @param timing  Optional.  When non-NULL the transport fills in the phases
+ *                it can see: pool reuse, fused DNS+TCP, TLS handshake, send,
+ *                first response byte and body.  Phases that did not run stay
+ *                at AGENT_T_NA.  The caller owns the struct and must reset
+ *                it before each attempt.
+ *
+ * Splitting DNS from TCP is deliberately not attempted: mbedtls_net_connect()
+ * performs both in one call, and a second resolver call would change the
+ * latency being measured.  dns_tcp_ms is therefore reported as fused.
+ */
+int vela_https_request_timed(
+    const char       *host,
+    const char       *port,
+    const char       *method,
+    const char       *path,
+    const vela_header_t *headers,
+    const char       *body,
+    size_t            body_len,
+    char             *resp_buf,
+    size_t            resp_cap,
+    size_t           *out_body_len,
+    agent_llm_timing_t *timing);
 
 /**
  * Convenience wrapper for GET with no extra headers or body.

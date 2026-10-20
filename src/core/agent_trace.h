@@ -30,6 +30,8 @@
  *   3 = timeout (iteration limit reached)
  */
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -46,10 +48,12 @@ typedef struct {
     char run_id[17]; /* 16 hex chars + NUL */
     char chat_id[64];
     char channel[16];
-    uint32_t start_ts; /* epoch seconds */
+    uint32_t start_ts; /* epoch seconds, for correlating with other logs */
+    uint32_t start_mono_ms; /* CLOCK_MONOTONIC at begin, for elapsed */
     int iteration; /* current iteration number */
     int backend_idx; /* current router backend index */
     uint32_t total_latency_ms; /* cumulative LLM latency */
+    uint32_t total_tool_ms; /* cumulative tool execution time */
     int total_tool_calls; /* cumulative tool call count */
     int status; /* AGENT_TRACE_* */
 } agent_trace_t;
@@ -61,14 +65,33 @@ void agent_trace_begin(agent_trace_t* t, const char* chat_id,
     const char* channel);
 
 /**
- * Log one iteration step (after each LLM call + tool execution).
+ * Log one iteration step.
+ *
+ * latency_ms is the LLM call time, not the tool time; the tool ran after
+ * this number was taken.  Use agent_trace_tool() for the tool itself.  The
+ * field name latency is kept because the acceptance scripts match on it.
  */
 void agent_trace_step(agent_trace_t* t, int iteration,
     const char* tool_name, uint32_t latency_ms,
     int llm_ok);
 
 /**
- * End the trace and log the summary.
+ * Log one tool execution: wall time, name, phase, result size and success.
+ * Separate from agent_trace_step() so the two waits never share a field.
+ */
+void agent_trace_tool(agent_trace_t* t, int iteration, const char* tool_name,
+    uint32_t ms, size_t output_bytes, bool ok);
+
+/**
+ * Emit one free-form line under this run_id, e.g. the "http" phase line.
+ * The text must not contain credentials or business payloads.
+ */
+void agent_trace_log(agent_trace_t* t, const char* kind, const char* text);
+
+/**
+ * End the trace and log the summary.  elapsed comes from CLOCK_MONOTONIC;
+ * the wall clock jumps forward when SNTP syncs, and a summary measured
+ * across such a jump used to report a round longer than it was.
  */
 void agent_trace_end(agent_trace_t* t, int status);
 

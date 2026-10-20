@@ -131,6 +131,7 @@ CSRCS += src/infra/cron_service.c
 CSRCS += src/infra/heartbeat.c
 CSRCS += src/infra/network_manager.c
 CSRCS += src/infra/http_proxy.c
+CSRCS += src/infra/agent_timing.c
 CSRCS += src/infra/vela_tls.c
 
 ifeq ($(CONFIG_AI_AGENT_BLE_GATT),y)

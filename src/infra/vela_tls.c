@@ -248,9 +248,15 @@ void vela_tls_pool_cleanup(void)
     pthread_mutex_unlock(&s_pool_lock);
 }
 
-static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
+/* Timing is optional so the other callers (Feishu, vision, web search) keep
+ * their current behaviour.  The marks are taken back to back, so
+ * dns_tcp + tls_setup + tls add up to the whole connect. */
+
+static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
+    agent_llm_timing_t* timing)
 {
     int ret;
+    uint32_t mark = agent_mono_ms();
 
     mbedtls_ssl_init(&ctx->ssl);
     mbedtls_ssl_config_init(&ctx->cfg);
@@ -277,6 +283,10 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         clock_settime(CLOCK_REALTIME, &ts);
     }
 
+    if (timing != NULL) {
+        timing->tls_setup_ms = agent_lap_ms(&mark);
+    }
+
     /* TCP connect — use HTTP CONNECT proxy if configured */
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
     {
@@ -289,6 +299,14 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
 #endif
 
     if (http_proxy_is_enabled()) {
+        if (timing != NULL) {
+            /* The tunnel also covers reaching the proxy, so the phase is
+             * still one combined connect.  The LLM layer marks the proxy
+             * path separately when it sees http_proxy_is_enabled(). */
+
+            timing->fused_dns_tcp = true;
+        }
+
         int tunnel_fd = proxy_open_tunnel(host, atoi(port), 30000);
         if (tunnel_fd < 0) {
             syslog(LOG_ERR, "[%s] proxy tunnel to %s:%s failed\n",
@@ -306,6 +324,15 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
                 TAG, host, port, -ret);
             return VELA_TLS_ERR_CONNECT;
         }
+    }
+
+    if (timing != NULL) {
+        /* Resolver and connect happen inside one call above.  Reporting
+         * them as a combined phase is accurate; inventing a split would
+         * not be. */
+
+        timing->dns_tcp_ms = agent_lap_ms(&mark);
+        timing->fused_dns_tcp = true;
     }
 
     /* Force blocking mode and set socket-level read timeout.
@@ -391,6 +418,11 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
     mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
         mbedtls_net_send, mbedtls_net_recv, NULL);
 
+    /* Timer for the handshake starts here, after configuration.  Setup cost
+     * is already accounted for in tls_setup_ms so the two do not overlap. */
+
+    mark = agent_mono_ms();
+
     /* Handshake */
     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -407,6 +439,10 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
             }
             return VELA_TLS_ERR_HANDSHAKE;
         }
+    }
+
+    if (timing != NULL) {
+        timing->tls_ms = agent_lap_ms(&mark);
     }
 
     syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
@@ -588,20 +624,33 @@ static void tls_raw_release(char* buf)
     }
 }
 
+/* t0 is the moment the request finished sending, so ttfb_ms covers the
+ * server's wait before the first response byte.  The first byte is the
+ * status line: this path is not streamed, so it is not a model token. */
+
 static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
-    size_t* out_body_len, bool* out_keep_alive)
+    size_t* out_body_len, bool* out_keep_alive, uint32_t t0,
+    agent_llm_timing_t* timing)
 {
     /* Use static buffers to avoid heap fragmentation */
     char* raw = tls_raw_acquire();
     size_t raw_len = 0;
     int eof = 0;
     int ret;
+    bool first_byte_seen = false;
 
     /* Read until we have the full header (double CRLF) or buffer full */
     while (!eof && raw_len < TLS_RAW_BUF_SIZE - 1) {
         ret = mbedtls_ssl_read(&ctx->ssl,
             (unsigned char*)(raw + raw_len),
             TLS_RAW_BUF_SIZE - 1 - raw_len);
+        if (ret > 0 && !first_byte_seen) {
+            first_byte_seen = true;
+            if (timing != NULL) {
+                timing->ttfb_ms = agent_elapsed_ms(t0, agent_mono_ms());
+            }
+        }
+
         if (ret > 0) {
             raw_len += (size_t)ret;
             if (memmem(raw, raw_len, "\r\n\r\n", 4))
@@ -697,6 +746,18 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     resp_buf[resp_pos] = '\0';
     tls_raw_release(raw);
 
+    if (timing != NULL && first_byte_seen) {
+        /* Measured from the first byte, so headers and body form one span
+         * and never overlap ttfb_ms. */
+
+        timing->body_ms = agent_elapsed_ms(t0, agent_mono_ms())
+            - timing->ttfb_ms;
+        if (timing->body_ms < 0) {
+            timing->body_ms = AGENT_T_NA;
+        }
+    }
+
+
     /* A body that filled the caller's buffer was cut off mid-stream.  The
      * caller only sees a short string, so a JSON consumer reports a syntax
      * error that does not exist in the server's reply.  Name the real cause
@@ -721,7 +782,7 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
 
 /* ── Public API ──────────────────────────────────────────────── */
 
-int vela_https_request(
+int vela_https_request_timed(
     const char* host,
     const char* port,
     const char* method,
@@ -731,12 +792,21 @@ int vela_https_request(
     size_t body_len,
     char* resp_buf,
     size_t resp_cap,
-    size_t* out_body_len)
+    size_t* out_body_len,
+    agent_llm_timing_t* timing)
 {
     int ret;
+    uint32_t mark = agent_mono_ms();
 
     /* Try to get a pooled connection first */
     conn_slot_t* slot = pool_acquire(host, port);
+
+    if (timing != NULL) {
+        /* Pool time covers waiting for the global pool lock as well as the
+         * slot scan, so it is the real price of serialized requests. */
+
+        timing->pool_ms = agent_lap_ms(&mark);
+    }
 
     if (slot && slot->valid) {
         /* Drain any leftover data from previous response before reuse.
@@ -766,10 +836,20 @@ int vela_https_request(
 
         /* Reuse existing connection — skip TLS handshake */
         syslog(LOG_DEBUG, "[%s] Reusing pooled connection to %s:%s\n", TAG, host, port);
+        if (timing != NULL) {
+            timing->reused = true;
+        }
+
+        mark = agent_mono_ms();
         ret = tls_write_request(&slot->ctx, method, host, path, headers, body, body_len);
+        if (timing != NULL) {
+            timing->send_ms = agent_lap_ms(&mark);
+        }
+
         if (ret == 0) {
             bool keep = false;
-            ret = tls_read_response(&slot->ctx, resp_buf, resp_cap, out_body_len, &keep);
+            ret = tls_read_response(&slot->ctx, resp_buf, resp_cap, out_body_len,
+                &keep, mark, timing);
             if (ret > 0) {
                 pool_release(slot, host, port, keep);
                 return ret;
@@ -780,46 +860,84 @@ int vela_https_request(
         syslog(LOG_INFO, "[%s] Pooled connection stale, reconnecting\n", TAG);
         tls_ctx_free(&slot->ctx);
         slot->valid = false;
+        if (timing != NULL) {
+            /* The reuse did not happen; the retry below pays for a full
+             * connect, and the breakdown has to say so. */
+
+            timing->reused = false;
+        }
     }
 
     /* New connection */
     if (!slot) {
         /* Pool full — use a temporary ephemeral context */
         tls_ctx_t tmp_ctx;
-        if ((ret = tls_ctx_connect(&tmp_ctx, host, port)) != 0) {
+        if ((ret = tls_ctx_connect(&tmp_ctx, host, port, timing)) != 0) {
             tls_ctx_free(&tmp_ctx);
             return ret;
         }
+        mark = agent_mono_ms();
         if ((ret = tls_write_request(&tmp_ctx, method, host, path,
                  headers, body, body_len))
             != 0) {
+            if (timing != NULL) {
+                timing->send_ms = agent_lap_ms(&mark);
+            }
             syslog(LOG_ERR, "[%s] Write request failed: %d\n", TAG, ret);
             tls_ctx_free(&tmp_ctx);
             return ret;
         }
-        ret = tls_read_response(&tmp_ctx, resp_buf, resp_cap, out_body_len, NULL);
+        if (timing != NULL) {
+            timing->send_ms = agent_lap_ms(&mark);
+        }
+        ret = tls_read_response(&tmp_ctx, resp_buf, resp_cap, out_body_len,
+            NULL, mark, timing);
         tls_ctx_free(&tmp_ctx);
         return ret;
     }
 
     /* Connect into the slot */
-    if ((ret = tls_ctx_connect(&slot->ctx, host, port)) != 0) {
+    if ((ret = tls_ctx_connect(&slot->ctx, host, port, timing)) != 0) {
         pool_release(slot, host, port, false);
         return ret;
     }
 
+    mark = agent_mono_ms();
     if ((ret = tls_write_request(&slot->ctx, method, host, path,
              headers, body, body_len))
         != 0) {
+        if (timing != NULL) {
+            timing->send_ms = agent_lap_ms(&mark);
+        }
         syslog(LOG_ERR, "[%s] Write request failed: %d\n", TAG, ret);
         pool_release(slot, host, port, false);
         return ret;
     }
+    if (timing != NULL) {
+        timing->send_ms = agent_lap_ms(&mark);
+    }
 
     bool keep = false;
-    ret = tls_read_response(&slot->ctx, resp_buf, resp_cap, out_body_len, &keep);
+    ret = tls_read_response(&slot->ctx, resp_buf, resp_cap, out_body_len,
+        &keep, mark, timing);
     pool_release(slot, host, port, ret > 0 && keep);
     return ret;
+}
+
+int vela_https_request(
+    const char* host,
+    const char* port,
+    const char* method,
+    const char* path,
+    const vela_header_t* headers,
+    const char* body,
+    size_t body_len,
+    char* resp_buf,
+    size_t resp_cap,
+    size_t* out_body_len)
+{
+    return vela_https_request_timed(host, port, method, path, headers, body,
+        body_len, resp_buf, resp_cap, out_body_len, NULL);
 }
 
 int vela_https_get(const char* host, const char* port, const char* path,
@@ -859,7 +977,7 @@ int vela_https_head_date(const char* host, const char* port, const char* path,
     tls_ctx_t ctx;
     int ret;
 
-    if ((ret = tls_ctx_connect(&ctx, host, port)) != 0) {
+    if ((ret = tls_ctx_connect(&ctx, host, port, NULL)) != 0) {
         tls_ctx_free(&ctx);
         return ret;
     }
