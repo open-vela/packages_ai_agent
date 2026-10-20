@@ -119,7 +119,7 @@ static void cmd_help(void)
         "  config_show          - Show current configuration\n"
         "  config_reset         - Clear all runtime config\n"
         "  ask <text>           - Chat with AI Agent\n"
-        "  point_shortcut [on|off] - Single-point reply shortcut (default off; not saved)\n"
+        "  point_shortcut [on|off] - Single-point reply shortcut (default on; not saved)\n"
         "  cache_clear          - Drop cached LLM replies\n"
         "  heartbeat_trigger    - Manually trigger heartbeat check\n"
         "  cron_start           - Start cron scheduler\n"

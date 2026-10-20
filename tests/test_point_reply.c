@@ -155,6 +155,17 @@ static void test_fall_through(void)
         "line without ok", VG_POINT_REPLY_INCOMPLETE);
     expect_null("", "empty input", VG_POINT_REPLY_NOT_TOOL_OUTPUT);
     expect_null(NULL, "null input", VG_POINT_REPLY_NOT_TOOL_OUTPUT);
+
+    /* A space inside a field would be cut in half by %s and echoed wrong:
+     * unit "V AC" would render as "230 V".  The point table rejects such a
+     * unit today, but the reply must not depend on that rule holding. */
+
+    expect_null("vgquery: point id=volt name=A相电压 value=230 "
+                "unit=V AC ok=1 age_ms=800\n",
+        "space inside unit", VG_POINT_REPLY_INCOMPLETE);
+    expect_null("vgquery: point id=volt name=A 相电压 value=230 "
+                "unit=V ok=1 age_ms=800\n",
+        "space inside name", VG_POINT_REPLY_INCOMPLETE);
 }
 
 /* 5. A fresh sample is not enough when the question asks for an explanation,
@@ -200,6 +211,45 @@ static void test_explanation_questions(void)
 
     if (!vg_point_reply_is_direct_question(DIRECT_QUESTION)) {
         printf("FAIL: a plain value question must be direct\n");
+        s_failures++;
+    }
+}
+
+/* 5b. A question whose bytes are not valid UTF-8 cannot be matched against
+ *     the keyword tables, so it must not take the shortcut: that is exactly
+ *     what an explanation question looks like when a console sends it in the
+ *     wrong code page. */
+
+static void test_malformed_question(void)
+{
+    /* "为什么" in GBK.  Valid bytes, invalid UTF-8 as a whole. */
+    static const char gbk[] = { (char)0xce, (char)0xaa, (char)0xca, (char)0xc3,
+                                (char)0xb8, (char)0xba, (char)0x00 };
+    const char* in = "vgquery: point id=ups_load name=UPS负载 value=42.5 "
+                     "unit=% ok=1 age_ms=900\n";
+    vg_point_reply_verdict_t got = VG_POINT_REPLY_HIT;
+    char* out = render(in, gbk, &got);
+
+    if (out != NULL) {
+        printf("FAIL: malformed question must reach the model, got: %s\n", out);
+        s_failures++;
+        free(out);
+    } else if (got != VG_POINT_REPLY_NOT_DIRECT) {
+        printf("FAIL: malformed question reason %s, expected not_direct\n",
+            vg_point_reply_verdict_name(got));
+        s_failures++;
+    }
+
+    /* A truncated multibyte sequence at the end is malformed too.  Note
+     * "\xe6\xb8\xa9" alone would be a complete 「温」; cut it after 2 bytes. */
+    if (vg_point_reply_is_direct_question("\xe6\xb8")) {
+        printf("FAIL: truncated UTF-8 must not be direct\n");
+        s_failures++;
+    }
+
+    /* A valid CJK question still passes. */
+    if (!vg_point_reply_is_direct_question("温度多少")) {
+        printf("FAIL: valid CJK question must be direct\n");
         s_failures++;
     }
 }
@@ -271,6 +321,7 @@ int main(void)
     test_value_verbatim();
     test_fall_through();
     test_explanation_questions();
+    test_malformed_question();
     test_multi_point_questions();
     test_id_fallback();
     test_missing_unit();

@@ -39,9 +39,10 @@ bool agent_loop_is_running(void);
  *
  * A lone vg_point_read that resolved to one point, from a question that only
  * asks for the current value, is answered from the tool output instead of a
- * second model call.  Off by default; "point_shortcut on" enables it for a
- * measurement run.  Switching also clears the response cache, because a
- * cached reply would be replayed under both arms.  Not persisted.
+ * second model call.  On by default; "point_shortcut off" restores the
+ * two-request path for re-measurement.  Switching also clears the response
+ * cache, because a cached reply would be replayed under both arms.  Not
+ * persisted.
  */
 void agent_point_reply_set_enabled(bool enabled);
 bool agent_point_reply_enabled(void);

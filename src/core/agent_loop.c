@@ -400,14 +400,16 @@ static void add_tool_result_messages(cJSON* messages,
 
 /* ── Fast path counters ─────────────────────────────────── */
 
-/* A/B switch for the single-point reply shortcut.  Default off: the shortcut
- * is an experiment and stays out of the production path until the board
- * measurement shows it gains time without losing correctness.  The NSH
- * command "point_shortcut on" enables it for a measurement run.  Not
- * persisted: a reboot restores the default, so a test setting cannot
- * outlive the experiment. */
+/* A/B switch for the single-point reply shortcut.  Default on: the board
+ * measurement (2026-10-20, docs/maintenance-evidence/2026-10-20/
+ * rsp03-shortcut-ab.md) showed 1 request instead of 2-4 for a hit, a median
+ * round of 5.82 s against 10.68 s, and 11/11 correct values, with every
+ * explanation, multi-point, stale, offline and ambiguous round still falling
+ * through to the model.  The NSH command "point_shortcut off" restores the
+ * two-request path so a regression can be re-measured without a reflash.
+ * Not persisted: a reboot restores the default. */
 
-static volatile bool s_point_reply_disabled = true;
+static volatile bool s_point_reply_disabled = false;
 
 void agent_point_reply_set_enabled(bool enabled)
 {

@@ -53,6 +53,41 @@ static const char* const s_multi_point_terms[] = {
     NULL
 };
 
+/* The tool writes "key=value" fields separated by single spaces, and no
+ * field value may contain a space (the point table rejects one).  %s stops at
+ * the first space regardless, so a value that did contain one would be cut in
+ * half and echoed wrong: unit "V AC" would render as "230 V".  A reply must
+ * not depend on the writer's validation holding, so check the shape here:
+ * after "vgquery: point" every space-separated piece has to be a key=value
+ * pair.  A stray fragment is exactly what a space inside a value looks like. */
+
+static bool fields_are_well_formed(const char* tool_output)
+{
+    static const char prefix[] = "vgquery: point ";
+    const char* p = tool_output + sizeof(prefix) - 1;
+
+    while (*p != '\0' && *p != '\n' && *p != '\r') {
+        const char* end = p;
+        const char* eq;
+
+        while (*end != '\0' && *end != ' ' && *end != '\n' && *end != '\r') {
+            end++;
+        }
+
+        eq = memchr(p, '=', (size_t)(end - p));
+        if (eq == NULL || eq == p) {
+            return false;
+        }
+
+        p = end;
+        while (*p == ' ') {
+            p++;
+        }
+    }
+
+    return true;
+}
+
 static bool contains_any(const char* text, const char* const* terms)
 {
     int i;
@@ -65,9 +100,74 @@ static bool contains_any(const char* text, const char* const* terms)
     return false;
 }
 
+/* The keyword tables are the only thing standing between a question that
+ * needs an explanation and an echoed number.  They can only match text that
+ * arrives intact, so a question whose bytes are not valid UTF-8 (a console
+ * in the wrong code page, a truncated channel) would silently take the
+ * shortcut: "why is the load high" in mojibake has none of the keywords.
+ * Refuse anything that is not well-formed UTF-8 and let the model, which
+ * tolerates it, see the round. */
+
+static bool is_valid_utf8(const char* s)
+{
+    const unsigned char* p = (const unsigned char*)s;
+
+    while (*p != '\0') {
+        unsigned int bytes;
+        unsigned int min_cp;
+        unsigned int cp;
+        unsigned int i;
+
+        if (*p < 0x80) {
+            p++;
+            continue;
+        }
+
+        if ((*p & 0xe0) == 0xc0) {
+            bytes = 2;
+            min_cp = 0x80;
+            cp = *p & 0x1fu;
+        } else if ((*p & 0xf0) == 0xe0) {
+            bytes = 3;
+            min_cp = 0x800;
+            cp = *p & 0x0fu;
+        } else if ((*p & 0xf8) == 0xf0) {
+            bytes = 4;
+            min_cp = 0x10000;
+            cp = *p & 0x07u;
+        } else {
+            return false;
+        }
+
+        p++;
+
+        for (i = 1; i < bytes; i++) {
+            if ((p[0] & 0xc0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (p[0] & 0x3fu);
+            p++;
+        }
+
+        /* Overlong forms, surrogates and out-of-range code points are not
+         * text a keyword table can reason about. */
+
+        if (cp < min_cp || cp > 0x10ffffu
+            || (cp >= 0xd800u && cp <= 0xdfffu)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool vg_point_reply_is_direct_question(const char* question)
 {
     if (question == NULL || question[0] == '\0') {
+        return false;
+    }
+
+    if (!is_valid_utf8(question)) {
         return false;
     }
 
@@ -188,6 +288,14 @@ char* vg_point_reply_render(const char* tool_output, const char* question,
         || sscanf(value, " value=%31s", value_buf) != 1
         || sscanf(unit, " unit=%15s", unit_buf) != 1
         || sscanf(age, " age_ms=%lu", &age_ms) != 1) {
+        why = VG_POINT_REPLY_INCOMPLETE;
+        goto fall_through;
+    }
+
+    /* A value containing a space would be cut in half by %s and echoed
+     * wrong.  Require the line to be made of key=value pieces only. */
+
+    if (!fields_are_well_formed(tool_output)) {
         why = VG_POINT_REPLY_INCOMPLETE;
         goto fall_through;
     }
