@@ -25,6 +25,7 @@
 #include "cJSON.h"
 #include "agent_compat.h"
 #include "agent_config.h"
+#include "infra/agent_timing.h"
 #include <stdbool.h>
 #include <stddef.h>
 

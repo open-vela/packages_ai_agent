@@ -252,6 +252,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
              strlen(pers)))
         != 0) {
         syslog(LOG_ERR, "[%s] ctr_drbg_seed ret=0x%x\n", TAG, -ret);
+        if (timing != NULL) {
+            timing->tls_setup_ms = agent_lap_ms(&mark);
+        }
         return VELA_TLS_ERR_HANDSHAKE;
     }
 
@@ -299,19 +302,30 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
         syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
             TAG, tunnel_fd, host, port);
     } else {
-        if ((ret = mbedtls_net_connect(&ctx->net, host, port,
-                 MBEDTLS_NET_PROTO_TCP))
-            != 0) {
+        ret = mbedtls_net_connect(&ctx->net, host, port,
+            MBEDTLS_NET_PROTO_TCP);
+
+        /* The connect time is recorded before looking at the result.  It
+         * used to be recorded only on success, so a connect that burned 81 s
+         * of SYN retries before failing left dns_tcp at na and the wait
+         * appeared only in the http total.  A failed connect is still a
+         * measured connect. */
+
+        if (timing != NULL) {
+            timing->dns_tcp_ms = agent_lap_ms(&mark);
+            timing->fused_dns_tcp = true;
+        }
+
+        if (ret != 0) {
             syslog(LOG_ERR, "[%s] net_connect %s:%s ret=0x%x\n",
                 TAG, host, port, -ret);
             return VELA_TLS_ERR_CONNECT;
         }
     }
 
-    if (timing != NULL) {
-        /* Resolver and connect happen inside one call above.  Reporting
-         * them as a combined phase is accurate; inventing a split would
-         * not be. */
+    if (timing != NULL && timing->dns_tcp_ms == AGENT_T_NA) {
+        /* Proxy path: the tunnel call above also covers reaching the proxy,
+         * so it is one combined connect. */
 
         timing->dns_tcp_ms = agent_lap_ms(&mark);
         timing->fused_dns_tcp = true;
@@ -418,6 +432,13 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
             /* Log if it was a fatal alert */
             if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
                 syslog(LOG_ERR, "[%s] Server sent fatal alert message\n", TAG);
+            }
+
+            /* A handshake that failed after waiting is still a measured
+             * handshake; leaving tls at na would put its time nowhere. */
+
+            if (timing != NULL) {
+                timing->tls_ms = agent_lap_ms(&mark);
             }
             return VELA_TLS_ERR_HANDSHAKE;
         }
