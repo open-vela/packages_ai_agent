@@ -26,6 +26,8 @@
  */
 
 #include "ui/lvgl_toast.h"
+#include "ui/ui_palette.h"
+#include "ui/lvgl_ui_channel.h"
 #include "agent_config.h"
 
 #include <string.h>
@@ -141,12 +143,20 @@ static void toast_build(const toast_payload_t *p)
     if (w < 200) w = 200;
     lv_obj_set_size(toast, w, 80);
     lv_obj_align(toast, LV_ALIGN_TOP_MID, 0, 12);
-    lv_obj_set_style_bg_color(toast, lv_color_hex(0x2a2a3e), 0);
+    /* White card (HachimoDock panel): light border + dark drop shadow + colored
+     * left bar, matching the agent chat card instead of the old qemu dark-purple
+     * toast.  The full colored border is dropped in favor of the left color bar. */
+    lv_obj_set_style_bg_color(toast, lv_color_hex(UI_PAL_CARD), 0);
     lv_obj_set_style_bg_opa(toast, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(toast, lv_color_hex(p->bar_color), 0);
-    lv_obj_set_style_border_width(toast, 2, 0);
+    lv_obj_set_style_border_color(toast, lv_color_hex(UI_PAL_LINE), 0);
+    lv_obj_set_style_border_width(toast, 1, 0);
     lv_obj_set_style_border_side(toast, LV_BORDER_SIDE_FULL, 0);
-    lv_obj_set_style_radius(toast, 8, 0);
+    lv_obj_set_style_radius(toast, 10, 0);
+    lv_obj_set_style_shadow_width(toast, 4, 0);
+    lv_obj_set_style_shadow_offset_x(toast, 2, 0);
+    lv_obj_set_style_shadow_offset_y(toast, 4, 0);
+    lv_obj_set_style_shadow_color(toast, lv_color_hex(UI_PAL_CARD_SHADOW), 0);
+    lv_obj_set_style_shadow_opa(toast, LV_OPA_40, 0);
     lv_obj_set_style_pad_all(toast, 8, 0);
     lv_obj_clear_flag(toast, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(toast, LV_OBJ_FLAG_CLICKABLE);
@@ -167,7 +177,7 @@ static void toast_build(const toast_payload_t *p)
     if (title) {
         lv_label_set_text(title, p->title);
         lv_obj_set_style_text_font(title, &lv_font_misans_16_cjk, 0);
-        lv_obj_set_style_text_color(title, lv_color_hex(0xe8e8e8), 0);
+        lv_obj_set_style_text_color(title, lv_color_hex(UI_PAL_INK), 0);
         lv_obj_align(title, LV_ALIGN_TOP_LEFT, 14, 4);
     }
 
@@ -176,7 +186,7 @@ static void toast_build(const toast_payload_t *p)
     if (body) {
         lv_label_set_text(body, p->body);
         lv_obj_set_style_text_font(body, &lv_font_misans_16_cjk, 0);
-        lv_obj_set_style_text_color(body, lv_color_hex(0xc8c8d0), 0);
+        lv_obj_set_style_text_color(body, lv_color_hex(UI_PAL_MUTED), 0);
         lv_label_set_long_mode(body, LV_LABEL_LONG_DOT);
         lv_obj_set_width(body, w - 28);
         lv_obj_align(body, LV_ALIGN_BOTTOM_LEFT, 14, -4);
@@ -223,7 +233,7 @@ void lvgl_toast_show_async(const char *title, const char *body,
     p->bar_color = bar_color;
     p->duration_ms = duration_ms ? duration_ms : TOAST_DEFAULT_MS;
 
-    if (lv_async_call(toast_async_cb, p) == LV_RESULT_OK) {
+    if (lvgl_ui_async_call(toast_async_cb, p) == 0) {
         /* async scheduled; payload freed in callback */
         return;
     }

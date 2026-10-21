@@ -86,6 +86,21 @@ const char* voice_tts_get_backend(void)
     return s_active ? s_active->name : NULL;
 }
 
+int voice_tts_is_ready(void)
+{
+    if (!s_active) {
+        return 0;
+    }
+
+    /* Backends without the optional hook are assumed ready: their
+     * synthesize() reports the real problem. */
+    if (s_active->is_ready) {
+        return s_active->is_ready() ? 1 : 0;
+    }
+
+    return 1;
+}
+
 int voice_tts_speak(const char* text,
     unsigned char* pcm_out,
     size_t pcm_cap,

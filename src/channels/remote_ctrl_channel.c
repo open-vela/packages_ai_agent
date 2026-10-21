@@ -26,6 +26,7 @@
 
 #if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
 #include "ui/lvgl_toast.h"
+#include "ui/lvgl_ui_channel.h"
 #endif
 
 #include <errno.h>
@@ -71,6 +72,11 @@ static bool g_turn_finished;
  * starts, read once when the transcript lands. */
 static bool g_mirror_turn;
 
+/* Debug-only simulated approval (see remote_ctrl_channel_debug_pending()).
+ * When set, pending() reports an approval and the next decide() answers it
+ * locally instead of reaching the session, which has no real prompt. */
+static bool g_debug_pending;
+
 /* ── Event handler ─────────────────────────────────────────────────── */
 
 static void notify_observer_state(const char *text);
@@ -101,7 +107,7 @@ static void on_session_event(void* context, enum remote_event_e event,
             if (text != NULL && strncmp(text, "approval required: ", 19) == 0) {
                 tag = "[需要审批]";
                 snprintf(body, sizeof(body),
-                         "%s   ->  按 KEY1 批准 / KEY2 拒绝", text + 19);
+                         "%s   ->  按 S2 通过 / S3 取消", text + 19);
             } else if (text != NULL && strstr(text, "completed") != NULL) {
                 tag = "[工具]";
                 snprintf(body, sizeof(body), "%s", text);
@@ -122,13 +128,17 @@ static void on_session_event(void* context, enum remote_event_e event,
             notify_observer_state(text);
         }
 #if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
-        /* A permission request parks the turn until a human decides, and the
-         * console log line is easy to miss — surface it on the toast the
-         * notify service uses, naming the two human-only commands. */
-        if (text != NULL && strncmp(text, "approval required: ", 19) == 0) {
-            char body[112];
-            snprintf(body, sizeof(body), "ronce / rdeny: %s", text + 19);
-            lvgl_toast_show_async("Approval", body, 0xff9800, 8000);
+        /* Reflect the authority latch onto the approval page: show it the
+         * moment a permission request is pending, dismiss it once the prompt
+         * clears (decided locally, timed out, or resolved from the dashboard).
+         * Reading link state directly is safe — this handler runs with the
+         * session lock held and must not re-enter the session, so we never call
+         * remote_ctrl_channel_status() here (it would re-lock and deadlock). */
+        if (g_session.link.has_prompt) {
+            lvgl_ui_channel_set_approval(g_session.link.prompt.tool,
+                                         g_session.link.prompt.hint);
+        } else {
+            lvgl_ui_channel_clear_approval();
         }
 #endif
         break;
@@ -511,15 +521,52 @@ int remote_ctrl_channel_decide(enum remote_decision_e decision)
     return remote_session_decide(&g_session, decision) ? OK : ERROR;
 }
 
-/* The entry point handed to an input adapter.  It keeps the console
+/* The entry points handed to an input adapter.  They keep the console
  * feedback here so every source -- keys, a touch widget, a voice intent --
  * reports the same way, and so the adapter never has to know about the
  * channel's configuration or session state.
  */
+
+static int remote_ctrl_pending_from_input(void *ctx)
+{
+    (void)ctx;
+    struct remote_status_s st;
+
+    if (g_debug_pending)
+        return 1;
+
+    if (!g_configured)
+        return 0;
+
+    if (remote_ctrl_channel_status(&st) != OK)
+        return 0;
+
+    return st.has_prompt ? 1 : 0;
+}
+
 static void remote_ctrl_decide_from_input(enum remote_decision_e decision,
                                           void *ctx)
 {
     (void)ctx;
+
+    if (g_debug_pending) {
+        /* A simulated approval (rpending): answer it locally.  There is no
+         * real prompt in the session, so remote_ctrl_channel_decide() would
+         * only report "nothing pending". */
+        g_debug_pending = false;
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        lvgl_ui_channel_clear_approval();
+        lvgl_toast_show_async("审批",
+                              decision == REMOTE_DECISION_DENY ? "已取消"
+                                                               : "已通过",
+                              decision == REMOTE_DECISION_DENY ? 0xeb5952
+                                                               : 0x4caf50,
+                              2000);
+#endif
+        printf(decision == REMOTE_DECISION_DENY ? "Denied (debug).\n"
+                                                : "Approved once (debug).\n");
+        return;
+    }
 
     if (remote_ctrl_channel_decide(decision) != OK) {
         printf("No approvable request is pending (or one was already "
@@ -531,13 +578,76 @@ static void remote_ctrl_decide_from_input(enum remote_decision_e decision,
                                             : "Approved once.\n");
 }
 
+static void remote_ctrl_scroll_from_input(int dir, void *ctx)
+{
+    (void)ctx;
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    lvgl_ui_channel_scroll(dir);
+#else
+    (void)dir;
+#endif
+}
+
+static void remote_ctrl_model_next_from_input(void *ctx)
+{
+    (void)ctx;
+    /* Larger than the 4 KB key-thread stack: keep it static. */
+    static struct remote_model_view_s view;
+    unsigned int i;
+    unsigned int next;
+
+    if (remote_ctrl_channel_model_view(&view) != OK || view.count == 0) {
+        printf("No model list to cycle (channel unconfigured?).\n");
+        return;
+    }
+
+    for (i = 0; i < view.count; i++) {
+        if (strcmp(view.options[i], view.current) == 0)
+            break;
+    }
+    next = (i == view.count ? 0 : (i + 1) % view.count);
+
+    if (remote_ctrl_channel_select_model(view.options[next]) != OK) {
+        printf("Model switch request failed.\n");
+        return;
+    }
+    printf("Model -> %s\n", view.options[next]);
+}
+
+static void remote_ctrl_session_new_from_input(void *ctx)
+{
+    (void)ctx;
+
+    if (remote_ctrl_channel_new_session() != OK) {
+        printf("New-session request failed (channel unconfigured?).\n");
+        return;
+    }
+    printf("New session requested.\n");
+}
+
 int remote_ctrl_register_input(const struct remote_input_ops_s *ops)
 {
     if (ops == NULL || ops->attach == NULL) {
         return ERROR;
     }
 
-    return ops->attach(remote_ctrl_decide_from_input, NULL);
+    return ops->attach(remote_ctrl_decide_from_input,
+                       remote_ctrl_pending_from_input,
+                       remote_ctrl_scroll_from_input,
+                       remote_ctrl_model_next_from_input,
+                       remote_ctrl_session_new_from_input,
+                       NULL);
+}
+
+void remote_ctrl_channel_debug_pending(const char *tool, const char *hint)
+{
+    g_debug_pending = true;
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    lvgl_ui_channel_set_approval(tool != NULL ? tool : "remote-tool",
+                                 hint != NULL ? hint : "");
+#endif
+    printf("Simulated approval pending: %s\n",
+           tool != NULL ? tool : "remote-tool");
 }
 
 static const struct remote_observer_ops_s *g_observer;

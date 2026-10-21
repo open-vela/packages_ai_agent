@@ -6,11 +6,17 @@
 
 #include <lvgl/lvgl.h>
 
-#ifndef LV_FONT_MISANS_16_CJK
-#define LV_FONT_MISANS_16_CJK 1
+/* App-owned font, compiled under CONFIG_AI_AGENT_LVGL_UI (see
+ * packages/ai_agent/CMakeLists.txt).  The guard macro is deliberately NOT
+ * LV_FONT_MISANS_16_CJK: lv_conf_internal.h maps that name to
+ * CONFIG_LV_FONT_MISANS_16_CJK (0 when unset), which would compile this font
+ * out on cores that do not enable the LVGL-tree copy -- leaving the UI's
+ * lv_font_misans_16_cjk reference undefined at link time. */
+#ifndef AI_AGENT_LV_FONT_MISANS_16_CJK
+#define AI_AGENT_LV_FONT_MISANS_16_CJK 1
 #endif
 
-#if LV_FONT_MISANS_16_CJK
+#if AI_AGENT_LV_FONT_MISANS_16_CJK
 
 /*-----------------
  *    BITMAPS
@@ -71188,5 +71194,5 @@ lv_font_t lv_font_misans_16_cjk = {
 
 
 
-#endif /*#if LV_FONT_MISANS_16_CJK*/
+#endif /*#if AI_AGENT_LV_FONT_MISANS_16_CJK*/
 

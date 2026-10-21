@@ -33,6 +33,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <syslog.h>
@@ -44,6 +45,55 @@
 #endif
 
 #define TAG "ai_agent_ui"
+
+/* ── Local debug console ─────────────────────────────────────────────
+ * The AP→CP RPMsg path (ui_rpmsg_server) is the production driver, but it
+ * only fires once the AP agent link is up.  For on-device visual testing of
+ * the pure-LVGL pages (pet ring / particle flow / chat cards) this console
+ * accepts a small word set so each view and agent-state animation can be
+ * exercised straight from the CP NSH, without the AP or a network.  Mirrors
+ * the AP nsh_commands debug words (show_chat / set_pet / set_page) and adds
+ * bubble injection so the chat-card color bars are verifiable too. */
+
+static void ui_print_help(void)
+{
+  syslog(LOG_INFO,
+         "[%s] cmds: show | page <0|1> | pet <0-5> | ptype <0-4> | ptt <0|1|2> |\n"
+         "       say <text> | sayc <hex> <text> | user <text> | demo | quit |\n"
+         "       approve <tool> <hint> | unapprove | scroll <0|1>\n",
+         TAG);
+}
+
+static void ui_demo_sequence(void)
+{
+  syslog(LOG_INFO, "[%s] demo: pet states 0..5\n", TAG);
+  lvgl_ui_channel_set_page(0);
+  for (int st = 0; st <= 5; st++)
+    {
+      lvgl_ui_channel_set_pet_state(st);
+      usleep(1500 * 1000);
+    }
+
+  syslog(LOG_INFO, "[%s] demo: particle page (state mirrors pet)\n", TAG);
+  lvgl_ui_channel_set_page(1);
+  for (int st = 0; st <= 5; st++)
+    {
+      lvgl_ui_channel_set_pet_state(st);
+      usleep(1200 * 1000);
+    }
+
+  syslog(LOG_INFO, "[%s] demo: chat screen + 4 card color bars\n", TAG);
+  lvgl_ui_channel_show();
+  lvgl_ui_channel_send_user("帮我看看这个提交能不能合入");
+  lvgl_ui_channel_send("这个提交已 MERGED，状态：正常合入");      /* 蓝 structured */
+  lvgl_ui_channel_send("值得合入，建议采纳");                     /* 绿 conclusion */
+  lvgl_ui_channel_send("Jira 经办人待确认，More Info");           /* 橙 jira */
+  lvgl_ui_channel_send("这是一条普通回复，用于展示默认灰色色条"); /* 灰 plain */
+
+  syslog(LOG_INFO, "[%s] demo done → back to pet IDLE\n", TAG);
+  lvgl_ui_channel_set_pet_state(0);
+  lvgl_ui_channel_set_page(0);
+}
 
 int main(int argc, FAR char *argv[])
 {
@@ -110,8 +160,12 @@ int main(int argc, FAR char *argv[])
    * pause() so the endpoint keeps being hosted. */
   for (;;)
     {
-      char line[16];
+      char line[256];
+      char cmd[32];
       char *s;
+      char *arg;
+      int n = 0;
+      size_t len;
 
       if (fgets(line, sizeof(line), stdin) == NULL)
         {
@@ -125,14 +179,118 @@ int main(int argc, FAR char *argv[])
         {
           s++;
         }
+      len = strlen(s);
+      while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r'))
+        {
+          s[--len] = '\0';
+        }
 
-      if (strncmp(s, "quit", 4) == 0 || strncmp(s, "exit", 4) == 0 ||
-          strncmp(s, "q", 1) == 0)
+      if (sscanf(s, "%31s%n", cmd, &n) != 1)
+        {
+          continue; /* empty line */
+        }
+      arg = s + n;
+      while (*arg == ' ' || *arg == '\t')
+        {
+          arg++;
+        }
+
+      if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0 ||
+          strcmp(cmd, "q") == 0)
         {
           syslog(LOG_INFO, "[%s] quit received; tearing down UI\n", TAG);
           break;
         }
-      /* Ignore other input; keep hosting. */
+      else if (strcmp(cmd, "help") == 0)
+        {
+          ui_print_help();
+        }
+      else if (strcmp(cmd, "show") == 0 || strcmp(cmd, "chat") == 0)
+        {
+          lvgl_ui_channel_show();
+        }
+      else if (strcmp(cmd, "page") == 0)
+        {
+          lvgl_ui_channel_set_page(atoi(arg));
+        }
+      else if (strcmp(cmd, "pet") == 0)
+        {
+          lvgl_ui_channel_set_pet_state(atoi(arg));
+        }
+      else if (strcmp(cmd, "ptype") == 0)
+        {
+          pet_status_view_set_type(atoi(arg));
+        }
+      else if (strcmp(cmd, "ptt") == 0)
+        {
+          lvgl_ui_channel_set_ptt(atoi(arg));
+        }
+      else if (strcmp(cmd, "user") == 0 && *arg)
+        {
+          lvgl_ui_channel_send_user(arg);
+        }
+      else if (strcmp(cmd, "sayc") == 0)
+        {
+          char *end = NULL;
+          uint32_t color = (uint32_t)strtoul(arg, &end, 0);
+          if (end && end != arg)
+            {
+              const char *txt = end;
+              while (*txt == ' ' || *txt == '\t')
+                {
+                  txt++;
+                }
+              if (*txt)
+                {
+                  lvgl_ui_channel_send_ex(txt, color);
+                }
+            }
+        }
+      else if (strcmp(cmd, "say") == 0 && *arg)
+        {
+          lvgl_ui_channel_send(arg);
+        }
+      else if (strcmp(cmd, "approve") == 0 && *arg)
+        {
+          /* Debug trigger for the approval page: tokenise "<tool> <hint>"
+           * and load it exactly as the AP's remote_ctrl does via RPMsg. */
+          char tool[48];
+          const char *p = arg;
+          size_t tl = 0;
+          while (p[tl] && p[tl] != ' ' && p[tl] != '\t')
+            {
+              tl++;
+            }
+          if (tl >= sizeof(tool))
+            {
+              tl = sizeof(tool) - 1;
+            }
+          memcpy(tool, p, tl);
+          tool[tl] = '\0';
+          p += tl;
+          while (*p == ' ' || *p == '\t')
+            {
+              p++;
+            }
+          lvgl_ui_channel_set_approval(tool, *p ? p : "");
+        }
+      else if (strcmp(cmd, "unapprove") == 0)
+        {
+          lvgl_ui_channel_clear_approval();
+        }
+      else if (strcmp(cmd, "scroll") == 0)
+        {
+          lvgl_ui_channel_scroll(atoi(arg));
+        }
+      else if (strcmp(cmd, "demo") == 0)
+        {
+          ui_demo_sequence();
+        }
+      else
+        {
+          syslog(LOG_WARNING, "[%s] unknown cmd '%s' (help for list)\n",
+                 TAG, cmd);
+        }
     }
 
   /* Graceful teardown (schedules widget deletion in the LVGL thread,

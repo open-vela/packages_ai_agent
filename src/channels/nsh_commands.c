@@ -56,6 +56,10 @@
 #include "ui/lvgl_ui_channel.h"
 #endif
 
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+#include "channels/remote_ctrl_channel.h"
+#endif
+
 #ifdef CONFIG_AI_AGENT_TEST
 #include "integs/test_vision_integ.h"
 #include "core/arena_alloc.h"
@@ -145,6 +149,9 @@ static void cmd_help(void)
         "  rusage               - Refresh remote session billing\n"
         "  ronce                - Approve the pending request (human only)\n"
         "  rdeny                - Deny the pending request (human only)\n"
+#endif
+#if defined(CONFIG_AI_AGENT_REMOTE_CTRL) && (defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG))
+        "  rpending <tool> [hint] - Simulate a pending approval (debug; S2/S3 decide)\n"
 #endif
         "  restart              - Restart the device\n"
         "  quit                 - Exit agent\n"
@@ -630,6 +637,11 @@ static void cmd_ask(const char* text)
     msg.content = strdup(text);
     if (msg.content)
         message_bus_push_inbound(&msg);
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* Echo the typed text as a right-aligned user bubble, matching the
+     * PTT path, so the screen shows both halves of the exchange. */
+    (void)lvgl_ui_channel_send_user(text);
+#endif
     printf("Sent to agent: %s\n", text);
     syslog(LOG_INFO, "[agent] ask: %s\n", text);
 }
@@ -701,6 +713,18 @@ static void cmd_quit(void)
     fflush(stdout);
     agent_request_shutdown();
 }
+
+#if defined(CONFIG_AI_AGENT_REMOTE_CTRL) && (defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG))
+/* rpending <tool> [hint] — debug-only: simulate a pending remote approval so the
+ * S2/S3 short-press approve/deny flow can be exercised on-device without a PC
+ * bridge. Shows the approval page and arms the next S2/S3 press as a decision. */
+static void cmd_remote_pending(int argc, char** argv)
+{
+    const char* tool = (argc >= 2) ? argv[1] : "remote-tool";
+    const char* hint = (argc >= 3) ? argv[2] : "需要你的确认";
+    remote_ctrl_channel_debug_pending(tool, hint);
+}
+#endif
 
 static void cmd_launch_app(int argc, char** argv)
 {
@@ -1206,6 +1230,10 @@ static void* cli_thread(void* arg)
             cmd_remote_once();
         else if (strcmp(cmd, "rdeny") == 0)
             cmd_remote_deny();
+#endif
+#if defined(CONFIG_AI_AGENT_REMOTE_CTRL) && (defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG))
+        else if (strcmp(cmd, "rpending") == 0)
+            cmd_remote_pending(argc, argv);
 #endif
         else if (strcmp(cmd, "quit") == 0) {
             cmd_quit();

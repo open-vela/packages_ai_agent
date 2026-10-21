@@ -679,6 +679,11 @@ int ai_agent_main(int argc, char* argv[])
         BOOT_LOG_RC(&t0, "P3", "ptt_button_start", rc);
 #endif
 
+        /* The S2/S3 context keys are owned by the board's button input layer
+         * (bk7258_buttons_input.c), which registers itself as a remote_ctrl
+         * input adapter and drives scroll / model / session / approval from
+         * the same /dev/btn0.  No agent-side thread to start here. */
+
 #ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
         /* Loads per-source config + cursors only (no network, no thread).
          * The polling thread is started later in network_watch_task once
@@ -710,6 +715,16 @@ int ai_agent_main(int argc, char* argv[])
         return -1;
     }
     BOOT_LOG(&t0, "P5", "outbound dispatch thread started");
+
+    /* Start the agent loop before the network comes up.  Input typed or
+     * spoken while offline is then still consumed: the loop answers it
+     * with an explicit "no network / no model" card instead of leaving
+     * the message in the inbound queue with no visible reaction.
+     * network_watch_task and net_state_change_cb also call
+     * agent_loop_start(); it is idempotent. */
+    if (agent_loop_start() != OK)
+        syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
+    BOOT_LOG(&t0, "P5", "agent loop started");
 
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
     /* Quickapp mqueue listener - receives requests from quickapp process */

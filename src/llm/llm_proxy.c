@@ -454,7 +454,10 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
         return ERROR;
     }
 
-    char tmp[4096];
+    /* 1 KB read chunk instead of 4 KB: llm_http_direct already has a 1 KB
+     * header buffer on its stack, and the whole LLM call runs on the 32 KB
+     * agent-loop thread.  Smaller chunks keep peak stack headroom. */
+    char tmp[1024];
     while (1) {
         int n = proxy_conn_read(conn, tmp, sizeof(tmp), 120000);
         if (n <= 0)

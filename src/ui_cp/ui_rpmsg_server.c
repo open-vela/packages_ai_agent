@@ -182,6 +182,63 @@ static int ui_rpmsg_server_rx(struct rpmsg_endpoint *ept, void *data,
         }
         break;
 
+      case UI_RPMSG_SET_PAGE:
+        {
+          /* Switch the round-screen page (0=pet home, 1=particle flow).
+           * Delegates to the CP-side lvgl_ui_channel_set_page, which gates
+           * each page behind its CONFIG guard. */
+          if (m->payload_len < 1)
+            {
+              break;
+            }
+          (void)lvgl_ui_channel_set_page((int)m->payload[0]);
+        }
+        break;
+
+      case UI_RPMSG_SET_APPROVAL:
+        {
+          /* payload = [tool\0hint\0] (both NUL-terminated). */
+          char tool[UI_RPMSG_MAX_TEXT + 1];
+          char hint[UI_RPMSG_MAX_TEXT + 1];
+          const char *p = (const char *)m->payload;
+          size_t avail = m->payload_len;
+          size_t tl = strnlen(p, avail);
+          const char *h = "";
+          if (tl < avail)
+            {
+              h = p + tl + 1;
+            }
+          size_t copy = tl > UI_RPMSG_MAX_TEXT ? UI_RPMSG_MAX_TEXT : tl;
+          memcpy(tool, p, copy);
+          tool[copy] = '\0';
+          /* hint is bounded by the remaining bytes after tool's NUL. */
+          size_t ha = (tl < avail) ? (avail - tl - 1) : 0;
+          size_t hc = strnlen(h, ha);
+          if (hc > UI_RPMSG_MAX_TEXT)
+            {
+              hc = UI_RPMSG_MAX_TEXT;
+            }
+          memcpy(hint, h, hc);
+          hint[hc] = '\0';
+          (void)lvgl_ui_channel_set_approval(tool, hint);
+        }
+        break;
+
+      case UI_RPMSG_CLEAR_APPROVAL:
+        (void)lvgl_ui_channel_clear_approval();
+        break;
+
+      case UI_RPMSG_SCROLL:
+        {
+          /* payload[0] = dir (0=up/older, 1=down/newer). */
+          if (m->payload_len < 1)
+            {
+              break;
+            }
+          (void)lvgl_ui_channel_scroll((int)m->payload[0]);
+        }
+        break;
+
       case UI_RPMSG_TOAST:
         {
           if (m->payload_len < 2 * sizeof(uint32_t))

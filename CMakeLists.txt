@@ -120,6 +120,12 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_SRCS src/ui/particle_flow_view.c)
   endif()
 
+  # M7 待机界面: dim digital clock standby screen (standby_view.c), faded in by
+  # lvgl_ui_channel.c after 60s of no activity.  AP-local only.
+  if(CONFIG_AI_AGENT_STANDBY_UI)
+    list(APPEND AGENT_SRCS src/ui/standby_view.c)
+  endif()
+
   # 路 B (dual-core BK7258): the AP runs the agent but has no LCD/LVGL/FPU.
   # Instead of building bubbles locally, a thin shim (ui_rpmsg_client.c)
   # implements the SAME lvgl_ui_channel_* / lvgl_toast_* API as RPMsg
@@ -138,6 +144,13 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   if(CONFIG_AI_AGENT_PTT)
     list(APPEND AGENT_SRCS src/voice/ptt_button.c)
   endif()
+
+  # S2/S3 context keys now live in the board's button input layer
+  # (board/bk7258-devkit/src/bk7258_buttons_input.c), which registers as a
+  # remote_ctrl input adapter: short press scrolls the transcript when idle
+  # or approves/denies a pending permission, long press cycles the model /
+  # opens a fresh session.  The retired key_manager.c owned this before the
+  # fusion with the colleague's layer.
 
   if(CONFIG_AI_AGENT_NOTIFY_SERVICE)
     list(APPEND AGENT_SRCS src/infra/notify_service.c)

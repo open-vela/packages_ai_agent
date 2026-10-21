@@ -121,24 +121,46 @@ int remote_ctrl_channel_decide(enum remote_decision_e decision);
 
 /* Input-adapter plug point.
  *
- * What reaches decide() is a human decision, not a button press: a physical
- * key map, a touch-screen widget and a voice intent parser are all adapters
- * over the same vocabulary.  Each registers here and receives the decide
- * entry point, so an adapter knows remote_decision_e and nothing else about
- * remote_ctrl -- and remote_ctrl never learns what hardware the product
- * has.  A product with a touch screen registers a different adapter and
- * leaves the channel untouched.
+ * What reaches the callbacks is an application intent, not a button press:
+ * a physical key map, a touch-screen widget and a voice intent parser are
+ * all adapters over the same vocabulary.  Each registers here and receives
+ * the decide / pending / scroll / model-next / new-session entry points, so
+ * an adapter knows the intents and nothing else about remote_ctrl -- and
+ * remote_ctrl never learns what hardware the product has.  A product with a
+ * touch screen registers a different adapter and leaves the channel
+ * untouched.
  */
 typedef void (*remote_decide_fn)(enum remote_decision_e decision, void *ctx);
+typedef int  (*remote_pending_fn)(void *ctx);      /* 1 when an approval is up */
+typedef void (*remote_scroll_fn)(int dir, void *ctx); /* 0=older, 1=newer */
+typedef void (*remote_action_fn)(void *ctx);          /* model-next / new-session */
 
 struct remote_input_ops_s
 {
   const char *name;                       /* "keymap" / "touch" / "voice" */
-  int (*attach)(remote_decide_fn decide, void *ctx);
+
+  /* The adapter receives the *application* surface, not raw button indices:
+   * it maps its gesture vocabulary onto decide / scroll / model / session and
+   * the channel owns the semantics.  Every callback except `decide` is
+   * optional -- a product with no transcript leaves `scroll` NULL and the
+   * channel simply never offers it.  `pending` lets the adapter pick a key
+   * context (idle keys scroll, approval keys decide) without reading session
+   * state itself. */
+  int (*attach)(remote_decide_fn decide,
+                remote_pending_fn pending,
+                remote_scroll_fn scroll,
+                remote_action_fn model_next,
+                remote_action_fn session_new,
+                void *ctx);
   void (*detach)(void);
 };
 
 int remote_ctrl_register_input(const struct remote_input_ops_s *ops);
+
+/* Debug-only: simulate a pending permission request so the on-device
+ * approve/deny path can be exercised without a live broker.  Shows the
+ * approval page and arms the next decide() against it. */
+void remote_ctrl_channel_debug_pending(const char *tool, const char *hint);
 
 /* Output-observer plug point, the mirror of the input one.
  *

@@ -948,6 +948,13 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
                 TAG, text);
             strncpy(text_out, text, text_cap - 1);
             text_out[text_cap - 1] = '\0';
+        } else if (ret != 0) {
+            /* Propagate the failure: otherwise the PTT path reports an
+             * empty result and the screen shows nothing at all when the
+             * network or the ASR credentials are missing. */
+            syslog(LOG_WARNING, "[%s] stream ASR failed: %d\n",
+                TAG, ret);
+            return ret;
         }
         return 0;
     }
@@ -977,6 +984,7 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     } else if (ret != 0) {
         syslog(LOG_WARNING, "[%s] batch ASR failed: %d\n",
             TAG, ret);
+        return ret;
     }
 
     return 0;
@@ -1144,6 +1152,16 @@ int voice_channel_speak(const char* text)
         return -EBUSY;
     }
     pthread_mutex_unlock(&s_voice.lock);
+
+    /* Without credentials the network synth can only fail.  Bail out before
+     * touching the audio hardware (beep + playback open/close): that path
+     * stalls the caller for seconds and churns the audio driver for nothing. */
+    if (!voice_tts_is_ready()) {
+        syslog(LOG_WARNING,
+            "[%s] speak: TTS not configured, skipped\n", TAG);
+        pthread_mutex_unlock(&s_voice.speak_lock);
+        return -ENOENT;
+    }
 
     /* Work on a mutable copy so we can strip markdown in-place */
     size_t text_len = strlen(text);

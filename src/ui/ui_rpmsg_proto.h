@@ -85,6 +85,19 @@ enum ui_rpmsg_op {
                                   * (0=idle,1=listening,2=thinking,
                                   *  3=executing,4=waiting,5=error);
                                   * payload_len = 1. */
+    UI_RPMSG_SET_PAGE = 11,      /* switch the CP round-screen page:
+                                  * payload[0] = page index
+                                  * (0 = pet home, 1 = particle flow);
+                                  * payload_len = 1. */
+    UI_RPMSG_SET_APPROVAL = 12, /* show the approval screen (a remote permission
+                                 * request is pending): payload = [tool\0hint\0]
+                                 * (both NUL-terminated, truncated to the cap).
+                                 * tool ≤ 24, hint ≤ 96 bytes from the bridge. */
+    UI_RPMSG_CLEAR_APPROVAL = 13, /* dismiss the approval screen and restore the
+                                   * previous foreground page; payload_len = 0. */
+    UI_RPMSG_SCROLL = 14,       /* scroll the chat transcript: payload[0] =
+                                 * direction (0 = up/older, 1 = down/newer);
+                                 * payload_len = 1. */
 };
 
 /** Fixed wire format (packed, little-endian on both M-class cores). */
@@ -104,6 +117,8 @@ struct ui_rpmsg_msg {
      *               like SEND but rendered as a user (right) bubble, no TTS.
      *   SET_PET_STATE : payload[0] = pet state (0..5, see enum pet_state);
  *                  payload_len = 1.
+ *   SET_PAGE : payload[0] = page index (0=pet home,1=particle flow);
+ *              payload_len = 1.
  *   INIT/START/STOP/SHOW: payload_len = 0.
      */
     uint8_t  payload[UI_RPMSG_MAX_PAYLOAD];

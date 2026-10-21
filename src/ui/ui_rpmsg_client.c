@@ -57,6 +57,7 @@
 #include <nuttx/rpmsg/rpmsg.h>
 
 #include "ui_rpmsg_proto.h"
+#include "infra/network_manager.h" /* network_is_connected — gate TTS */
 #include "voice/voice_channel.h"   /* voice_channel_speak — real on AP */
 
 #define TAG "ui_rpmsg_client"
@@ -211,8 +212,16 @@ int lvgl_ui_channel_send(const char *text)
 
   /* TTS plays locally on AP (real voice_channel_speak); the bubble is
    * sent to CP separately.  Original single-core send() did both in one
-   * call, so we preserve both side-effects here. */
-  (void)voice_channel_speak(text);
+   * call, so we preserve both side-effects here.
+   *
+   * Offline, TTS can only fail — after a ~20 s network timeout — and the
+   * bubble would sit behind it, leaving the user staring at a blank
+   * screen.  Skip TTS when there is no network so the on-screen reason
+   * (e.g. the "未联网" card) appears immediately. */
+  if (network_is_connected())
+    {
+      (void)voice_channel_speak(text);
+    }
 
   memset(&m, 0, sizeof(m));
   m.op = UI_RPMSG_SEND;
@@ -245,7 +254,12 @@ int lvgl_ui_channel_send_ex(const char *text, uint32_t bar_color)
     {
       return -EINVAL;
     }
-  (void)voice_channel_speak(text);
+  /* See lvgl_ui_channel_send(): no network → skip the doomed TTS wait so
+   * the colored card (usually an error explanation) shows right away. */
+  if (network_is_connected())
+    {
+      (void)voice_channel_speak(text);
+    }
 
   memset(&m, 0, sizeof(m));
   m.op = UI_RPMSG_SEND_EX;
@@ -323,6 +337,14 @@ int lvgl_ui_channel_set_ptt(int state)
 
 /* Drive the CP-side pet status ring (M7 差异化页) from the AP agent's
  * lifecycle state.  payload[0] = enum pet_state (0..5). */
+int lvgl_ui_channel_set_pet_error(const char *reason)
+{
+  /* The SET_PET_STATE op carries no text payload, so the concrete reason
+   * stays local to this core; the CP side shows its generic ERROR caption. */
+  (void)reason;
+  return lvgl_ui_channel_set_pet_state(5);
+}
+
 int lvgl_ui_channel_set_pet_state(int state)
 {
   struct ui_rpmsg_msg m;
@@ -341,6 +363,116 @@ int lvgl_ui_channel_set_pet_state(int state)
   if (ret < 0)
     {
       syslog(LOG_WARNING, "[%s] set_pet_state to CP failed: %d\n", TAG, ret);
+    }
+  return ret;
+}
+
+/* Switch the CP round-screen page from the AP side (debug `set_page` nsh
+ * command and idle-rotate logic).  payload[0] = page index (0=pet,1=particle). */
+int lvgl_ui_channel_set_page(int page)
+{
+  struct ui_rpmsg_msg m;
+  int ret;
+
+  if (page < 0 || page > 1)
+    {
+      return -EINVAL;
+    }
+  memset(&m, 0, sizeof(m));
+  m.op = UI_RPMSG_SET_PAGE;
+  m.payload[0] = (uint8_t)page;
+  m.payload_len = 1;
+
+  ret = ui_rpmsg_send(&m);
+  if (ret < 0)
+    {
+      syslog(LOG_WARNING, "[%s] set_page to CP failed: %d\n", TAG, ret);
+    }
+  return ret;
+}
+
+/* Show the CP approval screen for a pending remote permission request.
+ * payload = [tool\0hint\0]. */
+int lvgl_ui_channel_set_approval(const char *tool, const char *hint)
+{
+  struct ui_rpmsg_msg m;
+  size_t off = 0, tlen, hlen;
+  int ret;
+
+  /* Guard against NULL — memcpy(dst, NULL, 0) is UB even at zero length. */
+  const char *st = tool != NULL ? tool : "";
+  const char *sh = hint != NULL ? hint : "";
+
+  memset(&m, 0, sizeof(m));
+  m.op = UI_RPMSG_SET_APPROVAL;
+
+  tlen = strlen(st);
+  hlen = strlen(sh);
+  if (tlen + hlen + 2 > UI_RPMSG_MAX_PAYLOAD)
+    {
+      /* Truncate hint first, then tool, keeping both NUL-terminated. */
+      size_t room = UI_RPMSG_MAX_PAYLOAD - 2;   /* 2 NULs */
+      if (tlen > room)
+        {
+          tlen = room;
+          hlen = 0;
+        }
+      else if (tlen + hlen > room)
+        {
+          hlen = room - tlen;
+        }
+    }
+
+  memcpy(m.payload + off, st, tlen); off += tlen;
+  m.payload[off++] = '\0';
+  memcpy(m.payload + off, sh, hlen); off += hlen;
+  m.payload[off++] = '\0';
+  m.payload_len = (uint16_t)off;
+
+  ret = ui_rpmsg_send(&m);
+  if (ret < 0)
+    {
+      syslog(LOG_WARNING, "[%s] set_approval to CP failed: %d\n", TAG, ret);
+    }
+  return ret;
+}
+
+/* Dismiss the CP approval screen. */
+int lvgl_ui_channel_clear_approval(void)
+{
+  struct ui_rpmsg_msg m;
+  int ret;
+
+  memset(&m, 0, sizeof(m));
+  m.op = UI_RPMSG_CLEAR_APPROVAL;
+
+  ret = ui_rpmsg_send(&m);
+  if (ret < 0)
+    {
+      syslog(LOG_WARNING, "[%s] clear_approval to CP failed: %d\n", TAG, ret);
+    }
+  return ret;
+}
+
+/* Scroll the CP chat transcript. payload[0] = dir (0=up, 1=down). */
+int lvgl_ui_channel_scroll(int dir)
+{
+  struct ui_rpmsg_msg m;
+  int ret;
+
+  if (dir < 0 || dir > 1)
+    {
+      return -EINVAL;
+    }
+  memset(&m, 0, sizeof(m));
+  m.op = UI_RPMSG_SCROLL;
+  m.payload[0] = (uint8_t)dir;
+  m.payload_len = 1;
+
+  ret = ui_rpmsg_send(&m);
+  if (ret < 0)
+    {
+      syslog(LOG_WARNING, "[%s] scroll to CP failed: %d\n", TAG, ret);
     }
   return ret;
 }

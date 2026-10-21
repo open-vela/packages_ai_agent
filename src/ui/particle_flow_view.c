@@ -32,6 +32,8 @@
 #ifdef CONFIG_AI_AGENT_PARTICLE_FLOW
 
 #include "ui/particle_flow_view.h"
+#include "ui/ui_palette.h"
+#include "ui/lvgl_ui_channel.h"
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -44,6 +46,11 @@
 
 #define TAG "particle_view"
 
+/* 屏幕切换淡入时长(ms)。硬 lv_screen_load() 的整帧 SPI flush 会与面板 60Hz
+ * GRAM 扫描竞争,表现为从上到下的白底刷屏;改用淡入交叉渐变分散到多帧,
+ * 把刷屏变成优雅的渐隐渐显。 */
+#define SCREEN_FADE_MS 500
+
 LV_FONT_DECLARE(lv_font_misans_16_cjk);
 
 #define N_PARTICLES    18
@@ -54,12 +61,15 @@ LV_FONT_DECLARE(lv_font_misans_16_cjk);
 #define ONE_PX          (1 << VEL_Q)
 #define TICK_MS         33
 
-/* State palette — same agent-status semantics as pet_status_view. */
+/* State palette — HachimoDock 柔和低饱和状态色，语义同 pet_status_view。 */
 static const uint32_t s_state_color[] = {
-  0x4ade80, 0x22d3ee, 0x3b82f6, 0xf97316, 0xeab308, 0xef4444,
+  UI_PAL_IDLE, UI_PAL_LISTEN, UI_PAL_THINK, UI_PAL_EXEC, UI_PAL_WAIT, UI_PAL_ERROR,
 };
 static const char *const s_state_text[] = {
-  "粒子·待机", "粒子·聆听", "粒子·思考", "粒子·执行", "粒子·等待", "粒子·错误",
+  /* Mirrors pet_status_view's captions — and, critically, sticks to glyphs
+   * present in the CP MiSans 16 subset (the old "粒子·" prefix used 粒/子,
+   * which are NOT in the trimmed CP font and rendered as tofu on-device). */
+  "待机", "聆听中", "思考中", "执行中", "等待确认", "出错了",
 };
 
 /* Per-state physics knobs:
@@ -99,6 +109,7 @@ struct pf_state_s {
   lv_obj_t *core;        /* central pulsing circle */
   lv_obj_t *particles[N_PARTICLES];
   lv_obj_t *label;
+  lv_obj_t *status_dot;  /* colored dot paired with the state caption */
   lv_obj_t *prev_screen;
   struct particle_s p[N_PARTICLES];
   lv_timer_t *timer;
@@ -243,13 +254,13 @@ static void apply_state_async_cb(void *data)
     {
       lv_obj_set_style_bg_color(s_pf.core, lv_color_hex(color), 0);
     }
-  if (s_pf.guide_ring)
-    {
-      lv_obj_set_style_arc_color(s_pf.guide_ring, lv_color_hex(color), 0);
-    }
   if (s_pf.label)
     {
       lv_label_set_text(s_pf.label, s_state_text[st]);
+    }
+  if (s_pf.status_dot)
+    {
+      lv_obj_set_style_bg_color(s_pf.status_dot, lv_color_hex(color), 0);
     }
   syslog(LOG_INFO, "[%s] state → %s\n", TAG, s_state_text[st]);
 }
@@ -257,7 +268,7 @@ static void apply_state_async_cb(void *data)
 void particle_flow_view_set_state(enum particle_state state)
 {
   if ((int)state < 0 || (int)state > PARTICLE_STATE_ERROR) return;
-  lv_async_call(apply_state_async_cb, (void *)(intptr_t)state);
+  lvgl_ui_async_call(apply_state_async_cb, (void *)(intptr_t)state);
 }
 
 /* ---------- screen show / hide ---------- */
@@ -267,15 +278,14 @@ static void show_async_cb(void *data)
   (void)data;
   if (!s_pf.initialized || !s_pf.screen || s_pf.visible) return;
   s_pf.prev_screen = lv_screen_active();
-  lv_screen_load(s_pf.screen);
-  /* Re-assert bg + force a synchronous refresh so the secondary (async-loaded)
-   * screen flushes immediately.  The boot/home pet screen is flushed during
-   * lvgl_ui_channel_init; a page-switched-in screen needs the explicit nudge
-   * or its first frame can be skipped by lazy flush paths. */
-  lv_obj_set_style_bg_color(s_pf.screen, lv_color_hex(0x1a1a2e), 0);
-  lv_obj_set_style_bg_opa(s_pf.screen, LV_OPA_COVER, 0);
-  lv_obj_invalidate(s_pf.screen);
-  lv_refr_now(lv_display_get_default());
+  lv_screen_load_anim(s_pf.screen, LV_SCR_LOAD_ANIM_FADE_IN,
+                      SCREEN_FADE_MS, 0, false);
+  /* lv_screen_load already invalidates the full screen and schedules a redraw;
+   * the explicit invalidate + lv_refr_now below was a qemu-goldfish-headless
+   * lazy-flush workaround that is unnecessary on the real CP /dev/lcd0 panel,
+   * where it caused a full-frame (top-to-bottom) white flicker on every idle
+   * pet↔particle rotate.  Real hardware renders screen switches fine without
+   * the extra synchronous refresh, so we drop it to stop the standby flicker. */
   s_pf.visible = true;
   syslog(LOG_INFO, "[%s] particle screen shown\n", TAG);
 }
@@ -283,14 +293,16 @@ static void show_async_cb(void *data)
 void particle_flow_view_show(void)
 {
   if (!s_pf.initialized) return;
-  lv_async_call(show_async_cb, NULL);
+  lvgl_ui_async_call(show_async_cb, NULL);
 }
 
 static void hide_async_cb(void *data)
 {
   (void)data;
   if (!s_pf.initialized || !s_pf.visible) return;
-  if (s_pf.prev_screen) lv_screen_load(s_pf.prev_screen);
+  if (s_pf.prev_screen)
+    lv_screen_load_anim(s_pf.prev_screen, LV_SCR_LOAD_ANIM_FADE_IN,
+                        SCREEN_FADE_MS, 0, false);
   s_pf.visible = false;
   syslog(LOG_INFO, "[%s] particle screen hidden\n", TAG);
 }
@@ -298,7 +310,7 @@ static void hide_async_cb(void *data)
 void particle_flow_view_hide(void)
 {
   if (!s_pf.initialized) return;
-  lv_async_call(hide_async_cb, NULL);
+  lvgl_ui_async_call(hide_async_cb, NULL);
 }
 
 bool particle_flow_view_is_visible(void)
@@ -332,7 +344,7 @@ int particle_flow_view_init(void)
 
   s_pf.screen = lv_obj_create(NULL);
   if (!s_pf.screen) return -ENOMEM;
-  lv_obj_set_style_bg_color(s_pf.screen, lv_color_hex(0x1a1a2e), 0);
+  lv_obj_set_style_bg_color(s_pf.screen, lv_color_hex(UI_PAL_BG), 0);
   lv_obj_set_style_bg_opa(s_pf.screen, LV_OPA_COVER, 0);
   lv_obj_set_style_text_font(s_pf.screen, &lv_font_misans_16_cjk, 0);
 
@@ -343,10 +355,15 @@ int particle_flow_view_init(void)
   s_pf.cx = h / 2;
   s_pf.cy = v / 2;
   int32_t half = (h < v ? h : v) / 2;
-  s_pf.R = (half > 8) ? (half - 8) : 8;
+  /* Inscribe the particle travel bound INSIDE the round face: subtract the
+   * particle radius (PARTICLE_DIAM/2) so a particle centred at the bound has
+   * its outer edge on the circle, never spilling into the bezel. */
+  s_pf.R = (half > 8) ? (half - 8 - PARTICLE_DIAM / 2) : 8;
   s_pf.R_sq = s_pf.R * s_pf.R;
 
-  /* Faint guide ring (shared motif with pet_status_view). */
+  /* Faint guide ring (shared motif with pet_status_view): a barely-there dark
+   * boundary circle.  The particles + core already carry the state color, so
+   * the ring itself stays subtle rather than competing with them. */
   s_pf.guide_ring = lv_arc_create(s_pf.screen);
   if (s_pf.guide_ring)
     {
@@ -354,16 +371,15 @@ int particle_flow_view_init(void)
       lv_obj_center(s_pf.guide_ring);
       lv_arc_set_bg_angles(s_pf.guide_ring, 0, 360);
       lv_arc_set_angles(s_pf.guide_ring, 0, 360);
-      lv_obj_set_style_arc_width(s_pf.guide_ring, 2, 0);
       lv_obj_set_style_arc_width(s_pf.guide_ring, 2, LV_PART_MAIN);
-      lv_obj_set_style_arc_color(s_pf.guide_ring, lv_color_hex(0x2a2a3e), LV_PART_MAIN);
-      lv_obj_set_style_arc_color(s_pf.guide_ring, lv_color_hex(0x4ade80), 0);
+      lv_obj_set_style_arc_width(s_pf.guide_ring, 0, LV_PART_INDICATOR);
+      lv_obj_set_style_arc_color(s_pf.guide_ring, lv_color_hex(UI_PAL_TRACK), LV_PART_MAIN);
       lv_obj_set_style_bg_opa(s_pf.guide_ring, LV_OPA_TRANSP, LV_PART_KNOB);
       lv_obj_remove_flag(s_pf.guide_ring, LV_OBJ_FLAG_CLICKABLE);
     }
 
   /* Central pulsing core. */
-  s_pf.core = make_circle(s_pf.screen, CORE_DIAM, 0x4ade80, LV_OPA_80);
+  s_pf.core = make_circle(s_pf.screen, CORE_DIAM, UI_PAL_IDLE, LV_OPA_80);
 
   /* Particles — scattered initially within the disc. */
   uint32_t seed = 0x1234abcd;
@@ -390,8 +406,10 @@ int particle_flow_view_init(void)
       s_pf.p[i].vy = lcg_next(&seed) / 8;
       s_pf.p[i].lcg = seed;
 
+      /* Soft particles — 80% opacity recedes them into the near-black field
+       * (HachimoDock softness) instead of hard neon dots. */
       s_pf.particles[i] = make_circle(s_pf.screen, PARTICLE_DIAM,
-                                       0x4ade80, LV_OPA_COVER);
+                                       UI_PAL_IDLE, LV_OPA_80);
       if (s_pf.particles[i])
         {
           int32_t prx = s_pf.p[i].x - (PARTICLE_DIAM / 2);
@@ -402,15 +420,49 @@ int particle_flow_view_init(void)
         }
     }
 
-  /* State label. */
-  s_pf.label = lv_label_create(s_pf.screen);
-  if (s_pf.label)
-    {
-      lv_label_set_text(s_pf.label, s_state_text[PARTICLE_STATE_IDLE]);
-      lv_obj_set_style_text_color(s_pf.label, lv_color_hex(0xcccccc), 0);
-      lv_obj_set_style_text_font(s_pf.label, &lv_font_misans_16_cjk, 0);
-      lv_obj_align(s_pf.label, LV_ALIGN_CENTER, 0, s_pf.cy / 2 + 8);
-    }
+  /* State caption row (dot + text), mirroring pet_status_view's caption so the
+   * particle page's status text is anchored to a UI block rather than floating
+   * as a bare label.  Placed low inside the circle, clear of the core/ring. */
+  {
+    lv_obj_t *caption = lv_obj_create(s_pf.screen);
+    if (caption)
+      {
+        lv_obj_remove_flag(caption, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(caption, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(caption, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(caption, 0, 0);
+        lv_obj_set_style_pad_all(caption, 0, 0);
+        lv_obj_set_flex_flow(caption, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(caption, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(caption, 6, 0);
+        /* 88 matches pet_status_view's PET_LABEL_DY: the caption (dot+text)
+         * is 20px tall (MiSans line_height=20), so its top is 88-10=78 below
+         * center → y=226, clearing the 150px guide ring bottom (y=223) by 3px
+         * instead of overlapping. */
+        lv_obj_align(caption, LV_ALIGN_CENTER, 0, 88);
+
+        s_pf.status_dot = lv_obj_create(caption);
+        if (s_pf.status_dot)
+          {
+            lv_obj_remove_flag(s_pf.status_dot, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_size(s_pf.status_dot, 8, 8);
+            lv_obj_set_style_radius(s_pf.status_dot, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(s_pf.status_dot, lv_color_hex(UI_PAL_IDLE), 0);
+            lv_obj_set_style_bg_opa(s_pf.status_dot, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(s_pf.status_dot, 0, 0);
+            lv_obj_set_style_pad_all(s_pf.status_dot, 0, 0);
+          }
+
+        s_pf.label = lv_label_create(caption);
+        if (s_pf.label)
+          {
+            lv_label_set_text(s_pf.label, s_state_text[PARTICLE_STATE_IDLE]);
+            lv_obj_set_style_text_color(s_pf.label, lv_color_hex(UI_PAL_TEXT_DIM), 0);
+            lv_obj_set_style_text_font(s_pf.label, &lv_font_misans_16_cjk, 0);
+          }
+      }
+  }
 
   /* Physics timer — runs on the LVGL thread, so widget mutation is safe. */
   s_pf.timer = lv_timer_create(timer_cb, TICK_MS, NULL);

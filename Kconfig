@@ -526,6 +526,19 @@ config AI_AGENT_PARTICLE_FLOW
 	  Reached via the set_page command (page 1) or a future idle auto-switch;
 	  does not displace the pet home screen.
 
+config AI_AGENT_STANDBY_UI
+	bool "Standby dim digital clock (M7 待机界面)"
+	default n
+	depends on AI_AGENT_LVGL_UI || AI_AGENT_UI_RPMSG || EXAMPLES_AI_AGENT_UI_CP
+	---help---
+	  Build standby_view.c: a minimal dim digital clock (large HH:MM in
+	  Montserrat 24 + date in MiSans 16 CJK + a "待机中" hint) that
+	  lvgl_ui_channel.c fades in after 60s with no real activity (no chat
+	  bubble, PTT, pet-state change, page switch, approval or scroll) and the
+	  agent idle.  Any such activity wakes it and restores the previous
+	  screen.  Runs on the same core that owns the local LVGL UI (AP on the
+	  BK7258, or qemu single-core).
+
 if EXAMPLES_AI_AGENT_UI_CP
 
 config EXAMPLES_AI_AGENT_UI_CP_PROGNAME

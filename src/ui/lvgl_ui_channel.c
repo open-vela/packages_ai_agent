@@ -24,7 +24,9 @@
  */
 
 #include "ui/lvgl_ui_channel.h"
+#include "ui/ui_palette.h"
 #include "core/message_bus.h"
+#include "infra/network_manager.h"  /* network_is_connected — gate TTS */
 #include "agent_compat.h"
 #include "agent_config.h"
 #include "voice/voice_channel.h"
@@ -37,19 +39,30 @@
  * src/ui/lv_font_misans_16_cjk.c, same pattern as xiaozhi_gui's
  * font_awesome_*.c) — declared here instead of patching apps_graphics_lvgl. */
 LV_FONT_DECLARE(lv_font_misans_16_cjk);
+#ifdef CONFIG_STACK_COLORATION
+#include <nuttx/arch.h>   /* up_check_tcbstack — LVGL thread stack high-water */
+#include <nuttx/sched.h>  /* nxsched_self / nxsched_get_stackinfo */
+#endif
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef CONFIG_AI_AGENT_PET_STATUS
 #include "ui/pet_status_view.h"
 #ifdef CONFIG_AI_AGENT_PARTICLE_FLOW
 #include "ui/particle_flow_view.h"
+#endif
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+#include "ui/standby_view.h"
 #endif
 /* Idle time (ms) after the last chat message before yielding the foreground
  * back to the pet status ring home screen.  Only active when PET_STATUS is on
@@ -60,6 +73,193 @@ LV_FONT_DECLARE(lv_font_misans_16_cjk);
 /* ── Constants ────────────────────────────────────────────────── */
 
 static const char* TAG = "lvgl_ui";
+
+/* ── Reply-card hang probe (BUG-20261021-01) ────────────────────
+ * Step markers written from the LVGL thread around every call in
+ * chat_view_add_message()/chat_view_build_agent_card().  A log whose
+ * last line is "tr<N>" (with no "tr<N+1>") names the exact LVGL entry
+ * point that never returned.
+ *
+ * These go out through a raw write(1) to the console on purpose: syslog
+ * takes a process-wide mutex, so if one thread wedges inside syslog the
+ * probes stop too and a syslog deadlock looks exactly like a widget call
+ * that never returns.  Bypassing it separates the two.
+ * Drop this once the freeze is fixed. */
+static void ui_raw_log(const char* what, long a, long b)
+{
+    char bfr[96];
+    int n = snprintf(bfr, sizeof(bfr), "\r\n[lvgl_ui] %s %ld %ld\r\n",
+                     what, a, b);
+
+    if (n > 0)
+      {
+        ssize_t ignored = write(1, bfr, (size_t)n);
+        (void)ignored;
+      }
+}
+
+/* Free-form variant of ui_raw_log() for reports with more than two numbers
+ * (lock-wait reports need the owner, the probe step and the LVGL progress
+ * counters at once).  Same raw write(1) rationale. */
+static void ui_raw_line(const char* fmt, ...)
+{
+    char bfr[192];
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(bfr, sizeof(bfr), fmt, ap);
+    va_end(ap);
+
+    if (n > (int)sizeof(bfr) - 1)
+      {
+        n = (int)sizeof(bfr) - 1;
+      }
+
+    if (n > 0)
+      {
+        ssize_t ignored = write(1, bfr, (size_t)n);
+        (void)ignored;
+      }
+}
+
+/* Last probe step reached by the UI thread.  The watchdog prints it, so a
+ * stall report still names the call the UI thread is stuck in even when the
+ * UI thread's own probe line never made it out (blocked console write). */
+static volatile int s_ui_trace_step;
+
+#define UITRACE(step)                                        \
+  do {                                                       \
+      s_ui_trace_step = (step);                              \
+      bk7258_ap_dbg_mark((uint32_t)(step));                  \
+      ui_raw_log("tr", (long)(step), 0);                     \
+    } while (0)
+
+/* LVGL-side progress counters, defined in core/lv_obj_pos.c.  They tell a
+ * spin inside one layout pass (counters climb) from a block inside a single
+ * call (counters frozen); lv_dbg_class names the widget being processed. */
+extern volatile uint32_t lv_dbg_layout_outer;
+extern volatile uint32_t lv_dbg_layout_calls;
+extern volatile uint32_t lv_dbg_refr_calls;
+extern volatile const char* lv_dbg_class;
+
+/* AP boot-record debug marker (SWAP word 40).  The CP's ap-monitor thread
+ * prints every change to this word directly on UART0 (ttyUSB0), so a freeze
+ * that wedges the AP's RPMsg console can still be attributed to the last
+ * trace step reached.  Declared here rather than including the chip header
+ * (the ai_agent app include path does not provide it) — the symbol is linked
+ * into the same flat AP image. */
+extern void bk7258_ap_dbg_mark(uint32_t mark);
+
+/* ── LVGL thread-safety lock ─────────────────────────────────────
+ *
+ * This build has CONFIG_LV_USE_OS=0, so LVGL has no internal locking:
+ * its timer list, object tree and lv_malloc heap are plain
+ * unsynchronized globals.  lv_loop_thread() calls lv_timer_handler(),
+ * but every other thread (agent loop, outbound dispatch, PTT button,
+ * cmd channel, notify) reaches LVGL through lv_async_call() /
+ * lv_timer_create().  Without a lock those calls race the handler:
+ * lv_timer_create() links the new timer into the global list *before*
+ * filling in its fields, so the handler can run a half-built timer and
+ * read a garbage user_data pointer.  Observed on BK7258 hardware:
+ * lv_async_timer_cb's `ldmia` on an unaligned user_data -> UsageFault
+ * (CFSR=0x01000000 UNALIGNED) in the ai_agent process, which RPTUN
+ * escalates to "Panic by remote core: ap" and resets AP.
+ *
+ * Hold this lock around any LVGL entry point called from a non-LVGL
+ * thread, and around lv_timer_handler() itself.
+ *
+ * Recursion is required: LVGL-thread callbacks (pet_idle_timer_cb,
+ * standby_timer_cb) themselves queue async calls.  CONFIG_PTHREAD_MUTEX_TYPES
+ * is disabled in this build, so a recursive pthread mutex is unavailable;
+ * emulate it with owner + depth instead.
+ */
+static pthread_mutex_t s_lvgl_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile pthread_t s_lvgl_lock_owner;  /* 0 = not held */
+static volatile int s_lvgl_lock_depth;
+
+void lvgl_ui_lock(void)
+{
+    pthread_t self = pthread_self();
+    struct timespec t0;
+    struct timespec t1;
+    bool wait_logged = false;
+    long next_raw = 5000;   /* periodic raw report while waiting */
+
+    /* Fast path: this thread already owns the lock.  Only the owner ever
+     * stores its tid here, and unlock() clears it before releasing, so a
+     * stale value from a previous owner can never match a non-owner. */
+    if (s_lvgl_lock_owner != (pthread_t)0 &&
+        pthread_equal(s_lvgl_lock_owner, self))
+      {
+        s_lvgl_lock_depth++;
+        return;
+      }
+
+    /* Try-then-sleep instead of a plain blocking lock so a stuck LVGL
+     * thread can be identified: whoever holds the lock too long is named
+     * in the log before the caller gives up waiting. */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (pthread_mutex_trylock(&s_lvgl_lock) != 0)
+      {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000
+                + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+
+        if (!wait_logged && ms >= 500)
+          {
+            syslog(LOG_WARNING,
+                   "[%s] ui lock wait %ldms (owner tid=%p)\n",
+                   TAG, ms, (void *)s_lvgl_lock_owner);
+            wait_logged = true;
+          }
+
+        /* Backup channel for BUG-20261021-01: this thread is alive and
+         * waiting, so it can report the state of the thread that holds the
+         * lock even if that thread (and the watchdog) never prints again.
+         * Raw write(1), same reason as the probes: no syslog lock. */
+        if (ms >= next_raw)
+          {
+            ui_raw_line("\r\n[lvgl_ui] lw %ld owner %p tr %d lvl %lu/%lu/%lu %s\r\n",
+                        ms, (void *)s_lvgl_lock_owner, s_ui_trace_step,
+                        (unsigned long)lv_dbg_layout_outer,
+                        (unsigned long)lv_dbg_layout_calls,
+                        (unsigned long)lv_dbg_refr_calls,
+                        lv_dbg_class ? lv_dbg_class : "-");
+            next_raw += 5000;
+          }
+
+        usleep(1000);
+      }
+
+    s_lvgl_lock_owner = self;
+    s_lvgl_lock_depth = 1;
+}
+
+void lvgl_ui_unlock(void)
+{
+    if (s_lvgl_lock_depth > 1)
+      {
+        s_lvgl_lock_depth--;
+        return;
+      }
+
+    s_lvgl_lock_depth = 0;
+    s_lvgl_lock_owner = (pthread_t)0;  /* before release: no stale-owner fast path */
+    pthread_mutex_unlock(&s_lvgl_lock);
+}
+
+/* Locked lv_async_call(): returns 0 on success, -1 on failure. */
+int lvgl_ui_async_call(void (*cb)(void*), void* data)
+{
+    int ret;
+
+    lvgl_ui_lock();
+    ret = lv_async_call((lv_async_cb_t)cb, data);
+    lvgl_ui_unlock();
+
+    return ret == LV_RESULT_OK ? 0 : -1;
+}
 
 /* Self-test toggle: define to inject one card per reply category on
  * show_chat, for visual verification of all four color-bar variants.
@@ -73,10 +273,6 @@ static const char* TAG = "lvgl_ui";
 /* Layout constants for 466x466 round screen */
 #define LVGL_UI_SCREEN_W 466
 #define LVGL_UI_SCREEN_H 466
-#define LVGL_UI_PADDING_H 50
-#define LVGL_UI_PADDING_TOP 60
-#define LVGL_UI_PADDING_BOTTOM 30
-#define LVGL_UI_PTT_SIZE 112
 #define LVGL_UI_CHAT_GAP 10
 #define LVGL_UI_BUBBLE_RADIUS 14
 #define LVGL_UI_BUBBLE_PAD 10
@@ -87,6 +283,11 @@ static const char* TAG = "lvgl_ui";
 #define LVGL_UI_MSG_MAX_LEN 1024
 #define CHAT_HISTORY_MAX 20
 
+/* 屏幕切换淡入时长(ms)。硬 lv_screen_load() 的整帧 SPI flush 会与面板 60Hz
+ * GRAM 扫描竞争,表现为从上到下的白底刷屏;改用淡入交叉渐变分散到多帧,
+ * 把刷屏变成优雅的渐隐渐显。cleanup 路径(删屏前)必须保留硬切换,不能淡入。 */
+#define SCREEN_FADE_MS 500
+
 /* ── Enhanced Agent card styling ─────────────────────────────── */
 /* Agent replies render as a richer card: title bar + divider +
  * left status color bar + body.  The color bar reflects a coarse
@@ -94,20 +295,14 @@ static const char* TAG = "lvgl_ui";
  * plain) so the user gets a glanceable cue on the round screen. */
 #define LVGL_UI_CARD_TITLE "Agent"
 #define LVGL_UI_CARD_TITLEBAR_H 18
-#define LVGL_UI_CARD_COLOR_BAR_W 3
+#define LVGL_UI_CARD_COLOR_BAR_W 4
 #define LVGL_UI_CARD_GAP 4
 
-/* Status palette (RGB 0xRRGGBB) */
-#define LVGL_UI_CARD_COLOR_CONCLUSION 0x4caf50 /* green  — yes/no/建议 */
-#define LVGL_UI_CARD_COLOR_STRUCTURED 0x3a7bd5 /* blue   — MERGED/状态: */
-#define LVGL_UI_CARD_COLOR_JIRA        0xff9800 /* orange — More Info/经办人 */
-#define LVGL_UI_CARD_COLOR_PLAIN       0x9e9e9e /* grey   — default */
-
-/* PTT button label — use CJK text that MiSans definitely supports.
- * Emoji glyphs (U+1F399/U+1F3A4) are NOT in MiSans and cause
- * FT_Load_Glyph error 0x14 (glyph not found). */
-#define PTT_ICON_MIC "\xe8\xaf\xb7\xe8\xaf\xb4" /* "请说" in UTF-8 */
-#define CLOSE_BTN_TEXT "\xe5\x85\xb3\xe9\x97\xad" /* "关闭" in UTF-8 */
+/* Status palette (HachimoDock 柔和低饱和, see ui_palette.h) */
+#define LVGL_UI_CARD_COLOR_CONCLUSION UI_PAL_DONE  /* green — yes/no/建议 */
+#define LVGL_UI_CARD_COLOR_STRUCTURED UI_PAL_THINK /* blue  — MERGED/状态: */
+#define LVGL_UI_CARD_COLOR_JIRA        UI_PAL_WAIT  /* amber — More Info/经办人 */
+#define LVGL_UI_CARD_COLOR_PLAIN       UI_PAL_IDLE  /* grey  — default */
 
 /* ── Data structures ──────────────────────────────────────────── */
 
@@ -134,11 +329,13 @@ typedef struct {
     /* UI widget references */
     lv_obj_t* screen;
     lv_obj_t* chat_list;
-    lv_obj_t* ptt_btn;
-    lv_obj_t* ptt_label;
-    lv_obj_t* rec_indicator;
-    lv_obj_t* close_btn;
-    lv_anim_t rec_anim;
+
+    /* Approval screen (remote permission request pending) */
+    lv_obj_t* approval_screen;
+    lv_obj_t* approval_tool;    /* tool name label */
+    lv_obj_t* approval_hint;    /* hint text label */
+    bool approval_visible;
+    lv_obj_t* approval_prev_screen;
 
     /* Chat history */
     chat_history_t history;
@@ -167,14 +364,252 @@ static lvgl_ui_state_t s_state;
  * the init so stop() can deinit symmetrically. */
 static bool s_lv_owned = false;
 static pthread_t s_lv_loop_tid;
+static pthread_t s_lv_wd_tid;
 static volatile bool s_lv_loop_running = false;
 static lv_nuttx_result_t s_lv_result;
 
+/* LVGL log sink (see the registration in lv_loop_thread). */
+static void lvgl_log_cb(lv_log_level_t level, const char* buf)
+{
+    (void)level;
+    syslog(LOG_INFO, "[lvgl] %s", buf);
+}
+
+/* Frame counter polled by the UI watchdog.  Bumped by the LVGL loop. */
+static volatile uint32_t s_lv_frames;
+
+/* Watchdog ticks.  Printed by the LVGL thread's heartbeat as well as by the
+ * watchdog itself: if the watchdog's own console write is ever lost, a
+ * rising tick count in the heartbeat still proves the thread is scheduled. */
+static volatile uint32_t s_wd_ticks;
+
+/* How far the watchdog thread got.  1 = entered, 2 = priority set,
+ * 3 = raw console write returned, 4 = syslog returned.  Frozen at 1 means
+ * the thread never ran at all; frozen at 2/3 means it blocks in console
+ * output.  Read from the heartbeat, so it needs no output of its own. */
+static volatile int s_wd_stage;
+static volatile int s_wd_prio = -1;
+static volatile int s_wd_setrc = -2;
+
+/* UI watchdog (BUG-20261021-01).  Two very different failures look the
+ * same in the log: the LVGL thread wedging inside a widget call, and the
+ * whole AP dying.  The watchdog runs above the LVGL thread's priority, so
+ * if it keeps printing while the frame counter is frozen, the scheduler
+ * and the console are alive and the LVGL thread is the stuck one; if it
+ * goes silent too, the AP or the console path itself is gone. */
+static void* ui_watchdog_thread(void* arg)
+{
+    struct sched_param got;
+    char bfr[192];
+    int n;
+    uint32_t last = 0;
+    int stall = 0;
+
+    (void)arg;
+
+    /* First statement on purpose: a store, no syscall, no console.  If the
+     * heartbeat reports stage 1 forever, this thread never got scheduled at
+     * all — which is a different bug from one that blocks in console output
+     * (stage 2/3). */
+    s_wd_stage = 1;
+
+    /* Priority is set at pthread_create() time via the attribute (see
+     * lv_loop_thread below), NOT here.  A self sched_setparam(0) to the
+     * highest priority hangs on this config (observed stage 1 forever),
+     * so read the effective priority back instead of raising it. */
+    memset(&got, 0, sizeof(got));
+    int grc = sched_getparam(0, &got);
+    s_wd_prio = (grc == 0) ? got.sched_priority : -1;
+    s_wd_setrc = 0;
+    s_wd_stage = 2;
+
+    /* Unconditional beacon through BOTH channels: as long as these keep
+     * coming, the scheduler and the serial output are alive and any silence
+     * elsewhere is a stuck thread, not a dead AP.  Sending it twice keeps
+     * the answer readable even if one of the two paths is wedged.  The
+     * priority read-back says whether the thread really runs at 20. */
+    n = snprintf(bfr, sizeof(bfr),
+                 "\r\n[lvgl_ui] wd up setrc=%d prio=%d getrc=%d\r\n",
+                 s_wd_setrc, s_wd_prio, grc);
+    if (n > 0)
+      {
+        ssize_t ign = write(1, bfr, (size_t)n);
+        (void)ign;
+      }
+    s_wd_stage = 3;
+
+    syslog(LOG_INFO, "[%s] wd up setrc=%d prio=%d getrc=%d\n",
+           TAG, s_wd_setrc, s_wd_prio, grc);
+    s_wd_stage = 4;
+
+    while (s_lv_loop_running)
+      {
+        uint32_t cur;
+
+        usleep(5000 * 1000);
+        if (!s_lv_loop_running)
+          {
+            break;
+          }
+
+        s_wd_ticks++;
+
+        cur = s_lv_frames;
+        if (cur == last)
+          {
+            stall += 5;
+          }
+        else
+          {
+            last = cur;
+            stall = 0;
+          }
+
+        /* `tr` is the last probe step the UI thread reached: a frozen frame
+         * count plus a frozen tr names the widget call that never returned.
+         * `lvl` is the patched-LVGL layout progress: outer passes / object
+         * visits / refr_size calls, and the class being worked on.  While the
+         * frames are frozen, growing lvl = spinning inside layout; static lvl
+         * = blocked inside one call. */
+        n = snprintf(bfr, sizeof(bfr),
+                     "\r\n[lvgl_ui] wd frames %lu stall %d tr %d lvl %lu/%lu/%lu %s\r\n",
+                     (unsigned long)cur, stall, s_ui_trace_step,
+                     (unsigned long)lv_dbg_layout_outer,
+                     (unsigned long)lv_dbg_layout_calls,
+                     (unsigned long)lv_dbg_refr_calls,
+                     lv_dbg_class ? lv_dbg_class : "-");
+        if (n > 0)
+          {
+            ssize_t ign = write(1, bfr, (size_t)n);
+            (void)ign;
+          }
+
+        if (stall > 0)
+          {
+            syslog(LOG_WARNING,
+                   "[%s] wd: LVGL stalled %ds (frames=%lu tr=%d)\n",
+                   TAG, stall, (unsigned long)cur, s_ui_trace_step);
+          }
+      }
+
+    return NULL;
+}
+
 static void* lv_loop_thread(void* arg)
 {
+    struct sched_param sp;
+    uint32_t frames = 0;
+
     (void)arg;
+
+    /* LV_USE_LOG is on but LV_LOG_PRINTF is off, so every LVGL log line —
+     * including "Asserted at expression: ... (Out of memory)" — was being
+     * discarded.  Route them to syslog so an assert is visible before
+     * lv_assert_handler() takes the system down. */
+    lv_log_register_print_cb(lvgl_log_cb);
+
+    /* The loop thread was created with the default pthread priority
+     * (inherited), so TLS / LLM dispatch / TTS work preempts it.  A frame
+     * that is preempted mid-flush holds lvgl_ui_lock() for that whole
+     * time, and every cross-thread LVGL caller (agent reply path, pet
+     * state, PTT) blocks behind it.  Run at the UI priority instead. */
+    sp.sched_priority = AGENT_LVGL_UI_PRIO;
+    int prc = sched_setparam(0, &sp);
+    syslog(LOG_INFO, "[%s] LVGL loop prio -> %d (rc=%d)\n",
+           TAG, AGENT_LVGL_UI_PRIO, prc);
+
+    /* Stall detector — see ui_watchdog_thread().  Give it an explicit 8 KB
+     * stack: CONFIG_PTHREAD_STACK_DEFAULT is 2048 here, which is marginal for
+     * one snprintf, and the previous run's watchdog never printed a byte while
+     * every other thread kept logging — a too-small stack is the likeliest
+     * reason.  The creation result is logged so a silent watchdog can no
+     * longer be confused with a wedged scheduler. */
+    {
+      pthread_attr_t wattr;
+      int crc = -1;
+
+      if (pthread_attr_init(&wattr) == 0)
+        {
+          struct sched_param wsp;
+
+          (void)pthread_attr_setstacksize(&wattr, 8192);
+          wsp.sched_priority = 20;   /* above the LVGL loop (45) */
+          (void)pthread_attr_setschedparam(&wattr, &wsp);
+          (void)pthread_attr_setschedpolicy(&wattr, SCHED_FIFO);
+          (void)pthread_attr_setinheritsched(&wattr, PTHREAD_EXPLICIT_SCHED);
+          crc = pthread_create(&s_lv_wd_tid, &wattr, ui_watchdog_thread, NULL);
+          (void)pthread_attr_destroy(&wattr);
+        }
+
+      syslog(LOG_INFO, "[%s] watchdog create rc=%d\n", TAG, crc);
+    }
+
     while (s_lv_loop_running) {
-        uint32_t idle = lv_timer_handler();
+        uint32_t idle;
+        struct timespec t0;
+        struct timespec t1;
+        long ms;
+
+        /* Serialize with cross-thread lv_async_call()/lv_timer_create()
+         * users.  CONFIG_LV_USE_OS=0 means LVGL does no locking itself. */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        lvgl_ui_lock();
+        idle = lv_timer_handler();
+        lvgl_ui_unlock();
+        s_lv_frames++;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        ms = (t1.tv_sec - t0.tv_sec) * 1000
+           + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+
+        /* One slow frame is the first symptom of a wedged render/flush;
+         * log it while the board is still talking. */
+        if (ms >= 300)
+          {
+            syslog(LOG_WARNING, "[%s] handler %ldms idle=%u\n",
+                   TAG, ms, (unsigned)idle);
+          }
+
+        /* Heartbeat: ~every 5 s at the normal cadence.  Silence after a
+         * hang means the LVGL thread itself stopped, not just the caller. */
+        if (++frames % 20 == 0)
+          {
+            char hb[192];
+            int hn;
+
+#if defined(CONFIG_STACK_COLORATION)
+            /* Stack high-water for this thread: if the reply-card build
+             * overflows the 64 KB LVGL stack, the log simply stops with no
+             * message, so surface the headroom while the board still talks. */
+            struct stackinfo_s si = {0};
+            size_t used = 0;
+
+            if (nxsched_get_stackinfo(0, &si) == 0 && si.adj_stack_size > 0)
+              {
+                used = up_check_tcbstack(nxsched_self(), si.adj_stack_size);
+              }
+
+            hn = snprintf(hb, sizeof(hb),
+                          "\r\n[lvgl_ui] hb frames stack %lu %lu wd %lu st %d pr %d "
+                          "lvl %lu/%lu/%lu\r\n",
+                          (unsigned long)frames, (unsigned long)used,
+                          (unsigned long)s_wd_ticks, s_wd_stage, s_wd_prio,
+                          (unsigned long)lv_dbg_layout_outer,
+                          (unsigned long)lv_dbg_layout_calls,
+                          (unsigned long)lv_dbg_refr_calls);
+#else
+            hn = snprintf(hb, sizeof(hb),
+                          "\r\n[lvgl_ui] hb frames %lu 0 wd %lu st %d pr %d\r\n",
+                          (unsigned long)frames, (unsigned long)s_wd_ticks,
+                          s_wd_stage, s_wd_prio);
+#endif
+            if (hn > 0)
+              {
+                ssize_t ign = write(1, hb, (size_t)hn);
+                (void)ign;
+              }
+          }
+
         if (idle == 0)
             idle = 1;
         usleep(idle * 1000);
@@ -201,11 +636,10 @@ static void chat_view_add_message_async_cb(void* data);
 static void chat_view_scroll_to_bottom(void);
 static void chat_view_trim_history(void);
 static void show_screen_async_cb(void* data);
-static void ptt_btn_event_cb(lv_event_t* e);
-static void close_btn_event_cb(lv_event_t* e);
-static void recording_indicator_start(void);
-static void recording_indicator_stop(void);
-static void recording_indicator_show_processing(void);
+static void approval_screen_build(void);
+static void set_approval_async_cb(void* data);
+static void clear_approval_async_cb(void* data);
+static void scroll_async_cb(void* data);
 
 /* ── Ring buffer ──────────────────────────────────────────────── */
 
@@ -290,11 +724,6 @@ static chat_msg_t* chat_history_add(chat_history_t* h, const char* text, bool is
 /* ── Public API stubs (filled in by later tasks) ──────────────── */
 
 #ifdef CONFIG_AI_AGENT_PET_STATUS
-#if defined(CONFIG_AI_AGENT_PARTICLE_FLOW)
-/* Forward decl: pet_idle_reset (below) calls this to pause rotation; the
- * full rotate block follows the pet idle section. */
-static void rotate_idle_reset(void);
-#endif
 /* Idle-yield support: when the pet status ring is enabled, the chat screen
  * yields the foreground to the pet after PET_IDLE_YIELD_MS of message silence.
  * All access is confined to the LVGL thread (init creates the timer; the send
@@ -306,7 +735,14 @@ static void pet_idle_timer_cb(lv_timer_t *t)
 {
     (void)t;
     if (!s_state.initialized || !s_state.screen_visible) return;
-    if (!pet_status_view_is_visible() &&
+    /* A pending remote permission request owns the foreground: never yield it
+     * back to the pet home screen while the approval page is up, or the user
+     * loses the S2/S3 approve/cancel cue mid-decision. */
+    if (s_state.approval_visible) return;
+    /* Judge by the active screen, not the cached visible flag: opening the
+     * chat screen does not call pet_status_view_hide(), so the flag stays true
+     * and the yield below would never fire (blank chat page stuck forever). */
+    if (!pet_status_view_is_active() &&
         (lv_tick_get() - s_pet_last_msg_tick) >= PET_IDLE_YIELD_MS)
       {
         /* Yield: the chat screen stays alive but releases the foreground so
@@ -321,52 +757,55 @@ static void pet_idle_timer_cb(lv_timer_t *t)
 static void pet_idle_reset(void)
 {
     s_pet_last_msg_tick = lv_tick_get();
-    rotate_idle_reset();   /* a live message pauses idle page rotation */
 }
 #else
 static void pet_idle_reset(void) {}
 #endif
 
-#if defined(CONFIG_AI_AGENT_PET_STATUS) && defined(CONFIG_AI_AGENT_PARTICLE_FLOW)
-/* Idle auto-rotate between the two 差异化 pages (M7 ① pet / ② particle).
- * When the agent is idle (state==IDLE) and no chat is visible, alternate
- * the foreground between the pet home screen and the particle flow every
- * ROTATE_INTERVAL_MS so a demo shows both round-screen pages without a
- * manual set_page.  Any non-idle state or incoming chat message pauses
- * rotation (reset the tick), since those have their own pet animation or
- * preempt the foreground.  Mirrors UI方案.md §2.4 "agent 空闲态自动切". */
-#define ROTATE_INTERVAL_MS  10000
-static lv_timer_t *s_rotate_timer = NULL;
-static uint32_t    s_rotate_last_switch_tick = 0;
-static int         s_last_pet_state = 0;   /* mirrored in set_pet_state */
+/* Agent lifecycle state, mirrored by set_pet_state().  The standby timer
+ * reads it to postpone standby while the agent is busy (non-idle). */
+static int s_last_pet_state = 0;
 
-static void rotate_idle_reset(void)
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+/* ── Standby dim clock (M7 待机界面) ────────────────────────────── */
+/* After STANDBY_TIMEOUT_MS with no real activity — no chat bubble, no PTT,
+ * no pet-state change, no page switch, no approval, no scroll — and the agent
+ * idle (s_last_pet_state==0), fade the foreground over to a dim digital clock
+ * (standby_view).  Any of those activity points calls ui_activity_reset(),
+ * which both restarts the countdown and (if the clock is up) fades it away,
+ * restoring the screen that was up before standby. */
+#define STANDBY_TIMEOUT_MS 60000
+static lv_timer_t *s_standby_timer = NULL;
+static uint32_t    s_last_activity_tick = 0;
+
+static void ui_activity_reset(void)
 {
-    s_rotate_last_switch_tick = lv_tick_get();
+    s_last_activity_tick = lv_tick_get();
+    if (standby_view_is_visible())
+        standby_view_hide();   /* async fade back to the previous screen */
 }
 
-static void rotate_timer_cb(lv_timer_t *t)
+static void standby_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (!s_state.initialized) return;
-    if (s_state.screen_visible) return;        /* chat holds the foreground */
-    if (s_last_pet_state != 0) return;         /* only idle rotates */
-    uint32_t now = lv_tick_get();
-    if ((now - s_rotate_last_switch_tick) < ROTATE_INTERVAL_MS) return;
-    if (pet_status_view_is_visible())
+    if (!s_state.initialized || !s_state.running) return;
+    if (standby_view_is_visible()) return;
+    /* A busy (non-idle) agent keeps postponing standby so the thinking /
+     * executing / waiting animation is never interrupted mid-task. */
+    if (s_last_pet_state != 0)
       {
-        lvgl_ui_channel_set_page(1);
-        syslog(LOG_INFO, "[%s] idle rotate → particle\n", TAG);
+        s_last_activity_tick = lv_tick_get();
+        return;
       }
-    else if (particle_flow_view_is_visible())
+    if ((lv_tick_get() - s_last_activity_tick) >= STANDBY_TIMEOUT_MS)
       {
-        lvgl_ui_channel_set_page(0);
-        syslog(LOG_INFO, "[%s] idle rotate → pet\n", TAG);
+        syslog(LOG_INFO, "[%s] idle %ums → standby clock\n", TAG,
+               STANDBY_TIMEOUT_MS);
+        standby_view_show();
       }
-    s_rotate_last_switch_tick = now;
 }
 #else
-static void rotate_idle_reset(void) {}
+static void ui_activity_reset(void) {}
 #endif
 
 int lvgl_ui_channel_init(void)
@@ -409,24 +848,12 @@ int lvgl_ui_channel_init(void)
             goto cleanup;
         }
 
-        /* Start the LVGL event loop thread (miwear would own this on real
-         * hardware; on qemu we run it ourselves). */
-        s_lv_loop_running = true;
-        /* LVGL rendering + CJK (SIMSUN/FreeType) glyph rasterization needs a
-         * deep stack; the default pthread stack overflows -> recursive
-         * assert. Use an explicitly sized stack. */
-        pthread_attr_t lv_attr;
-        pthread_attr_init(&lv_attr);
-        pthread_attr_setstacksize(&lv_attr, AGENT_LVGL_UI_STACK);
-        if (pthread_create(&s_lv_loop_tid, &lv_attr, lv_loop_thread, NULL) != 0) {
-            syslog(LOG_ERR, "[%s] LVGL loop thread create failed\n", TAG);
-            lv_nuttx_deinit(&s_lv_result);
-            s_lv_loop_running = false;
-            ret = -EIO;
-            goto cleanup;
-        }
+        /* The event loop thread is started at the END of this function:
+         * widget creation below runs on this thread, and the loop thread
+         * would otherwise touch the same unsynchronized LVGL globals
+         * (timer list, object tree, lv_malloc heap) concurrently. */
         s_lv_owned = true;
-        syslog(LOG_INFO, "[%s] LVGL self-init OK, loop thread started\n", TAG);
+        syslog(LOG_INFO, "[%s] LVGL self-init OK\n", TAG);
     } else {
         syslog(LOG_INFO, "[%s] LVGL already initialized (system owns it)\n", TAG);
     }
@@ -441,9 +868,32 @@ int lvgl_ui_channel_init(void)
         if (rw > 0 && rh > 0) {
             disp_w = rw;
             disp_h = rh;
-            syslog(LOG_INFO, "[%s] display %dx%d\n", TAG, disp_w, disp_h);
+            syslog(LOG_INFO, "[%s] display %ldx%ld\n", TAG,
+                   (long)disp_w, (long)disp_h);
         }
     }
+
+    /* Round-face geometry.  The BK7258 JD9853 panel is a round watch face
+     * (Ø224) inscribed in a 240×296 rectangle centered at (120,148), leaving
+     * 8px side bezels and 36px top/bottom bezels.  The 466 reference is a full
+     * square face (Ø466, no bezel).  We derive the inscribed circle from the
+     * panel and lay out every widget inside it, so nothing spills into the
+     * bezel or off screen on either board. */
+    bool round_panel = (disp_w == 240 && disp_h == 296);
+    int32_t round_d  = round_panel ? 224 : ((disp_w < disp_h) ? disp_w : disp_h);
+    int32_t cx       = disp_w / 2;
+    int32_t cy       = disp_h / 2;
+    int32_t face_r   = round_d / 2;
+
+    /* Inner gutters as fractions of the circle.  Real-face values (Ø224,
+     * R=112, center (120,148)):
+     *   side_m 13 — chat_list side gutter
+     *   top_m  31 — chat_list top y=67
+     *   bot_m   0 — chat_list bottom flush with the round-face bottom edge
+     *               (y=260) */
+    int32_t side_m   = (round_d * 6)  / 100;   /* chat_list side gutter */
+    int32_t top_m    = (round_d * 14) / 100;   /* chat_list top gutter */
+    int32_t bot_m    = 0;                       /* chat_list bottom gutter */
 
     /* Create main screen with dark background */
     s_state.screen = lv_obj_create(NULL);
@@ -453,7 +903,7 @@ int lvgl_ui_channel_init(void)
         goto cleanup;
     }
 
-    lv_obj_set_style_bg_color(s_state.screen, lv_color_hex(0x1a1a2e), 0);
+    lv_obj_set_style_bg_color(s_state.screen, lv_color_hex(UI_PAL_BG), 0);
     lv_obj_set_style_bg_opa(s_state.screen, LV_OPA_COVER, 0);
     /* Do NOT call lv_screen_load() here — we load the screen on
      * demand when the user activates the chat UI, to avoid
@@ -466,9 +916,11 @@ int lvgl_ui_channel_init(void)
      * corrupt the heap.  Falls back to SimSun-16 (1000 chars) then Montserrat. */
     lv_obj_set_style_text_font(s_state.screen, &lv_font_misans_16_cjk, 0);
 
-    /* Step 5: Create Chat View container */
-    chat_h = disp_h - LVGL_UI_PADDING_TOP - LVGL_UI_PADDING_BOTTOM
-        - LVGL_UI_PTT_SIZE - 20;
+    /* Step 5: Create Chat View container — sized to the inscribed circle so
+     * the message list stays inside the round face (top and bottom leave
+     * bezel gutters). */
+    int32_t chat_list_w = round_d - 2 * side_m;
+    chat_h = 2 * face_r - top_m - bot_m;
 
     s_state.chat_list = lv_obj_create(s_state.screen);
     if (!s_state.chat_list) {
@@ -477,9 +929,8 @@ int lvgl_ui_channel_init(void)
         goto cleanup;
     }
 
-    lv_obj_set_size(s_state.chat_list,
-        disp_w - 2 * LVGL_UI_PADDING_H, chat_h);
-    lv_obj_align(s_state.chat_list, LV_ALIGN_TOP_MID, 0, LVGL_UI_PADDING_TOP);
+    lv_obj_set_size(s_state.chat_list, chat_list_w, chat_h);
+    lv_obj_set_pos(s_state.chat_list, cx - chat_list_w / 2, cy - face_r + top_m);
     lv_obj_set_scroll_dir(s_state.chat_list, LV_DIR_VER);
     lv_obj_set_flex_flow(s_state.chat_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_state.chat_list, LVGL_UI_CHAT_GAP, 0);
@@ -492,85 +943,16 @@ int lvgl_ui_channel_init(void)
     lv_obj_set_scrollbar_mode(s_state.chat_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(s_state.chat_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
-    /* Step 6: Create PTT Button */
-    s_state.ptt_btn = lv_btn_create(s_state.screen);
-    if (!s_state.ptt_btn) {
-        syslog(LOG_ERR, "[%s] ptt_btn create failed\n", TAG);
-        ret = -EIO;
-        goto cleanup;
-    }
-
-    lv_obj_set_size(s_state.ptt_btn, LVGL_UI_PTT_SIZE, LVGL_UI_PTT_SIZE);
-    lv_obj_align(s_state.ptt_btn, LV_ALIGN_BOTTOM_MID, 0, -LVGL_UI_PADDING_BOTTOM);
-    lv_obj_set_style_radius(s_state.ptt_btn, LVGL_UI_PTT_SIZE / 2, 0);
-    lv_obj_set_style_bg_color(s_state.ptt_btn, lv_color_hex(0x4a90d9), 0);
-    lv_obj_set_style_shadow_width(s_state.ptt_btn, 12, 0);
-    lv_obj_set_style_shadow_color(s_state.ptt_btn, lv_color_hex(0x4a90d9), 0);
-    lv_obj_set_style_shadow_opa(s_state.ptt_btn, LV_OPA_40, 0);
-
-    s_state.ptt_label = lv_label_create(s_state.ptt_btn);
-    if (!s_state.ptt_label) {
-        syslog(LOG_ERR, "[%s] ptt_label create failed\n", TAG);
-        ret = -EIO;
-        goto cleanup;
-    }
-
-    /* Use Unicode microphone emoji — MiSans includes it, unlike
-     * LV_SYMBOL_AUDIO which needs FontAwesome glyphs not in MiSans
-     * and renders as a rectangle. */
-    lv_label_set_text(s_state.ptt_label, PTT_ICON_MIC);
-    lv_obj_center(s_state.ptt_label);
-
-    lv_obj_add_event_cb(s_state.ptt_btn, ptt_btn_event_cb, LV_EVENT_ALL, NULL);
-
-    /* Step 7: Create Recording Indicator (initially hidden) */
-    s_state.rec_indicator = lv_label_create(s_state.screen);
-    if (!s_state.rec_indicator) {
-        syslog(LOG_ERR, "[%s] rec_indicator create failed\n", TAG);
-        ret = -EIO;
-        goto cleanup;
-    }
-
-    lv_label_set_text(s_state.rec_indicator, "");
-    lv_obj_align_to(s_state.rec_indicator, s_state.ptt_btn, LV_ALIGN_OUT_TOP_MID, 0, -8);
-    lv_obj_add_flag(s_state.rec_indicator, LV_OBJ_FLAG_HIDDEN);
-
-    /* Step 7b: Create Close Button (top-right corner) */
-    s_state.close_btn = lv_btn_create(s_state.screen);
-    if (!s_state.close_btn) {
-        syslog(LOG_ERR, "[%s] close_btn create failed\n", TAG);
-        ret = -EIO;
-        goto cleanup;
-    }
-
-    lv_obj_set_size(s_state.close_btn, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    /* Position close button inside the visible circular area.
-     * On a 466x466 round screen (radius 233), the top-right corner
-     * is clipped by the bezel.  Place the button at a position that
-     * is safely inside the circle: top-center with a rightward offset.
-     * At y=30 from top, the visible horizontal range is roughly
-     * center ± sqrt(233²-203²) ≈ ±115px, so x offset of +80 is safe. */
-    lv_obj_align(s_state.close_btn, LV_ALIGN_TOP_MID, 80, LVGL_UI_PADDING_TOP - 30);
-    lv_obj_set_style_bg_opa(s_state.close_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_state.close_btn, 0, 0);
-    lv_obj_set_style_shadow_opa(s_state.close_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(s_state.close_btn, 8, 0);
-
-    lv_obj_t* close_label = lv_label_create(s_state.close_btn);
-    if (close_label) {
-        lv_label_set_text(close_label, CLOSE_BTN_TEXT);
-        lv_obj_set_style_text_color(close_label, lv_color_hex(0x999999), 0);
-        lv_obj_center(close_label);
-    }
-
-    lv_obj_add_event_cb(s_state.close_btn, close_btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-    /* Step 8: Initialize chat history and mutex */
+    /* Step 6: Initialize chat history and mutex */
     memset(&s_state.history, 0, sizeof(chat_history_t));
     pthread_mutex_init(&s_state.lock, NULL);
 
     s_state.initialized = true;
     syslog(LOG_INFO, "[%s] init OK\n", TAG);
+
+    /* Build the approval screen (remote permission request) — a hidden,
+     * independent screen reached via lvgl_ui_channel_set_approval. */
+    approval_screen_build();
 
 #ifdef CONFIG_AI_AGENT_PET_STATUS
     /* Build the pet status ring home screen (M7 差异化页).  It is NOT loaded
@@ -595,17 +977,40 @@ int lvgl_ui_channel_init(void)
      * Init here so it is ready to show without a per-call create latency. */
     (void)particle_flow_view_init();
 #endif
-#if defined(CONFIG_AI_AGENT_PET_STATUS) && defined(CONFIG_AI_AGENT_PARTICLE_FLOW)
-    /* Idle auto-rotate between pet ① and particle ② (UI方案.md §2.4).
-     * 1 s period polls the idle condition; the cb self-throttles to
-     * ROTATE_INTERVAL_MS between actual switches. */
-    s_rotate_timer = lv_timer_create(rotate_timer_cb, 1000, NULL);
-    if (s_rotate_timer)
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+    /* M7 待机界面: build the dim digital clock screen (NOT loaded — the pet is
+     * the cold-start home screen; the standby timer fades it in after
+     * STANDBY_TIMEOUT_MS of idle).  Init here so it is ready to show without a
+     * per-call create latency.  1 s period polls the idle condition. */
+    (void)standby_view_init();
+    s_standby_timer = lv_timer_create(standby_timer_cb, 1000, NULL);
+    if (s_standby_timer)
       {
-        lv_timer_set_repeat_count(s_rotate_timer, -1);
+        lv_timer_set_repeat_count(s_standby_timer, -1);
       }
-    rotate_idle_reset();
+    ui_activity_reset();
 #endif
+
+    /* All widgets/timers exist now; start the LVGL event loop.  LVGL
+     * rendering + CJK glyph rasterization needs a deep stack — the default
+     * pthread stack overflows (recursive assert), so size it explicitly. */
+    if (s_lv_owned && !s_lv_loop_running) {
+        pthread_attr_t lv_attr;
+
+        s_lv_loop_running = true;
+        pthread_attr_init(&lv_attr);
+        pthread_attr_setstacksize(&lv_attr, AGENT_LVGL_UI_STACK);
+        if (pthread_create(&s_lv_loop_tid, &lv_attr, lv_loop_thread, NULL) != 0) {
+            syslog(LOG_ERR, "[%s] LVGL loop thread create failed\n", TAG);
+            lv_nuttx_deinit(&s_lv_result);
+            s_lv_loop_running = false;
+            s_lv_owned = false;
+            ret = -EIO;
+            goto cleanup;
+        }
+        syslog(LOG_INFO, "[%s] LVGL loop thread started\n", TAG);
+    }
+
     return 0;
 
 cleanup:
@@ -616,10 +1021,12 @@ cleanup:
         s_state.screen = NULL;
         /* Child widgets are deleted with the screen */
         s_state.chat_list = NULL;
-        s_state.ptt_btn = NULL;
-        s_state.ptt_label = NULL;
-        s_state.rec_indicator = NULL;
-        s_state.close_btn = NULL;
+    }
+    if (s_state.approval_screen) {
+        lv_obj_del(s_state.approval_screen);
+        s_state.approval_screen = NULL;
+        s_state.approval_tool = NULL;
+        s_state.approval_hint = NULL;
     }
 
     syslog(LOG_ERR, "[%s] init failed (rc=%d)\n", TAG, ret);
@@ -675,10 +1082,6 @@ static void lvgl_ui_do_cleanup(void)
     s_state.prev_screen = NULL;
 
     s_state.chat_list = NULL;
-    s_state.ptt_btn = NULL;
-    s_state.ptt_label = NULL;
-    s_state.rec_indicator = NULL;
-    s_state.close_btn = NULL;
 
     for (i = 0; i < CHAT_HISTORY_MAX; i++) {
         s_state.history.msgs[i].bubble = NULL;
@@ -703,24 +1106,6 @@ static void stop_screen_async_cb(void* data)
     sem_post(&s_stop_sem);
 }
 
-/* Stop from within the LVGL thread (e.g. close button callback).
- * Performs cleanup directly — no async scheduling needed. */
-void lvgl_ui_channel_stop_sync(void)
-{
-    if (!s_state.initialized || !s_state.running) {
-        return;
-    }
-
-    syslog(LOG_INFO, "[%s] stopping (sync)\n", TAG);
-
-    s_state.running = false;
-    lvgl_ui_do_cleanup();
-    pthread_mutex_destroy(&s_state.lock);
-    s_state.initialized = false;
-
-    syslog(LOG_INFO, "[%s] stopped\n", TAG);
-}
-
 /* Stop from an external thread (e.g. velaquit shutdown).
  * Schedules cleanup in the LVGL thread to avoid racing with the
  * miwear/launcher event loop. */
@@ -733,7 +1118,7 @@ void lvgl_ui_channel_stop(void)
 
     syslog(LOG_INFO, "[%s] stopping\n", TAG);
 
-    /* Mark as not running first — prevents callbacks (PTT, close_btn,
+    /* Mark as not running first — prevents callbacks (PTT,
      * chat_view_add_message) from touching widgets during teardown. */
     s_state.running = false;
 
@@ -742,7 +1127,7 @@ void lvgl_ui_channel_stop(void)
      * shutdown thread causes a MemManage fault because the LVGL
      * thread may be mid-render on the same objects. */
     sem_init(&s_stop_sem, 0, 0);
-    lv_async_call(stop_screen_async_cb, NULL);
+    lvgl_ui_async_call(stop_screen_async_cb, NULL);
 
     /* Wait for LVGL thread to complete the deletion (timeout 2s) */
     struct timespec ts;
@@ -757,10 +1142,6 @@ void lvgl_ui_channel_stop(void)
          * acceptable during shutdown to avoid crash). */
         s_state.screen = NULL;
         s_state.chat_list = NULL;
-        s_state.ptt_btn = NULL;
-        s_state.ptt_label = NULL;
-        s_state.rec_indicator = NULL;
-        s_state.close_btn = NULL;
     }
 
     sem_destroy(&s_stop_sem);
@@ -806,7 +1187,8 @@ static void show_screen_async_cb(void* data)
      * The launcher (miwear) owns this screen — we must not delete it. */
     s_state.prev_screen = lv_screen_active();
 
-    lv_screen_load(s_state.screen);
+    lv_screen_load_anim(s_state.screen, LV_SCR_LOAD_ANIM_FADE_IN,
+                        SCREEN_FADE_MS, 0, false);
     s_state.screen_visible = true;
 
 #ifdef LVGL_UI_CARD_SELFTEST
@@ -829,18 +1211,19 @@ void lvgl_ui_channel_show(void)
         return;
     }
 
+    ui_activity_reset();
+
     if (s_state.screen_visible) {
         return;
     }
 
     /* Schedule screen load in LVGL thread to avoid cross-thread
      * invalidation assertion. */
-    lv_async_call(show_screen_async_cb, NULL);
+    lvgl_ui_async_call(show_screen_async_cb, NULL);
 }
 
 int lvgl_ui_channel_send(const char* text)
 {
-    int ret;
     async_msg_t* payload;
 
     /* Parameter validation: NULL or empty string */
@@ -856,10 +1239,17 @@ int lvgl_ui_channel_send(const char* text)
         return -EINVAL;
     }
 
+    ui_activity_reset();
+
     /* Auto-show chat screen on first Agent reply */
     if (!s_state.screen_visible) {
         lvgl_ui_channel_show();
     }
+
+    /* Reply-path probes (BUG-20261021-01): tr40..tr43 are emitted by the
+     * agent/CLI thread, not the LVGL thread, so they show whether a silent
+     * console is this thread blocking on the UI lock or something earlier. */
+    UITRACE(40);
 
     /* Schedule bubble creation in LVGL thread via lv_async_call.
      * This avoids the "Invalidate area is not allowed during rendering"
@@ -875,12 +1265,19 @@ int lvgl_ui_channel_send(const char* text)
     chat_view_copy_text(payload->text, text, LVGL_UI_MSG_MAX_LEN);
     payload->is_user = false;
 
-    lv_async_call(chat_view_add_message_async_cb, payload);
+    UITRACE(41);
+    lvgl_ui_async_call(chat_view_add_message_async_cb, payload);
+    UITRACE(42);
 
-    /* TTS is blocking — run after scheduling the UI update */
-    ret = voice_channel_speak(text);
-    if (ret != 0) {
-        syslog(LOG_ERR, "[%s] voice_channel_speak failed (rc=%d)\n", TAG, ret);
+    /* TTS is blocking — run after scheduling the UI update.  Offline it can
+     * only fail, but only after a ~20 s network timeout that stalls the
+     * outbound dispatch thread (and the "no network" explanation that is
+     * already on screen).  Skip it when there is no network. */
+    if (network_is_connected()) {
+        int ret = voice_channel_speak(text);
+        if (ret != 0) {
+            syslog(LOG_ERR, "[%s] voice_channel_speak failed (rc=%d)\n", TAG, ret);
+        }
     }
 
     return 0;
@@ -902,6 +1299,8 @@ int lvgl_ui_channel_send_ex(const char* text, uint32_t bar_color)
         return -EINVAL;
     }
 
+    ui_activity_reset();
+
     if (!s_state.screen_visible) {
         lvgl_ui_channel_show();
     }
@@ -915,7 +1314,7 @@ int lvgl_ui_channel_send_ex(const char* text, uint32_t bar_color)
     payload->is_user = false;
     payload->bar_color = bar_color;
 
-    lv_async_call(chat_view_add_message_async_cb, payload);
+    lvgl_ui_async_call(chat_view_add_message_async_cb, payload);
     return 0;
 }
 
@@ -935,6 +1334,8 @@ int lvgl_ui_channel_send_user(const char* text)
         return -EINVAL;
     }
 
+    ui_activity_reset();
+
     if (!s_state.screen_visible) {
         lvgl_ui_channel_show();
     }
@@ -948,7 +1349,7 @@ int lvgl_ui_channel_send_user(const char* text)
     payload->is_user = true;
     payload->bar_color = 0;
 
-    lv_async_call(chat_view_add_message_async_cb, payload);
+    lvgl_ui_async_call(chat_view_add_message_async_cb, payload);
     return 0;
 }
 
@@ -975,7 +1376,6 @@ static void set_ptt_async_cb(void* data)
     case LVGL_UI_PTT_RECORDING:
         s_state.is_recording = true;
         s_state.is_processing = false;
-        recording_indicator_start();
 #ifdef CONFIG_AI_AGENT_PET_STATUS
         /* Mirror PTT onto the pet: a recording session reads as "listening". */
         pet_status_view_set_state(PET_STATE_LISTENING);
@@ -984,7 +1384,6 @@ static void set_ptt_async_cb(void* data)
     case LVGL_UI_PTT_PROCESSING:
         s_state.is_recording = false;
         s_state.is_processing = true;
-        recording_indicator_show_processing();
 #ifdef CONFIG_AI_AGENT_PET_STATUS
         pet_status_view_set_state(PET_STATE_THINKING);
 #endif
@@ -993,7 +1392,6 @@ static void set_ptt_async_cb(void* data)
     default:
         s_state.is_recording = false;
         s_state.is_processing = false;
-        recording_indicator_stop();
 #ifdef CONFIG_AI_AGENT_PET_STATUS
         pet_status_view_set_state(PET_STATE_IDLE);
 #endif
@@ -1009,6 +1407,7 @@ int lvgl_ui_channel_set_ptt(int state)
     if (!s_state.initialized || !s_state.running) {
         return -EINVAL;
     }
+    ui_activity_reset();
     /* Coerce unknown values to IDLE. */
     if (state != LVGL_UI_PTT_IDLE && state != LVGL_UI_PTT_RECORDING &&
         state != LVGL_UI_PTT_PROCESSING) {
@@ -1021,13 +1420,24 @@ int lvgl_ui_channel_set_ptt(int state)
         return -ENOMEM;
     }
     payload->state = state;
-    lv_async_call(set_ptt_async_cb, payload);
+    lvgl_ui_async_call(set_ptt_async_cb, payload);
     return 0;
 }
 
 /* Drive the pet status ring from the AP agent's lifecycle state (M7 差异化页).
  * On the CP/qemu core this delegates to pet_status_view; on the AP UI_RPMSG
  * shim (ui_rpmsg_client.c) the same symbol sends UI_RPMSG_SET_PET_STATE. */
+int lvgl_ui_channel_set_pet_error(const char *reason)
+{
+    if (reason && reason[0] != '\0') {
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+        /* Queued first so the caption is ready when the state applies. */
+        pet_status_view_set_error_text(reason);
+#endif
+    }
+    return lvgl_ui_channel_set_pet_state(PET_STATE_ERROR);
+}
+
 int lvgl_ui_channel_set_pet_state(int state)
 {
     int rc = -ENOSYS;
@@ -1049,7 +1459,7 @@ int lvgl_ui_channel_set_pet_state(int state)
     if (state != s_last_pet_state)
       {
         s_last_pet_state = state;
-        rotate_idle_reset();   /* state change restarts the idle-rotate countdown */
+        ui_activity_reset();   /* a genuine lifecycle change is activity */
       }
     return rc;
 }
@@ -1060,6 +1470,11 @@ int lvgl_ui_channel_set_pet_state(int state)
  * to the pet on idle.  Dispatched async on the LVGL thread. */
 int lvgl_ui_channel_set_page(int page)
 {
+    ui_activity_reset();
+    /* Switching to pet/particle means the chat screen no longer owns the
+     * foreground; keep the flag honest so the next scroll or Agent reply can
+     * bring the transcript back. */
+    s_state.screen_visible = false;
     switch (page)
       {
         case 0:
@@ -1109,7 +1524,16 @@ static void chat_view_add_message_async_cb(void* data)
      * is alive).  No-op when PET_STATUS is off. */
     pet_idle_reset();
 
+    /* Entry/exit markers: if a hang reports "add msg" without "add msg
+     * done", the fault is inside widget construction/rendering, not in
+     * the caller or the lock. */
+    syslog(LOG_INFO, "[%s] async: add msg (%u bytes)\n",
+           TAG, (unsigned)strlen(payload->text));
+
     chat_view_add_message(payload->text, payload->is_user, payload->bar_color);
+
+    syslog(LOG_INFO, "[%s] async: add msg done\n", TAG);
+
     free(payload);
     payload = NULL;
 }
@@ -1173,8 +1597,10 @@ static void chat_view_build_agent_card(lv_obj_t* bubble, const char* text,
     lv_obj_t* color_bar;
     lv_obj_t* body_lbl;
 
+    UITRACE(20);
     /* Title bar: a thin row holding the status dot + title text */
     title_bar = lv_obj_create(bubble);
+    UITRACE(21);
     lv_obj_remove_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(title_bar, lv_pct(100));
     lv_obj_set_height(title_bar, LVGL_UI_CARD_TITLEBAR_H);
@@ -1186,6 +1612,7 @@ static void chat_view_build_agent_card(lv_obj_t* bubble, const char* text,
     lv_obj_set_flex_align(title_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(title_bar, LVGL_UI_CARD_GAP, 0);
+    UITRACE(22);
 
     /* Status dot — colored circle reflecting the reply category */
     status_dot = lv_obj_create(title_bar);
@@ -1196,11 +1623,14 @@ static void chat_view_build_agent_card(lv_obj_t* bubble, const char* text,
     lv_obj_set_style_bg_opa(status_dot, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(status_dot, 0, 0);
     lv_obj_set_style_pad_all(status_dot, 0, 0);
+    UITRACE(23);
 
     /* Title label */
     title_lbl = lv_label_create(title_bar);
+    UITRACE(24);
     lv_label_set_text(title_lbl, LVGL_UI_CARD_TITLE);
-    lv_obj_set_style_text_color(title_lbl, lv_color_hex(0x9e9e9e), 0);
+    lv_obj_set_style_text_color(title_lbl, lv_color_hex(UI_PAL_MUTED), 0);
+    UITRACE(25);
 
     /* Divider line under the title */
     divider = lv_obj_create(bubble);
@@ -1209,12 +1639,13 @@ static void chat_view_build_agent_card(lv_obj_t* bubble, const char* text,
     lv_obj_set_height(divider, 1);
     lv_obj_set_style_pad_all(divider, 0, 0);
     lv_obj_set_style_border_width(divider, 0, 0);
-    lv_obj_set_style_bg_color(divider, lv_color_hex(0x3a3a4a), 0);
+    lv_obj_set_style_bg_color(divider, lv_color_hex(UI_PAL_LINE), 0);
     lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(divider, 0, 0);
     lv_obj_set_style_pad_ver(divider, 0, 0);
     lv_obj_set_style_margin_top(divider, LVGL_UI_CARD_GAP, 0);
     lv_obj_set_style_margin_bottom(divider, LVGL_UI_CARD_GAP, 0);
+    UITRACE(26);
 
     /* Body row: left color bar + body label */
     body_row = lv_obj_create(bubble);
@@ -1229,25 +1660,42 @@ static void chat_view_build_agent_card(lv_obj_t* bubble, const char* text,
     lv_obj_set_flex_align(body_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_column(body_row, LVGL_UI_CARD_GAP, 0);
+    UITRACE(27);
 
-    /* Left color bar (the category indicator) */
+    /* Left color bar (the category indicator).  The 0x27xx markers bisect a
+     * freeze inside this block: LVGL object ops cannot block (no console/IPC),
+     * so a stop here is a spin and the last marker names the call. */
     color_bar = lv_obj_create(body_row);
+    bk7258_ap_dbg_mark(0x2701);
     lv_obj_remove_flag(color_bar, LV_OBJ_FLAG_SCROLLABLE);
+    bk7258_ap_dbg_mark(0x2702);
     lv_obj_set_width(color_bar, LVGL_UI_CARD_COLOR_BAR_W);
+    bk7258_ap_dbg_mark(0x2703);
     lv_obj_set_height(color_bar, LV_SIZE_CONTENT);
+    bk7258_ap_dbg_mark(0x2704);
     lv_obj_set_style_pad_all(color_bar, 0, 0);
     lv_obj_set_style_border_width(color_bar, 0, 0);
     lv_obj_set_style_bg_color(color_bar, lv_color_hex(bar_color), 0);
     lv_obj_set_style_bg_opa(color_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(color_bar, 2, 0);
+    bk7258_ap_dbg_mark(0x2705);
+    UITRACE(28);
 
     /* Body label — the actual reply text */
     body_lbl = lv_label_create(body_row);
+    UITRACE(29);
     lv_label_set_text(body_lbl, text);
+    UITRACE(30);
     lv_label_set_long_mode(body_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(body_lbl, lv_pct(85));
-    lv_obj_set_style_text_color(body_lbl, lv_color_hex(0xe8e8e8), 0);
+    UITRACE(31);
+    /* The label fills the row's remaining width via flex_grow below; an
+     * additional lv_pct(85) width is a conflicting second hint that makes
+     * LVGL oscillate between the two (grow-share vs percentage) and never
+     * converge inside lv_obj_update_layout().  Let flex_grow own the width. */
+    UITRACE(32);
+    lv_obj_set_style_text_color(body_lbl, lv_color_hex(UI_PAL_INK), 0);
     lv_obj_set_flex_grow(body_lbl, 1);
+    UITRACE(33);
 }
 
 static void chat_view_add_message(const char* text, bool is_user,
@@ -1263,72 +1711,136 @@ static void chat_view_add_message(const char* text, bool is_user,
         chat_view_trim_history();
     }
 
+    UITRACE(is_user ? 10 : 11);
+
     /* Store message in ring buffer (handles truncation + old bubble deletion) */
     slot = chat_history_add(h, text, is_user);
 
-    /* Create bubble container inside chat_list */
-    bubble = lv_obj_create(s_state.chat_list);
+    /* Create a full-width flex-row wrapper so the bubble can right-align
+     * (user) or left-align (agent) inside the vertical chat column.  LVGL
+     * flex ignores a child's own `align` style, so alignment is carried by
+     * the wrapper's justify axis instead of a per-bubble align property. */
+    UITRACE(12);
+    lv_obj_t* wrap = lv_obj_create(s_state.chat_list);
+    if (!wrap) {
+        syslog(LOG_ERR, "[%s] bubble wrapper create failed\n", TAG);
+        return;
+    }
+    lv_obj_remove_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(wrap, lv_pct(100));
+    lv_obj_set_height(wrap, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(wrap, 0, 0);
+    lv_obj_set_style_border_width(wrap, 0, 0);
+    lv_obj_set_style_bg_opa(wrap, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(wrap, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wrap,
+                          is_user ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    UITRACE(13);
+    /* Create bubble container inside the alignment wrapper */
+    bubble = lv_obj_create(wrap);
     if (!bubble) {
         syslog(LOG_ERR, "[%s] bubble create failed\n", TAG);
+        lv_obj_del(wrap);
         return;
     }
 
-    lv_obj_set_width(bubble, lv_pct(85));
+    /* Agent cards are a uniform 85%-wide panel; the user bubble hugs its text
+     * (auto-width) so a short "你好" reads as a compact orange chip rather than
+     * a full-width bar.  The label's max_width (set below) caps long lines. */
+    lv_obj_set_width(bubble, is_user ? LV_SIZE_CONTENT : lv_pct(85));
     lv_obj_set_height(bubble, LV_SIZE_CONTENT);
     lv_obj_set_style_radius(bubble, LVGL_UI_BUBBLE_RADIUS, 0);
     lv_obj_set_style_pad_all(bubble, LVGL_UI_BUBBLE_PAD, 0);
     lv_obj_set_style_border_width(bubble, 0, 0);
 
     if (is_user) {
-        /* User bubble: right-aligned, blue background, white text */
-        lv_obj_set_style_align(bubble, LV_ALIGN_RIGHT_MID, 0);
-        lv_obj_set_style_bg_color(bubble, lv_color_hex(0x3a7bd5), 0);
+        /* User bubble: brand-orange background, white text (the wrapper's
+         * justify axis right-aligns it in the chat column). */
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(UI_PAL_ACCENT), 0);
         lv_obj_set_style_text_color(bubble, lv_color_white(), 0);
+        lv_obj_set_style_shadow_width(bubble, 4, 0);
+        lv_obj_set_style_shadow_offset_x(bubble, 2, 0);
+        lv_obj_set_style_shadow_offset_y(bubble, 4, 0);
+        lv_obj_set_style_shadow_color(bubble, lv_color_hex(UI_PAL_CARD_SHADOW), 0);
+        lv_obj_set_style_shadow_opa(bubble, LV_OPA_40, 0);
     } else {
-        /* Agent card: left-aligned, semi-transparent dark bg, vertical
-         * flex layout so title bar / divider / body stack top-to-bottom. */
-        lv_obj_set_style_align(bubble, LV_ALIGN_LEFT_MID, 0);
-        /* Card bg lighter than the screen bg (0x1a1a2e) + thin border so
-         * the card reads as a distinct rounded box instead of blending
-         * invisibly into the dark background. */
-        lv_obj_set_style_bg_color(bubble, lv_color_hex(0x363650), 0);
+        /* Agent card: left-aligned white card (HachimoDock panel) with a
+         * dark drop shadow + light border, so it reads as a raised card on
+         * the near-black background. */
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(UI_PAL_CARD), 0);
         lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_color(bubble, lv_color_hex(0x4a4a66), 0);
+        lv_obj_set_style_border_color(bubble, lv_color_hex(UI_PAL_LINE), 0);
         lv_obj_set_style_border_width(bubble, 1, 0);
-        lv_obj_set_style_text_color(bubble, lv_color_hex(0xe8e8e8), 0);
+        lv_obj_set_style_text_color(bubble, lv_color_hex(UI_PAL_INK), 0);
+        lv_obj_set_style_shadow_width(bubble, 4, 0);
+        lv_obj_set_style_shadow_offset_x(bubble, 2, 0);
+        lv_obj_set_style_shadow_offset_y(bubble, 4, 0);
+        lv_obj_set_style_shadow_color(bubble, lv_color_hex(UI_PAL_CARD_SHADOW), 0);
+        lv_obj_set_style_shadow_opa(bubble, LV_OPA_40, 0);
         lv_obj_set_flex_flow(bubble, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(bubble, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
                               LV_FLEX_ALIGN_START);
         lv_obj_set_style_pad_row(bubble, LVGL_UI_CARD_GAP, 0);
     }
 
+    UITRACE(14);
+
     if (is_user) {
         /* User bubble: plain label */
         lbl = lv_label_create(bubble);
         if (!lbl) {
             syslog(LOG_ERR, "[%s] bubble label create failed\n", TAG);
-            lv_obj_del(bubble);
+            lv_obj_del(wrap);
             slot->bubble = NULL;
             return;
         }
 
+        UITRACE(15);
         lv_label_set_text(lbl, slot->text);
+        UITRACE(16);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(lbl, lv_pct(100));
+        /* Cap the label so a long user line wraps (the content-sized bubble then
+         * hugs the wrapped text) while a short message stays a compact chip.
+         * Max = 85% of the chat column content width minus the bubble padding,
+         * keeping the wrapped bubble inside the round face. */
+        int32_t list_cw = lv_obj_get_content_width(s_state.chat_list);
+        int32_t lbl_max = (list_cw * 85) / 100 - 2 * LVGL_UI_BUBBLE_PAD;
+        if (lbl_max < 40) lbl_max = 40;
+        lv_obj_set_style_max_width(lbl, lbl_max, 0);
+        UITRACE(17);
     } else {
         /* Agent bubble: enhanced card (title bar + divider + color bar + body) */
         uint32_t color = bar_color ? bar_color : chat_view_classify_reply(slot->text);
+        UITRACE(18);
         chat_view_build_agent_card(bubble, slot->text, color);
+        UITRACE(19);
     }
 
-    slot->bubble = bubble;
+    /* slot->bubble stores the wrapper so history trim deletes bubble+wrapper
+     * in one lv_obj_del (deleting a parent removes its children). */
+    slot->bubble = wrap;
+    UITRACE(34);
 
     chat_view_scroll_to_bottom();
+    UITRACE(35);
 }
 
 static void chat_view_scroll_to_bottom(void)
 {
+    /* Split into the two halves LVGL actually runs, so a hang here is named:
+     * tr36 -> forced layout pass (lv_obj_update_layout walks the whole screen
+     *         and re-runs it while the screen keeps reporting layout
+     *         invalidation — an oscillating content-size/percentage pair
+     *         never converges and spins there forever), tr37 -> the scroll
+     *         itself. */
+    UITRACE(36);
+    lv_obj_update_layout(s_state.chat_list);
+    UITRACE(37);
+
     lv_obj_scroll_to_y(s_state.chat_list, LV_COORD_MAX, LV_ANIM_ON);
+    UITRACE(38);
 }
 
 static void chat_view_trim_history(void)
@@ -1338,152 +1850,271 @@ static void chat_view_trim_history(void)
      * in the future (e.g. scroll position adjustment). */
 }
 
-static void ptt_btn_event_cb(lv_event_t* e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-
-    /* Single-click toggle: first click starts recording, second stops */
-    if (code != LV_EVENT_CLICKED) {
-        return;
-    }
-
-    pthread_mutex_lock(&s_state.lock);
-
-    if (s_state.is_processing) {
-        pthread_mutex_unlock(&s_state.lock);
-        return;
-    }
-
-    if (!s_state.is_recording) {
-        /* First click: start recording */
-        int ret = voice_channel_start();
-        if (ret != 0) {
-            syslog(LOG_ERR, "[%s] voice_channel_start failed (rc=%d)\n", TAG, ret);
-            pthread_mutex_unlock(&s_state.lock);
-            chat_view_add_message("录音启动失败", false, 0);
-            return;
-        }
-
-        s_state.is_recording = true;
-        pthread_mutex_unlock(&s_state.lock);
-
-        recording_indicator_start();
-    } else {
-        /* Second click: stop recording and process */
-        s_state.is_recording = false;
-        s_state.is_processing = true;
-        pthread_mutex_unlock(&s_state.lock);
-
-        recording_indicator_show_processing();
-
-        /* Stop recording and get ASR text synchronously */
-        char asr_text[LVGL_UI_MSG_MAX_LEN];
-        int ret = voice_channel_stop_with_text(asr_text,
-            sizeof(asr_text));
-
-        if (ret != 0) {
-            syslog(LOG_ERR,
-                "[%s] voice_channel_stop_with_text failed (rc=%d)\n",
-                TAG, ret);
-            goto done;
-        }
-
-        if (asr_text[0] == '\0') {
-            chat_view_add_message("未识别到语音", false, 0);
-            goto done;
-        }
-
-        /* Route through the single dispatch point so the destination stays
-         * out of this file: with no sink registered the utterance goes to the
-         * chat bus exactly as before, and a product that registered one owns
-         * it instead.  This file must not learn which consumer exists.
-         */
-
-        voice_channel_dispatch(asr_text);
-        chat_view_add_message(asr_text, true, 0);
-
-    done:
-        pthread_mutex_lock(&s_state.lock);
-        s_state.is_processing = false;
-        pthread_mutex_unlock(&s_state.lock);
-        recording_indicator_stop();
-    }
-}
-
-/* Close button callback — destroy chat screen and stop audio */
-static void close_btn_event_cb(lv_event_t* e)
-{
-    (void)e;
-    if (!s_state.initialized || !s_state.running) {
-        return;
-    }
-
-    syslog(LOG_INFO, "[%s] chat screen closed by user\n", TAG);
-
-    /* Stop any active recording first */
-    if (s_state.is_recording) {
-        voice_channel_stop();
-        s_state.is_recording = false;
-    }
-
-    /* Full teardown: destroy screen, free font, reset state.
-     * Use sync version — we are already in the LVGL thread. */
-    lvgl_ui_channel_stop_sync();
-}
-
-/* Animation callback wrapper — lv_obj_set_style_opa requires the
- * selector argument, so we cannot cast it directly as exec_cb. */
-static void anim_opa_cb(void* obj, int32_t v)
-{
-    lv_obj_set_style_opa((lv_obj_t*)obj, (lv_opa_t)v, 0);
-}
-
-static void recording_indicator_start(void)
-{
-    /* PTT button: red background + slight scale-up */
-    lv_obj_set_style_bg_color(s_state.ptt_btn, lv_color_hex(0xe74c3c), 0);
-    lv_obj_set_style_transform_scale(s_state.ptt_btn, 280, 0);
-
-    /* Show recording indicator label */
-    lv_label_set_text(s_state.rec_indicator, "录音中...");
-    lv_obj_set_style_text_color(s_state.rec_indicator, lv_color_hex(0xe74c3c), 0);
-    lv_obj_clear_flag(s_state.rec_indicator, LV_OBJ_FLAG_HIDDEN);
-
-    /* Pulse animation on PTT button opacity */
-    lv_anim_init(&s_state.rec_anim);
-    lv_anim_set_var(&s_state.rec_anim, s_state.ptt_btn);
-    lv_anim_set_values(&s_state.rec_anim, LV_OPA_COVER, LV_OPA_70);
-    lv_anim_set_time(&s_state.rec_anim, 600);
-    lv_anim_set_repeat_count(&s_state.rec_anim, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_playback_time(&s_state.rec_anim, 600);
-    lv_anim_set_exec_cb(&s_state.rec_anim, anim_opa_cb);
-    lv_anim_start(&s_state.rec_anim);
-}
-
-static void recording_indicator_stop(void)
-{
-    /* Restore PTT button default style */
-    lv_obj_set_style_bg_color(s_state.ptt_btn, lv_color_hex(0x4a90d9), 0);
-    lv_obj_set_style_transform_scale(s_state.ptt_btn, 256, 0);
-    lv_obj_set_style_opa(s_state.ptt_btn, LV_OPA_COVER, 0);
-
-    /* Stop pulse animation */
-    lv_anim_del(s_state.ptt_btn, anim_opa_cb);
-
-    /* Hide indicator */
-    lv_obj_add_flag(s_state.rec_indicator, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void recording_indicator_show_processing(void)
-{
-    /* Stop pulse animation and restore opacity */
-    lv_anim_del(s_state.ptt_btn, anim_opa_cb);
-    lv_obj_set_style_opa(s_state.ptt_btn, LV_OPA_COVER, 0);
-
-    /* Switch indicator text to processing state */
-    lv_label_set_text(s_state.rec_indicator, "识别中...");
-    lv_obj_set_style_text_color(s_state.rec_indicator, lv_color_hex(0xf39c12), 0);
-}
-
 /* lvgl_ui_thread removed — we no longer run our own LVGL event loop.
  * The system's miwear event loop handles lv_timer_handler(). */
+
+/* ── Approval screen (remote permission request) + chat scroll ─────── */
+
+#define LVGL_UI_SCROLL_STEP 120   /* px per short-press scroll tick */
+
+typedef struct {
+    char tool[32];
+    char hint[128];
+} async_approval_t;
+
+typedef struct {
+    int dir;   /* 0 = up/older, 1 = down/newer */
+} async_scroll_t;
+
+/* Build the standalone approval screen once at init() time.  It is NOT
+ * loaded here — lvgl_ui_channel_set_approval() loads it when a remote
+ * permission request is pending and lvgl_ui_channel_clear_approval()
+ * restores the previous page.  Content is a centered white card inside the
+ * inscribed round face so nothing spills into the panel bezel. */
+static void approval_screen_build(void)
+{
+    lv_coord_t disp_w = LVGL_UI_SCREEN_W;
+    lv_coord_t disp_h = LVGL_UI_SCREEN_H;
+    lv_display_t* disp = lv_display_get_default();
+
+    if (disp) {
+        lv_coord_t rw = lv_display_get_horizontal_resolution(disp);
+        lv_coord_t rh = lv_display_get_vertical_resolution(disp);
+        if (rw > 0 && rh > 0) {
+            disp_w = rw;
+            disp_h = rh;
+        }
+    }
+
+    bool round_panel = (disp_w == 240 && disp_h == 296);
+    int32_t round_d = round_panel ? 224 : ((disp_w < disp_h) ? disp_w : disp_h);
+    int32_t card_w = (round_d * 82) / 100;   /* 82% of the face width */
+    if (card_w < 160) card_w = 160;
+
+    s_state.approval_screen = lv_obj_create(NULL);
+    if (!s_state.approval_screen) {
+        syslog(LOG_ERR, "[%s] approval screen create failed\n", TAG);
+        return;
+    }
+    lv_obj_set_style_bg_color(s_state.approval_screen, lv_color_hex(UI_PAL_BG), 0);
+    lv_obj_set_style_bg_opa(s_state.approval_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(s_state.approval_screen, &lv_font_misans_16_cjk, 0);
+
+    /* White card centered on the panel (the round face is concentric with
+     * the full panel, so lv_obj_center lands it on the face center). */
+    lv_obj_t* card = lv_obj_create(s_state.approval_screen);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(card, card_w);
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_center(card);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(UI_PAL_CARD), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(UI_PAL_LINE), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_shadow_width(card, 4, 0);
+    lv_obj_set_style_shadow_offset_x(card, 2, 0);
+    lv_obj_set_style_shadow_offset_y(card, 4, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(UI_PAL_CARD_SHADOW), 0);
+    lv_obj_set_style_shadow_opa(card, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(card, 8, 0);
+
+    /* Title — amber, the "permission request" cue.  Font-safe subset: 等待确认. */
+    lv_obj_t* title = lv_label_create(card);
+    lv_label_set_text(title, "等待确认");
+    lv_obj_set_style_text_color(title, lv_color_hex(UI_PAL_WAIT), 0);
+
+    /* Tool name — ink.  Hides itself when the bridge sends an empty tool. */
+    s_state.approval_tool = lv_label_create(card);
+    lv_label_set_text(s_state.approval_tool, "");
+    lv_obj_set_style_text_color(s_state.approval_tool, lv_color_hex(UI_PAL_INK), 0);
+
+    /* Hint — muted grey, wraps within the card. */
+    s_state.approval_hint = lv_label_create(card);
+    lv_label_set_text(s_state.approval_hint, "");
+    lv_label_set_long_mode(s_state.approval_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_state.approval_hint, card_w - 2 * 14);
+    lv_obj_set_style_text_color(s_state.approval_hint, lv_color_hex(UI_PAL_MUTED), 0);
+
+    /* Button row: two capsules mapping the two non-PTT keys to their approval
+     * meaning (S2 → approve, S3 → cancel).  Purely visual — the actual key
+     * handling lives in the board's button input layer, which registers as a
+     * remote_ctrl input adapter; this page only tells the user what a short
+     * press means right now. */
+    lv_obj_t* btns = lv_obj_create(card);
+    lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(btns, lv_pct(100));
+    lv_obj_set_height(btns, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(btns, 0, 0);
+    lv_obj_set_style_border_width(btns, 0, 0);
+    lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(btns, 0, 0);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t* ok = lv_obj_create(btns);
+    lv_obj_remove_flag(ok, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_height(ok, 32);
+    lv_obj_set_width(ok, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_hor(ok, 14, 0);
+    lv_obj_set_style_radius(ok, 16, 0);
+    lv_obj_set_style_bg_color(ok, lv_color_hex(UI_PAL_DONE), 0);
+    lv_obj_set_style_bg_opa(ok, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ok, 0, 0);
+    lv_obj_set_flex_flow(ok, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ok, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_t* ok_lbl = lv_label_create(ok);
+    lv_label_set_text(ok_lbl, "S2 通过");
+    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
+
+    lv_obj_t* no = lv_obj_create(btns);
+    lv_obj_remove_flag(no, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_height(no, 32);
+    lv_obj_set_width(no, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_hor(no, 14, 0);
+    lv_obj_set_style_radius(no, 16, 0);
+    lv_obj_set_style_bg_color(no, lv_color_hex(UI_PAL_ERROR), 0);
+    lv_obj_set_style_bg_opa(no, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(no, 0, 0);
+    lv_obj_set_flex_flow(no, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(no, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_t* no_lbl = lv_label_create(no);
+    lv_label_set_text(no_lbl, "S3 取消");
+    lv_obj_set_style_text_color(no_lbl, lv_color_white(), 0);
+}
+
+static void set_approval_async_cb(void* data)
+{
+    async_approval_t* p = (async_approval_t*)data;
+
+    if (!p) {
+        return;
+    }
+    if (!s_state.initialized || !s_state.running || !s_state.approval_screen) {
+        free(p);
+        return;
+    }
+
+    lv_label_set_text(s_state.approval_tool, p->tool);
+    lv_label_set_text(s_state.approval_hint, p->hint);
+    if (p->tool[0] == '\0') {
+        lv_obj_add_flag(s_state.approval_tool, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(s_state.approval_tool, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Save the page we were on (pet/particle/chat) so clear can restore it. */
+    if (!s_state.approval_visible) {
+        s_state.approval_prev_screen = lv_screen_active();
+        lv_screen_load_anim(s_state.approval_screen, LV_SCR_LOAD_ANIM_FADE_IN,
+                            SCREEN_FADE_MS, 0, false);
+        s_state.approval_visible = true;
+    }
+    free(p);
+}
+
+static void clear_approval_async_cb(void* data)
+{
+    (void)data;
+    if (!s_state.initialized || !s_state.approval_screen) {
+        return;
+    }
+    if (!s_state.approval_visible) {
+        return;
+    }
+    if (s_state.approval_prev_screen) {
+        lv_screen_load_anim(s_state.approval_prev_screen, LV_SCR_LOAD_ANIM_FADE_IN,
+                            SCREEN_FADE_MS, 0, false);
+    }
+    s_state.approval_visible = false;
+    s_state.approval_prev_screen = NULL;
+}
+
+static void scroll_async_cb(void* data)
+{
+    async_scroll_t* p = (async_scroll_t*)data;
+
+    if (!p) {
+        return;
+    }
+    if (!s_state.initialized || !s_state.running || !s_state.chat_list) {
+        free(p);
+        return;
+    }
+
+    int32_t delta = (p->dir == 0) ? -LVGL_UI_SCROLL_STEP : LVGL_UI_SCROLL_STEP;
+    lv_obj_scroll_by(s_state.chat_list, 0, delta, LV_ANIM_ON);
+    free(p);
+}
+
+int lvgl_ui_channel_set_approval(const char* tool, const char* hint)
+{
+    async_approval_t* p;
+
+    if (!s_state.initialized || !s_state.running) {
+        return -EINVAL;
+    }
+    ui_activity_reset();
+
+    p = malloc(sizeof(async_approval_t));
+    if (!p) {
+        syslog(LOG_ERR, "[%s] set_approval: payload alloc failed\n", TAG);
+        return -ENOMEM;
+    }
+    chat_view_copy_text(p->tool, tool ? tool : "", sizeof(p->tool));
+    chat_view_copy_text(p->hint, hint ? hint : "", sizeof(p->hint));
+    lvgl_ui_async_call(set_approval_async_cb, p);
+    return 0;
+}
+
+int lvgl_ui_channel_clear_approval(void)
+{
+    if (!s_state.initialized || !s_state.running) {
+        return -EINVAL;
+    }
+    ui_activity_reset();
+    lvgl_ui_async_call(clear_approval_async_cb, NULL);
+    return 0;
+}
+
+int lvgl_ui_channel_scroll(int dir)
+{
+    async_scroll_t* p;
+
+    if (dir != 0 && dir != 1) {
+        return -EINVAL;
+    }
+    if (!s_state.initialized || !s_state.running) {
+        return -EINVAL;
+    }
+    ui_activity_reset();
+
+    /* First scroll brings the chat screen to the foreground (async, queued
+     * before the scroll cb so the transcript is visible when it moves) — but
+     * only when there is a transcript.  With an empty conversation, e.g. an
+     * S3 tap waking from standby, switching to the chat screen would show a
+     * blank near-black page with no bubbles and no hint; the tap should just
+     * wake the pet home screen instead. */
+    if (!s_state.screen_visible) {
+        if (s_state.history.count == 0) {
+            return 0;
+        }
+        lvgl_ui_channel_show();
+    }
+
+    p = malloc(sizeof(async_scroll_t));
+    if (!p) {
+        syslog(LOG_ERR, "[%s] scroll: payload alloc failed\n", TAG);
+        return -ENOMEM;
+    }
+    p->dir = dir;
+    lvgl_ui_async_call(scroll_async_cb, p);
+    return 0;
+}

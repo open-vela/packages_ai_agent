@@ -445,9 +445,17 @@ int volc_tts_synthesize_compat(const char* text,
 }
 
 /* Backend ops registration */
+static int volc_tts_is_ready(void)
+{
+    /* Reload in case set_volc_key ran after registration */
+    volc_tts_init();
+    return s_api_key[0] != '\0';
+}
+
 static const voice_tts_ops_t s_volc_tts_ops = {
     .name = "volcengine",
     .init = volc_tts_init,
+    .is_ready = volc_tts_is_ready,
     .synthesize = volc_tts_synthesize,
     .deinit = NULL,
 };

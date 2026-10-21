@@ -51,6 +51,16 @@ enum pet_state {
     PET_STATE_ERROR     = 5, /* 错误：抖动 + 红色，眼睛 X */
 };
 
+/** 宠物类型（可选像素动物，`ptype` 调试命令切换）。 */
+enum pet_type {
+    PET_TYPE_CAT       = 0,  /* 白猫脸（默认，粉耳 + 腮红 + 2×2 眼） */
+    PET_TYPE_FROG      = 1,  /* 绿青蛙（2×2 大眼） */
+    PET_TYPE_BLACKCAT  = 2,  /* 黑猫（黑脸 + 白瞳 + 白胡须/下巴） */
+    PET_TYPE_DOG       = 3,  /* 棕狗（垂耳 + 黑鼻 + 粉吐舌） */
+    PET_TYPE_PIG       = 4,  /* 粉猪（大耳 + 两个黑鼻孔） */
+    PET_TYPE_COUNT     = 5,
+};
+
 /**
  * 初始化宠物屏（创建 widgets，但不加载到前台）。
  * 必须在 LVGL 已起（lvgl_ui_channel_init 之后）后调用。
@@ -70,14 +80,34 @@ void pet_status_view_show(void);
  */
 void pet_status_view_hide(void);
 
-/** 宠物屏当前是否在前台。 */
+/** 宠物屏当前是否在前台（缓存的 visible 标志）。 */
 bool pet_status_view_is_visible(void);
+
+/**
+ * 宠物屏是否为当前活动屏（与 lv_screen_active() 实时比较）。
+ * 仅可在 LVGL 线程调用；供让位计时器等线程内逻辑判断“前台被谁占用”。
+ */
+bool pet_status_view_is_active(void);
 
 /**
  * 设置宠物状态（驱动颜色/动画/眼睛/文案）。
  * 线程安全：异步调度到 LVGL 线程。无视觉效果时静默返回。
  */
 void pet_status_view_set_state(enum pet_state state);
+
+/**
+ * 设置 ERROR 态下显示的具体原因文案（2~3 行、短句，如
+ * "未联网\n请先连接 Wi-Fi"）。仅在 ERROR 态替换通用「出错了」标题；
+ * 切回其它状态时自动清空。传 NULL/空串恢复通用文案。
+ * 线程安全：异步调度到 LVGL 线程；须在 set_state(ERROR) 之前调用。
+ */
+void pet_status_view_set_error_text(const char *text);
+
+/**
+ * 切换宠物类型（0=猫 1=青蛙 2=黑猫 3=狗 4=猪，越界按猫处理）。下一帧状态
+ * 更新即生效。线程安全：异步调度到 LVGL 线程。
+ */
+void pet_status_view_set_type(int type);
 
 #ifdef __cplusplus
 }

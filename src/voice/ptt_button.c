@@ -161,6 +161,13 @@ static void ptt_on_release(void)
       syslog(LOG_ERR, "[%s] voice_channel_stop_with_text failed rc=%d\n",
              TAG, ret);
       asr_failed = true;
+#if PTT_HAVE_UI
+      /* ASR cannot run without the network (or its credentials).  Show a
+       * red-bar card that says so; otherwise the screen simply drops back
+       * to the pet with no clue about what went wrong. */
+      (void)lvgl_ui_channel_send_ex(
+          "语音识别不可用：请检查网络和语音识别配置。", 0xff5252);
+#endif
       goto done;
     }
 
@@ -192,7 +199,7 @@ done:
    * the RPMsg FIFO delivers ERROR last — the pet shows red+shake instead of
    * silently going idle-green.  pet_status_view.h: 5=PET_STATE_ERROR. */
   if (asr_failed)
-    (void)lvgl_ui_channel_set_pet_state(5);
+    (void)lvgl_ui_channel_set_pet_error("语音识别不可用\n请检查网络和凭据");
 #endif
 }
 

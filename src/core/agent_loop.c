@@ -28,6 +28,7 @@
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
+#include "infra/network_manager.h"
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
@@ -867,7 +868,7 @@ static void dispatch_response(const agent_msg_t* msg,
             sizeof(out.channel) - 1);
         strncpy(out.chat_id, msg->chat_id,
             sizeof(out.chat_id) - 1);
-        out.content = strdup("Sorry, I encountered an error.");
+        out.content = strdup("请求失败：请检查网络或模型配置。");
         if (out.content) {
             if (message_bus_push_outbound(&out) != OK) {
                 free(out.content);
@@ -1405,6 +1406,83 @@ static void inject_session_context(char* sys_prompt, size_t size,
         channel, chat_id);
 }
 
+/* ── Prerequisite gate for the LLM leg ───────────────────── */
+
+/* User-facing reason why the LLM cannot run, or NULL when it can.
+ * The text is shown as a chat card, so it says what is missing and
+ * which command fixes it. */
+static const char* llm_blocked_reason(const char** short_text)
+{
+    llm_backend_t backend;
+
+    if (short_text) {
+        *short_text = NULL;
+    }
+
+    if (!network_is_connected()) {
+        if (short_text) {
+            /* Pet screen caption: 2 lines, must fit the 240px round LCD. */
+            *short_text = "未联网\n请先连接 Wi-Fi";
+        }
+        return "未联网：请先连接 Wi-Fi，设置好网络后再试。";
+    }
+
+    if (llm_router_get_backend(0, &backend) != 0
+        || backend.model[0] == '\0') {
+        if (short_text) {
+            *short_text = "模型未配置\n请用 set_llm 配置";
+        }
+        return "模型未配置：请先用 set_llm 配置模型。";
+    }
+
+    return NULL;
+}
+
+/* Answer a message that cannot reach the LLM.  Voice replies normally go
+ * through TTS, which needs the very network/credentials found missing, so
+ * the text is delivered on the UI channel instead (the bubble appears on
+ * the round screen and TTS is attempted only once).  The pet goes to ERROR
+ * (red + shake) so the failure is still visible after the chat screen
+ * yields back to the pet; ERROR has no auto-return timer. */
+static void reply_llm_unavailable(const agent_msg_t* msg, const char* text,
+                                  const char* short_text)
+{
+    agent_msg_t out = { 0 };
+    const char* channel = msg->channel;
+    const char* chat_id = msg->chat_id;
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    if (strcmp(msg->channel, AGENT_CHAN_VOICE) == 0) {
+        channel = AGENT_CHAN_LVGL_UI;
+        chat_id = "lvgl_ui";
+    }
+#endif
+
+    strncpy(out.channel, channel, sizeof(out.channel) - 1);
+    strncpy(out.chat_id, chat_id, sizeof(out.chat_id) - 1);
+    out.content = strdup(text);
+    if (out.content && message_bus_push_outbound(&out) != OK) {
+        free(out.content);
+    }
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* Only local input should paint the on-device pet red; a remote
+     * channel (feishu/ws/mqtt) failing says nothing about this screen. */
+    if (strcmp(msg->channel, "cli") == 0
+        || strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
+        || strcmp(msg->channel, AGENT_CHAN_LVGL_UI) == 0) {
+        /* Carry the concrete reason onto the pet screen too: the chat card
+         * yields back to the pet after 8s, and a bare "出错了" there leaves
+         * the user guessing whether Wi-Fi or the model is the problem. */
+        if (short_text && short_text[0] != '\0') {
+            (void)lvgl_ui_channel_set_pet_error(short_text);
+        } else {
+            (void)lvgl_ui_channel_set_pet_state(5);
+        }
+    }
+#endif
+}
+
 /* ── Main agent loop task ─────────────────────────────────── */
 
 static void* agent_loop_task(void* arg)
@@ -1530,6 +1608,23 @@ static void* agent_loop_task(void* arg)
             continue;
         }
 
+        /* Prerequisites for the LLM leg.  Without this, a device that is
+         * offline or has no model configured either blocks on network
+         * timeouts or answers with a bare English error, leaving the user
+         * with no idea what is wrong.  Say it on the chat screen instead. */
+        const char* blocked_short = NULL;
+        const char* blocked = llm_blocked_reason(&blocked_short);
+        if (blocked) {
+            syslog(LOG_WARNING,
+                "[%s] LLM unavailable for %s:%s: %s\n",
+                TAG, msg.channel, msg.chat_id, blocked);
+            reply_llm_unavailable(&msg, blocked, blocked_short);
+            free(msg.content);
+            free(msg.image_b64);
+            msg.image_b64 = NULL;
+            continue;
+        }
+
         /* Hot-reload skills if directory changed */
         if (skill_loader_check_changed()) {
             syslog(LOG_INFO, "[%s] Skills changed, refreshing\n", TAG);
@@ -1606,12 +1701,23 @@ int agent_loop_init(void)
 
 int agent_loop_start(void)
 {
+    /* The loop is started at boot (so offline input is still answered)
+     * and again when the network comes up; keep the second call a no-op
+     * instead of spawning a competing consumer on the inbound queue. */
+    static bool started = false;
+
+    if (started) {
+        return OK;
+    }
+
     int ret = agent_task_create(agent_loop_task, "agent_loop",
         AGENT_AI_AGENT_STACK, NULL, AGENT_AI_AGENT_PRIO);
 
     if (ret != OK) {
         syslog(LOG_ERR,
             "[%s] Failed to create agent_loop task\n", TAG);
+    } else {
+        started = true;
     }
     return ret;
 }

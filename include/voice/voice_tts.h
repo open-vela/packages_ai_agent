@@ -31,6 +31,10 @@ typedef struct voice_tts_ops {
     /* Load credentials from config store. */
     int (*init)(void);
 
+    /* Optional: 1 when credentials/resources are ready to synthesize.
+     * Lets callers skip work (and hardware) that can only fail. */
+    int (*is_ready)(void);
+
     /* Synthesize UTF-8 text into raw PCM (16-bit LE, 16kHz, mono). */
     int (*synthesize)(const char *text,
                       unsigned char *pcm_out,
@@ -49,6 +53,10 @@ int voice_tts_set_backend(const char *name);
 
 /* Get the name of the current active backend, or NULL. */
 const char *voice_tts_get_backend(void);
+
+/* Is the active backend ready to synthesize (e.g. credentials set)?
+ * Returns 1 when ready, 0 when it can only fail. */
+int voice_tts_is_ready(void);
 
 /* Synthesize text using the active backend. */
 int voice_tts_speak(const char *text,
