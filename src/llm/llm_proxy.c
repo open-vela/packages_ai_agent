@@ -729,6 +729,33 @@ int agent_http_post_stream(const char *post_data,
         out_body_len, out_status, NULL, ctl);
 }
 
+int agent_http_probe(const char *host, const char *port, const char *path,
+    const vela_req_ctl_t *ctl, size_t *out_body_len, int *out_status)
+{
+    static const vela_header_t headers[] = {
+        { "Content-Type", "application/json" },
+        { "Authorization", "Bearer velaguard-invalid-test-credential" },
+        { NULL, NULL }
+    };
+    static const char probe_json[] =
+        "{\"model\":\"mimo-v2.6-flash\",\"messages\":[{\"role\":\"user\","
+        "\"content\":\"test\"}]}";
+    struct llm_mem_body mem = { .p = probe_json, .len = sizeof(probe_json) - 1 };
+    vela_body_src_t body = { .len = sizeof(probe_json) - 1,
+        .read = llm_mem_body_read, .ctx = &mem };
+    char response[512];
+
+    if (host == NULL || port == NULL || path == NULL || path[0] != '/'
+        || strpbrk(host, "\r\n \t") != NULL
+        || strpbrk(path, "\r\n \t") != NULL) {
+        return AGENT_HTTP_ERR_CONNECT;
+    }
+
+    return vela_https_request_stream(host, port, "POST", path, headers,
+        &body, NULL, ctl, response, sizeof(response), out_body_len,
+        out_status, NULL);
+}
+
 /* ── JSON helpers ─────────────────────────────────────────── */
 
 /* Extract text from OpenAI response format: choices[0].message.content */

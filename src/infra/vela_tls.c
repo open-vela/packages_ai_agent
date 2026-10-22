@@ -45,6 +45,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <time.h>
 
 static int simple_entropy_func(void* data, unsigned char* output, size_t len)
@@ -125,7 +126,10 @@ typedef struct {
 static void tls_ctx_free(tls_ctx_t* ctx)
 {
     mbedtls_ssl_close_notify(&ctx->ssl);
-    mbedtls_net_free(&ctx->net);
+    /* close_notify already finishes TLS.  A separate shutdown followed by
+     * close schedules overlapping TCP callbacks on NuttX, and controlled
+     * callers used to shut down twice.  Close the socket exactly once. */
+    mbedtls_net_close(&ctx->net);
     mbedtls_ssl_free(&ctx->ssl);
     mbedtls_ssl_config_free(&ctx->cfg);
     mbedtls_ctr_drbg_free(&ctx->ctr_drbg);
@@ -234,8 +238,106 @@ void vela_tls_pool_cleanup(void)
  * their current behaviour.  The marks are taken back to back, so
  * dns_tcp + tls_setup + tls add up to the whole connect. */
 
+/* Wait in short poll slices on controlled requests.  The legacy chat path
+ * keeps its existing blocking transport when ctl is NULL. */
+static int tls_wait_socket(int fd, short events, const vela_req_ctl_t *ctl)
+{
+    struct pollfd pfd = { .fd = fd, .events = events };
+    uint32_t started = agent_mono_ms();
+
+    for (;;) {
+        uint32_t now = agent_mono_ms();
+        uint32_t slice;
+        int ret;
+
+        if (vela_req_cancelled(ctl)) {
+            return VELA_TLS_ERR_CANCELLED;
+        }
+        if (vela_req_budget_ms(ctl, now) == 0
+            || agent_elapsed_ms(started, now) >= 60000) {
+            return VELA_TLS_ERR_TIMEOUT;
+        }
+        slice = vela_req_io_timeout_ms(ctl, now, 100);
+        ret = poll(&pfd, 1, (int)slice);
+        if (ret > 0) {
+            return (pfd.revents & POLLNVAL) ? VELA_TLS_ERR_CONNECT : 0;
+        }
+        if (ret < 0 && errno != EINTR) {
+            return VELA_TLS_ERR_CONNECT;
+        }
+    }
+}
+
+static int tls_connect_controlled(tls_ctx_t *ctx, const char *host,
+    const char *port, const vela_req_ctl_t *ctl)
+{
+    struct addrinfo hints = {0};
+    struct addrinfo *addresses = NULL;
+    struct addrinfo *a;
+    int result = VELA_TLS_ERR_CONNECT;
+
+    /* getaddrinfo remains the platform resolver.  Its blocking DNS lookup
+     * cannot yet be interrupted here; check the same budget immediately
+     * after it returns, and do not start TCP on an expired request. */
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+    int ret = getaddrinfo(host, port, &hints, &addresses);
+    if (vela_req_cancelled(ctl)) {
+        result = VELA_TLS_ERR_CANCELLED;
+        goto out;
+    }
+    if (vela_req_budget_ms(ctl, agent_mono_ms()) == 0) {
+        result = VELA_TLS_ERR_TIMEOUT;
+        goto out;
+    }
+    if (ret != 0) {
+        goto out;
+    }
+
+    for (a = addresses; a != NULL; a = a->ai_next) {
+        int flags;
+        int error = 0;
+        socklen_t error_len = sizeof(error);
+
+        ctx->net.fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (ctx->net.fd < 0) {
+            syslog(LOG_ERR, "[%s] socket allocation failed errno=%d\n", TAG, errno);
+            continue;
+        }
+        flags = fcntl(ctx->net.fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(ctx->net.fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            goto next;
+        }
+        ret = connect(ctx->net.fd, a->ai_addr, a->ai_addrlen);
+        if (ret == 0) {
+            result = 0;
+            break;
+        }
+        if (errno != EINPROGRESS && errno != EWOULDBLOCK && errno != EALREADY) {
+            goto next;
+        }
+        ret = tls_wait_socket(ctx->net.fd, POLLOUT, ctl);
+        if (ret != 0) {
+            result = ret;
+            break;
+        }
+        if (getsockopt(ctx->net.fd, SOL_SOCKET, SO_ERROR, &error, &error_len) == 0
+            && error == 0) {
+            result = 0;
+            break;
+        }
+next:
+        mbedtls_net_close(&ctx->net);
+    }
+out:
+    if (addresses != NULL) {
+        freeaddrinfo(addresses);
+    }
+    return result;
+}
+
 static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
-    agent_llm_timing_t* timing)
+    agent_llm_timing_t* timing, const vela_req_ctl_t *ctl)
 {
     int ret;
     uint32_t mark = agent_mono_ms();
@@ -292,6 +394,11 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
             timing->fused_dns_tcp = true;
         }
 
+        /* The proxy tunnel has a separate blocking contract.  Controlled
+         * callers must fail explicitly rather than silently lose the budget. */
+        if (ctl != NULL) {
+            return VELA_TLS_ERR_CONNECT;
+        }
         int tunnel_fd = proxy_open_tunnel(host, atoi(port), 30000);
         if (tunnel_fd < 0) {
             syslog(LOG_ERR, "[%s] proxy tunnel to %s:%s failed\n",
@@ -302,8 +409,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
         syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
             TAG, tunnel_fd, host, port);
     } else {
-        ret = mbedtls_net_connect(&ctx->net, host, port,
-            MBEDTLS_NET_PROTO_TCP);
+        ret = ctl != NULL ? tls_connect_controlled(ctx, host, port, ctl)
+                          : mbedtls_net_connect(&ctx->net, host, port,
+                                MBEDTLS_NET_PROTO_TCP);
 
         /* The connect time is recorded before looking at the result.  It
          * used to be recorded only on success, so a connect that burned 81 s
@@ -319,7 +427,7 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
         if (ret != 0) {
             syslog(LOG_ERR, "[%s] net_connect %s:%s ret=0x%x\n",
                 TAG, host, port, -ret);
-            return VELA_TLS_ERR_CONNECT;
+            return ctl != NULL ? ret : VELA_TLS_ERR_CONNECT;
         }
     }
 
@@ -337,7 +445,11 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
      * Timeout is configured via AGENT_LLM_SOCKET_TIMEOUT_SEC in
      * agent_config.h.  LLM APIs (especially kimi with thinking mode)
      * can take over 60s for long responses. */
-    mbedtls_net_set_block(&ctx->net);
+    if (ctl == NULL) {
+        mbedtls_net_set_block(&ctx->net);
+    } else if (mbedtls_net_set_nonblock(&ctx->net) != 0) {
+        return VELA_TLS_ERR_CONNECT;
+    }
     if (ctx->net.fd >= 0) {
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
         int read_timeout_sec = network_get_read_timeout();
@@ -420,7 +532,19 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
     mark = agent_mono_ms();
 
     /* Handshake */
-    while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
+    for (;;) {
+        if (ctl != NULL) {
+            if (vela_req_cancelled(ctl)) {
+                return VELA_TLS_ERR_CANCELLED;
+            }
+            if (vela_req_budget_ms(ctl, agent_mono_ms()) == 0) {
+                return VELA_TLS_ERR_TIMEOUT;
+            }
+        }
+        ret = mbedtls_ssl_handshake(&ctx->ssl);
+        if (ret == 0) {
+            break;
+        }
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
 #if defined(MBEDTLS_ERROR_C)
             char err_buf[128];
@@ -441,6 +565,13 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
                 timing->tls_ms = agent_lap_ms(&mark);
             }
             return VELA_TLS_ERR_HANDSHAKE;
+        }
+        if (ctl != NULL) {
+            ret = tls_wait_socket(ctx->net.fd,
+                ret == MBEDTLS_ERR_SSL_WANT_READ ? POLLIN : POLLOUT, ctl);
+            if (ret != 0) {
+                return ret;
+            }
         }
     }
 
@@ -1025,7 +1156,8 @@ static bool stream_read_retryable(int ret)
     return ret == MBEDTLS_ERR_SSL_WANT_READ
         || ret == MBEDTLS_ERR_SSL_WANT_WRITE
         || ret == MBEDTLS_ERR_SSL_TIMEOUT
-        || ret == MBEDTLS_ERR_NET_RECV_FAILED;
+        || (ret == MBEDTLS_ERR_NET_RECV_FAILED
+            && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR));
 }
 
 static void stream_set_timeout(tls_ctx_t *ctx, uint32_t ms)
@@ -1105,11 +1237,18 @@ static int stream_write_all(tls_ctx_t *ctx, const char *what,
         }
 
         if (ret == MBEDTLS_ERR_SSL_WANT_WRITE
-            || ret == MBEDTLS_ERR_NET_SEND_FAILED
+            || ret == MBEDTLS_ERR_SSL_WANT_READ
+            || (ret == MBEDTLS_ERR_NET_SEND_FAILED
+                && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
             || ret == MBEDTLS_ERR_SSL_TIMEOUT) {
             /* A full send buffer is retryable, but only for a bounded
              * number of slices. */
 
+            int wait_rc = tls_wait_socket(ctx->net.fd,
+                ret == MBEDTLS_ERR_SSL_WANT_READ ? POLLIN : POLLOUT, ctl);
+            if (wait_rc != 0) {
+                return wait_rc;
+            }
             if (++stalls > 120) {
                 syslog(LOG_ERR, "[%s] %s write gave up at %u/%u\n", TAG, what,
                     (unsigned)off, (unsigned)len);
@@ -1195,7 +1334,7 @@ int vela_https_request_stream(
     mark = agent_mono_ms();
     last_progress = mark;
 
-    ret = tls_ctx_connect(&ctx, host, port, timing);
+    ret = tls_ctx_connect(&ctx, host, port, timing, ctl);
     if (ret != 0) {
         tls_ctx_free(&ctx);
         return ret;
@@ -1340,6 +1479,11 @@ int vela_https_request_stream(
         }
 
         if (stream_read_retryable(n)) {
+            ret = tls_wait_socket(ctx.net.fd,
+                n == MBEDTLS_ERR_SSL_WANT_WRITE ? POLLOUT : POLLIN, ctl);
+            if (ret != 0) {
+                goto out;
+            }
             continue;
         }
 
@@ -1493,6 +1637,11 @@ int vela_https_request_stream(
         }
 
         if (stream_read_retryable(n)) {
+            ret = tls_wait_socket(ctx.net.fd,
+                n == MBEDTLS_ERR_SSL_WANT_WRITE ? POLLOUT : POLLIN, ctl);
+            if (ret != 0) {
+                goto out;
+            }
             continue;
         }
 
@@ -1523,10 +1672,6 @@ out:
     /* Reclaim before returning, on every path.  A cancelled request must not
      * leave a socket, a TLS context or a partially read record behind: the
      * next request has to be able to start immediately. */
-
-    if (ctx.net.fd >= 0) {
-        shutdown(ctx.net.fd, SHUT_RDWR);
-    }
 
     tls_ctx_free(&ctx);
     return ret;
@@ -1624,7 +1769,7 @@ int vela_https_request_timed(
     if (!slot) {
         /* Pool full — use a temporary ephemeral context */
         tls_ctx_t tmp_ctx;
-        if ((ret = tls_ctx_connect(&tmp_ctx, host, port, timing)) != 0) {
+        if ((ret = tls_ctx_connect(&tmp_ctx, host, port, timing, NULL)) != 0) {
             tls_ctx_free(&tmp_ctx);
             return ret;
         }
@@ -1649,7 +1794,7 @@ int vela_https_request_timed(
     }
 
     /* Connect into the slot */
-    if ((ret = tls_ctx_connect(&slot->ctx, host, port, timing)) != 0) {
+    if ((ret = tls_ctx_connect(&slot->ctx, host, port, timing, NULL)) != 0) {
         pool_release(slot, host, port, false);
         return ret;
     }
@@ -1729,7 +1874,7 @@ int vela_https_head_date(const char* host, const char* port, const char* path,
     tls_ctx_t ctx;
     int ret;
 
-    if ((ret = tls_ctx_connect(&ctx, host, port, NULL)) != 0) {
+    if ((ret = tls_ctx_connect(&ctx, host, port, NULL, NULL)) != 0) {
         tls_ctx_free(&ctx);
         return ret;
     }

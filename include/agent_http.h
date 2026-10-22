@@ -161,6 +161,12 @@ int agent_http_post_stream(const char *post_data,
     size_t *out_body_len, int *out_status,
     const vela_req_ctl_t *ctl);
 
+/* Explicit transport diagnostic.  Sends a fixed invalid test credential,
+ * never reads configured credentials, discards the response body, and never
+ * changes the product endpoint.  Not registered as an Agent tool. */
+int agent_http_probe(const char *host, const char *port, const char *path,
+    const vela_req_ctl_t *ctl, size_t *out_body_len, int *out_status);
+
 #ifdef __cplusplus
 }
 #endif
