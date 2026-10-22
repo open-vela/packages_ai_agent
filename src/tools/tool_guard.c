@@ -85,6 +85,8 @@ static bool vg_product_tool_allowed(const char *tool_name)
         "run_shell",
         "vg_point_read",
         "vg_run_report",
+        "vg_anomaly_read",
+        "vg_alarm_recovery",
         NULL
     };
 
