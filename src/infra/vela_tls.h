@@ -16,10 +16,12 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
 #include "agent_timing.h"
+#include "infra/req_ctl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,12 +30,17 @@ extern "C" {
 /* Maximum size of HTTP response header section we buffer internally */
 #define VELA_TLS_HDR_BUF  4096
 
-/* Return codes (negative on error, HTTP status code on success) */
-#define VELA_TLS_ERR_CONNECT   -1
-#define VELA_TLS_ERR_HANDSHAKE -2
-#define VELA_TLS_ERR_WRITE     -3
-#define VELA_TLS_ERR_READ      -4
-#define VELA_TLS_ERR_OVERFLOW  -5
+/* Return codes (negative on error, HTTP status code on success).  The values
+ * are shared with the public agent_http.h so a caller that only sees the
+ * public header can name them. */
+#define VELA_TLS_ERR_CONNECT   AGENT_HTTP_ERR_CONNECT
+#define VELA_TLS_ERR_HANDSHAKE AGENT_HTTP_ERR_HANDSHAKE
+#define VELA_TLS_ERR_WRITE     AGENT_HTTP_ERR_WRITE
+#define VELA_TLS_ERR_READ      AGENT_HTTP_ERR_READ
+#define VELA_TLS_ERR_OVERFLOW  AGENT_HTTP_ERR_OVERFLOW
+#define VELA_TLS_ERR_TIMEOUT   AGENT_HTTP_ERR_TIMEOUT
+#define VELA_TLS_ERR_CANCELLED AGENT_HTTP_ERR_CANCELLED
+#define VELA_TLS_ERR_SINK      AGENT_HTTP_ERR_SINK
 
 /**
  * Extra header entry; pass an array terminated by {NULL, NULL}.
@@ -98,6 +105,38 @@ int vela_https_request_timed(
     char             *resp_buf,
     size_t            resp_cap,
     size_t           *out_body_len,
+    agent_llm_timing_t *timing);
+
+/**
+ * One HTTPS request bounded by a deadline and a cancel flag.
+ *
+ * Opens its own connection rather than using the keep-alive pool: the
+ * request may carry a large body and the response may be streamed, and a
+ * cancelled request must not leave a half-read connection behind for the
+ * next caller.  The pool is still used by every other request.
+ *
+ * @param body   Optional request body source; NULL sends no body.
+ * @param sink   Optional response consumer; NULL buffers into resp_buf.
+ * @param ctl    Deadline and cancel flag; NULL means neither.
+ * @param out_status  Receives the HTTP status, including 4xx and 5xx.
+ *
+ * @return 0 when a complete HTTP response was read, negative
+ *         VELA_TLS_ERR_* otherwise.  On any error the socket is shut down
+ *         and the TLS context freed before returning.
+ */
+int vela_https_request_stream(
+    const char       *host,
+    const char       *port,
+    const char       *method,
+    const char       *path,
+    const vela_header_t *headers,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    const vela_req_ctl_t *ctl,
+    char             *resp_buf,
+    size_t            resp_cap,
+    size_t           *out_body_len,
+    int              *out_status,
     agent_llm_timing_t *timing);
 
 /**

@@ -875,6 +875,663 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     return http_status;
 }
 
+/* ── Deadline-bounded streaming request ──────────────────────── */
+
+/* Every I/O below is one slice at a time.  The socket timeout is recomputed
+ * from the remaining budget before each slice, so a request cannot outlive
+ * its deadline even if the peer stops sending, and a cancel is noticed
+ * within VELA_REQ_IO_SLICE_MS rather than at the next phase boundary. */
+
+struct vela_emit {
+    const vela_resp_sink_t *sink;
+    char  *buf;
+    size_t cap;
+    size_t len;
+    bool   truncated;
+};
+
+static int emit_bytes(struct vela_emit *e, const char *data, size_t len)
+{
+    size_t room;
+    size_t copy;
+
+    if (len == 0) {
+        return 0;
+    }
+
+    if (e->sink != NULL) {
+        return e->sink->write(e->sink->ctx, data, len) < 0 ? -1 : 0;
+    }
+
+    if (e->buf == NULL || e->cap == 0) {
+        e->truncated = true;
+        return 0;
+    }
+
+    room = e->cap - 1 - e->len;
+    copy = (len < room) ? len : room;
+
+    if (copy > 0) {
+        memcpy(e->buf + e->len, data, copy);
+        e->len += copy;
+        e->buf[e->len] = '\0';
+    }
+
+    if (copy < len) {
+        e->truncated = true;
+    }
+
+    return 0;
+}
+
+/* Incremental chunked decoder.  The whole body is never in one buffer, so
+ * vela_http_chunked_complete() cannot be used here: the state has to advance
+ * as bytes arrive.  A zero-size chunk ends the message; trailer fields after
+ * it are not consumed, which matches the framing rule used by the buffered
+ * reader. */
+
+enum vela_chunk_state {
+    VELA_CHUNK_SIZE = 0,
+    VELA_CHUNK_DATA,
+    VELA_CHUNK_DATA_END,
+    VELA_CHUNK_DONE
+};
+
+struct vela_chunk_dec {
+    enum vela_chunk_state state;
+    size_t remaining;
+    char   line[24];
+    size_t line_len;
+};
+
+static int chunk_feed(struct vela_chunk_dec *d, struct vela_emit *e,
+    const char *data, size_t len)
+{
+    size_t i = 0;
+
+    while (i < len && d->state != VELA_CHUNK_DONE) {
+        switch (d->state) {
+        case VELA_CHUNK_SIZE:
+            while (i < len) {
+                char c = data[i++];
+
+                if (c == '\n') {
+                    long sz;
+
+                    d->line[d->line_len] = '\0';
+                    sz = strtol(d->line, NULL, 16);
+                    d->line_len = 0;
+
+                    if (sz <= 0) {
+                        d->state = VELA_CHUNK_DONE;
+                    } else {
+                        d->remaining = (size_t)sz;
+                        d->state = VELA_CHUNK_DATA;
+                    }
+
+                    break;
+                }
+
+                if (c != '\r' && d->line_len + 1 < sizeof(d->line)) {
+                    d->line[d->line_len++] = c;
+                }
+            }
+            break;
+
+        case VELA_CHUNK_DATA:
+            {
+                size_t take = len - i;
+
+                if (take > d->remaining) {
+                    take = d->remaining;
+                }
+
+                if (emit_bytes(e, data + i, take) < 0) {
+                    return -1;
+                }
+
+                i += take;
+                d->remaining -= take;
+
+                if (d->remaining == 0) {
+                    d->state = VELA_CHUNK_DATA_END;
+                }
+            }
+            break;
+
+        case VELA_CHUNK_DATA_END:
+            while (i < len) {
+                char c = data[i++];
+
+                if (c == '\n') {
+                    d->state = VELA_CHUNK_SIZE;
+                    break;
+                }
+            }
+            break;
+
+        case VELA_CHUNK_DONE:
+            break;
+        }
+    }
+
+    return 0;
+}
+
+/* A read that only means "nothing yet" must not end the request. */
+
+static bool stream_read_retryable(int ret)
+{
+    return ret == MBEDTLS_ERR_SSL_WANT_READ
+        || ret == MBEDTLS_ERR_SSL_WANT_WRITE
+        || ret == MBEDTLS_ERR_SSL_TIMEOUT
+        || ret == MBEDTLS_ERR_NET_RECV_FAILED;
+}
+
+static void stream_set_timeout(tls_ctx_t *ctx, uint32_t ms)
+{
+    struct timeval tv;
+
+    if (ctx->net.fd < 0) {
+        return;
+    }
+
+    if (ms == 0) {
+        ms = 1;
+    }
+
+    tv.tv_sec = (time_t)(ms / 1000u);
+    tv.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
+
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) {
+        tv.tv_usec = 1000;
+    }
+
+    setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static int stream_write_all(tls_ctx_t *ctx, const char *what,
+    const char *buf, size_t len, const vela_req_ctl_t *ctl)
+{
+    size_t off = 0;
+    uint32_t last_progress = agent_mono_ms();
+    int stalls = 0;
+
+    while (off < len) {
+        uint32_t now = agent_mono_ms();
+        size_t chunk;
+        int ret;
+
+        if (vela_req_cancelled(ctl)) {
+            return VELA_TLS_ERR_CANCELLED;
+        }
+
+        if (vela_req_budget_ms(ctl, now) == 0) {
+            return VELA_TLS_ERR_TIMEOUT;
+        }
+
+        /* No deadline and no progress: bound the wait anyway, so a stalled
+         * peer cannot hold the request thread forever. */
+
+        if (ctl == NULL || ctl->deadline_ms == 0) {
+            if (agent_elapsed_ms(last_progress, now) > 60000) {
+                syslog(LOG_ERR, "[%s] %s write stalled with no deadline\n",
+                    TAG, what);
+                return VELA_TLS_ERR_TIMEOUT;
+            }
+        }
+
+        stream_set_timeout(ctx, vela_req_io_timeout_ms(ctl, now,
+            VELA_REQ_IO_SLICE_MS));
+
+        chunk = len - off;
+        if (chunk > TLS_WRITE_CHUNK) {
+            chunk = TLS_WRITE_CHUNK;
+        }
+
+        ret = mbedtls_ssl_write(&ctx->ssl, (const unsigned char *)buf + off,
+            chunk);
+
+        if (ret > 0) {
+            off += (size_t)ret;
+            last_progress = agent_mono_ms();
+            stalls = 0;
+            continue;
+        }
+
+        if (ret == 0) {
+            return VELA_TLS_ERR_WRITE;
+        }
+
+        if (ret == MBEDTLS_ERR_SSL_WANT_WRITE
+            || ret == MBEDTLS_ERR_NET_SEND_FAILED
+            || ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+            /* A full send buffer is retryable, but only for a bounded
+             * number of slices. */
+
+            if (++stalls > 120) {
+                syslog(LOG_ERR, "[%s] %s write gave up at %u/%u\n", TAG, what,
+                    (unsigned)off, (unsigned)len);
+                return VELA_TLS_ERR_WRITE;
+            }
+
+            continue;
+        }
+
+        syslog(LOG_ERR, "[%s] %s write failed ret=-0x%04x at %u/%u\n", TAG,
+            what, -ret, (unsigned)off, (unsigned)len);
+        return VELA_TLS_ERR_WRITE;
+    }
+
+    return 0;
+}
+
+int vela_https_request_stream(
+    const char *host,
+    const char *port,
+    const char *method,
+    const char *path,
+    const vela_header_t *headers,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    const vela_req_ctl_t *ctl,
+    char *resp_buf,
+    size_t resp_cap,
+    size_t *out_body_len,
+    int *out_status,
+    agent_llm_timing_t *timing)
+{
+    tls_ctx_t ctx;
+    struct vela_emit emit;
+    struct vela_chunk_dec chunk;
+    char *hdr = NULL;
+    char tmp[2048];
+    size_t hdr_len = 0;
+    size_t body_got = 0;
+    long content_length = -1;
+    bool chunked = false;
+    bool header_done = false;
+    bool eof = false;
+    uint32_t mark;
+    uint32_t last_progress;
+    int status = 0;
+    int ret = 0;
+    int n;
+
+    if (host == NULL || port == NULL || method == NULL || path == NULL) {
+        return VELA_TLS_ERR_CONNECT;
+    }
+
+    if (out_body_len != NULL) {
+        *out_body_len = 0;
+    }
+
+    if (out_status != NULL) {
+        *out_status = 0;
+    }
+
+    if (resp_buf != NULL && resp_cap > 0) {
+        resp_buf[0] = '\0';
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&chunk, 0, sizeof(chunk));
+
+    emit.sink = sink;
+    emit.buf = resp_buf;
+    emit.cap = resp_cap;
+    emit.len = 0;
+    emit.truncated = false;
+
+    if (vela_req_cancelled(ctl)) {
+        return VELA_TLS_ERR_CANCELLED;
+    }
+
+    if (vela_req_budget_ms(ctl, agent_mono_ms()) == 0) {
+        return VELA_TLS_ERR_TIMEOUT;
+    }
+
+    mark = agent_mono_ms();
+    last_progress = mark;
+
+    ret = tls_ctx_connect(&ctx, host, port, timing);
+    if (ret != 0) {
+        tls_ctx_free(&ctx);
+        return ret;
+    }
+
+    /* Request headers.  Content-Length comes from the source's declared
+     * length, so the body is written without ever being assembled. */
+
+    hdr = malloc(4096);
+    if (hdr == NULL) {
+        tls_ctx_free(&ctx);
+        return VELA_TLS_ERR_OVERFLOW;
+    }
+
+    {
+        int pos = 0;
+
+#define SHDR(fmt, ...)                                          \
+    do {                                                        \
+        pos += snprintf(hdr + pos, 4096 - pos, fmt, ##__VA_ARGS__); \
+        if (pos >= 4096) {                                      \
+            free(hdr);                                          \
+            tls_ctx_free(&ctx);                                 \
+            return VELA_TLS_ERR_OVERFLOW;                       \
+        }                                                       \
+    } while (0)
+
+        SHDR("%s %s HTTP/1.1\r\n", method, path);
+        SHDR("Host: %s\r\n", host);
+        SHDR("Connection: close\r\n");
+        SHDR("User-Agent: agent-vela/1.0\r\n");
+
+        if (body != NULL && body->len > 0) {
+            SHDR("Content-Length: %zu\r\n", body->len);
+        }
+
+        if (headers != NULL) {
+            for (const vela_header_t *h = headers; h->name != NULL; h++) {
+                SHDR("%s: %s\r\n", h->name, h->value);
+            }
+        }
+
+        SHDR("\r\n");
+#undef SHDR
+
+        ret = stream_write_all(&ctx, "hdr", hdr, (size_t)pos, ctl);
+    }
+
+    free(hdr);
+    hdr = NULL;
+
+    if (ret != 0) {
+        tls_ctx_free(&ctx);
+        return ret;
+    }
+
+    if (timing != NULL) {
+        timing->send_ms = agent_elapsed_ms(mark, agent_mono_ms());
+    }
+
+    /* Body, one bounded piece at a time. */
+
+    if (body != NULL && body->len > 0) {
+        size_t sent = 0;
+        char piece[4096];
+
+        while (sent < body->len) {
+            int got = body->read(body->ctx, piece, sizeof(piece));
+
+            if (got < 0) {
+                tls_ctx_free(&ctx);
+                return VELA_TLS_ERR_READ;
+            }
+
+            if (got == 0) {
+                /* The source promised len bytes and stopped early.  Sending
+                 * a short body would leave the server waiting for the rest,
+                 * so fail now and name the size. */
+
+                syslog(LOG_ERR, "[%s] body source ended at %u/%u\n", TAG,
+                    (unsigned)sent, (unsigned)body->len);
+                tls_ctx_free(&ctx);
+                return VELA_TLS_ERR_WRITE;
+            }
+
+            if (sent + (size_t)got > body->len) {
+                got = (int)(body->len - sent);
+            }
+
+            ret = stream_write_all(&ctx, "body", piece, (size_t)got, ctl);
+            if (ret != 0) {
+                tls_ctx_free(&ctx);
+                return ret;
+            }
+
+            sent += (size_t)got;
+        }
+    }
+
+    /* Response headers. */
+
+    while (!header_done && hdr_len < sizeof(tmp) - 1) {
+        uint32_t now = agent_mono_ms();
+
+        if (vela_req_cancelled(ctl)) {
+            ret = VELA_TLS_ERR_CANCELLED;
+            goto out;
+        }
+
+        if (vela_req_budget_ms(ctl, now) == 0) {
+            ret = VELA_TLS_ERR_TIMEOUT;
+            goto out;
+        }
+
+        if ((ctl == NULL || ctl->deadline_ms == 0)
+            && agent_elapsed_ms(last_progress, now) > 60000) {
+            ret = VELA_TLS_ERR_TIMEOUT;
+            goto out;
+        }
+
+        stream_set_timeout(&ctx, vela_req_io_timeout_ms(ctl, now,
+            VELA_REQ_IO_SLICE_MS));
+
+        n = mbedtls_ssl_read(&ctx.ssl, (unsigned char *)tmp + hdr_len,
+            sizeof(tmp) - 1 - hdr_len);
+
+        if (n > 0) {
+            hdr_len += (size_t)n;
+            tmp[hdr_len] = '\0';
+            last_progress = agent_mono_ms();
+
+            if (memmem(tmp, hdr_len, "\r\n\r\n", 4) != NULL) {
+                header_done = true;
+            }
+
+            continue;
+        }
+
+        if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            eof = true;
+            break;
+        }
+
+        if (stream_read_retryable(n)) {
+            continue;
+        }
+
+        syslog(LOG_ERR, "[%s] stream header read ret=-0x%04x\n", TAG, -n);
+        ret = VELA_TLS_ERR_READ;
+        goto out;
+    }
+
+    if (!header_done) {
+        ret = eof ? VELA_TLS_ERR_READ : VELA_TLS_ERR_OVERFLOW;
+        goto out;
+    }
+
+    if (sscanf(tmp, "HTTP/1.%*d %d", &status) != 1) {
+        syslog(LOG_ERR, "[%s] stream: bad status line: %.80s\n", TAG, tmp);
+        ret = VELA_TLS_ERR_READ;
+        goto out;
+    }
+
+    {
+        char *body_start = (char *)memmem(tmp, hdr_len, "\r\n\r\n", 4) + 4;
+        char *cl;
+        char *te;
+        size_t initial = hdr_len - (size_t)(body_start - tmp);
+
+        cl = strcasestr(tmp, "Content-Length:");
+        if (cl != NULL && cl < body_start) {
+            content_length = strtol(cl + strlen("Content-Length:"), NULL, 10);
+            if (content_length < 0 || content_length > 16 * 1024 * 1024) {
+                content_length = -1;
+            }
+        }
+
+        te = strcasestr(tmp, "Transfer-Encoding:");
+        if (te != NULL && te < body_start) {
+            chunked = (strcasestr(te, "chunked") != NULL);
+        }
+
+        if (initial > 0) {
+            if (chunked) {
+                if (chunk_feed(&chunk, &emit, body_start, initial) < 0) {
+                    ret = VELA_TLS_ERR_SINK;
+                    goto out;
+                }
+            } else {
+                size_t take = initial;
+
+                if (content_length >= 0 && (long)take > content_length) {
+                    take = (size_t)content_length;
+                }
+
+                if (emit_bytes(&emit, body_start, take) < 0) {
+                    ret = VELA_TLS_ERR_SINK;
+                    goto out;
+                }
+
+                body_got = take;
+            }
+        }
+    }
+
+    /* Response body. */
+
+    for (;;) {
+        uint32_t now;
+        bool complete;
+
+        if (chunked) {
+            complete = (chunk.state == VELA_CHUNK_DONE);
+        } else if (content_length >= 0) {
+            complete = (body_got >= (size_t)content_length);
+        } else {
+            complete = eof;
+        }
+
+        if (complete) {
+            break;
+        }
+
+        now = agent_mono_ms();
+
+        if (vela_req_cancelled(ctl)) {
+            ret = VELA_TLS_ERR_CANCELLED;
+            goto out;
+        }
+
+        if (vela_req_budget_ms(ctl, now) == 0) {
+            ret = VELA_TLS_ERR_TIMEOUT;
+            goto out;
+        }
+
+        if ((ctl == NULL || ctl->deadline_ms == 0)
+            && agent_elapsed_ms(last_progress, now) > 60000) {
+            ret = VELA_TLS_ERR_TIMEOUT;
+            goto out;
+        }
+
+        stream_set_timeout(&ctx, vela_req_io_timeout_ms(ctl, now,
+            VELA_REQ_IO_SLICE_MS));
+
+        n = mbedtls_ssl_read(&ctx.ssl, (unsigned char *)tmp, sizeof(tmp));
+
+        if (n > 0) {
+            last_progress = agent_mono_ms();
+
+            if (chunked) {
+                if (chunk_feed(&chunk, &emit, tmp, (size_t)n) < 0) {
+                    ret = VELA_TLS_ERR_SINK;
+                    goto out;
+                }
+            } else {
+                size_t take = (size_t)n;
+
+                if (content_length >= 0
+                    && body_got + take > (size_t)content_length) {
+                    take = (size_t)content_length - body_got;
+                }
+
+                if (emit_bytes(&emit, tmp, take) < 0) {
+                    ret = VELA_TLS_ERR_SINK;
+                    goto out;
+                }
+
+                body_got += take;
+            }
+
+            continue;
+        }
+
+        if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            eof = true;
+
+            /* An unframed body ends at EOF; a framed one that ends early is
+             * truncated and must not be reported as complete. */
+
+            if (chunked && chunk.state != VELA_CHUNK_DONE) {
+                syslog(LOG_ERR, "[%s] chunked body ended before zero chunk\n",
+                    TAG);
+                ret = VELA_TLS_ERR_READ;
+                goto out;
+            }
+
+            if (content_length >= 0 && body_got < (size_t)content_length) {
+                syslog(LOG_ERR, "[%s] body ended at %u/%ld\n", TAG,
+                    (unsigned)body_got, content_length);
+                ret = VELA_TLS_ERR_READ;
+                goto out;
+            }
+
+            break;
+        }
+
+        if (stream_read_retryable(n)) {
+            continue;
+        }
+
+        syslog(LOG_ERR, "[%s] stream body read ret=-0x%04x\n", TAG, -n);
+        ret = VELA_TLS_ERR_READ;
+        goto out;
+    }
+
+    if (timing != NULL) {
+        timing->ttfb_ms = AGENT_T_NA;
+        timing->body_ms = agent_elapsed_ms(mark, agent_mono_ms());
+    }
+
+    if (emit.truncated) {
+        syslog(LOG_ERR, "[%s] streamed response did not fit the %zu byte "
+            "buffer; caller must treat it as incomplete\n", TAG, resp_cap);
+    }
+
+    if (out_body_len != NULL) {
+        *out_body_len = (sink != NULL) ? body_got : emit.len;
+    }
+
+    if (out_status != NULL) {
+        *out_status = status;
+    }
+
+out:
+    /* Reclaim before returning, on every path.  A cancelled request must not
+     * leave a socket, a TLS context or a partially read record behind: the
+     * next request has to be able to start immediately. */
+
+    if (ctx.net.fd >= 0) {
+        shutdown(ctx.net.fd, SHUT_RDWR);
+    }
+
+    tls_ctx_free(&ctx);
+    return ret;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 int vela_https_request_timed(

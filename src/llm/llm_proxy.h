@@ -26,6 +26,8 @@
 #include "agent_compat.h"
 #include "agent_config.h"
 #include "infra/agent_timing.h"
+#include "infra/req_ctl.h"
+#include "infra/vela_tls.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -88,6 +90,26 @@ int llm_chat_tools(const char* system_prompt,
     agent_llm_timing_t* out_timing);
 
 bool llm_proxy_echo_reasoning(void);
+
+/**
+ * One POST to the configured LLM endpoint, bounded by ctl.
+ *
+ * The request body is either post_data or a source that produces it in
+ * pieces; the response is either buffered into resp_buf or handed to sink
+ * as it arrives.  Used by the voice path, where a 15 s recording is 640 KB
+ * once base64-encoded and a TTS reply can be 400 KB.
+ *
+ * Returns 0 when a complete HTTP response was read (the status may still be
+ * 4xx/5xx), or a negative VELA_TLS_ERR_* / ERROR on a transport failure.
+ * The TLS connection is closed before returning in every case.
+ */
+int llm_http_call_stream(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl);
 
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).
