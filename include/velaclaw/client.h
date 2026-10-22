@@ -26,6 +26,11 @@ int velaclaw_ask(velaclaw_client_t* c,
  * flag that the network watcher turns into a real start about a second
  * later.  A message pushed straight onto the bus without this would sit
  * unread, so any caller that is not an interactive CLI prompt needs it. */
+/* Release the client's pending slot without waiting for its reply.  The late
+ * reply is dropped by the chat_id check; the caller uses this after giving up
+ * on a round so the next question is not refused as busy. */
+void velaclaw_client_abandon(velaclaw_client_t* c);
+
 int velaclaw_ask_async(velaclaw_client_t* c,
     const velaclaw_ask_req_t* req,
     void (*cb)(int, const char*, void*), void* cookie);

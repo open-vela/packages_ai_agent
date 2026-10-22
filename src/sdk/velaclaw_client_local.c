@@ -68,6 +68,19 @@ static void tap_callback(const agent_msg_t* msg, void* cookie)
     if (cb && !expired) cb(0, msg->content, ck);
 }
 
+void velaclaw_client_abandon(velaclaw_client_t* c)
+{
+    if (!c) {
+        return;
+    }
+
+    pthread_mutex_lock(&c->mtx);
+    c->active = false;
+    c->async_cb = NULL;
+    c->async_cookie = NULL;
+    pthread_mutex_unlock(&c->mtx);
+}
+
 velaclaw_client_t* velaclaw_client_open(const char* name)
 {
     if (g_client_instance) {
