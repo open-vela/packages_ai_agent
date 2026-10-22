@@ -34,6 +34,10 @@ extern "C" {
  * no backend is configured, -EIO when the update could not be applied. */
 int agent_llm_set_model(const char *model);
 
+/* Drop the cached answer for this request text.  Call it before a request
+ * whose answer must come from a fresh tool run. */
+void agent_llm_cache_forget(const char *prompt);
+
 #ifdef __cplusplus
 }
 #endif

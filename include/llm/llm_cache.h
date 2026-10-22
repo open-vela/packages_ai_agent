@@ -54,6 +54,11 @@ char* llm_cache_get(const char* prompt, size_t prompt_len);
  * @param prompt_len  Length of prompt
  * @param response  Response text to cache
  */
+/* Drop the entry for this prompt.  A caller with a freshness requirement
+ * (the voice round must run its tool every time) uses this before asking so
+ * a previous model answer cannot skip the tool. */
+void llm_cache_forget(const char* prompt, size_t prompt_len);
+
 void llm_cache_put(const char* prompt, size_t prompt_len,
     const char* response);
 

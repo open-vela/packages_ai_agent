@@ -1476,6 +1476,32 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 }
             }
 
+            /* A single VelaGuard anomaly or recovery read already carries
+             * the whole answer.  The voice path renders from the published
+             * snapshot and ignores model prose entirely, so the second model
+             * round only adds latency: measured 10.7 to 16.4 s for two
+             * rounds against 4 to 5 s for one, inside a 30 s budget shared
+             * with ASR and TTS.  Same single-call shape as the point
+             * shortcut; system-channel work keeps the model in the loop. */
+
+            if ((strcmp(resp.calls[0].name, "vg_anomaly_read") == 0
+                 || strcmp(resp.calls[0].name, "vg_alarm_recovery") == 0)
+                && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0
+                && tool_output[0]) {
+                syslog(LOG_INFO,
+                    "[%s] Snapshot shortcut: skip LLM round (%s)\n",
+                    TAG, resp.calls[0].name);
+                final_text = strdup(tool_output);
+
+                /* The text is a live sample, not a model answer: keep it out
+                 * of the response cache so a later round still runs the
+                 * tool instead of replaying a stale list. */
+
+                reply_from_sample = true;
+                llm_response_free(&resp);
+                break;
+            }
+
             bool all_local = true;
             for (int i = 0; i < resp.call_count; i++) {
                 if (strcmp(resp.calls[i].name, "read_file") != 0

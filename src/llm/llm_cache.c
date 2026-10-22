@@ -107,6 +107,28 @@ char* llm_cache_get(const char* prompt, size_t prompt_len)
     return result;
 }
 
+void llm_cache_forget(const char* prompt, size_t prompt_len)
+{
+    if (!prompt || prompt_len == 0) {
+        return;
+    }
+
+    uint32_t h = djb2_hash(prompt, prompt_len);
+
+    pthread_mutex_lock(&s_cache_lock);
+    for (int i = 0; i < LLM_CACHE_SLOTS; i++) {
+        if (s_slots[i].hash == h && s_slots[i].response) {
+            free(s_slots[i].response);
+            s_slots[i].response = NULL;
+            s_slots[i].hash = 0;
+            s_slots[i].ts = 0;
+            s_slots[i].hits = 0;
+            s_slots[i].tokens = 0;
+        }
+    }
+    pthread_mutex_unlock(&s_cache_lock);
+}
+
 void llm_cache_put(const char* prompt, size_t prompt_len,
     const char* response)
 {

@@ -24,6 +24,7 @@
 #include "llm/llm_parse.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
+#include "llm/llm_cache.h"
 #include "agent_llm.h"
 #include "core/message_bus.h"
 #include "infra/config_store.h"
@@ -1216,6 +1217,13 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 /* Replace the model of backend 0 and keep host, path and key.  The key never
  * leaves the backend structure, so a caller that only needs to correct a
  * model name does not have to handle the credential. */
+
+void agent_llm_cache_forget(const char *prompt)
+{
+    if (prompt != NULL && prompt[0] != '\0') {
+        llm_cache_forget(prompt, strlen(prompt));
+    }
+}
 
 int agent_llm_set_model(const char *model)
 {
