@@ -23,6 +23,8 @@
 #include "llm/llm_internal.h"
 #include "llm/llm_parse.h"
 #include "llm/llm_proxy.h"
+#include "llm/llm_router.h"
+#include "agent_llm.h"
 #include "core/message_bus.h"
 #include "infra/config_store.h"
 #include "infra/http_proxy.h"
@@ -1209,4 +1211,35 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
         resp->tool_use ? "tool_calls" : "end_turn");
 
     return OK;
+}
+
+/* Replace the model of backend 0 and keep host, path and key.  The key never
+ * leaves the backend structure, so a caller that only needs to correct a
+ * model name does not have to handle the credential. */
+
+int agent_llm_set_model(const char *model)
+{
+    llm_backend_t backend;
+    size_t len;
+
+    if (model == NULL || model[0] == '\0') {
+        return -EINVAL;
+    }
+
+    len = strlen(model);
+    if (len >= sizeof(backend.model)) {
+        return -E2BIG;
+    }
+
+    if (llm_router_get_backend(0, &backend) != 0) {
+        return -ENODEV;
+    }
+
+    memcpy(backend.model, model, len + 1);
+
+    if (llm_router_set_backend(0, &backend) != 0) {
+        return -EIO;
+    }
+
+    return (llm_router_apply(0) == 0) ? 0 : -EIO;
 }
