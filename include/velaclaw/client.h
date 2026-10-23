@@ -43,6 +43,11 @@ int velaclaw_ask_async_deadline(velaclaw_client_t *c,
     const velaclaw_ask_req_t *req, uint32_t deadline_ms,
     void (*cb)(int, const char *, void *), void *cookie);
 
+/* 可取消的后台请求，保留后台完整提示词和工具范围，不标记为语音请求。 */
+int velaclaw_ask_async_background(velaclaw_client_t *c,
+    const velaclaw_ask_req_t *req, uint32_t deadline_ms,
+    void (*cb)(int, const char *, void *), void *cookie);
+
 /* Agent-loop lifetime handshake.  begin registers a cancellation flag owned
  * by the currently processing message.  end must run on every exit before
  * that flag leaves scope.  No message retains a pointer to a client's flag.
@@ -50,6 +55,11 @@ int velaclaw_ask_async_deadline(velaclaw_client_t *c,
 int velaclaw_request_begin(const char *chat_id, vela_req_ctl_t *ctl,
     volatile int *cancel);
 void velaclaw_request_end(volatile int *cancel);
+/* 可选的只读请求观察钩子，默认空实现。仅受控请求 begin 时通知其处理线程；
+ * end 在同一线程退出请求作用域时通知。不得在回调内调用客户端 API。
+ * cookie 是该次 ask 的原始关联值，只作来源关联，不授予工具权限。 */
+void velaclaw_request_observe(const char *app_id, const char *request_id,
+    void *cookie, bool begin);
 /* Mark a matching controlled reply as failed without changing bus frames. */
 void velaclaw_request_failed(const char *chat_id, int status);
 

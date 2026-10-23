@@ -469,7 +469,7 @@ out:
 
 /* 仅对 HMI 已知服务的受控连接缓存 TLS 1.2 会话，恢复资格一分钟后失效。
  * 不保存到文件，不缓存 HTTP 凭据；服务端可拒绝恢复并执行完整握手。 */
-#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+#if defined(CONFIG_VG_HMI) && defined(CONFIG_VG_VOICE_TLS_CACHE) && defined(MBEDTLS_SSL_CLI_C)
 static pthread_mutex_t voice_session_lock = PTHREAD_MUTEX_INITIALIZER;
 static mbedtls_ssl_session voice_session;
 static pthread_once_t voice_session_once = PTHREAD_ONCE_INIT;
@@ -721,7 +721,7 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
         return VELA_TLS_ERR_HANDSHAKE;
     }
 
-#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+#if defined(CONFIG_VG_HMI) && defined(CONFIG_VG_VOICE_TLS_CACHE) && defined(MBEDTLS_SSL_CLI_C)
     bool session_offered = tls_voice_session_offer(&ctx->ssl, host, port, ctl, agent_mono_ms());
 #endif
 
@@ -773,7 +773,7 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
             if (timing != NULL) {
                 timing->tls_ms = agent_lap_ms(&mark);
             }
-#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+#if defined(CONFIG_VG_HMI) && defined(CONFIG_VG_VOICE_TLS_CACHE) && defined(MBEDTLS_SSL_CLI_C)
             if (session_offered) tls_voice_session_clear();
 #endif
             return VELA_TLS_ERR_HANDSHAKE;
@@ -787,14 +787,14 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
         }
     }
 
-#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+#if defined(CONFIG_VG_HMI) && defined(CONFIG_VG_VOICE_TLS_CACHE) && defined(MBEDTLS_SSL_CLI_C)
     uint32_t handshake_ms = agent_elapsed_ms(mark, agent_mono_ms());
 #endif
     if (timing != NULL) {
         timing->tls_ms = agent_lap_ms(&mark);
     }
 
-#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+#if defined(CONFIG_VG_HMI) && defined(CONFIG_VG_VOICE_TLS_CACHE) && defined(MBEDTLS_SSL_CLI_C)
     if (tls_voice_session_target(host, port, ctl)) {
         syslog(LOG_INFO, "[%s] voice session offered=%u handshake_ms=%u\n", TAG,
             session_offered, (unsigned)handshake_ms);
@@ -1490,9 +1490,9 @@ static int stream_write_all(tls_ctx_t *ctx, const char *what,
             VELA_REQ_IO_SLICE_MS));
 
         chunk = len - off;
-        if (chunk > TLS_WRITE_CHUNK) {
-            chunk = TLS_WRITE_CHUNK;
-        }
+        /* 受控流可使用完整 TLS 记录；原来的普通请求分片保持不变。 */
+        size_t limit = ctl != NULL ? 16384u : TLS_WRITE_CHUNK;
+        if (chunk > limit) chunk = limit;
 
         ret = mbedtls_ssl_write(&ctx->ssl, (const unsigned char *)buf + off,
             chunk);
@@ -1554,6 +1554,44 @@ static int stream_write_all(tls_ctx_t *ctx, const char *what,
     }
 
     return 0;
+}
+
+/* 有界合并上传源的短片段，避免前缀、WAV 头和每个余片各发一条 TLS 记录。
+ * 缓冲放在堆上；不增加语音工作线程栈，也不延长原取消与截止预算。 */
+static int stream_send_body(tls_ctx_t *ctx, const vela_body_src_t *body,
+                            const vela_req_ctl_t *ctl)
+{
+    if (body == NULL || body->len == 0) return 0;
+    if (body->read == NULL) return VELA_TLS_ERR_READ;
+    const size_t capacity = ctl != NULL ? 16384u : 4096u;
+    char *piece = malloc(capacity);
+    if (!piece) return VELA_TLS_ERR_OVERFLOW;
+    size_t sent = 0;
+    int ret = 0;
+    while (sent < body->len) {
+        size_t target = body->len - sent;
+        if (target > capacity) target = capacity;
+        size_t used = 0;
+        while (used < target) {
+            if (vela_req_cancelled(ctl)) { ret = VELA_TLS_ERR_CANCELLED; goto out; }
+            if (vela_req_budget_ms(ctl, agent_mono_ms()) == 0) {
+                ret = VELA_TLS_ERR_TIMEOUT; goto out;
+            }
+            int got = body->read(body->ctx, piece + used, target - used);
+            if (got < 0) { ret = VELA_TLS_ERR_READ; goto out; }
+            if (got == 0) { ret = VELA_TLS_ERR_WRITE; goto out; }
+            if ((size_t)got > target - used) { ret = VELA_TLS_ERR_OVERFLOW; goto out; }
+            used += (size_t)got;
+        }
+        ret = stream_write_all(ctx, "body", piece, used, ctl);
+        if (ret != 0) goto out;
+        sent += used;
+    }
+out:
+    /* 上传片段可能包含录音或提示词，归还堆之前清零。 */
+    for (size_t i=0;i<capacity;i++) ((volatile unsigned char *)piece)[i]=0;
+    free(piece);
+    return ret;
 }
 
 int vela_https_request_stream(
@@ -1689,43 +1727,10 @@ int vela_https_request_stream(
         timing->send_ms = agent_elapsed_ms(mark, agent_mono_ms());
     }
 
-    /* Body, one bounded piece at a time. */
-
-    if (body != NULL && body->len > 0) {
-        size_t sent = 0;
-        char piece[4096];
-
-        while (sent < body->len) {
-            int got = body->read(body->ctx, piece, sizeof(piece));
-
-            if (got < 0) {
-                tls_ctx_free(&ctx);
-                return VELA_TLS_ERR_READ;
-            }
-
-            if (got == 0) {
-                /* The source promised len bytes and stopped early.  Sending
-                 * a short body would leave the server waiting for the rest,
-                 * so fail now and name the size. */
-
-                syslog(LOG_ERR, "[%s] body source ended at %u/%u\n", TAG,
-                    (unsigned)sent, (unsigned)body->len);
-                tls_ctx_free(&ctx);
-                return VELA_TLS_ERR_WRITE;
-            }
-
-            if (sent + (size_t)got > body->len) {
-                got = (int)(body->len - sent);
-            }
-
-            ret = stream_write_all(&ctx, "body", piece, (size_t)got, ctl);
-            if (ret != 0) {
-                tls_ctx_free(&ctx);
-                return ret;
-            }
-
-            sent += (size_t)got;
-        }
+    ret = stream_send_body(&ctx, body, ctl);
+    if (ret != 0) {
+        tls_ctx_free(&ctx);
+        return ret;
     }
 
     /* Response headers. */

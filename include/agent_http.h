@@ -79,7 +79,8 @@ typedef struct {
 
 /**
  * Response body consumer.  When set, bytes are handed over as they arrive.
- * write() returns 0 to continue, negative to abort.
+ * write() returns 0 to continue, negative to abort, positive when the
+ * application protocol has a verified complete response (connection closes).
  */
 typedef struct {
     int (*write)(void *ctx, const char *data, size_t len);
@@ -164,6 +165,12 @@ int agent_http_post_stream(const char *post_data,
 /* Explicit transport diagnostic.  Sends a fixed invalid test credential,
  * never reads configured credentials, discards the response body, and never
  * changes the product endpoint.  Not registered as an Agent tool. */
+/* 诊断流式 POST：与 probe 相同，固定使用无效测试凭据，不读取真实配置。 */
+int agent_http_probe_post_stream(const char *host, const char *port,
+    const char *path, const char *post_data, const vela_body_src_t *body,
+    const vela_resp_sink_t *sink, char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status, const vela_req_ctl_t *ctl);
+
 int agent_http_probe(const char *host, const char *port, const char *path,
     const vela_req_ctl_t *ctl, size_t *out_body_len, int *out_status);
 

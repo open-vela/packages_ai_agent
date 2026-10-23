@@ -158,7 +158,7 @@ void velaclaw_client_close(velaclaw_client_t* c)
 }
 
 static int client_ask(velaclaw_client_t *c, const velaclaw_ask_req_t *req,
-    uint32_t deadline_ms, void (*cb)(int, const char *, void *), void *cookie);
+    uint32_t deadline_ms, bool voice, void (*cb)(int, const char *, void *), void *cookie);
 
 int velaclaw_ask_async(velaclaw_client_t* c,
     const velaclaw_ask_req_t* req,
@@ -178,7 +178,7 @@ int velaclaw_ask_async(velaclaw_client_t* c,
 }
 
 static int client_ask(velaclaw_client_t* c,
-    const velaclaw_ask_req_t* req, uint32_t deadline_ms,
+    const velaclaw_ask_req_t* req, uint32_t deadline_ms, bool voice,
     void (*cb)(int, const char*, void*), void* cookie)
 {
     if (!c || !req || !req->text) {
@@ -200,7 +200,7 @@ static int client_ask(velaclaw_client_t* c,
     c->reply_status = 0;
     c->serial++;
     snprintf(c->pending_id, sizeof(c->pending_id),
-             deadline_ms != 0 ? "%s:voice:%u" : "%s:%u",
+             voice ? "%s:voice:%u" : "%s:%u",
              c->app_id, (unsigned)c->serial);
     c->started_ms = now;
     c->timeout_ms = req->timeout_ms > 0 ? (uint32_t)req->timeout_ms : 300000u;
@@ -229,7 +229,7 @@ static int client_ask(velaclaw_client_t* c,
 int velaclaw_ask(velaclaw_client_t *c, const velaclaw_ask_req_t *req,
     void (*cb)(int, const char *, void *), void *cookie)
 {
-    return client_ask(c, req, 0, cb, cookie);
+    return client_ask(c, req, 0, false, cb, cookie);
 }
 
 int velaclaw_ask_async_deadline(velaclaw_client_t *c,
@@ -240,13 +240,31 @@ int velaclaw_ask_async_deadline(velaclaw_client_t *c,
         return -ETIMEDOUT;
     }
     agent_loop_ensure_started();
-    return client_ask(c, req, deadline_ms, cb, cookie);
+    return client_ask(c, req, deadline_ms, true, cb, cookie);
+}
+
+int velaclaw_ask_async_background(velaclaw_client_t *c,
+    const velaclaw_ask_req_t *req, uint32_t deadline_ms,
+    void (*cb)(int, const char *, void *), void *cookie)
+{
+    if (!deadline_ms || agent_http_remaining_ms(deadline_ms,client_now_ms()) == 0)
+        return -ETIMEDOUT;
+    agent_loop_ensure_started();
+    return client_ask(c,req,deadline_ms,false,cb,cookie);
+}
+
+__attribute__((weak)) void velaclaw_request_observe(const char *app_id,
+    const char *request_id, void *cookie, bool begin)
+{
+    (void)app_id; (void)request_id; (void)cookie; (void)begin;
 }
 
 int velaclaw_request_begin(const char *chat_id, vela_req_ctl_t *ctl,
     volatile int *cancel)
 {
     int ret = -ESTALE;
+    char app_id[32] = {0}, request_id[64] = {0};
+    void *cookie = NULL;
     pthread_mutex_lock(&g_instance_lock);
     struct velaclaw_client_s *c = g_client_instance;
     if (c != NULL) {
@@ -258,12 +276,16 @@ int velaclaw_request_begin(const char *chat_id, vela_req_ctl_t *ctl,
                 ctl->deadline_ms = c->deadline_ms;
                 ctl->cancel = cancel;
                 c->active_cancel = cancel;
+                memcpy(app_id, c->app_id, sizeof(app_id));
+                memcpy(request_id,c->pending_id,sizeof(request_id));
+                cookie = c->async_cookie;
                 ret = 1;
             }
         }
         pthread_mutex_unlock(&c->mtx);
     }
     pthread_mutex_unlock(&g_instance_lock);
+    if (ret == 1) velaclaw_request_observe(app_id, request_id, cookie, true);
     return ret;
 }
 
@@ -279,6 +301,7 @@ void velaclaw_request_end(volatile int *cancel)
         pthread_mutex_unlock(&c->mtx);
     }
     pthread_mutex_unlock(&g_instance_lock);
+    velaclaw_request_observe(NULL, NULL, NULL, false);
 }
 
 void velaclaw_request_failed(const char *chat_id, int status)

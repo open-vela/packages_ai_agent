@@ -743,6 +743,30 @@ int agent_http_post_stream(const char *post_data,
         out_body_len, out_status, NULL, ctl);
 }
 
+int agent_http_probe_post_stream(const char *host, const char *port,
+    const char *path, const char *post_data, const vela_body_src_t *body,
+    const vela_resp_sink_t *sink, char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status, const vela_req_ctl_t *ctl)
+{
+    static const vela_header_t headers[] = {
+        { "Content-Type", "application/json" },
+        { "Authorization", "Bearer velaguard-invalid-test-credential" },
+        { NULL, NULL }
+    };
+    struct llm_mem_body mem = {0};
+    vela_body_src_t mem_src;
+    if (!host || !port || !path || path[0] != '/' ||
+        strpbrk(host, "\r\n \t") || strpbrk(port, "\r\n \t") ||
+        strpbrk(path, "\r\n \t")) return AGENT_HTTP_ERR_CONNECT;
+    if (!body && post_data) {
+        mem.p = post_data; mem.len = strlen(post_data);
+        mem_src = (vela_body_src_t){.len=mem.len,.read=llm_mem_body_read,.ctx=&mem};
+        body = &mem_src;
+    }
+    return vela_https_request_stream(host, port, "POST", path, headers, body,
+        sink, ctl, resp_buf, resp_cap, out_body_len, out_status, NULL);
+}
+
 int agent_http_probe(const char *host, const char *port, const char *path,
     const vela_req_ctl_t *ctl, size_t *out_body_len, int *out_status)
 {

@@ -8,6 +8,16 @@
 #include <velaclaw/client.h>
 #include "core/message_bus_tap.h"
 
+static int observed_begins, observed_ends;
+static void *observed_cookie;
+void velaclaw_request_observe(const char *app_id, const char *request_id, void *cookie, bool begin)
+{
+    if (begin) {
+        assert(app_id && !strcmp(app_id, "test"));
+        assert(request_id && !strncmp(request_id,"test:",5));
+        observed_begins++; observed_cookie = cookie;
+    } else observed_ends++;
+}
 static mbus_tap_cb_t tap;
 static void *tap_cookie;
 static int fail_push;
@@ -75,19 +85,23 @@ int main(void)
     volatile int cancel_new = 0;
     assert(velaclaw_request_begin(sent.chat_id, &ctl, &cancel_old) == 1);
     assert(ctl.deadline_ms == now + 1000 && ctl.cancel == &cancel_old);
+    assert(observed_begins == 1 && observed_cookie == &calls);
     velaclaw_client_abandon(c);
     assert(cancel_old == 1);
     assert(!velaclaw_ask_async_deadline(c, &req, now + 1000, reply, &calls));
     assert(velaclaw_request_begin(controlled_old.chat_id, &ctl, &cancel_old) < 0);
     assert(velaclaw_request_begin(sent.chat_id, &ctl, &cancel_new) == 1);
+    assert(observed_begins == 2);
     velaclaw_request_end(&cancel_old);
     velaclaw_client_abandon(c);
     assert(cancel_new == 1);
     velaclaw_request_end(&cancel_new);
 
+    assert(observed_ends == 2);
     /* Uncontrolled background work remains independent of a voice cancel. */
     assert(!velaclaw_ask(c, &req, reply, &calls));
     assert(velaclaw_request_begin(sent.chat_id, &ctl, &cancel_new) == 0);
+    assert(observed_begins == 2);
     cancel_new = 0;
     velaclaw_client_abandon(c);
     assert(cancel_new == 0);
@@ -111,8 +125,14 @@ int main(void)
     tap(&current, tap_cookie);
     assert(calls == 4);
 
+    assert(!velaclaw_ask_async_background(c,&req,now+1000,reply,&calls));
+    assert(!strstr(sent.chat_id,":voice:"));
+    assert(velaclaw_request_begin(sent.chat_id,&ctl,&cancel_new)==1);
+    cancel_new=0; velaclaw_client_abandon(c); assert(cancel_new==1);
+    velaclaw_request_end(&cancel_new);
     assert(!velaclaw_ask_async_deadline(c, &req, now + 1000, reply, &calls));
     assert(velaclaw_request_begin(sent.chat_id, &ctl, &cancel_new) == 1);
+    assert(observed_begins == 4);
     velaclaw_client_close(c);
     assert(cancel_new == 1);
     velaclaw_request_end(&cancel_new);
