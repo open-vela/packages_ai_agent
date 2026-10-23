@@ -27,7 +27,6 @@
 #include "core/agent_trace.h"
 #include "core/point_reply.h"
 #include "infra/agent_timing.h"
-#include "infra/voice_sched.h"
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
@@ -1794,7 +1793,6 @@ static void* agent_loop_task(void* arg)
         }
 
         char *voice_tools = NULL;
-        struct agent_voice_sched voice_sched = {0};
         volatile int request_cancel = 0;
         vela_req_ctl_t request_ctl = {0};
         const vela_req_ctl_t *ctl = NULL;
@@ -1845,9 +1843,6 @@ static void* agent_loop_task(void* arg)
 
         bool voice_scope = ctl != NULL
             && vg_voice_scope_request(msg.channel, msg.chat_id);
-
-        int sched_rc = agent_voice_sched_enter(&voice_sched, voice_scope);
-        if (sched_rc) syslog(LOG_WARNING, "[%s] voice scheduling unchanged rc=%d\n", TAG, sched_rc);
 
         /* Fast paths may execute file/shell tools. Voice stays in its
          * scoped ReAct route instead of bypassing runtime checks. */
@@ -1933,8 +1928,6 @@ static void* agent_loop_task(void* arg)
         dispatch_response(&msg, final_text, ctl == NULL);
 
 release_message:
-        if (agent_voice_sched_leave(&voice_sched))
-            syslog(LOG_ERR, "[%s] voice scheduling restore failed\n", TAG);
         free(voice_tools);
         velaclaw_request_end(&request_cancel);
         message_bus_msg_free(&msg);
