@@ -670,6 +670,26 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
 #define TLS_WRITE_ATTEMPTS   64
 #define TLS_WRITE_BACKOFF_US 20000
 
+/* A send that failed because the socket is gone must not be retried: the
+ * peer closed the connection and every retry waits for a timeout that
+ * cannot succeed.  NuttX reports these as ENOTCONN, EPIPE, ECONNRESET or
+ * EBADF.  ENOMEM is the opposite case: the stack ran out of packet buffers
+ * and the send becomes possible again once the peer acknowledges. */
+static bool tls_send_error_is_fatal(int err)
+{
+    switch (err)
+    {
+        case ENOTCONN:
+        case EPIPE:
+        case ECONNRESET:
+        case EBADF:
+        case ENOTSOCK:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static int tls_ssl_write_all(tls_ctx_t* ctx, const char* what,
     const unsigned char* buf, size_t len)
 {
@@ -698,21 +718,45 @@ static int tls_ssl_write_all(tls_ctx_t* ctx, const char* what,
         }
 
         attempts++;
-        if (attempts == 1 || attempts >= TLS_WRITE_ATTEMPTS) {
+        {
             int err = errno;
-            int fl = (ctx->net.fd >= 0) ? fcntl(ctx->net.fd, F_GETFL) : -1;
 
-            syslog(attempts == 1 ? LOG_WARNING : LOG_ERR,
-                "[%s] %s write retry %d at %u/%u ret=-0x%04x errno=%d fl=0x%x\n",
-                TAG, what, attempts, (unsigned)off, (unsigned)len,
-                -ret, err, (unsigned)fl);
+            /* The connection is gone: retrying only burns the budget. */
+
+            if (tls_send_error_is_fatal(err)) {
+                syslog(LOG_ERR,
+                    "[%s] %s write failed at %u/%u ret=-0x%04x errno=%d (connection gone)\n",
+                    TAG, what, (unsigned)off, (unsigned)len, -ret, err);
+                return VELA_TLS_ERR_WRITE;
+            }
+
+            if (attempts == 1 || attempts >= TLS_WRITE_ATTEMPTS) {
+                int fl = (ctx->net.fd >= 0) ? fcntl(ctx->net.fd, F_GETFL) : -1;
+
+                syslog(attempts == 1 ? LOG_WARNING : LOG_ERR,
+                    "[%s] %s write retry %d at %u/%u ret=-0x%04x errno=%d fl=0x%x\n",
+                    TAG, what, attempts, (unsigned)off, (unsigned)len,
+                    -ret, err, (unsigned)fl);
+            }
         }
 
         if (attempts >= TLS_WRITE_ATTEMPTS) {
             return VELA_TLS_ERR_WRITE;
         }
 
-        usleep(TLS_WRITE_BACKOFF_US);
+        /* Wait for the socket to take data again.  A closed peer reports an
+         * error event immediately instead of after the full backoff. */
+
+        {
+            struct pollfd pfd = { .fd = ctx->net.fd, .events = POLLOUT };
+            int pr = poll(&pfd, 1, TLS_WRITE_BACKOFF_US / 1000);
+
+            if (pr > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                syslog(LOG_ERR, "[%s] %s write sees a dead socket at %u/%u\n",
+                    TAG, what, (unsigned)off, (unsigned)len);
+                return VELA_TLS_ERR_WRITE;
+            }
+        }
     }
 
     return 0;
@@ -1305,7 +1349,8 @@ static int stream_write_all(tls_ctx_t *ctx, const char *what,
         if (ret == MBEDTLS_ERR_SSL_WANT_WRITE
             || ret == MBEDTLS_ERR_SSL_WANT_READ
             || (ret == MBEDTLS_ERR_NET_SEND_FAILED
-                && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                    errno == EINTR || errno == ENOMEM))
             || ret == MBEDTLS_ERR_SSL_TIMEOUT) {
             /* A full send buffer is retryable, but only for a bounded
              * number of slices. */
@@ -1315,6 +1360,23 @@ static int stream_write_all(tls_ctx_t *ctx, const char *what,
             if (wait_rc != 0) {
                 return wait_rc;
             }
+
+            /* A peer that went away leaves an error on the socket; the
+             * next write would only spin until the budget is gone. */
+
+            {
+                int soerr = 0;
+                socklen_t slen = sizeof(soerr);
+
+                if (getsockopt(ctx->net.fd, SOL_SOCKET, SO_ERROR, &soerr,
+                               &slen) == 0 && soerr != 0) {
+                    syslog(LOG_ERR,
+                        "[%s] %s write sees socket error %d at %u/%u\n",
+                        TAG, what, soerr, (unsigned)off, (unsigned)len);
+                    return VELA_TLS_ERR_WRITE;
+                }
+            }
+
             if (++stalls > 120) {
                 syslog(LOG_ERR, "[%s] %s write gave up at %u/%u\n", TAG, what,
                     (unsigned)off, (unsigned)len);

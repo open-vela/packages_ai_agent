@@ -35,6 +35,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "cJSON.h"
 
 static const char *TAG = "context";
@@ -143,6 +145,111 @@ static size_t append_file(char *buf, size_t size, size_t offset,
     return offset;
 }
 
+/* ── Cached prompt body ───────────────────────────────────────────
+ *
+ * The body is the part of the prompt that needs file reads: the
+ * bootstrap files, the long-term memory, the recent notes and the
+ * skills summary.  On this board those files live on the eMMC, and one
+ * round of reads costs about 4.6 s, while their content does not change
+ * between rounds.  The body is therefore kept in RAM and refreshed by a
+ * background thread; the header above it still carries the current time,
+ * so the model never reads a stale clock.
+ */
+
+#define CONTEXT_BODY_MAX 3072
+#define CONTEXT_BODY_REFRESH_MS 30000
+
+static char s_body_cache[CONTEXT_BODY_MAX];
+static size_t s_body_len;
+static pthread_mutex_t s_body_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool s_body_refresher_started;
+
+static size_t build_prompt_body(char *buf, size_t size)
+{
+    size_t off = 0;
+
+    if (size == 0) {
+        return 0;
+    }
+
+    /* Bootstrap files */
+    off = append_file(buf, size, off, AGENT_SOUL_FILE, "Personality");
+    off = append_file(buf, size, off, AGENT_USER_FILE, "User Info");
+
+    /* Long-term memory */
+    off = ctx_append(buf, size, off, "\n## Long-term Memory\n\n");
+    {
+        /* off <= size - 1 由 ctx_append 保证，故 avail 恒非负。 */
+        size_t avail = size - off - 1;
+        if (avail > 0 && memory_read_long_term(buf + off, avail) == OK && buf[off]) {
+            off += strlen(buf + off);
+            off = ctx_append(buf, size, off, "\n");
+        }
+    }
+
+    /* Recent daily notes */
+    off = ctx_append(buf, size, off, "\n## Recent Notes\n\n");
+    {
+        size_t avail = size - off - 1;
+        if (avail > 0 && memory_read_recent(buf + off, avail, 3) == OK && buf[off]) {
+            off += strlen(buf + off);
+            off = ctx_append(buf, size, off, "\n");
+        }
+    }
+
+    /* Skills summary — use smaller stack buffer.
+     * 10 个技能摘要按当前内容约 1086 字节，封顶后若仍用 1024 会整条丢掉一个，
+     * 扩到 1280 让提示词内容与修复前保持一致。 */
+    {
+        char skills_buf[1280];
+        size_t skills_len = skill_loader_build_summary(skills_buf, sizeof(skills_buf));
+        if (skills_len > 0) {
+            off = ctx_append(buf, size, off, "\n## Skills\n%s\n", skills_buf);
+        }
+    }
+
+    buf[off] = '\0';
+    return off;
+}
+
+static void *context_body_refresher(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        usleep(CONTEXT_BODY_REFRESH_MS * 1000);
+
+        pthread_mutex_lock(&s_body_lock);
+        s_body_len = build_prompt_body(s_body_cache, sizeof(s_body_cache));
+        pthread_mutex_unlock(&s_body_lock);
+    }
+
+    return NULL;
+}
+
+static void context_body_refresher_start(void)
+{
+    pthread_t tid;
+    pthread_attr_t attr;
+
+    if (s_body_refresher_started) {
+        return;
+    }
+
+    s_body_refresher_started = true;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16 * 1024);
+    if (pthread_create(&tid, &attr, context_body_refresher, NULL) != 0) {
+        syslog(LOG_ERR,
+            "[%s] prompt body thread failed; every round reads the files again\n",
+            TAG);
+    } else {
+        pthread_detach(tid);
+    }
+    pthread_attr_destroy(&attr);
+}
+
 int context_build_system_prompt(char *buf, size_t size)
 {
     /* 下面每处 ctx_append / append_file 都依赖 size >= 1。 */
@@ -204,40 +311,32 @@ int context_build_system_prompt(char *buf, size_t size)
         "Skill files in %s. Match task→read full file.\n",
         AGENT_DATA_DIR, AGENT_DATA_DIR, AGENT_SKILLS_DIR);
 
-    /* Bootstrap files */
-    off = append_file(buf, size, off, AGENT_SOUL_FILE, "Personality");
-    off = append_file(buf, size, off, AGENT_USER_FILE, "User Info");
+    /* The file-backed part of the prompt is cached in RAM: the first
+     * round builds it and a background thread keeps it fresh, so a
+     * question does not pay for the eMMC reads. */
 
-    /* Long-term memory — write directly into buf */
-    off = ctx_append(buf, size, off, "\n## Long-term Memory\n\n");
-    {
-        /* off <= size - 1 由 ctx_append 保证，故 avail 恒非负。 */
-        size_t avail = size - off - 1;
-        if (avail > 0 && memory_read_long_term(buf + off, avail) == OK && buf[off]) {
-            off += strlen(buf + off);
-            off = ctx_append(buf, size, off, "\n");
-        }
-    }
-
-    /* Recent daily notes — write directly into buf */
-    off = ctx_append(buf, size, off, "\n## Recent Notes\n\n");
     {
         size_t avail = size - off - 1;
-        if (avail > 0 && memory_read_recent(buf + off, avail, 3) == OK && buf[off]) {
-            off += strlen(buf + off);
-            off = ctx_append(buf, size, off, "\n");
+
+        pthread_mutex_lock(&s_body_lock);
+        if (s_body_len == 0) {
+            s_body_len = build_prompt_body(s_body_cache, sizeof(s_body_cache));
         }
+
+        if (avail >= s_body_len) {
+            memcpy(buf + off, s_body_cache, s_body_len);
+            off += s_body_len;
+            buf[off] = '\0';
+        }
+        else {
+            /* Not enough room for the cached body: build it into the
+             * remaining space so the prompt stays inside the buffer. */
+            off = build_prompt_body(buf + off, avail);
+        }
+        pthread_mutex_unlock(&s_body_lock);
     }
 
-    /* Skills summary — use smaller stack buffer.
-     * 10 个技能摘要按当前内容约 1086 字节，封顶后若仍用 1024 会整条丢掉一个，
-     * 扩到 1280 让提示词内容与修复前保持一致。 */
-    char skills_buf[1280];
-    size_t skills_len = skill_loader_build_summary(skills_buf, sizeof(skills_buf));
-    if (skills_len > 0) {
-        off = ctx_append(buf, size, off,
-            "\n## Skills\n%s\n", skills_buf);
-    }
+    context_body_refresher_start();
 
     /* Remote Node devices */
 #ifdef CONFIG_AI_AGENT_NODE

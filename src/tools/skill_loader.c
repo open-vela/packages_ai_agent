@@ -28,6 +28,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static const char *TAG = "skills";
 
@@ -462,7 +463,19 @@ static uint32_t compute_skills_hash(void)
 
 bool skill_loader_check_changed(void)
 {
-    uint32_t current = compute_skills_hash();
+    static time_t s_last_check;
+    time_t now = time(NULL);
+    uint32_t current;
+
+    /* Listing the skills directory costs file system time on the eMMC and
+     * the prompt body is rebuilt every 30 s anyway, so a check more often
+     * than that buys nothing. */
+    if (s_last_check != 0 && (now - s_last_check) < 30) {
+        return false;
+    }
+    s_last_check = now;
+
+    current = compute_skills_hash();
     if (s_last_skill_hash == 0) {
         s_last_skill_hash = current;
         return false;
