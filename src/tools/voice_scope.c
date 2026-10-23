@@ -69,6 +69,8 @@ bool vg_voice_scope_model_options(cJSON *body, const char *prompt,
     cJSON_AddItemToObject(body, "thinking", thinking);
     cJSON_DeleteItemFromObject(body, "max_tokens");
     cJSON_AddNumberToObject(body, "max_tokens", 256);
+    cJSON_DeleteItemFromObject(body, "max_completion_tokens");
+    cJSON_AddNumberToObject(body, "max_completion_tokens", 256);
     return true;
 #else
     (void)body; (void)prompt; (void)host; (void)model; (void)controlled;

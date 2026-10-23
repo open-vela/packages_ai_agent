@@ -253,8 +253,11 @@ static void pool_release(conn_slot_t* s, const char* host, const char* port, boo
     pthread_mutex_unlock(&s_pool_lock);
 }
 
+static void tls_voice_session_clear(void);
+
 void vela_tls_pool_cleanup(void)
 {
+    tls_voice_session_clear();
     pthread_mutex_lock(&s_pool_lock);
     for (int i = 0; i < CONN_POOL_SIZE; i++) {
         if (s_pool[i].in_use) {
@@ -306,6 +309,13 @@ static int tls_wait_socket(int fd, short events, const vela_req_ctl_t *ctl)
 }
 
 #if defined(__NuttX__) && defined(CONFIG_NETDB_DNSCLIENT)
+#if defined(CONFIG_VG_HMI)
+static struct sockaddr_storage voice_dns_addrs[4];
+static int voice_dns_count;
+static uint32_t voice_dns_saved;
+static pthread_mutex_t voice_dns_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 static int tls_dns_budget(void *arg)
 {
     const vela_req_ctl_t *ctl = arg;
@@ -329,10 +339,36 @@ static int tls_resolve_controlled(const char *host, const char *port,
     ret = getaddrinfo(host, port, &numeric, addresses);
     if (ret == 0) return 0;
 
+#if defined(CONFIG_VG_HMI)
+    bool is_target = (host != NULL && strcmp(host, "token-plan-cn.xiaomimimo.com") == 0);
+    uint32_t now = agent_mono_ms();
+    if (is_target) {
+        pthread_mutex_lock(&voice_dns_lock);
+        if (voice_dns_count > 0 && (uint32_t)(now - voice_dns_saved) < 300000) {
+            n = voice_dns_count;
+            memcpy(resolved, voice_dns_addrs, sizeof(struct sockaddr_storage) * (size_t)n);
+            pthread_mutex_unlock(&voice_dns_lock);
+            goto convert;
+        }
+        pthread_mutex_unlock(&voice_dns_lock);
+    }
+#endif
+
     control.budget_ms = tls_dns_budget;
     control.arg = (void *)ctl;
     ret = dns_query_controlled(host, resolved, &n, &control);
     if (ret < 0) return ret;
+
+#if defined(CONFIG_VG_HMI)
+    if (is_target && n > 0) {
+        pthread_mutex_lock(&voice_dns_lock);
+        voice_dns_count = n > 4 ? 4 : n;
+        memcpy(voice_dns_addrs, resolved, sizeof(struct sockaddr_storage) * (size_t)voice_dns_count);
+        voice_dns_saved = now;
+        pthread_mutex_unlock(&voice_dns_lock);
+    }
+convert:
+#endif
     for (int i = 0; i < n; i++) {
         char ip[INET6_ADDRSTRLEN];
         const void *address;
@@ -421,8 +457,82 @@ out:
     if (addresses != NULL) {
         freeaddrinfo(addresses);
     }
+#if defined(__NuttX__) && defined(CONFIG_NETDB_DNSCLIENT) && defined(CONFIG_VG_HMI)
+    if (result != 0 && host != NULL && strcmp(host, "token-plan-cn.xiaomimimo.com") == 0) {
+        pthread_mutex_lock(&voice_dns_lock);
+        voice_dns_count = 0;
+        pthread_mutex_unlock(&voice_dns_lock);
+    }
+#endif
     return result;
 }
+
+/* 仅对 HMI 已知服务的受控连接缓存 TLS 1.2 会话，恢复资格一分钟后失效。
+ * 不保存到文件，不缓存 HTTP 凭据；服务端可拒绝恢复并执行完整握手。 */
+#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+static pthread_mutex_t voice_session_lock = PTHREAD_MUTEX_INITIALIZER;
+static mbedtls_ssl_session voice_session;
+static pthread_once_t voice_session_once = PTHREAD_ONCE_INIT;
+static bool voice_session_valid;
+static uint32_t voice_session_saved;
+
+static bool tls_voice_session_target(const char *host, const char *port,
+                                     const vela_req_ctl_t *ctl)
+{
+    return ctl != NULL && host != NULL && port != NULL &&
+        strcmp(host, "token-plan-cn.xiaomimimo.com") == 0 && strcmp(port, "443") == 0;
+}
+
+static void tls_voice_session_init_once(void)
+{
+    mbedtls_ssl_session_init(&voice_session);
+}
+
+static void tls_voice_session_clear(void)
+{
+    pthread_once(&voice_session_once, tls_voice_session_init_once);
+    pthread_mutex_lock(&voice_session_lock);
+    mbedtls_ssl_session_free(&voice_session);
+    mbedtls_ssl_session_init(&voice_session);
+    voice_session_valid = false;
+    pthread_mutex_unlock(&voice_session_lock);
+}
+
+static bool tls_voice_session_offer(mbedtls_ssl_context *ssl, const char *host,
+                                    const char *port, const vela_req_ctl_t *ctl,
+                                    uint32_t now)
+{
+    if (!tls_voice_session_target(host, port, ctl)) return false;
+    pthread_once(&voice_session_once, tls_voice_session_init_once);
+    pthread_mutex_lock(&voice_session_lock);
+    bool offered = false;
+    if (voice_session_valid && (uint32_t)(now - voice_session_saved) >= 60000) {
+        mbedtls_ssl_session_free(&voice_session);
+        mbedtls_ssl_session_init(&voice_session);
+        voice_session_valid = false;
+    }
+    if (voice_session_valid) offered = mbedtls_ssl_set_session(ssl, &voice_session) == 0;
+    pthread_mutex_unlock(&voice_session_lock);
+    return offered;
+}
+
+static void tls_voice_session_save(mbedtls_ssl_context *ssl, const char *host,
+                                   const char *port, const vela_req_ctl_t *ctl,
+                                   uint32_t now)
+{
+    if (!tls_voice_session_target(host, port, ctl) ||
+        strcmp(mbedtls_ssl_get_version(ssl), "TLSv1.2") != 0) return;
+    pthread_once(&voice_session_once, tls_voice_session_init_once);
+    pthread_mutex_lock(&voice_session_lock);
+    mbedtls_ssl_session_free(&voice_session);
+    mbedtls_ssl_session_init(&voice_session);
+    voice_session_valid = mbedtls_ssl_get_session(ssl, &voice_session) == 0;
+    voice_session_saved = now;
+    pthread_mutex_unlock(&voice_session_lock);
+}
+#else
+static void tls_voice_session_clear(void) {}
+#endif
 
 static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
     agent_llm_timing_t* timing, const vela_req_ctl_t *ctl)
@@ -611,6 +721,10 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
         return VELA_TLS_ERR_HANDSHAKE;
     }
 
+#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+    bool session_offered = tls_voice_session_offer(&ctx->ssl, host, port, ctl, agent_mono_ms());
+#endif
+
     /* Use blocking recv — no select()/poll().  The read
      * timeout is enforced by the SO_RCVTIMEO socket option set above. */
     if (ctl != NULL) {
@@ -659,6 +773,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
             if (timing != NULL) {
                 timing->tls_ms = agent_lap_ms(&mark);
             }
+#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+            if (session_offered) tls_voice_session_clear();
+#endif
             return VELA_TLS_ERR_HANDSHAKE;
         }
         if (ctl != NULL) {
@@ -670,9 +787,20 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
         }
     }
 
+#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+    uint32_t handshake_ms = agent_elapsed_ms(mark, agent_mono_ms());
+#endif
     if (timing != NULL) {
         timing->tls_ms = agent_lap_ms(&mark);
     }
+
+#if defined(CONFIG_VG_HMI) && defined(MBEDTLS_SSL_CLI_C)
+    if (tls_voice_session_target(host, port, ctl)) {
+        syslog(LOG_INFO, "[%s] voice session offered=%u handshake_ms=%u\n", TAG,
+            session_offered, (unsigned)handshake_ms);
+        tls_voice_session_save(&ctx->ssl, host, port, ctl, agent_mono_ms());
+    }
+#endif
 
     syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
         mbedtls_ssl_get_ciphersuite(&ctx->ssl));
@@ -1170,7 +1298,7 @@ static int emit_bytes(struct vela_emit *e, const char *data, size_t len)
     }
 
     if (e->sink != NULL) {
-        return e->sink->write(e->sink->ctx, data, len) < 0 ? -1 : 0;
+        return e->sink->write(e->sink->ctx, data, len);
     }
 
     if (e->buf == NULL || e->cap == 0) {
@@ -1256,8 +1384,13 @@ static int chunk_feed(struct vela_chunk_dec *d, struct vela_emit *e,
                     take = d->remaining;
                 }
 
-                if (emit_bytes(e, data + i, take) < 0) {
+                int emit_rc = emit_bytes(e, data + i, take);
+                if (emit_rc < 0) {
                     return -1;
+                }
+                if (emit_rc > 0) {
+                    d->state = VELA_CHUNK_DONE;
+                    return 1;
                 }
 
                 i += take;
@@ -1442,13 +1575,14 @@ int vela_https_request_stream(
     struct vela_emit emit;
     struct vela_chunk_dec chunk;
     char *hdr = NULL;
-    char tmp[2048];
+    char tmp[8192];
     size_t hdr_len = 0;
     size_t body_got = 0;
     long content_length = -1;
     bool chunked = false;
     bool header_done = false;
     bool eof = false;
+    bool complete = false;
     uint32_t mark;
     uint32_t last_progress;
     int status = 0;
@@ -1684,9 +1818,13 @@ int vela_https_request_stream(
 
         if (initial > 0) {
             if (chunked) {
-                if (chunk_feed(&chunk, &emit, body_start, initial) < 0) {
+                int cf_rc = chunk_feed(&chunk, &emit, body_start, initial);
+                if (cf_rc < 0) {
                     ret = VELA_TLS_ERR_SINK;
                     goto out;
+                }
+                if (cf_rc > 0 || chunk.state == VELA_CHUNK_DONE) {
+                    complete = true;
                 }
             } else {
                 size_t take = initial;
@@ -1695,9 +1833,13 @@ int vela_https_request_stream(
                     take = (size_t)content_length;
                 }
 
-                if (emit_bytes(&emit, body_start, take) < 0) {
+                int emit_rc = emit_bytes(&emit, body_start, take);
+                if (emit_rc < 0) {
                     ret = VELA_TLS_ERR_SINK;
                     goto out;
+                }
+                if (emit_rc > 0) {
+                    complete = true;
                 }
 
                 body_got = take;
@@ -1709,7 +1851,10 @@ int vela_https_request_stream(
 
     for (;;) {
         uint32_t now;
-        bool complete;
+
+        if (complete) {
+            break;
+        }
 
         if (chunked) {
             complete = (chunk.state == VELA_CHUNK_DONE);
@@ -1750,9 +1895,13 @@ int vela_https_request_stream(
             last_progress = agent_mono_ms();
 
             if (chunked) {
-                if (chunk_feed(&chunk, &emit, tmp, (size_t)n) < 0) {
+                int cf_rc = chunk_feed(&chunk, &emit, tmp, (size_t)n);
+                if (cf_rc < 0) {
                     ret = VELA_TLS_ERR_SINK;
                     goto out;
+                }
+                if (cf_rc > 0 || chunk.state == VELA_CHUNK_DONE) {
+                    break;
                 }
             } else {
                 size_t take = (size_t)n;
@@ -1762,9 +1911,13 @@ int vela_https_request_stream(
                     take = (size_t)content_length - body_got;
                 }
 
-                if (emit_bytes(&emit, tmp, take) < 0) {
+                int emit_rc = emit_bytes(&emit, tmp, take);
+                if (emit_rc < 0) {
                     ret = VELA_TLS_ERR_SINK;
                     goto out;
+                }
+                if (emit_rc > 0) {
+                    break;
                 }
 
                 body_got += take;
