@@ -32,6 +32,10 @@
 
 /* POSIX networking */
 #include <netdb.h>
+#include <arpa/inet.h>
+#if defined(__NuttX__) && defined(CONFIG_NETDB_DNSCLIENT)
+#  include <nuttx/net/dns.h>
+#endif
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -121,11 +125,21 @@ typedef struct {
     mbedtls_ssl_config cfg;
     mbedtls_net_context net;
     mbedtls_ctr_drbg_context ctr_drbg;
+    bool abort_on_close;
 } tls_ctx_t;
 
 static void tls_ctx_free(tls_ctx_t* ctx)
 {
-    mbedtls_ssl_close_notify(&ctx->ssl);
+    if (ctx->abort_on_close) {
+#ifdef CONFIG_NET_SOLINGER
+        if (ctx->net.fd >= 0) {
+            struct linger abort = {1, 0};
+            setsockopt(ctx->net.fd, SOL_SOCKET, SO_LINGER, &abort, sizeof(abort));
+        }
+#endif
+    } else {
+        mbedtls_ssl_close_notify(&ctx->ssl);
+    }
     /* close_notify already finishes TLS.  A separate shutdown followed by
      * close schedules overlapping TCP callbacks on NuttX, and controlled
      * callers used to shut down twice.  Close the socket exactly once. */
@@ -268,6 +282,53 @@ static int tls_wait_socket(int fd, short events, const vela_req_ctl_t *ctl)
     }
 }
 
+#if defined(__NuttX__) && defined(CONFIG_NETDB_DNSCLIENT)
+static int tls_dns_budget(void *arg)
+{
+    const vela_req_ctl_t *ctl = arg;
+    if (vela_req_cancelled(ctl)) return -ECANCELED;
+    int32_t remaining = vela_req_budget_ms(ctl, agent_mono_ms());
+    return remaining < 0 ? INT32_MAX : remaining;
+}
+
+static int tls_resolve_controlled(const char *host, const char *port,
+    const struct addrinfo *hints, struct addrinfo **addresses,
+    const vela_req_ctl_t *ctl)
+{
+    struct addrinfo numeric = *hints;
+    struct sockaddr_storage resolved[4];
+    struct dns_query_control_s control = {0};
+    struct addrinfo **tail = addresses;
+    int n = 4;
+    int ret;
+
+    numeric.ai_flags |= AI_NUMERICHOST | AI_NUMERICSERV;
+    ret = getaddrinfo(host, port, &numeric, addresses);
+    if (ret == 0) return 0;
+
+    control.budget_ms = tls_dns_budget;
+    control.arg = (void *)ctl;
+    ret = dns_query_controlled(host, resolved, &n, &control);
+    if (ret < 0) return ret;
+    for (int i = 0; i < n; i++) {
+        char ip[INET6_ADDRSTRLEN];
+        const void *address;
+        struct addrinfo *entry = NULL;
+        if (resolved[i].ss_family == AF_INET) {
+            address = &((struct sockaddr_in *)&resolved[i])->sin_addr;
+        } else if (resolved[i].ss_family == AF_INET6) {
+            address = &((struct sockaddr_in6 *)&resolved[i])->sin6_addr;
+        } else continue;
+        if (!inet_ntop(resolved[i].ss_family, address, ip, sizeof(ip))) continue;
+        if (getaddrinfo(ip, port, &numeric, &entry) == 0) {
+            *tail = entry;
+            while (*tail != NULL) tail = &(*tail)->ai_next;
+        }
+    }
+    return *addresses != NULL ? 0 : -EHOSTUNREACH;
+}
+#endif
+
 static int tls_connect_controlled(tls_ctx_t *ctx, const char *host,
     const char *port, const vela_req_ctl_t *ctl)
 {
@@ -276,12 +337,16 @@ static int tls_connect_controlled(tls_ctx_t *ctx, const char *host,
     struct addrinfo *a;
     int result = VELA_TLS_ERR_CONNECT;
 
-    /* getaddrinfo remains the platform resolver.  Its blocking DNS lookup
-     * cannot yet be interrupted here; check the same budget immediately
-     * after it returns, and do not start TCP on an expired request. */
+    /* On NuttX, DNS polls the same request budget without a helper thread.
+     * Numeric address/service conversion cannot initiate another DNS query.
+     * Other platforms retain their platform resolver. */
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family = AF_UNSPEC;
+#if defined(__NuttX__) && defined(CONFIG_NETDB_DNSCLIENT)
+    int ret = tls_resolve_controlled(host, port, &hints, &addresses, ctl);
+#else
     int ret = getaddrinfo(host, port, &hints, &addresses);
+#endif
     if (vela_req_cancelled(ctl)) {
         result = VELA_TLS_ERR_CANCELLED;
         goto out;
@@ -342,6 +407,7 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
     int ret;
     uint32_t mark = agent_mono_ms();
 
+    ctx->abort_on_close = ctl != NULL;
     mbedtls_ssl_init(&ctx->ssl);
     mbedtls_ssl_config_init(&ctx->cfg);
     mbedtls_net_init(&ctx->net);
@@ -1315,6 +1381,7 @@ int vela_https_request_stream(
     }
 
     memset(&ctx, 0, sizeof(ctx));
+    ctx.abort_on_close = ctl != NULL;
     memset(&chunk, 0, sizeof(chunk));
 
     emit.sink = sink;
@@ -1669,6 +1736,7 @@ int vela_https_request_stream(
     }
 
 out:
+    ctx.abort_on_close = ctl != NULL && ret < 0;
     /* Reclaim before returning, on every path.  A cancelled request must not
      * leave a socket, a TLS context or a partially read record behind: the
      * next request has to be able to start immediately. */
