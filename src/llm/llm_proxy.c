@@ -208,33 +208,33 @@ int llm_set_port(const char* port)
     return OK;
 }
 
-int llm_set_all(const char* host, const char* path,
-    const char* port, const char* api_key, const char* model)
+static int llm_update_all(const char* host, const char* path,
+    const char* port, const char* api_key, const char* model, bool persist)
 {
     pthread_mutex_lock(&s_llm_lock);
 
     if (host && host[0]) {
-        claw_config_set(AGENT_CFG_KEY_LLM_HOST, host);
+        if (persist) claw_config_set(AGENT_CFG_KEY_LLM_HOST, host);
         strncpy(s_llm_host, host, sizeof(s_llm_host) - 1);
         s_llm_host[sizeof(s_llm_host) - 1] = '\0';
     }
     if (path && path[0]) {
-        claw_config_set(AGENT_CFG_KEY_LLM_PATH, path);
+        if (persist) claw_config_set(AGENT_CFG_KEY_LLM_PATH, path);
         strncpy(s_llm_path, path, sizeof(s_llm_path) - 1);
         s_llm_path[sizeof(s_llm_path) - 1] = '\0';
     }
     if (port && port[0]) {
-        claw_config_set("llm_port", port);
+        if (persist) claw_config_set("llm_port", port);
         strncpy(s_llm_port, port, sizeof(s_llm_port) - 1);
         s_llm_port[sizeof(s_llm_port) - 1] = '\0';
     }
     if (api_key && api_key[0]) {
-        claw_config_set(AGENT_CFG_KEY_API_KEY, api_key);
+        if (persist) claw_config_set(AGENT_CFG_KEY_API_KEY, api_key);
         strncpy(s_api_key, api_key, sizeof(s_api_key) - 1);
         s_api_key[sizeof(s_api_key) - 1] = '\0';
     }
     if (model && model[0]) {
-        claw_config_set(AGENT_CFG_KEY_MODEL, model);
+        if (persist) claw_config_set(AGENT_CFG_KEY_MODEL, model);
         strncpy(s_model, model, sizeof(s_model) - 1);
         s_model[sizeof(s_model) - 1] = '\0';
     }
@@ -245,6 +245,19 @@ int llm_set_all(const char* host, const char* path,
         TAG, s_llm_host, s_llm_path, s_model);
     return OK;
 }
+
+int llm_set_all(const char *host, const char *path, const char *port,
+    const char *api_key, const char *model)
+{
+    return llm_update_all(host, path, port, api_key, model, true);
+}
+
+int llm_set_all_runtime(const char *host, const char *path, const char *port,
+    const char *api_key, const char *model)
+{
+    return llm_update_all(host, path, port, api_key, model, false);
+}
+
 
 /* ── Config snapshot (used by llm_vision.c) ───────────────── */
 

@@ -49,6 +49,11 @@ int llm_set_port(const char* port);
 int llm_set_all(const char* host, const char* path,
     const char* port, const char* api_key,
     const char* model);
+/* Select an existing backend for a controlled round without rewriting its
+ * credentials/configuration to storage on every request. */
+int llm_set_all_runtime(const char *host, const char *path, const char *port,
+    const char *api_key, const char *model);
+
 
 int llm_chat(const char* system_prompt, const char* messages_json,
     char* response_buf, size_t buf_size);

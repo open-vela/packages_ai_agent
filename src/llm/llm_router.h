@@ -169,6 +169,8 @@ void llm_router_report_tokens(int index, int prompt_tokens,
  * @return 0 on success, -1 on error
  */
 int llm_router_apply(int index);
+/* Voice/controlled selection spends no time rewriting stored credentials. */
+int llm_router_apply_runtime(int index);
 
 /**
  * Get router status as JSON string.

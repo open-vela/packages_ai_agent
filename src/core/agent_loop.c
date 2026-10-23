@@ -35,6 +35,7 @@
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
+#include "tools/voice_scope.h"
 #include "tools/tool_registry.h"
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -1158,6 +1159,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     int last_total_tokens = 0;
     bool watchdog_fired = false;
     bool tool_break = false;
+    bool scope_failed = false;
+    bool voice_scope = ctl != NULL
+        && vg_voice_scope_request(msg->channel, msg->chat_id);
 
     /* Set when the reply was rendered from a live sample.  Such a reply
      * carries a value and an age that were true at render time; replaying it
@@ -1175,7 +1179,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
     int router_idx = llm_router_select(complexity);
     if (router_idx >= 0) {
-        llm_router_apply(router_idx);
+        if (ctl != NULL) llm_router_apply_runtime(router_idx);
+        else llm_router_apply(router_idx);
     }
 
     /* Structured trace: begin */
@@ -1422,6 +1427,23 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             break;
         }
 
+        /* Check every call before either sequential or parallel dispatch.
+         * Model-generated names never widen a voice request's C scope. */
+        if (voice_scope) {
+            for (int i = 0; i < resp.call_count; i++) {
+                if (!vg_voice_scope_tool(resp.calls[i].name)) {
+                    scope_failed = true;
+                    break;
+                }
+            }
+            if (scope_failed) {
+                syslog(LOG_WARNING, "[%s] voice tool scope rejected\n", TAG);
+                velaclaw_request_failed(msg->chat_id, -EPERM);
+                llm_response_free(&resp);
+                break;
+            }
+        }
+
         VG_HEAP_SCAN("llm_done");
         syslog(LOG_INFO, "[%s] Tool iter %d: %d calls\n",
             TAG, iteration + 1, resp.call_count);
@@ -1468,6 +1490,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
              * file-op branch and only fires on that exact shape. */
 
             if (strcmp(resp.calls[0].name, "vg_point_read") == 0
+                && !voice_scope
                 && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
                 if (s_point_reply_disabled) {
                     syslog(LOG_INFO,
@@ -1502,7 +1525,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
              * shortcut; system-channel work keeps the model in the loop. */
 
             if ((strcmp(resp.calls[0].name, "vg_anomaly_read") == 0
-                 || strcmp(resp.calls[0].name, "vg_alarm_recovery") == 0)
+                 || strcmp(resp.calls[0].name, "vg_alarm_recovery") == 0
+                 || (voice_scope && strcmp(resp.calls[0].name, "vg_point_read") == 0))
                 && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0
                 && tool_output[0]) {
                 syslog(LOG_INFO,
@@ -1607,6 +1631,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             "Tool repeat guard tripped", ctl);
         agent_trace_end(&trace, final_text ? AGENT_TRACE_OK
                                            : AGENT_TRACE_FAIL);
+    } else if (scope_failed) {
+        agent_trace_end(&trace, AGENT_TRACE_FAIL);
     } else if (watchdog_fired) {
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
     } else if (final_text) {
@@ -1766,6 +1792,7 @@ static void* agent_loop_task(void* arg)
             break;
         }
 
+        char *voice_tools = NULL;
         volatile int request_cancel = 0;
         vela_req_ctl_t request_ctl = {0};
         const vela_req_ctl_t *ctl = NULL;
@@ -1814,8 +1841,12 @@ static void* agent_loop_task(void* arg)
         }
 #endif
 
-        /* Slash commands — fast path, bypass LLM */
-        char* reply = handle_slash_command(&msg);
+        bool voice_scope = ctl != NULL
+            && vg_voice_scope_request(msg.channel, msg.chat_id);
+
+        /* Fast paths may execute file/shell tools. Voice stays in its
+         * scoped ReAct route instead of bypassing runtime checks. */
+        char* reply = voice_scope ? NULL : handle_slash_command(&msg);
 
         /* Prompt injection check — before LLM */
         if (!reply && tool_guard_check_injection(msg.content)) {
@@ -1830,7 +1861,7 @@ static void* agent_loop_task(void* arg)
         }
 
         /* NL fast path — after injection check, before LLM */
-        if (!reply) {
+        if (!reply && !voice_scope) {
             reply = handle_nl_fast_path(msg.content);
         }
 
@@ -1863,6 +1894,14 @@ static void* agent_loop_task(void* arg)
         free(tools_json);
         tools_json = tool_registry_get_tools_json();
 
+        if (voice_scope) {
+            voice_tools = vg_voice_scope_schema(tools_json);
+            if (voice_tools == NULL) {
+                dispatch_response(&msg, NULL, false);
+                goto release_message;
+            }
+        }
+
         cJSON* messages = build_messages(ctl == NULL ? msg.chat_id : NULL,
             msg.content,
             history_json, hist_size);
@@ -1877,13 +1916,15 @@ static void* agent_loop_task(void* arg)
             /* ReAct loop */
             s_llm_path_count++;
             final_text = run_react_loop(sys_prompt, messages,
-                tools_json, tool_output, tool_size, &msg, ctl);
+                voice_scope ? voice_tools : tools_json,
+                tool_output, tool_size, &msg, ctl);
             cJSON_Delete(messages);
         }
 
         dispatch_response(&msg, final_text, ctl == NULL);
 
 release_message:
+        free(voice_tools);
         velaclaw_request_end(&request_cancel);
         message_bus_msg_free(&msg);
     }
