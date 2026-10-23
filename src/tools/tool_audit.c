@@ -112,9 +112,10 @@ static void audit_start(void)
         pthread_attr_init(&attr);
 #ifdef __NuttX__
         pthread_attr_setstacksize(&attr, 8192);
-        struct sched_param sp = {.sched_priority = 40};
+        /* 与板端现有文件写线程使用相同调度级别，再验证存储超时。 */
+        struct sched_param sp = {.sched_priority = 100};
         pthread_attr_setschedparam(&attr, &sp);
-        pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+        pthread_attr_setschedpolicy(&attr, SCHED_RR);
         pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 #else
         pthread_attr_setstacksize(&attr, 64 * 1024);
