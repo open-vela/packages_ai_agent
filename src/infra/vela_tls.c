@@ -126,7 +126,30 @@ typedef struct {
     mbedtls_net_context net;
     mbedtls_ctr_drbg_context ctr_drbg;
     bool abort_on_close;
+    unsigned send_pressure;
 } tls_ctx_t;
+
+/* NuttX may report temporary packet-buffer pressure as ENOMEM, including
+ * during handshake. Translate it at the BIO boundary so mbedTLS retains
+ * the pending TLS record and the controlled poll loop applies its budget. */
+static int tls_controlled_send(void *arg, const unsigned char *buf, size_t len)
+{
+    tls_ctx_t *ctx = arg;
+    int ret = mbedtls_net_send(&ctx->net, buf, len);
+    int error = errno;
+    if (ret == MBEDTLS_ERR_NET_SEND_FAILED && error == ENOMEM) {
+        if (ctx->send_pressure++ == 0)
+            syslog(LOG_INFO, "[%s] controlled send waiting for packet buffers\n", TAG);
+        return MBEDTLS_ERR_SSL_WANT_WRITE;
+    }
+    return ret;
+}
+
+static int tls_controlled_recv(void *arg, unsigned char *buf, size_t len)
+{
+    tls_ctx_t *ctx = arg;
+    return mbedtls_net_recv(&ctx->net, buf, len);
+}
 
 static void tls_ctx_free(tls_ctx_t* ctx)
 {
@@ -408,6 +431,7 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
     uint32_t mark = agent_mono_ms();
 
     ctx->abort_on_close = ctl != NULL;
+    ctx->send_pressure = 0;
     mbedtls_ssl_init(&ctx->ssl);
     mbedtls_ssl_config_init(&ctx->cfg);
     mbedtls_net_init(&ctx->net);
@@ -589,8 +613,13 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
 
     /* Use blocking recv — no select()/poll().  The read
      * timeout is enforced by the SO_RCVTIMEO socket option set above. */
-    mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
-        mbedtls_net_send, mbedtls_net_recv, NULL);
+    if (ctl != NULL) {
+        mbedtls_ssl_set_bio(&ctx->ssl, ctx,
+            tls_controlled_send, tls_controlled_recv, NULL);
+    } else {
+        mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
+            mbedtls_net_send, mbedtls_net_recv, NULL);
+    }
 
     /* Timer for the handshake starts here, after configuration.  Setup cost
      * is already accounted for in tls_setup_ms so the two do not overlap. */
@@ -1386,8 +1415,8 @@ static int stream_write_all(tls_ctx_t *ctx, const char *what,
             continue;
         }
 
-        syslog(LOG_ERR, "[%s] %s write failed ret=-0x%04x at %u/%u\n", TAG,
-            what, -ret, (unsigned)off, (unsigned)len);
+        syslog(LOG_ERR, "[%s] %s write failed ret=-0x%04x errno=%d at %u/%u\n", TAG,
+            what, -ret, errno, (unsigned)off, (unsigned)len);
         return VELA_TLS_ERR_WRITE;
     }
 
@@ -1468,6 +1497,8 @@ int vela_https_request_stream(
         tls_ctx_free(&ctx);
         return ret;
     }
+
+    mark = agent_mono_ms();
 
     /* Request headers.  Content-Length comes from the source's declared
      * length, so the body is written without ever being assembled. */
