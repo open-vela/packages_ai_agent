@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include <agent_http.h>
+
 #include "cJSON.h"
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -73,6 +75,11 @@ typedef struct {
     int completion_tokens;
     int total_tokens;
 } llm_response_t;
+
+/* Same tool-call parser, with one shared deadline and no automatic 429 retry. */
+int llm_chat_tools_controlled(const char *system_prompt, cJSON *messages,
+    const char *tools_json, llm_response_t *resp,
+    agent_llm_timing_t *out_timing, const vela_req_ctl_t *ctl);
 
 void llm_response_free(llm_response_t* resp);
 

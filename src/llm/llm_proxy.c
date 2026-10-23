@@ -897,9 +897,22 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 /* ── Public: chat with tools ──────────────────────────────── */
 
 
-int llm_chat_tools(const char* system_prompt, cJSON* messages,
+static int llm_control_sink(void *ctx, const char *data, size_t len)
+{
+    return resp_buf_append((resp_buf_t *)ctx, data, len) == OK ? 0 : -1;
+}
+
+int llm_chat_tools(const char *system_prompt, cJSON *messages,
+    const char *tools_json, llm_response_t *resp,
+    agent_llm_timing_t *out_timing)
+{
+    return llm_chat_tools_controlled(system_prompt, messages, tools_json,
+        resp, out_timing, NULL);
+}
+
+int llm_chat_tools_controlled(const char* system_prompt, cJSON* messages,
     const char* tools_json, llm_response_t* resp,
-    agent_llm_timing_t* out_timing)
+    agent_llm_timing_t* out_timing, const vela_req_ctl_t *ctl)
 {
     /* Local timing always exists so the code paths stay identical whether or
      * not the caller asked for it.  out_timing is a one-time copy at the end:
@@ -913,6 +926,15 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     agent_timing_reset(timing);
 
     memset(resp, 0, sizeof(*resp));
+    if (agent_http_stop(ctl, call_t0)) {
+        int stopped = agent_http_cancelled(ctl) ? AGENT_HTTP_ERR_CANCELLED
+                                               : AGENT_HTTP_ERR_TIMEOUT;
+        timing->http_rc = stopped;
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
+        return stopped;
+    }
 
     /* Snapshot config under lock */
     char model[64];
@@ -1000,7 +1022,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
      * attempt say how many tries it took to get there.  Attempts are not
      * summed because the phases would no longer add up to one request. */
 
-    for (retry = 0; retry <= AGENT_LLM_MAX_RETRIES; retry++) {
+    for (retry = 0; retry <= (ctl == NULL ? AGENT_LLM_MAX_RETRIES : 0); retry++) {
         unsigned int delay = 0;
 
         if (retry > 0) {
@@ -1019,7 +1041,18 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
         rb.len = 0;
         status = 0;
         mark = agent_mono_ms();
-        err = llm_http_call(post_data, &rb, &status, timing);
+        if (ctl != NULL) {
+            if (resp_buf_init(&rb, 4096) != OK) {
+                err = ERROR;
+            } else {
+                vela_resp_sink_t sink = { .write = llm_control_sink, .ctx = &rb };
+                size_t received = 0;
+                err = llm_http_call_stream(post_data, NULL, &sink,
+                    NULL, 0, &received, &status, timing, ctl);
+            }
+        } else {
+            err = llm_http_call(post_data, &rb, &status, timing);
+        }
         timing->http_total_ms = agent_elapsed_ms(mark, agent_mono_ms());
         timing->http_rc = err;
         timing->http_status = status;

@@ -36,9 +36,21 @@ struct velaclaw_client_s {
     uint32_t started_ms;
     uint32_t timeout_ms;
     bool active;
+    uint32_t deadline_ms;
+    volatile int *active_cancel;
 };
 
 static struct velaclaw_client_s* g_client_instance;
+static pthread_mutex_t g_instance_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void client_cancel_locked(struct velaclaw_client_s *c)
+{
+    if (c->active_cancel != NULL) {
+        *c->active_cancel = 1;
+        c->active_cancel = NULL;
+    }
+}
+
 
 static uint32_t client_now_ms(void)
 {
@@ -60,12 +72,13 @@ static void tap_callback(const agent_msg_t* msg, void* cookie)
     }
     void (*cb)(int, const char*, void*) = c->async_cb;
     void* ck = c->async_cookie;
+    int status = c->reply_status;
     bool expired = client_now_ms() - c->started_ms >= c->timeout_ms;
     c->active = false;
     c->async_cb = NULL;
     c->async_cookie = NULL;
     pthread_mutex_unlock(&c->mtx);
-    if (cb && !expired) cb(0, msg->content, ck);
+    if (cb && !expired) cb(status, msg->content, ck);
 }
 
 void velaclaw_client_abandon(velaclaw_client_t* c)
@@ -75,6 +88,7 @@ void velaclaw_client_abandon(velaclaw_client_t* c)
     }
 
     pthread_mutex_lock(&c->mtx);
+    client_cancel_locked(c);
     c->active = false;
     c->async_cb = NULL;
     c->async_cookie = NULL;
@@ -83,12 +97,16 @@ void velaclaw_client_abandon(velaclaw_client_t* c)
 
 velaclaw_client_t* velaclaw_client_open(const char* name)
 {
+    pthread_mutex_lock(&g_instance_lock);
     if (g_client_instance) {
-        return g_client_instance;
+        velaclaw_client_t *existing = g_client_instance;
+        pthread_mutex_unlock(&g_instance_lock);
+        return existing;
     }
 
     struct velaclaw_client_s* c = calloc(1, sizeof(*c));
     if (!c) {
+        pthread_mutex_unlock(&g_instance_lock);
         return NULL;
     }
 
@@ -103,10 +121,12 @@ velaclaw_client_t* velaclaw_client_open(const char* name)
         sem_destroy(&c->reply_sem);
         pthread_mutex_destroy(&c->mtx);
         free(c);
+        pthread_mutex_unlock(&g_instance_lock);
         return NULL;
     }
 
     g_client_instance = c;
+    pthread_mutex_unlock(&g_instance_lock);
     syslog(LOG_INFO, "[%s] client opened: %s\n", TAG, c->app_id);
     return c;
 }
@@ -117,7 +137,11 @@ void velaclaw_client_close(velaclaw_client_t* c)
         return;
     }
 
+    pthread_mutex_lock(&g_instance_lock);
     mbus_tap_unregister(CLIENT_CHANNEL);
+    pthread_mutex_lock(&c->mtx);
+    client_cancel_locked(c);
+    pthread_mutex_unlock(&c->mtx);
 
     pthread_mutex_destroy(&c->mtx);
     sem_destroy(&c->reply_sem);
@@ -129,8 +153,12 @@ void velaclaw_client_close(velaclaw_client_t* c)
     }
 
     free(c);
+    pthread_mutex_unlock(&g_instance_lock);
     syslog(LOG_INFO, "[%s] client closed\n", TAG);
 }
+
+static int client_ask(velaclaw_client_t *c, const velaclaw_ask_req_t *req,
+    uint32_t deadline_ms, void (*cb)(int, const char *, void *), void *cookie);
 
 int velaclaw_ask_async(velaclaw_client_t* c,
     const velaclaw_ask_req_t* req,
@@ -149,8 +177,8 @@ int velaclaw_ask_async(velaclaw_client_t* c,
     return velaclaw_ask(c, req, cb, cookie);
 }
 
-int velaclaw_ask(velaclaw_client_t* c,
-    const velaclaw_ask_req_t* req,
+static int client_ask(velaclaw_client_t* c,
+    const velaclaw_ask_req_t* req, uint32_t deadline_ms,
     void (*cb)(int, const char*, void*), void* cookie)
 {
     if (!c || !req || !req->text) {
@@ -167,8 +195,12 @@ int velaclaw_ask(velaclaw_client_t* c,
         free(msg.content);
         return -EBUSY;
     }
+    client_cancel_locked(c);
+    c->deadline_ms = deadline_ms;
+    c->reply_status = 0;
     c->serial++;
-    snprintf(c->pending_id, sizeof(c->pending_id), "%s:%u",
+    snprintf(c->pending_id, sizeof(c->pending_id),
+             deadline_ms != 0 ? "%s:voice:%u" : "%s:%u",
              c->app_id, (unsigned)c->serial);
     c->started_ms = now;
     c->timeout_ms = req->timeout_ms > 0 ? (uint32_t)req->timeout_ms : 300000u;
@@ -192,4 +224,74 @@ int velaclaw_ask(velaclaw_client_t* c,
         return -EIO;
     }
     return 0;
+}
+
+int velaclaw_ask(velaclaw_client_t *c, const velaclaw_ask_req_t *req,
+    void (*cb)(int, const char *, void *), void *cookie)
+{
+    return client_ask(c, req, 0, cb, cookie);
+}
+
+int velaclaw_ask_async_deadline(velaclaw_client_t *c,
+    const velaclaw_ask_req_t *req, uint32_t deadline_ms,
+    void (*cb)(int, const char *, void *), void *cookie)
+{
+    if (deadline_ms == 0 || agent_http_remaining_ms(deadline_ms, client_now_ms()) == 0) {
+        return -ETIMEDOUT;
+    }
+    agent_loop_ensure_started();
+    return client_ask(c, req, deadline_ms, cb, cookie);
+}
+
+int velaclaw_request_begin(const char *chat_id, vela_req_ctl_t *ctl,
+    volatile int *cancel)
+{
+    int ret = -ESTALE;
+    pthread_mutex_lock(&g_instance_lock);
+    struct velaclaw_client_s *c = g_client_instance;
+    if (c != NULL) {
+        pthread_mutex_lock(&c->mtx);
+        if (c->active && strcmp(chat_id, c->pending_id) == 0) {
+            ret = 0;
+            if (c->deadline_ms != 0) {
+                *cancel = agent_http_remaining_ms(c->deadline_ms, client_now_ms()) == 0;
+                ctl->deadline_ms = c->deadline_ms;
+                ctl->cancel = cancel;
+                c->active_cancel = cancel;
+                ret = 1;
+            }
+        }
+        pthread_mutex_unlock(&c->mtx);
+    }
+    pthread_mutex_unlock(&g_instance_lock);
+    return ret;
+}
+
+void velaclaw_request_end(volatile int *cancel)
+{
+    pthread_mutex_lock(&g_instance_lock);
+    struct velaclaw_client_s *c = g_client_instance;
+    if (c != NULL) {
+        pthread_mutex_lock(&c->mtx);
+        if (c->active_cancel == cancel) {
+            c->active_cancel = NULL;
+        }
+        pthread_mutex_unlock(&c->mtx);
+    }
+    pthread_mutex_unlock(&g_instance_lock);
+}
+
+void velaclaw_request_failed(const char *chat_id, int status)
+{
+    pthread_mutex_lock(&g_instance_lock);
+    struct velaclaw_client_s *c = g_client_instance;
+    if (c != NULL) {
+        pthread_mutex_lock(&c->mtx);
+        if (c->active && c->deadline_ms != 0
+            && strcmp(c->pending_id, chat_id) == 0) {
+            c->reply_status = status < 0 ? status : -EIO;
+        }
+        pthread_mutex_unlock(&c->mtx);
+    }
+    pthread_mutex_unlock(&g_instance_lock);
 }

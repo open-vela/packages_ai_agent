@@ -1,6 +1,8 @@
 #ifndef __VELACLAW_CLIENT_H
 #define __VELACLAW_CLIENT_H
 
+#include <agent_http.h>
+
 typedef struct velaclaw_client_s velaclaw_client_t;
 
 typedef struct {
@@ -34,5 +36,21 @@ void velaclaw_client_abandon(velaclaw_client_t* c);
 int velaclaw_ask_async(velaclaw_client_t* c,
     const velaclaw_ask_req_t* req,
     void (*cb)(int, const char*, void*), void* cookie);
+
+/* Opt-in request control.  deadline_ms is the caller's existing monotonic
+ * deadline, including recognition and queue time; it is never restarted. */
+int velaclaw_ask_async_deadline(velaclaw_client_t *c,
+    const velaclaw_ask_req_t *req, uint32_t deadline_ms,
+    void (*cb)(int, const char *, void *), void *cookie);
+
+/* Agent-loop lifetime handshake.  begin registers a cancellation flag owned
+ * by the currently processing message.  end must run on every exit before
+ * that flag leaves scope.  No message retains a pointer to a client's flag.
+ * Returns 1 for controlled, 0 for legacy, negative for a stale local request. */
+int velaclaw_request_begin(const char *chat_id, vela_req_ctl_t *ctl,
+    volatile int *cancel);
+void velaclaw_request_end(volatile int *cancel);
+/* Mark a matching controlled reply as failed without changing bus frames. */
+void velaclaw_request_failed(const char *chat_id, int status);
 
 #endif
