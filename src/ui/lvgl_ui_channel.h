@@ -124,9 +124,20 @@ int lvgl_ui_channel_set_approval(const char* tool, const char* hint);
  * 超时后由 AP 驱动。返回 0 成功，负值错误。 */
 int lvgl_ui_channel_clear_approval(void);
 
+/* 审批页是否仍处于 pending（set 已调用、尚未 clear）。供同步执行工具的路径
+ * 判断宠物状态能否回落到 IDLE —— pending 期间审批页持有 WAITING，不能被
+ * 工具返回值覆盖。返回 1 pending，0 无。 */
+int lvgl_ui_channel_approval_pending(void);
+
 /* 滚动聊天记录：dir 0 = 上翻（更早），1 = 下翻（更新）。首次调用会自动把
  * 聊天屏切到前台。经 lv_async_call 调度到 LVGL 线程。 */
 int lvgl_ui_channel_scroll(int dir);
+
+/* 唤醒待机时钟:若待机屏当前可见,隐藏它并重启 60s 空闲倒计时,返回 1(表示
+ * 本次调用"吃掉"了这记按键,只做了解锁);若待机屏未可见返回 0(按键应照常派发)。
+ * 键适配器据此在待机可见时吞掉第一下按键,避免"唤醒"顺带答掉挂在审批页上的
+ * 请求。线程安全:ui_activity_reset 异步调度 hide。 */
+int lvgl_ui_channel_wake_from_standby(void);
 
 /* ── LVGL 线程安全锁 ───────────────────────────────────────────
  *

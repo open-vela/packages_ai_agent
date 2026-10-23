@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <lvgl/lvgl.h>
+#include <stdint.h>   /* uintptr_t — printing pthread_t as a pointer on 64-bit */
 
 /* App-owned pre-rasterized MiSans-16 CJK font (compiled from
  * src/ui/lv_font_misans_16_cjk.c, same pattern as xiaozhi_gui's
@@ -128,10 +129,24 @@ static void ui_raw_line(const char* fmt, ...)
  * UI thread's own probe line never made it out (blocked console write). */
 static volatile int s_ui_trace_step;
 
+/* AP boot-record debug marker (SWAP word 40).  The CP's ap-monitor thread
+ * prints every change to this word directly on UART0 (ttyUSB0), so a freeze
+ * that wedges the AP's RPMsg console can still be attributed to the last
+ * trace step reached.  Declared here rather than including the chip header
+ * (the ai_agent app include path does not provide it) — the symbol is linked
+ * into the same flat AP image.  Other boards (qemu goldfish) have no such
+ * marker, so it compiles away there. */
+#if defined(CONFIG_ARCH_CHIP_BK7258)
+extern void bk7258_ap_dbg_mark(uint32_t mark);
+#  define BK_MARK(step) bk7258_ap_dbg_mark((uint32_t)(step))
+#else
+#  define BK_MARK(step) ((void)0)
+#endif
+
 #define UITRACE(step)                                        \
   do {                                                       \
       s_ui_trace_step = (step);                              \
-      bk7258_ap_dbg_mark((uint32_t)(step));                  \
+      BK_MARK(step);                                         \
       ui_raw_log("tr", (long)(step), 0);                     \
     } while (0)
 
@@ -142,14 +157,6 @@ extern volatile uint32_t lv_dbg_layout_outer;
 extern volatile uint32_t lv_dbg_layout_calls;
 extern volatile uint32_t lv_dbg_refr_calls;
 extern volatile const char* lv_dbg_class;
-
-/* AP boot-record debug marker (SWAP word 40).  The CP's ap-monitor thread
- * prints every change to this word directly on UART0 (ttyUSB0), so a freeze
- * that wedges the AP's RPMsg console can still be attributed to the last
- * trace step reached.  Declared here rather than including the chip header
- * (the ai_agent app include path does not provide it) — the symbol is linked
- * into the same flat AP image. */
-extern void bk7258_ap_dbg_mark(uint32_t mark);
 
 /* ── LVGL thread-safety lock ─────────────────────────────────────
  *
@@ -210,7 +217,7 @@ void lvgl_ui_lock(void)
           {
             syslog(LOG_WARNING,
                    "[%s] ui lock wait %ldms (owner tid=%p)\n",
-                   TAG, ms, (void *)s_lvgl_lock_owner);
+                   TAG, ms, (void *)(uintptr_t)s_lvgl_lock_owner);
             wait_logged = true;
           }
 
@@ -221,7 +228,7 @@ void lvgl_ui_lock(void)
         if (ms >= next_raw)
           {
             ui_raw_line("\r\n[lvgl_ui] lw %ld owner %p tr %d lvl %lu/%lu/%lu %s\r\n",
-                        ms, (void *)s_lvgl_lock_owner, s_ui_trace_step,
+                        ms, (void *)(uintptr_t)s_lvgl_lock_owner, s_ui_trace_step,
                         (unsigned long)lv_dbg_layout_outer,
                         (unsigned long)lv_dbg_layout_calls,
                         (unsigned long)lv_dbg_refr_calls,
@@ -766,11 +773,20 @@ static void pet_idle_reset(void) {}
  * reads it to postpone standby while the agent is busy (non-idle). */
 static int s_last_pet_state = 0;
 
+/* WAITING (4) is an overlay, not a lifecycle state: the approval page is shown
+ * while the agent waits for a decision, then the pet must go back to whatever
+ * it was doing (EXECUTING while a tool blocks on the prompt, IDLE for a
+ * debug-only rpending).  Save that state on the first set_approval and restore
+ * it once, when the prompt clears. */
+static int s_approval_prev_pet_state = 0;
+static int s_approval_pet_saved = 0;
+
 #ifdef CONFIG_AI_AGENT_STANDBY_UI
 /* ── Standby dim clock (M7 待机界面) ────────────────────────────── */
 /* After STANDBY_TIMEOUT_MS with no real activity — no chat bubble, no PTT,
- * no pet-state change, no page switch, no approval, no scroll — and the agent
- * idle (s_last_pet_state==0), fade the foreground over to a dim digital clock
+ * no pet-state change, no page switch, no approval, no scroll — and no busy
+ * agent state (IDLE and WAITING both qualify; WAITING is a pending approval
+ * the device is waiting on), fade the foreground over to a dim digital clock
  * (standby_view).  Any of those activity points calls ui_activity_reset(),
  * which both restarts the countdown and (if the clock is up) fades it away,
  * restoring the screen that was up before standby. */
@@ -790,9 +806,14 @@ static void standby_timer_cb(lv_timer_t *t)
     (void)t;
     if (!s_state.initialized || !s_state.running) return;
     if (standby_view_is_visible()) return;
-    /* A busy (non-idle) agent keeps postponing standby so the thinking /
-     * executing / waiting animation is never interrupted mid-task. */
-    if (s_last_pet_state != 0)
+    /* A busy agent (listening / thinking / executing, or an error being shown)
+     * keeps postponing standby so the animation is never interrupted mid-task.
+     * WAITING (4) is the exception: it means a permission prompt is up and the
+     * device is waiting for a human, so dimming after the timeout is exactly
+     * right -- the first key then only wakes the clock and the approval page
+     * comes back untouched (see lvgl_ui_channel_wake_from_standby). */
+    if (s_last_pet_state != PET_STATE_IDLE &&
+        s_last_pet_state != PET_STATE_WAITING)
       {
         s_last_activity_tick = lv_tick_get();
         return;
@@ -807,6 +828,18 @@ static void standby_timer_cb(lv_timer_t *t)
 #else
 static void ui_activity_reset(void) {}
 #endif
+
+int lvgl_ui_channel_wake_from_standby(void)
+{
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+    if (!standby_view_is_visible())
+        return 0;
+    ui_activity_reset();   /* hides the clock and restarts the idle countdown */
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 int lvgl_ui_channel_init(void)
 {
@@ -1666,19 +1699,19 @@ static void chat_view_build_agent_card(lv_obj_t* bubble, const char* text,
      * freeze inside this block: LVGL object ops cannot block (no console/IPC),
      * so a stop here is a spin and the last marker names the call. */
     color_bar = lv_obj_create(body_row);
-    bk7258_ap_dbg_mark(0x2701);
+    BK_MARK(0x2701);
     lv_obj_remove_flag(color_bar, LV_OBJ_FLAG_SCROLLABLE);
-    bk7258_ap_dbg_mark(0x2702);
+    BK_MARK(0x2702);
     lv_obj_set_width(color_bar, LVGL_UI_CARD_COLOR_BAR_W);
-    bk7258_ap_dbg_mark(0x2703);
+    BK_MARK(0x2703);
     lv_obj_set_height(color_bar, LV_SIZE_CONTENT);
-    bk7258_ap_dbg_mark(0x2704);
+    BK_MARK(0x2704);
     lv_obj_set_style_pad_all(color_bar, 0, 0);
     lv_obj_set_style_border_width(color_bar, 0, 0);
     lv_obj_set_style_bg_color(color_bar, lv_color_hex(bar_color), 0);
     lv_obj_set_style_bg_opa(color_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(color_bar, 2, 0);
-    bk7258_ap_dbg_mark(0x2705);
+    BK_MARK(0x2705);
     UITRACE(28);
 
     /* Body label — the actual reply text */
@@ -2063,6 +2096,13 @@ int lvgl_ui_channel_set_approval(const char* tool, const char* hint)
     }
     ui_activity_reset();
 
+    if (!s_approval_pet_saved)
+      {
+        s_approval_prev_pet_state = s_last_pet_state;
+        s_approval_pet_saved = 1;
+        (void)lvgl_ui_channel_set_pet_state(PET_STATE_WAITING);
+      }
+
     p = malloc(sizeof(async_approval_t));
     if (!p) {
         syslog(LOG_ERR, "[%s] set_approval: payload alloc failed\n", TAG);
@@ -2080,8 +2120,18 @@ int lvgl_ui_channel_clear_approval(void)
         return -EINVAL;
     }
     ui_activity_reset();
+    if (s_approval_pet_saved)
+      {
+        s_approval_pet_saved = 0;
+        (void)lvgl_ui_channel_set_pet_state(s_approval_prev_pet_state);
+      }
     lvgl_ui_async_call(clear_approval_async_cb, NULL);
     return 0;
+}
+
+int lvgl_ui_channel_approval_pending(void)
+{
+    return s_approval_pet_saved;
 }
 
 int lvgl_ui_channel_scroll(int dir)

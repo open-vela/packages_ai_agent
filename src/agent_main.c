@@ -56,6 +56,7 @@
 #include "channels/remote_ctrl_channel.h"
 #endif
 #include "infra/network_manager.h"
+#include "infra/time_sync.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_client.h"
 #include "node/node_manager.h"
@@ -725,6 +726,14 @@ int ai_agent_main(int argc, char* argv[])
     if (agent_loop_start() != OK)
         syslog(LOG_WARNING, "[%s] agent_loop_start failed\n", TAG);
     BOOT_LOG(&t0, "P5", "agent loop started");
+
+    /* The AP has no netdev, so netinit never runs its NTP auto-start; Wi-Fi
+     * is brought up later by the user's `wapi connect`.  This supervisor
+     * sends SNTP requests as soon as the link has an IPv4 address and keeps
+     * the clock aligned (re-sync every 30 min).  Needed by the standby clock
+     * and TLS certificate validity. */
+    if (time_sync_start() != 0)
+        syslog(LOG_WARNING, "[%s] time_sync_start failed\n", TAG);
 
 #ifdef CONFIG_FEATURE_SYSTEM_VELACLAW
     /* Quickapp mqueue listener - receives requests from quickapp process */

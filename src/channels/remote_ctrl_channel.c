@@ -625,6 +625,20 @@ static void remote_ctrl_session_new_from_input(void *ctx)
     printf("New session requested.\n");
 }
 
+/* Wake intent: while the standby clock is up, a key press only unlocks the
+ * screen and must be swallowed — the S2/S3 that wakes the device must not also
+ * answer a pending approval (or scroll). Returns 1 when it consumed the press
+ * as a wake, 0 when the screen was already awake and the press should dispatch. */
+static int remote_ctrl_wake_from_input(void *ctx)
+{
+    (void)ctx;
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    return lvgl_ui_channel_wake_from_standby();
+#else
+    return 0;
+#endif
+}
+
 int remote_ctrl_register_input(const struct remote_input_ops_s *ops)
 {
     if (ops == NULL || ops->attach == NULL) {
@@ -636,6 +650,7 @@ int remote_ctrl_register_input(const struct remote_input_ops_s *ops)
                        remote_ctrl_scroll_from_input,
                        remote_ctrl_model_next_from_input,
                        remote_ctrl_session_new_from_input,
+                       remote_ctrl_wake_from_input,
                        NULL);
 }
 

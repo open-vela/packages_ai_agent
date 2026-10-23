@@ -38,6 +38,7 @@
 #include "ui/standby_view.h"
 #include "ui/ui_palette.h"
 #include "ui/lvgl_ui_channel.h"
+#include "agent_config.h"   /* AGENT_TZ_OFFSET_SEC */
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -83,7 +84,12 @@ static void refresh_time(void)
 
   time_t now = time(NULL);
   struct tm tm;
-  localtime_r(&now, &tm);
+
+  /* 板上 AP 构建未开 CONFIG_LIBC_LOCALTIME,libc 的 localtime_r() 退化成了
+   * gmtime_r(),TZ=CST-8 不生效 —— 直接用会少 8 小时。这里显式取 UTC+8,
+   * 与 tool_get_time 的处理保持一致(避开 zoneinfo 查找)。 */
+  time_t local_epoch = now + AGENT_TZ_OFFSET_SEC;
+  gmtime_r(&local_epoch, &tm);
 
   if (s_sb.clock)
     {
@@ -97,6 +103,17 @@ static void refresh_time(void)
       snprintf(buf, sizeof(buf), "%d月%d日 %s",
                tm.tm_mon + 1, tm.tm_mday, s_wday_cn[tm.tm_wday % 7]);
       lv_label_set_text(s_sb.date, buf);
+    }
+
+  /* 每分钟记一次实际渲染到屏上的日期时间:待机屏没有别的取证手段,
+   * 这行日志就是"屏上显示的是什么"的地面真值(控制台会丢字,看分钟即可)。 */
+  static int last_min = -1;
+  if (tm.tm_min != last_min)
+    {
+      last_min = tm.tm_min;
+      syslog(LOG_INFO, "[%s] standby shows %04d-%02d-%02d %02d:%02d %s\n",
+             TAG, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, s_wday_cn[tm.tm_wday % 7]);
     }
 }
 

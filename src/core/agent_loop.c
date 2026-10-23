@@ -203,6 +203,14 @@ static void add_tool_result_messages(cJSON* messages,
 {
     int n = resp->call_count;
 
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* The LLM asked for tools, so the turn has left THINKING and is now
+     * executing them (pet_status_view.h: 3, orange fill).  A permission
+     * prompt raised inside a tool overrides this with WAITING (4) and
+     * restores whatever we set here once it clears. */
+    (void)lvgl_ui_channel_set_pet_state(3);
+#endif
+
     if (n == 1) {
         const llm_tool_call_t* call = &resp->calls[0];
 
@@ -223,6 +231,11 @@ static void add_tool_result_messages(cJSON* messages,
         cJSON_AddStringToObject(result_msg, "tool_call_id", call->id);
         cJSON_AddStringToObject(result_msg, "content", tool_output);
         cJSON_AddItemToArray(messages, result_msg);
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        /* Back to THINKING while the LLM digests the tool result. */
+        (void)lvgl_ui_channel_set_pet_state(2);
+#endif
         return;
     }
 
@@ -312,6 +325,11 @@ static void add_tool_result_messages(cJSON* messages,
             free(tasks[i].output);
         }
     }
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* Back to THINKING while the LLM digests the tool results. */
+    (void)lvgl_ui_channel_set_pet_state(2);
+#endif
 }
 
 /* ── Fast path counters ─────────────────────────────────── */
@@ -359,6 +377,30 @@ static const nl_intent_t s_intents[] = {
     { NULL,         NULL,               NULL,  0    },
 };
 
+/* Pet-view state helpers for the NL fast path.  Unlike the ReAct path
+ * (add_tool_result_messages()), the fast path runs its tool synchronously
+ * before returning, so it has no THINKING phase: mark EXECUTING right before
+ * the tool call and let nl_fast_path_done() drop back to IDLE. */
+static inline void nl_fast_path_pet_state(int state)
+{
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    (void)lvgl_ui_channel_set_pet_state(state);
+#else
+    (void)state;
+#endif
+}
+
+static inline void nl_fast_path_done(void)
+{
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* A tool that raised an approval prompt leaves the approval page owning
+     * WAITING; only clear to IDLE when nothing is pending. */
+    if (!lvgl_ui_channel_approval_pending()) {
+        (void)lvgl_ui_channel_set_pet_state(0);
+    }
+#endif
+}
+
 static char* handle_nl_fast_path(const char* text)
 {
     /* Table-driven: scan intents, first match wins */
@@ -366,6 +408,7 @@ static char* handle_nl_fast_path(const char* text)
         if (contains_any(text, s_intents[i].keywords)) {
             char* reply = calloc(1, s_intents[i].output_size);
             if (reply) {
+                nl_fast_path_pet_state(3);
                 tool_registry_execute(s_intents[i].tool_name,
                     s_intents[i].tool_args, reply,
                     s_intents[i].output_size);
@@ -413,8 +456,10 @@ static char* handle_nl_fast_path(const char* text)
         snprintf(input, sizeof(input),
             "{\"location\":\"%s\"}", safe_city);
         char* reply = calloc(1, 4096);
-        if (reply)
+        if (reply) {
+            nl_fast_path_pet_state(3);
             tool_registry_execute("get_weather", input, reply, 4096);
+        }
         if (reply) {
             s_fast_path_count++;
             syslog(LOG_INFO,
@@ -443,6 +488,7 @@ static char* handle_nl_fast_path(const char* text)
                 "{\"keyword\":\"%.*s\"}", klen, kw);
             char search_result[4096];
             memset(search_result, 0, sizeof(search_result));
+            nl_fast_path_pet_state(3);
             tool_registry_execute("music_search", input, search_result, sizeof(search_result));
 
             /* Auto-play first result if search succeeded */
@@ -1592,6 +1638,10 @@ static void* agent_loop_task(void* arg)
         /* NL fast path — after injection check, before LLM */
         if (!reply) {
             reply = handle_nl_fast_path(msg.content);
+            if (reply) {
+                /* Tool already ran synchronously; the turn ends here. */
+                nl_fast_path_done();
+            }
         }
 
         if (reply) {

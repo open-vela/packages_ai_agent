@@ -134,6 +134,7 @@ typedef void (*remote_decide_fn)(enum remote_decision_e decision, void *ctx);
 typedef int  (*remote_pending_fn)(void *ctx);      /* 1 when an approval is up */
 typedef void (*remote_scroll_fn)(int dir, void *ctx); /* 0=older, 1=newer */
 typedef void (*remote_action_fn)(void *ctx);          /* model-next / new-session */
+typedef int  (*remote_wake_fn)(void *ctx);            /* 1 when it ate the press as a wake */
 
 struct remote_input_ops_s
 {
@@ -151,6 +152,7 @@ struct remote_input_ops_s
                 remote_scroll_fn scroll,
                 remote_action_fn model_next,
                 remote_action_fn session_new,
+                remote_wake_fn wake,
                 void *ctx);
   void (*detach)(void);
 };

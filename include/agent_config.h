@@ -130,6 +130,11 @@
 /* ── Timezone (POSIX TZ format) ────────────────────────────── */
 #define AGENT_TIMEZONE "CST-8"
 
+/* 板上 AP 构建没有 CONFIG_LIBC_LOCALTIME 时,libc 的 localtime_r() 退化成
+ * gmtime_r(),TZ 不起作用。需要本地时间显示的代码(localtime_r 调用处)显式
+ * 加这个偏移,和 tool_get_time 的做法一致。 */
+#define AGENT_TZ_OFFSET_SEC (8 * 3600)
+
 /* ── LLM ────────────────────────────────────────────────────── */
 #define AGENT_LLM_DEFAULT_MODEL ""
 #define AGENT_LLM_MAX_TOKENS 4096

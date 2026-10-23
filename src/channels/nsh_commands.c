@@ -39,6 +39,7 @@
 #include "core/memory_store.h"
 #include "core/session_mgr.h"
 #include "infra/network_manager.h"
+#include "infra/time_sync.h"
 #include "infra/http_proxy.h"
 #include "infra/vela_tls.h"
 #include "tools/tool_get_time.h"
@@ -54,6 +55,9 @@
 
 #if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
 #include "ui/lvgl_ui_channel.h"
+#endif
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+#include "ui/pet_status_view.h"
 #endif
 
 #ifdef CONFIG_AI_AGENT_REMOTE_CTRL
@@ -122,6 +126,7 @@ static void cmd_help(void)
         "  set_news_key <key>   - Set NewsAPI key\n"
         "  set_tavily_key <key> - Set Tavily AI search key\n"
         "  config_show          - Show current configuration\n"
+        "  sync_time            - Show clock, ensure network time sync (SNTP)\n"
         "  config_reset         - Clear all runtime config\n"
         "  ask <text>           - Chat with AI Agent\n"
         "  heartbeat_trigger    - Manually trigger heartbeat check\n"
@@ -197,6 +202,9 @@ static void cmd_help(void)
         "  show_chat            - Show chat UI on screen\n"
         "  set_pet <0-5>        - Drive pet to a state (debug; 0=idle 1=listen 2=think 3=exec 4=wait 5=err)\n"
         "  set_page <0|1>       - Switch round-screen page (0=pet home, 1=particle flow)\n"
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+        "  set_ptype <0-4>      - Switch pet species (0=cat 1=frog 2=blackcat 3=dog 4=pig)\n"
+#endif
 #endif
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
         "  net_diag [ping|http] <target>  Network diagnostics\n"
@@ -485,6 +493,37 @@ static void cmd_set_news_key(int argc, char** argv)
     }
     tool_web_search_set_news_key(argv[1]);
     printf("NewsAPI key saved.\n");
+}
+
+/* 打印系统时钟,并确保网络时间(SNTP)守护在跑。
+ * 板上 localtime_r() 退化成 gmtime_r(),本地时间用 UTC+8 显式换算。 */
+static void cmd_sync_time(void)
+{
+    char utc_s[32];
+    char cst_s[32];
+    struct tm tm;
+
+    time_t now = time(NULL);
+    gmtime_r(&now, &tm);
+    strftime(utc_s, sizeof(utc_s), "%Y-%m-%d %H:%M:%S", &tm);
+
+    time_t local = now + AGENT_TZ_OFFSET_SEC;
+    gmtime_r(&local, &tm);
+    strftime(cst_s, sizeof(cst_s), "%Y-%m-%d %H:%M:%S", &tm);
+
+    printf("clock  UTC %s | CST %s (epoch %lld)\n",
+        utc_s, cst_s, (long long)now);
+    printf("link   %s (%s)\n",
+        network_is_connected() ? "up" : "down", network_get_ip());
+
+    (void)time_sync_start();
+
+    if (time_sync_has_synced()) {
+        printf("sntp   synced (re-syncs every 30 min)\n");
+    } else {
+        printf("sntp   no sync yet — last error: %s\n",
+            time_sync_last_error());
+    }
 }
 
 static void cmd_config_show(void)
@@ -1184,6 +1223,8 @@ static void* cli_thread(void* arg)
             cmd_set_tavily_key(argc, argv);
         else if (strcmp(cmd, "config_show") == 0)
             cmd_config_show();
+        else if (strcmp(cmd, "sync_time") == 0)
+            cmd_sync_time();
         else if (strcmp(cmd, "config_reset") == 0)
             cmd_config_reset();
         else if (strcmp(cmd, "heartbeat_trigger") == 0)
@@ -1310,6 +1351,12 @@ static void* cli_thread(void* arg)
          * 0 = pet status ring home screen, 1 = particle flow visualizer. */
         else if (strcmp(cmd, "set_page") == 0 && argc >= 2)
             lvgl_ui_channel_set_page(atoi(argv[1]));
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+        /* Debug: switch the pet species without rebuilding (pet_status_view.h:
+         * enum pet_type).  The sprite is swapped on the LVGL thread. */
+        else if (strcmp(cmd, "set_ptype") == 0 && argc >= 2)
+            pet_status_view_set_type(atoi(argv[1]));
+#endif
 #endif
 #ifdef CONFIG_AI_AGENT_TEST
         else if (strcmp(cmd, "claw_test") == 0)
