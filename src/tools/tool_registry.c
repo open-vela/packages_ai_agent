@@ -21,6 +21,7 @@
  */
 
 #include "tools/tool_registry.h"
+#include "tools/tool_audit.h"
 #ifdef CONFIG_AI_AGENT_MCP
 #include "tools/mcp_client.h"
 #include "tools/mcp_bridge.h"
@@ -58,61 +59,11 @@ static const char* TAG = "tools";
 
 /* ── Persistent tool-call audit ─────────────────────────────── */
 
-/* Every tool call lands here, redacted and bounded.  AGENTS.md V5 asks for
- * the read-only boundary and the call trail to live in C rather than in the
- * prompt, and syslog alone is gone after a reboot, so a reviewer cannot see
- * what the agent actually ran.  A failure to write must never fail the call. */
-
-#define VG_TOOL_AUDIT_PATH      "/data/velaguard/logs/agent_tools.log"
-#define VG_TOOL_AUDIT_DIR       "/data/velaguard/logs"
-#define VG_TOOL_AUDIT_ARG_MAX   96
-#define VG_TOOL_AUDIT_MAX_BYTES (64 * 1024)
-
-/* rc column: 0 ok, the tool's own return otherwise, plus these two so a
- * refusal can be told apart from a tool that ran and failed. */
-
-#define VG_TOOL_AUDIT_BLOCKED   (-2)
-#define VG_TOOL_AUDIT_UNKNOWN   (-3)
-
-static void audit_tool_call(const char* name, const char* input_json, int rc)
-{
-    char safe[VG_TOOL_AUDIT_ARG_MAX];
-    struct timespec ts;
-    struct stat st;
-    FILE* fp;
-
-    if (name == NULL) {
-        return;
-    }
-
-    tool_guard_sanitize_log(input_json, safe, sizeof(safe));
-
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        ts.tv_sec = 0;
-        ts.tv_nsec = 0;
-    }
-
-    mkdir(VG_TOOL_AUDIT_DIR, 0755);
-
-    /* Rotate once so a chatty skill cannot fill the eMMC partition. */
-
-    if (stat(VG_TOOL_AUDIT_PATH, &st) == 0
-        && st.st_size > VG_TOOL_AUDIT_MAX_BYTES) {
-        (void)rename(VG_TOOL_AUDIT_PATH, VG_TOOL_AUDIT_PATH ".1");
-    }
-
-    fp = fopen(VG_TOOL_AUDIT_PATH, "a");
-    if (fp == NULL) {
-        return;
-    }
-
-    fprintf(fp, "%lu.%03lu tool=%s rc=%d args=%s\n",
-        (unsigned long)ts.tv_sec,
-        (unsigned long)(ts.tv_nsec / 1000000),
-        name, rc, safe);
-
-    fclose(fp);
-}
+/* 拒绝和执行都经 C 层脱敏审计。HMI 使用有界队列和一个批量写线程；
+ * 其他构建保持同步落盘，队列溢出或存储失败均计入审计统计。 */
+#define VG_TOOL_AUDIT_BLOCKED (-2)
+#define VG_TOOL_AUDIT_UNKNOWN (-3)
+#define audit_tool_call tool_audit_submit
 
 /* ── External tool provider registry ───────────────────────── */
 

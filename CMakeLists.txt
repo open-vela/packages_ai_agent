@@ -43,6 +43,8 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/channels/cmd_channel.c
     src/channels/ws_server.c
     src/tools/tool_registry.c
+    src/tools/tool_audit.c
+    src/tools/voice_scope.c
     src/tools/tool_files.c
     src/tools/tool_get_time.c
     src/tools/tool_web_search.c

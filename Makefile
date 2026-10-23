@@ -62,6 +62,7 @@ CSRCS += src/llm/llm_cache.c
 
 # tools/ - 工具系统（注册表、MCP、安全、技能）
 CSRCS += src/tools/tool_registry.c
+CSRCS += src/tools/tool_audit.c
 CSRCS += src/tools/tool_files.c
 CSRCS += src/tools/tool_get_time.c
 CSRCS += src/tools/tool_web_search.c
