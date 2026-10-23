@@ -1878,16 +1878,20 @@ static void* agent_loop_task(void* arg)
             goto release_message;
         }
 
-        /* Hot-reload skills if directory changed */
-        if (skill_loader_check_changed()) {
-            syslog(LOG_INFO, "[%s] Skills changed, refreshing\n", TAG);
-            skill_loader_refresh();
-        }
-
         VG_HEAP_SCAN("ctx_pre");
-        context_build_system_prompt(sys_prompt, ctx_size);
-        inject_session_context(sys_prompt, ctx_size,
-            msg.channel, msg.chat_id);
+        if (voice_scope) {
+            /* Fixed read-only voice scope needs no file/memory bootstrap.
+             * The model still chooses and invokes the registered tool. */
+            snprintf(sys_prompt, ctx_size, "%s", vg_voice_scope_prompt());
+        } else {
+            if (skill_loader_check_changed()) {
+                syslog(LOG_INFO, "[%s] Skills changed, refreshing\n", TAG);
+                skill_loader_refresh();
+            }
+            context_build_system_prompt(sys_prompt, ctx_size);
+            inject_session_context(sys_prompt, ctx_size,
+                msg.channel, msg.chat_id);
+        }
         VG_HEAP_SCAN("ctx_done");
 
         /* Refresh tools JSON — Node tools are dynamic */

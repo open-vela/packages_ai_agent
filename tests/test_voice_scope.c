@@ -15,6 +15,10 @@ int main(void)
     const char *denied[] = {"run_shell", "read_file", "write_file", "vg_run_report",
         "vgpoint", "vg_point_read_extra", "VG_POINT_READ", "", NULL};
     for (int i = 0; i < 9; i++) assert(!vg_voice_scope_tool(denied[i]));
+    assert(strstr(vg_voice_scope_prompt(), "vg_point_read"));
+    assert(strstr(vg_voice_scope_prompt(), "vg_anomaly_read"));
+    assert(strstr(vg_voice_scope_prompt(), "vg_alarm_recovery"));
+    assert(strstr(vg_voice_scope_prompt(), "Call the requested tool"));
     assert(vg_voice_scope_tool("vg_point_read"));
     assert(vg_voice_scope_tool("vg_anomaly_read"));
     assert(vg_voice_scope_tool("vg_alarm_recovery"));
@@ -42,6 +46,23 @@ int main(void)
     filtered = vg_voice_scope_schema("[]");
     assert(filtered && !strcmp(filtered, "[]"));
     free(filtered);
+    cJSON *body = cJSON_CreateObject();
+    assert(!vg_voice_scope_model_options(body, vg_voice_scope_prompt(),
+        "api.xiaomimimo.com", "mimo-v2.6-flash", false));
+    assert(!vg_voice_scope_model_options(body, "background report",
+        "api.xiaomimimo.com", "mimo-v2.6-flash", true));
+    assert(!vg_voice_scope_model_options(body, vg_voice_scope_prompt(),
+        "other.invalid", "mimo-v2.6-flash", true));
+    assert(!vg_voice_scope_model_options(body, vg_voice_scope_prompt(),
+        "api.xiaomimimo.com", "other-model", true));
+    assert(!cJSON_GetObjectItem(body, "thinking"));
+    cJSON_AddNumberToObject(body, "max_tokens", 4096);
+    assert(vg_voice_scope_model_options(body, vg_voice_scope_prompt(),
+        "token-plan-cn.xiaomimimo.com", "mimo-v2.6-flash", true));
+    assert(cJSON_GetObjectItem(body, "max_tokens")->valueint == 256);
+    cJSON *thinking = cJSON_GetObjectItem(body, "thinking");
+    assert(!strcmp(cJSON_GetObjectItem(thinking, "type")->valuestring, "disabled"));
+    cJSON_Delete(body);
     puts("test_voice_scope: OK (voice-only identity, exact allowlist, schema filtering, malformed input)");
     return 0;
 }

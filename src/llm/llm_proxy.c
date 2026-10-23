@@ -22,6 +22,7 @@
 
 #include "llm/llm_internal.h"
 #include "llm/llm_parse.h"
+#include "tools/voice_scope.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 #include "llm/llm_cache.h"
@@ -980,6 +981,10 @@ int llm_chat_tools_controlled(const char* system_prompt, cJSON* messages,
         cJSON_AddNumberToObject(body, "max_tokens",
             AGENT_LLM_MAX_TOKENS);
     }
+
+    if (vg_voice_scope_model_options(body, system_prompt, llm_host, model,
+                                    ctl != NULL))
+        syslog(LOG_INFO, "[%s] scoped voice model: thinking disabled, max_tokens=256\n", TAG);
 
     /* Clone messages and prepend system message */
     cJSON* msgs = cJSON_Duplicate(messages, 1);

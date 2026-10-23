@@ -157,12 +157,15 @@ static size_t append_file(char *buf, size_t size, size_t offset,
  */
 
 #define CONTEXT_BODY_MAX 3072
-#define CONTEXT_BODY_REFRESH_MS 30000
+#ifndef CONTEXT_BODY_REFRESH_MS
+#  define CONTEXT_BODY_REFRESH_MS 30000
+#endif
 
 static char s_body_cache[CONTEXT_BODY_MAX];
 static size_t s_body_len;
 static pthread_mutex_t s_body_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool s_body_refresher_started;
+static pthread_once_t s_body_once = PTHREAD_ONCE_INIT;
 
 static size_t build_prompt_body(char *buf, size_t size)
 {
@@ -212,40 +215,42 @@ static size_t build_prompt_body(char *buf, size_t size)
     return off;
 }
 
+/* File I/O happens outside the publication lock. A request may use the
+ * previous complete snapshot while a slow refresh is in progress. */
+static void context_body_refresh(void)
+{
+    char *next = malloc(CONTEXT_BODY_MAX);
+    if (!next) return;
+    size_t len = build_prompt_body(next, CONTEXT_BODY_MAX);
+    pthread_mutex_lock(&s_body_lock);
+    memcpy(s_body_cache, next, len + 1);
+    s_body_len = len;
+    pthread_mutex_unlock(&s_body_lock);
+    free(next);
+}
+
 static void *context_body_refresher(void *arg)
 {
     (void)arg;
-
     for (;;) {
         usleep(CONTEXT_BODY_REFRESH_MS * 1000);
-
-        pthread_mutex_lock(&s_body_lock);
-        s_body_len = build_prompt_body(s_body_cache, sizeof(s_body_cache));
-        pthread_mutex_unlock(&s_body_lock);
+        context_body_refresh();
     }
-
     return NULL;
 }
 
-static void context_body_refresher_start(void)
+static void context_body_init(void)
 {
     pthread_t tid;
     pthread_attr_t attr;
-
-    if (s_body_refresher_started) {
-        return;
-    }
-
-    s_body_refresher_started = true;
-
+    context_body_refresh();
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 16 * 1024);
-    if (pthread_create(&tid, &attr, context_body_refresher, NULL) != 0) {
-        syslog(LOG_ERR,
-            "[%s] prompt body thread failed; every round reads the files again\n",
-            TAG);
-    } else {
+    if (pthread_attr_setstacksize(&attr, 16 * 1024) == 0 &&
+        pthread_create(&tid, &attr, context_body_refresher, NULL) == 0) {
+        s_body_refresher_started = true;
         pthread_detach(tid);
+    } else {
+        syslog(LOG_ERR, "[%s] prompt refresh thread failed; refresh synchronously\n", TAG);
     }
     pthread_attr_destroy(&attr);
 }
@@ -315,28 +320,21 @@ int context_build_system_prompt(char *buf, size_t size)
      * round builds it and a background thread keeps it fresh, so a
      * question does not pay for the eMMC reads. */
 
+    pthread_once(&s_body_once, context_body_init);
+    if (!s_body_refresher_started) context_body_refresh();
     {
         size_t avail = size - off - 1;
-
         pthread_mutex_lock(&s_body_lock);
-        if (s_body_len == 0) {
-            s_body_len = build_prompt_body(s_body_cache, sizeof(s_body_cache));
-        }
-
         if (avail >= s_body_len) {
-            memcpy(buf + off, s_body_cache, s_body_len);
+            memcpy(buf + off, s_body_cache, s_body_len + 1);
             off += s_body_len;
-            buf[off] = '\0';
+            pthread_mutex_unlock(&s_body_lock);
+        } else {
+            pthread_mutex_unlock(&s_body_lock);
+            /* The returned length is relative to this remaining region. */
+            off += build_prompt_body(buf + off, avail + 1);
         }
-        else {
-            /* Not enough room for the cached body: build it into the
-             * remaining space so the prompt stays inside the buffer. */
-            off = build_prompt_body(buf + off, avail);
-        }
-        pthread_mutex_unlock(&s_body_lock);
     }
-
-    context_body_refresher_start();
 
     /* Remote Node devices */
 #ifdef CONFIG_AI_AGENT_NODE
