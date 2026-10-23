@@ -162,6 +162,17 @@ int agent_http_post_stream(const char *post_data,
     size_t *out_body_len, int *out_status,
     const vela_req_ctl_t *ctl);
 
+/* Same transport with per-phase timing for latency attribution; timing may
+ * be NULL, in which case this matches agent_http_post_stream exactly. */
+#include "infra/agent_timing.h"
+int agent_http_post_stream_timed(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl);
+
 /* Explicit transport diagnostic.  Sends a fixed invalid test credential,
  * never reads configured credentials, discards the response body, and never
  * changes the product endpoint.  Not registered as an Agent tool. */

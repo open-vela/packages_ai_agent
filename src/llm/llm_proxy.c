@@ -743,6 +743,18 @@ int agent_http_post_stream(const char *post_data,
         out_body_len, out_status, NULL, ctl);
 }
 
+int agent_http_post_stream_timed(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    return llm_http_call_stream(post_data, body, sink, resp_buf, resp_cap,
+        out_body_len, out_status, timing, ctl);
+}
+
 int agent_http_probe_post_stream(const char *host, const char *port,
     const char *path, const char *post_data, const vela_body_src_t *body,
     const vela_resp_sink_t *sink, char *resp_buf, size_t resp_cap,
