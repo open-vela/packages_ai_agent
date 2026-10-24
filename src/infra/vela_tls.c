@@ -2590,9 +2590,13 @@ int vela_https_voice_preconnect(const char *host, const char *port,
         return VELA_TLS_ERR_CONNECT;
     }
 
+    /* Release before the log line: a request arriving between the print
+     * and the release would find the slot busy and pay a connection it
+     * should have reused. */
+
+    voice_slot_release(host, port, true);
     syslog(LOG_INFO, "[%s] voice_preconnect %s:%s ms=%u\n", TAG, host, port,
            (unsigned)(agent_mono_ms() - t0));
-    voice_slot_release(host, port, true);
     return 0;
 }
 
@@ -2836,6 +2840,13 @@ static int stream_exchange(
         syslog(LOG_ERR, "[%s] stream: bad status line: %.80s\n", TAG, tmp);
         ret = VELA_TLS_ERR_READ;
         goto out;
+    }
+
+    if (status != 200) {
+        /* The raw response head says who rejected the request and why;
+         * it carries no credentials.  Truncated on purpose. */
+        syslog(LOG_ERR, "[%s] stream: status=%d head: %.256s\n", TAG,
+               status, tmp);
     }
 
     {
