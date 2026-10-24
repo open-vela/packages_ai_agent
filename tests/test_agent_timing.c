@@ -232,6 +232,54 @@ static void test_lap_advances(void)
     }
 }
 
+/* Streaming observation: first_data is na until a sink saw an SSE data
+ * line, stream=0 until the request went through the streaming entry, and
+ * send_done 0 means "unknown" rather than a real instant.  no_transport
+ * clears the observation along with the other transport phases. */
+
+static void test_stream_fields(void)
+{
+    agent_llm_timing_t t;
+    char line[512];
+
+    agent_timing_reset(&t);
+    if (t.first_data_ms != AGENT_T_NA) {
+        fail("reset left first_data_ms measured");
+    }
+    if (t.send_done_mono != 0) {
+        fail("reset left send_done_mono set");
+    }
+    if (t.streamed) {
+        fail("reset left streamed set");
+    }
+
+    if (agent_timing_format_http(line, sizeof(line), 0, &t) <= 0) {
+        fail("format returned <= 0 for a reset struct");
+        return;
+    }
+
+    expect_contains(line, "first_data=na");
+    expect_contains(line, "stream=0");
+
+    agent_timing_reset(&t);
+    t.first_data_ms = 320;
+    t.send_done_mono = 123456u;
+    t.streamed = true;
+    if (agent_timing_format_http(line, sizeof(line), 1, &t) <= 0) {
+        fail("format rejected a streaming struct");
+        return;
+    }
+
+    expect_contains(line, "first_data=320");
+    expect_contains(line, "stream=1");
+
+    agent_timing_no_transport(&t);
+    if (t.first_data_ms != AGENT_T_NA || t.streamed
+        || t.send_done_mono != 0) {
+        fail("no_transport left the streaming observation behind");
+    }
+}
+
 int main(void)
 {
     test_unmeasured_is_na();
@@ -241,6 +289,7 @@ int main(void)
     test_no_payload_leaks();
     test_elapsed_wrap();
     test_lap_advances();
+    test_stream_fields();
 
     if (s_failures != 0) {
         printf("%d failure(s)\n", s_failures);

@@ -46,6 +46,8 @@ void agent_timing_reset(agent_llm_timing_t* t)
     t->http_total_ms = AGENT_T_NA;
     t->llm_total_ms = AGENT_T_NA;
     t->backoff_ms = 0;
+    t->first_data_ms = AGENT_T_NA;
+    t->send_done_mono = 0;
     t->http_rc = 0;
     t->http_status = 0;
     t->req_bytes = 0;
@@ -68,6 +70,9 @@ void agent_timing_no_transport(agent_llm_timing_t* t)
     t->send_ms = AGENT_T_NA;
     t->ttfb_ms = AGENT_T_NA;
     t->body_ms = AGENT_T_NA;
+    t->first_data_ms = AGENT_T_NA;
+    t->send_done_mono = 0;
+    t->streamed = false;
     t->fused_dns_tcp = true;
     t->reused = false;
 }
@@ -80,10 +85,10 @@ void agent_timing_no_transport(agent_llm_timing_t* t)
     "iter=%d attempt=%u reused=%u proxy=%u dns_tcp=%s%s setup=%s tls=%s " \
     "send=%s ttfb=%s body=%s pool=%s build=%s parse=%s " \
     "http=%s backoff=%s total=%s req=%lu resp=%lu rc=%d status=%d " \
-    "parse_ok=%u"
+    "parse_ok=%u first_data=%s stream=%u"
 
 #define TIMING_HTTP_ARGS(t, iteration, pool, dns, setup, tls, send, ttfb, \
-    body, build, parse, http, total, backoff) \
+    body, build, parse, http, total, backoff, first_data) \
     iteration, (unsigned)(t)->attempt, (t)->reused ? 1u : 0u, \
         (t)->proxy ? 1u : 0u, \
         na_or_ms((dns), sizeof(dns), (t)->dns_tcp_ms), \
@@ -101,7 +106,9 @@ void agent_timing_no_transport(agent_llm_timing_t* t)
         na_or_ms((total), sizeof(total), (t)->llm_total_ms), \
         (unsigned long)(t)->req_bytes, (unsigned long)(t)->resp_bytes, \
         (t)->http_rc, (t)->http_status, \
-        (t)->parse_ok ? 1u : 0u
+        (t)->parse_ok ? 1u : 0u, \
+        na_or_ms((first_data), sizeof(first_data), (t)->first_data_ms), \
+        (t)->streamed ? 1u : 0u
 
 int agent_timing_format_http(char* buf, size_t cap, int iteration,
     const agent_llm_timing_t* t)
@@ -109,11 +116,12 @@ int agent_timing_format_http(char* buf, size_t cap, int iteration,
     char pool[16], dns[16], setup[16], tls[16], send[16], ttfb[16];
     char body[16];
     char build[16], parse[16], http[16], total[16], backoff[16];
+    char first_data[16];
     int n;
 
     n = snprintf(NULL, 0, TIMING_HTTP_FMT,
         TIMING_HTTP_ARGS(t, iteration, pool, dns, setup, tls, send, ttfb,
-            body, build, parse, http, total, backoff));
+            body, build, parse, http, total, backoff, first_data));
 
     if (n < 0 || (size_t)n >= cap) {
         return -1;
@@ -121,7 +129,7 @@ int agent_timing_format_http(char* buf, size_t cap, int iteration,
 
     snprintf(buf, cap, TIMING_HTTP_FMT,
         TIMING_HTTP_ARGS(t, iteration, pool, dns, setup, tls, send, ttfb,
-            body, build, parse, http, total, backoff));
+            body, build, parse, http, total, backoff, first_data));
 
     return n;
 }

@@ -946,10 +946,55 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 
 /* ── Public: chat with tools ──────────────────────────────── */
 
+/* Controlled-stream sink: appends to the response buffer and, until the
+ * first SSE "data:" line arrives, watches for it byte by byte so the
+ * timing records when the model produced its first visible output.  The
+ * transport ttfb (the HTTP status line) is a different, earlier mark and
+ * both are reported; neither is renamed to mean the other.  The state is
+ * a fixed-size struct on the caller's stack: no allocation on this path. */
+
+struct llm_sink_obs {
+    resp_buf_t *rb;
+    agent_llm_timing_t *t;
+    uint32_t req_mark; /* request start; anchor fallback when send_done is unknown */
+    bool first_seen;
+    bool line_start; /* the next byte begins an SSE line */
+    size_t head_len; /* bytes of the "data:" prefix matched so far */
+};
 
 static int llm_control_sink(void *ctx, const char *data, size_t len)
 {
-    return resp_buf_append((resp_buf_t *)ctx, data, len) == OK ? 0 : -1;
+    static const char prefix[] = "data:";
+    struct llm_sink_obs *obs = ctx;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        char c = data[i];
+
+        if (!obs->first_seen) {
+            if (obs->head_len == 0) {
+                if (obs->line_start && c == prefix[0]) {
+                    obs->head_len = 1;
+                }
+            } else if (c == prefix[obs->head_len]) {
+                obs->head_len++;
+                if (obs->head_len == sizeof(prefix) - 1) {
+                    uint32_t anchor = obs->t->send_done_mono;
+
+                    obs->first_seen = true;
+                    obs->t->first_data_ms = agent_elapsed_ms(
+                        anchor != 0 ? anchor : obs->req_mark,
+                        agent_mono_ms());
+                }
+            } else {
+                obs->head_len = 0;
+            }
+        }
+
+        obs->line_start = (c == '\n');
+    }
+
+    return resp_buf_append(obs->rb, data, len) == OK ? 0 : -1;
 }
 
 int llm_chat_tools(const char *system_prompt, cJSON *messages,
@@ -1099,7 +1144,15 @@ int llm_chat_tools_controlled(const char* system_prompt, cJSON* messages,
             if (resp_buf_init(&rb, 4096) != OK) {
                 err = ERROR;
             } else {
-                vela_resp_sink_t sink = { .write = llm_control_sink, .ctx = &rb };
+                struct llm_sink_obs obs = {
+                    .rb = &rb,
+                    .t = timing,
+                    .req_mark = mark,
+                    .first_seen = false,
+                    .line_start = true,
+                    .head_len = 0,
+                };
+                vela_resp_sink_t sink = { .write = llm_control_sink, .ctx = &obs };
                 size_t received = 0;
                 err = llm_http_call_stream(post_data, NULL, &sink,
                     NULL, 0, &received, &status, timing, ctl);

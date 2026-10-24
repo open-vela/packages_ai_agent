@@ -68,6 +68,17 @@ typedef struct {
     int32_t llm_total_ms; /* whole llm_chat_tools call */
     int32_t backoff_ms; /* sleep before this attempt, 0 for the first */
 
+    /* Streaming-request observation.  first_data_ms is the first SSE
+     * "data:" line the response sink saw, measured from the moment the
+     * request body finished writing; a request without a streaming sink
+     * leaves it NA.  It is the model's first visible output, not a tool
+     * argument completion.  send_done_mono is the absolute monotonic
+     * millisecond of that same send-done moment so upper layers can
+     * anchor their own block timestamps to it; 0 means unknown. */
+
+    int32_t first_data_ms; /* send done to first SSE data line */
+    uint32_t send_done_mono; /* absolute monotonic ms at send done, 0=unknown */
+
     int http_rc; /* raw transport return value */
     int http_status; /* parsed HTTP status, 0 when unknown */
     uint32_t req_bytes; /* serialized request size */
@@ -78,6 +89,7 @@ typedef struct {
     bool fused_dns_tcp; /* dns_tcp_ms is a combined phase */
     bool proxy; /* request went through the CONNECT proxy */
     bool parse_ok; /* JSON parse and field extraction succeeded */
+    bool streamed; /* request ran through a streaming sink */
 } agent_llm_timing_t;
 
 /**

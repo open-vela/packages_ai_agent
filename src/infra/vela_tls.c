@@ -2150,6 +2150,16 @@ out:
     return ret;
 }
 
+/* http_total_ms must cover the whole transport call, including the early
+ * failure exits, so the phases always add up to something that was really
+ * spent.  A NULL timing (Feishu, vision, web search) costs one branch. */
+static void stream_note_total(agent_llm_timing_t *timing, uint32_t t0)
+{
+    if (timing != NULL) {
+        timing->http_total_ms = agent_elapsed_ms(t0, agent_mono_ms());
+    }
+}
+
 int vela_https_request_stream(
     const char *host,
     const char *port,
@@ -2179,12 +2189,20 @@ int vela_https_request_stream(
     bool complete = false;
     uint32_t mark;
     uint32_t last_progress;
+    uint32_t t_http0 = agent_mono_ms();
+    uint32_t t_first_byte = 0;
+    bool ttfb_seen = false;
     int status = 0;
     int ret = 0;
     int n;
 
     if (host == NULL || port == NULL || method == NULL || path == NULL) {
+        stream_note_total(timing, t_http0);
         return VELA_TLS_ERR_CONNECT;
+    }
+
+    if (timing != NULL) {
+        timing->streamed = true;
     }
 
     if (out_body_len != NULL) {
@@ -2210,19 +2228,21 @@ int vela_https_request_stream(
     emit.truncated = false;
 
     if (vela_req_cancelled(ctl)) {
+        stream_note_total(timing, t_http0);
         return VELA_TLS_ERR_CANCELLED;
     }
 
     if (vela_req_budget_ms(ctl, agent_mono_ms()) == 0) {
+        stream_note_total(timing, t_http0);
         return VELA_TLS_ERR_TIMEOUT;
     }
 
-    mark = agent_mono_ms();
-    last_progress = mark;
+    last_progress = agent_mono_ms();
 
     ret = tls_ctx_connect(&ctx, host, port, timing, ctl);
     if (ret != 0) {
         tls_ctx_free(&ctx);
+        stream_note_total(timing, t_http0);
         return ret;
     }
 
@@ -2234,6 +2254,7 @@ int vela_https_request_stream(
     hdr = malloc(4096);
     if (hdr == NULL) {
         tls_ctx_free(&ctx);
+        stream_note_total(timing, t_http0);
         return VELA_TLS_ERR_OVERFLOW;
     }
 
@@ -2246,6 +2267,7 @@ int vela_https_request_stream(
         if (pos >= 4096) {                                      \
             free(hdr);                                          \
             tls_ctx_free(&ctx);                                 \
+            stream_note_total(timing, t_http0);                 \
             return VELA_TLS_ERR_OVERFLOW;                       \
         }                                                       \
     } while (0)
@@ -2275,18 +2297,33 @@ int vela_https_request_stream(
     hdr = NULL;
 
     if (ret != 0) {
+        /* A failed send is still a measured send: the time already spent
+         * belongs in send_ms, while ttfb and body stay NA. */
+        if (timing != NULL) {
+            timing->send_ms = agent_lap_ms(&mark);
+        }
         tls_ctx_free(&ctx);
+        stream_note_total(timing, t_http0);
         return ret;
-    }
-
-    if (timing != NULL) {
-        timing->send_ms = agent_elapsed_ms(mark, agent_mono_ms());
     }
 
     ret = stream_send_body(&ctx, body, ctl);
     if (ret != 0) {
+        if (timing != NULL) {
+            timing->send_ms = agent_lap_ms(&mark);
+        }
         tls_ctx_free(&ctx);
+        stream_note_total(timing, t_http0);
         return ret;
+    }
+
+    /* send covers headers and body, the same contract as the buffered
+     * request path, so the phases stay comparable across both entries.
+     * After the lap, mark is the send-done instant the sink layer anchors
+     * its own first-data and block timestamps to. */
+    if (timing != NULL) {
+        timing->send_ms = agent_lap_ms(&mark);
+        timing->send_done_mono = mark;
     }
 
     /* Response headers. */
@@ -2317,6 +2354,17 @@ int vela_https_request_stream(
             sizeof(tmp) - 1 - hdr_len);
 
         if (n > 0) {
+            if (!ttfb_seen) {
+                /* The first byte is the status line, not a model token;
+                 * the sink layer records the first SSE data line
+                 * separately.  Kept on later error paths: a reply that
+                 * arrived and then broke has still paid its ttfb. */
+                ttfb_seen = true;
+                t_first_byte = agent_mono_ms();
+                if (timing != NULL) {
+                    timing->ttfb_ms = agent_elapsed_ms(mark, t_first_byte);
+                }
+            }
             hdr_len += (size_t)n;
             tmp[hdr_len] = '\0';
             last_progress = agent_mono_ms();
@@ -2524,9 +2572,12 @@ int vela_https_request_stream(
         goto out;
     }
 
-    if (timing != NULL) {
-        timing->ttfb_ms = AGENT_T_NA;
-        timing->body_ms = agent_elapsed_ms(mark, agent_mono_ms());
+    if (timing != NULL && ttfb_seen) {
+        /* Measured from the first byte so headers and body form one span
+         * that never overlaps ttfb_ms, the same convention as the buffered
+         * reader.  Only the success path reaches here; an incomplete body
+         * keeps NA instead of a partial span. */
+        timing->body_ms = agent_elapsed_ms(t_first_byte, agent_mono_ms());
     }
 
     if (emit.truncated) {
@@ -2543,6 +2594,7 @@ int vela_https_request_stream(
     }
 
 out:
+    stream_note_total(timing, t_http0);
     ctx.abort_on_close = ctl != NULL && ret < 0;
     /* Reclaim before returning, on every path.  A cancelled request must not
      * leave a socket, a TLS context or a partially read record behind: the
@@ -2616,6 +2668,7 @@ int vela_https_request_timed(
         ret = tls_write_request(&slot->ctx, method, host, path, headers, body, body_len);
         if (timing != NULL) {
             timing->send_ms = agent_lap_ms(&mark);
+            timing->send_done_mono = mark;
         }
 
         if (ret == 0) {
@@ -2661,6 +2714,7 @@ int vela_https_request_timed(
         }
         if (timing != NULL) {
             timing->send_ms = agent_lap_ms(&mark);
+            timing->send_done_mono = mark;
         }
         ret = tls_read_response(&tmp_ctx, resp_buf, resp_cap, out_body_len,
             NULL, mark, timing);
@@ -2687,6 +2741,7 @@ int vela_https_request_timed(
     }
     if (timing != NULL) {
         timing->send_ms = agent_lap_ms(&mark);
+        timing->send_done_mono = mark;
     }
 
     bool keep = false;
