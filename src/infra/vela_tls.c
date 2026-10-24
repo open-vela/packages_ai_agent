@@ -158,6 +158,11 @@ static int tls_controlled_send(void *arg, const unsigned char *buf, size_t len)
             syslog(LOG_INFO, "[%s] controlled send waiting for packet buffers\n", TAG);
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
+    if (ret == MBEDTLS_ERR_NET_SEND_FAILED) {
+        syslog(LOG_ERR, "[%s] controlled send failed fd=%d errno=%d\n",
+               TAG, ctx->net.fd, error);
+        errno = error;
+    }
     return ret;
 }
 
@@ -568,14 +573,32 @@ static int tls_connect_controlled(tls_ctx_t *ctx, const char *host,
         if (errno != EINPROGRESS && errno != EWOULDBLOCK && errno != EALREADY) {
             goto next;
         }
-        ret = tls_wait_socket(ctx->net.fd, POLLOUT, ctl);
+        while ((ret = tls_wait_socket(ctx->net.fd, POLLOUT, ctl)) == 0) {
+            if (getsockopt(ctx->net.fd, SOL_SOCKET, SO_ERROR, &error,
+                           &error_len) != 0 || error != 0) {
+                break;
+            }
+            /* POLLOUT with a clear SO_ERROR can still fire before the TCP
+             * handshake completes on NuttX (TX notifications). getpeername
+             * only succeeds once the connection is established; keep
+             * waiting inside the same request budget instead of sending
+             * into a SYN_SENT socket (send would fail with ENOTCONN). */
+            struct sockaddr_storage peer;
+            socklen_t peer_len = sizeof(peer);
+            if (getpeername(ctx->net.fd, (struct sockaddr *)&peer,
+                            &peer_len) == 0) {
+                result = 0;
+                break;
+            }
+            if (errno != ENOTCONN) {
+                break;
+            }
+        }
         if (ret != 0) {
             result = ret;
             break;
         }
-        if (getsockopt(ctx->net.fd, SOL_SOCKET, SO_ERROR, &error, &error_len) == 0
-            && error == 0) {
-            result = 0;
+        if (result == 0) {
             break;
         }
 next:
