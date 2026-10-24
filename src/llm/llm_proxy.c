@@ -677,6 +677,10 @@ static int llm_stream_prepare(struct llm_stream_req *r,
     const char *slash;
     int n = 0;
 
+    /* Callers allocate this snapshot on the stack.  In particular a model
+     * without a provider prefix must not publish an uninitialized header. */
+    memset(r, 0, sizeof(*r));
+
     pthread_mutex_lock(&s_llm_lock);
     memcpy(api_key, s_api_key, sizeof(api_key));
     memcpy(r->llm_host, s_llm_host, sizeof(r->llm_host));
@@ -709,6 +713,7 @@ static int llm_stream_prepare(struct llm_stream_req *r,
         }
 
         memcpy(r->provider, model, plen);
+        r->provider[plen] = '\0';
     }
 
     r->hdrs[n++] = (vela_header_t) { "Content-Type", "application/json" };
@@ -806,6 +811,11 @@ int agent_http_post_stream_voice_timed(const char *post_data,
 {
     return llm_http_call_stream_voice(post_data, body, sink, resp_buf,
         resp_cap, out_body_len, out_status, timing, ctl);
+}
+
+void agent_http_set_req_dump(int on)
+{
+    vela_tls_set_req_dump(on);
 }
 
 int agent_http_voice_preconnect(const vela_req_ctl_t *ctl,

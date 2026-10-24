@@ -193,6 +193,10 @@ int agent_http_post_stream_voice_timed(const char *post_data,
 int agent_http_voice_preconnect(const vela_req_ctl_t *ctl,
                                 agent_llm_timing_t *timing);
 
+/* Diagnostic: dump the exact request bytes of every HTTPS request
+ * (credential header values masked) to syslog.  Default off. */
+void agent_http_set_req_dump(int on);
+
 /* Explicit transport diagnostic.  Sends a fixed invalid test credential,
  * never reads configured credentials, discards the response body, and never
  * changes the product endpoint.  Not registered as an Agent tool. */

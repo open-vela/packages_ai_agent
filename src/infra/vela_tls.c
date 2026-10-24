@@ -357,54 +357,12 @@ static bool voice_slot_alive(tls_ctx_t* ctx)
         || n == MBEDTLS_ERR_SSL_TIMEOUT;
 }
 
-/* Discard whatever the sink stopped reading (the final chunked
- * terminator after the TTS sink's early completion) so the next
- * request starts at a response boundary.  Bounded: more leftover than
- * this is a protocol problem, not a tail. */
-static bool voice_slot_drain(tls_ctx_t* ctx, uint32_t budget_ms,
-                             size_t cap_bytes)
-{
-    unsigned char drain[512];
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 };
-    uint32_t t0 = agent_mono_ms();
-    size_t total = 0;
-    int n;
-
-    setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    for (;;) {
-        n = mbedtls_ssl_read(&ctx->ssl, drain, sizeof(drain));
-        if (n > 0) {
-            total += (size_t)n;
-            if (total > cap_bytes
-                || (uint32_t)(agent_mono_ms() - t0) > budget_ms) {
-                return false;
-            }
-            continue;
-        }
-
-        return n == MBEDTLS_ERR_SSL_WANT_READ
-            || n == MBEDTLS_ERR_SSL_WANT_WRITE
-            || n == MBEDTLS_ERR_SSL_TIMEOUT;
-    }
-}
-
 /* Pure keep-decision so the unit tests can drive the truth table
- * without sockets.  A kept connection needs the exchange to have
- * succeeded AND its framing to be complete (a sink that stopped early
- * only qualifies once the drain reached the boundary). */
-static bool voice_slot_keep(int ret, bool framing_complete, bool sink_early,
-                            bool drain_ok)
+ * without sockets. Socket silence and a sink end marker are not proof
+ * that the HTTP response ended. */
+static bool voice_slot_keep(int ret, bool framing_complete, bool response_close)
 {
-    if (ret != 0) {
-        return false;
-    }
-
-    if (framing_complete) {
-        return true;
-    }
-
-    return sink_early && drain_ok;
+    return ret == 0 && framing_complete && !response_close;
 }
 
 #endif /* CONFIG_AI_AGENT_VOICE_CONN_SLOT */
@@ -590,7 +548,10 @@ static int tls_connect_controlled(tls_ctx_t *ctx, const char *host,
         int error = 0;
         socklen_t error_len = sizeof(error);
 
-        ctx->net.fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        /* NSH commands and daemons may spawn while this request is live.
+         * Inheriting its descriptor would outlive the transport owner. */
+        ctx->net.fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC,
+                             a->ai_protocol);
         if (ctx->net.fd < 0) {
             syslog(LOG_ERR, "[%s] socket allocation failed errno=%d\n", TAG, errno);
             continue;
@@ -1630,6 +1591,86 @@ static int tls_ssl_write_all(tls_ctx_t* ctx, const char* what,
     return 0;
 }
 
+/* ── Request byte dump (isolation diagnostics; default off) ──────
+ * Prints the exact request-line/header block and a short body prefix
+ * so a board failure can be diffed byte-for-byte against a host replay.
+ * Credential header values are masked before anything reaches the
+ * serial log. */
+
+static int g_req_dump;
+
+void vela_tls_set_req_dump(int on)
+{
+  g_req_dump = on;
+}
+
+static void tls_dump_head(const char *tag, const char *head, size_t len)
+{
+  char *copy = malloc(len + 1);
+  if (copy == NULL)
+    return;
+  memcpy(copy, head, len);
+  copy[len] = '\0';
+
+  char *auth = strcasestr(copy, "Authorization:");
+  if (auth != NULL)
+    {
+      char *val = strchr(auth, ':');
+      if (val != NULL)
+        {
+          val++;
+          while (*val == ' ')
+            val++;
+          while (*val != '\0' && *val != '\r' && *val != '\n')
+            *val++ = '*';
+        }
+    }
+
+  char line[96];
+  size_t o = 0;
+  for (size_t i = 0; i < len; i++)
+    {
+      unsigned char c = (unsigned char)copy[i];
+      const char *esc = c == '\r' ? "\\r" : c == '\n' ? "\\n" : NULL;
+      size_t need = esc ? 2 : (c >= 0x20 && c < 0x7f) ? 1 : 4;
+      if (o + need >= sizeof(line))
+        {
+          line[o] = '\0';
+          syslog(LOG_INFO, "[dump:%s] %s\n", tag, line);
+          o = 0;
+        }
+      if (esc != NULL)
+        {
+          line[o++] = esc[0];
+          line[o++] = esc[1];
+        }
+      else if (c >= 0x20 && c < 0x7f)
+        line[o++] = (char)c;
+      else
+        o += (size_t)snprintf(line + o, sizeof(line) - o, "\\x%02x", c);
+    }
+  if (o != 0)
+    {
+      line[o] = '\0';
+      syslog(LOG_INFO, "[dump:%s] %s\n", tag, line);
+    }
+  free(copy);
+}
+
+static void tls_dump_hex(const char *tag, const void *bytes, size_t len)
+{
+  const unsigned char *p = bytes;
+  char line[65];
+  for (size_t i = 0; i < len; i += 32)
+    {
+      size_t o = 0;
+      for (size_t j = i; j < len && j < i + 32; j++)
+        o += (size_t)snprintf(line + o, 3, "%02x", p[j]);
+      line[o] = '\0';
+      syslog(LOG_INFO, "[dump:%s] %s\n", tag, line);
+    }
+}
+
 static int tls_write_request(tls_ctx_t* ctx,
     const char* method, const char* host,
     const char* path,
@@ -1670,6 +1711,15 @@ static int tls_write_request(tls_ctx_t* ctx,
 
     HDR_APPEND("\r\n");
 #undef HDR_APPEND
+
+    if (g_req_dump)
+      {
+        tls_dump_head("req", hdr, (size_t)pos);
+        if (body != NULL && body_len > 0)
+          tls_dump_hex("reqbody", body,
+                       g_req_dump >= 2 ? body_len :
+                       (body_len < 96 ? body_len : 96));
+      }
 
     /* Write headers */
     if (tls_ssl_write_all(ctx, "hdr",
@@ -1997,6 +2047,10 @@ struct vela_emit {
     size_t cap;
     size_t len;
     bool   truncated;
+    bool   drain_sink;
+    bool   sink_done;
+    uint32_t sink_done_at;
+    size_t drained;
 };
 
 static int emit_bytes(struct vela_emit *e, const char *data, size_t len)
@@ -2009,7 +2063,17 @@ static int emit_bytes(struct vela_emit *e, const char *data, size_t len)
     }
 
     if (e->sink != NULL) {
-        return e->sink->write(e->sink->ctx, data, len);
+        if (e->sink_done) {
+            e->drained += len;
+            return e->drained > 65536 ? -1 : 0;
+        }
+        int rc = e->sink->write(e->sink->ctx, data, len);
+        if (rc > 0 && e->drain_sink) {
+            e->sink_done = true;
+            e->sink_done_at = agent_mono_ms();
+            return 0;
+        }
+        return rc;
     }
 
     if (e->buf == NULL || e->cap == 0) {
@@ -2035,14 +2099,14 @@ static int emit_bytes(struct vela_emit *e, const char *data, size_t len)
 
 /* Incremental chunked decoder.  The whole body is never in one buffer, so
  * vela_http_chunked_complete() cannot be used here: the state has to advance
- * as bytes arrive.  A zero-size chunk ends the message; trailer fields after
- * it are not consumed, which matches the framing rule used by the buffered
- * reader. */
+ * as bytes arrive. A zero-size chunk starts the trailers; the empty line
+ * after them is the boundary required before reusing the connection. */
 
 enum vela_chunk_state {
     VELA_CHUNK_SIZE = 0,
     VELA_CHUNK_DATA,
     VELA_CHUNK_DATA_END,
+    VELA_CHUNK_TRAILERS,
     VELA_CHUNK_DONE
 };
 
@@ -2065,14 +2129,21 @@ static int chunk_feed(struct vela_chunk_dec *d, struct vela_emit *e,
                 char c = data[i++];
 
                 if (c == '\n') {
-                    long sz;
+                    unsigned long sz;
+                    char *end;
 
                     d->line[d->line_len] = '\0';
-                    sz = strtol(d->line, NULL, 16);
+                    errno = 0;
+                    sz = strtoul(d->line, &end, 16);
+                    if (end == d->line || errno != 0 ||
+                        d->line[0] == '-' || d->line[0] == '+' ||
+                        (*end != '\0' && *end != ';')) {
+                        return -1;
+                    }
                     d->line_len = 0;
 
-                    if (sz <= 0) {
-                        d->state = VELA_CHUNK_DONE;
+                    if (sz == 0) {
+                        d->state = VELA_CHUNK_TRAILERS;
                     } else {
                         d->remaining = (size_t)sz;
                         d->state = VELA_CHUNK_DATA;
@@ -2081,7 +2152,8 @@ static int chunk_feed(struct vela_chunk_dec *d, struct vela_emit *e,
                     break;
                 }
 
-                if (c != '\r' && d->line_len + 1 < sizeof(d->line)) {
+                if (c != '\r') {
+                    if (d->line_len + 1 >= sizeof(d->line)) return -1;
                     d->line[d->line_len++] = c;
                 }
             }
@@ -2100,7 +2172,6 @@ static int chunk_feed(struct vela_chunk_dec *d, struct vela_emit *e,
                     return -1;
                 }
                 if (emit_rc > 0) {
-                    d->state = VELA_CHUNK_DONE;
                     return 1;
                 }
 
@@ -2126,10 +2197,23 @@ static int chunk_feed(struct vela_chunk_dec *d, struct vela_emit *e,
 
         case VELA_CHUNK_DONE:
             break;
+
+        case VELA_CHUNK_TRAILERS:
+            while (i < len) {
+                char c = data[i++];
+                if (c == '\n') {
+                    if (d->line_len == 0) d->state = VELA_CHUNK_DONE;
+                    d->line_len = 0;
+                    break;
+                }
+                if (c != '\r' && ++d->line_len > 8192) return -1;
+            }
+            break;
         }
     }
 
-    return 0;
+    /* There is only one outstanding HTTP request on this connection. */
+    return i == len ? 0 : -1;
 }
 
 /* A read that only means "nothing yet" must not end the request. */
@@ -2294,6 +2378,11 @@ static int stream_send_body(tls_ctx_t *ctx, const vela_body_src_t *body,
             if ((size_t)got > target - used) { ret = VELA_TLS_ERR_OVERFLOW; goto out; }
             used += (size_t)got;
         }
+        if (g_req_dump && (sent > 0 || used > 0) &&
+            (g_req_dump >= 2 || sent == 0))
+          tls_dump_hex("sreqbody", piece,
+                       g_req_dump >= 2 ? used : (used < 96 ? used : 96));
+
         ret = stream_write_all(ctx, "body", piece, used, ctl);
         if (ret != 0) goto out;
         sent += used;
@@ -2322,6 +2411,7 @@ struct stream_outcome
     bool framing_complete;  /* Content-Length satisfied or zero chunk consumed */
     bool sink_early;        /* the sink reported completion before framing ended */
     bool got_response_byte; /* at least one response byte arrived */
+    bool response_close;
 };
 
 static int stream_exchange(
@@ -2438,8 +2528,6 @@ int vela_https_request_stream_voice(
     struct stream_outcome outcome;
     uint32_t t_http0 = agent_mono_ms();
     bool reused = false;
-    bool drain_ok = false;
-    bool need_drain = false;
     int ret;
 
     if (host == NULL || port == NULL || method == NULL || path == NULL) {
@@ -2520,13 +2608,7 @@ int vela_https_request_stream_voice(
         ctl, resp_buf, resp_cap, out_body_len, out_status, timing, true,
         &outcome, t_http0);
 
-    if (ret == 0 && outcome.sink_early && !outcome.framing_complete) {
-        need_drain = true;
-        drain_ok = voice_slot_drain(&slot->ctx, 2000, 65536);
-    }
-
-    if (voice_slot_keep(ret, outcome.framing_complete, outcome.sink_early,
-                        need_drain ? drain_ok : true)) {
+    if (voice_slot_keep(ret, outcome.framing_complete, outcome.response_close)) {
         voice_slot_release(host, port, true);
         return ret;
     }
@@ -2542,19 +2624,10 @@ int vela_https_request_stream_voice(
     slot->valid = false;
     voice_slot_release(host, port, false);
 
-    /* A reused connection that failed before any response byte gets one
-     * transparent retry on a fresh connection: the server most likely
-     * closed it between rounds, and ASR/TTS are idempotent POSTs.  A
-     * fresh connection that fails keeps today's no-retry behavior. */
-
-    if (reused && ret < 0 && !outcome.got_response_byte
-        && !vela_req_cancelled(ctl)) {
-        syslog(LOG_INFO, "[%s] voice_conn reuse_failed rc=%d retry=1\n",
-               TAG, ret);
-        return vela_https_request_stream(host, port, method, path, headers,
-            body, sink, ctl, resp_buf, resp_cap, out_body_len, out_status,
-            timing);
-    }
+    /* After exchange starts, a POST may already have reached the server
+     * and a streaming upload source may be exhausted. Do not silently
+     * replay it. Stale sockets detected before exchange reconnect above;
+     * an ambiguous failure is reported and the next request starts fresh. */
 
     return ret;
 }
@@ -2662,7 +2735,7 @@ static int stream_exchange(
     struct stream_outcome *outcome,
     uint32_t t_http0)
 {
-    struct vela_emit emit;
+    struct vela_emit emit = {0};
     struct vela_chunk_dec chunk;
     char *hdr = NULL;
     char tmp[8192];
@@ -2689,6 +2762,7 @@ static int stream_exchange(
     emit.cap = resp_cap;
     emit.len = 0;
     emit.truncated = false;
+    emit.drain_sink = keep_alive;
 
     last_progress = agent_mono_ms();
 
@@ -2732,6 +2806,9 @@ static int stream_exchange(
 
         SHDR("\r\n");
 #undef SHDR
+
+        if (g_req_dump)
+          tls_dump_head("sreq", hdr, (size_t)pos);
 
         ret = stream_write_all(ctx, "hdr", hdr, (size_t)pos, ctl);
     }
@@ -2846,6 +2923,8 @@ static int stream_exchange(
         goto out;
     }
 
+    if (out_status != NULL) *out_status = status;
+
     if (status != 200) {
         /* The raw response head says who rejected the request and why;
          * it carries no credentials.  Truncated on purpose. */
@@ -2858,6 +2937,17 @@ static int stream_exchange(
         char *cl;
         char *te;
         size_t initial = hdr_len - (size_t)(body_start - tmp);
+
+        char *connection = strcasestr(tmp, "\r\nConnection:");
+        if (connection != NULL && connection < body_start) {
+            char *line_end = strstr(connection + 2, "\r\n");
+            char *close_token = strcasestr(connection, "close");
+            outcome->response_close = close_token != NULL &&
+                                      close_token < line_end;
+        }
+        if (strncmp(tmp, "HTTP/1.0 ", 9) == 0) {
+            outcome->response_close = true;
+        }
 
         cl = strcasestr(tmp, "Content-Length:");
         if (cl != NULL && cl < body_start) {
@@ -2917,6 +3007,8 @@ static int stream_exchange(
 
     for (;;) {
         uint32_t now;
+        vela_req_ctl_t drain_ctl;
+        const vela_req_ctl_t *read_ctl = ctl;
 
         if (complete) {
             break;
@@ -2942,6 +3034,23 @@ static int stream_exchange(
 
         now = agent_mono_ms();
 
+        if (emit.sink_done &&
+            agent_elapsed_ms(emit.sink_done_at, now) >= 2000) {
+            ret = VELA_TLS_ERR_TIMEOUT;
+            goto out;
+        }
+        if (emit.sink_done) {
+            drain_ctl.cancel = ctl != NULL ? ctl->cancel : NULL;
+            drain_ctl.deadline_ms = now + 2000 -
+                (uint32_t)agent_elapsed_ms(emit.sink_done_at, now);
+            if (drain_ctl.deadline_ms == 0) drain_ctl.deadline_ms = 1;
+            int32_t left = vela_req_budget_ms(ctl, now);
+            if (left < 0 || left >
+                vela_req_budget_ms(&drain_ctl, now)) {
+                read_ctl = &drain_ctl;
+            }
+        }
+
         if (vela_req_cancelled(ctl)) {
             ret = VELA_TLS_ERR_CANCELLED;
             goto out;
@@ -2958,7 +3067,7 @@ static int stream_exchange(
             goto out;
         }
 
-        stream_set_timeout(ctx, vela_req_io_timeout_ms(ctl, now,
+        stream_set_timeout(ctx, vela_req_io_timeout_ms(read_ctl, now,
             VELA_REQ_IO_SLICE_MS));
 
         n = mbedtls_ssl_read(&ctx->ssl, (unsigned char *)tmp, sizeof(tmp));
@@ -3034,7 +3143,7 @@ static int stream_exchange(
 
         if (stream_read_retryable(n)) {
             ret = tls_wait_socket(ctx->net.fd,
-                n == MBEDTLS_ERR_SSL_WANT_WRITE ? POLLOUT : POLLIN, ctl);
+                n == MBEDTLS_ERR_SSL_WANT_WRITE ? POLLOUT : POLLIN, read_ctl);
             if (ret != 0) {
                 goto out;
             }
@@ -3069,6 +3178,7 @@ static int stream_exchange(
 
 out:
     free(hdr);
+    if (emit.sink_done) outcome->sink_early = true;
     stream_note_total(timing, t_http0);
     return ret;
 }

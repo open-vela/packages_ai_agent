@@ -8,14 +8,15 @@
  *
  * Covered: the keep-decision truth table, sequential reuse on one slot
  * (timing.reused, handshake phases NA), the keep-alive vs close request
- * headers, sink-early + bounded drain publishing, the one transparent
- * retry after a reused connection fails before any response byte, and
+ * headers, sink-early + bounded framing drain, suppression of automatic
+ * POST replay after a request has been sent, and
  * preconnect warming the slot. */
 
 #define CONFIG_AI_AGENT_VOICE_CONN_SLOT 1
 
 #include <assert.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include "../src/infra/vela_tls.c"
@@ -33,6 +34,23 @@ static size_t reqlog_n;
  * acquire-time liveness probe on a quiet connection reads WANT_READ
  * instead of eating the next response's status line. */
 static int request_seen;
+static int script_eof;
+static size_t read_limit;
+static char diagnostic_log[8192];
+static size_t diagnostic_len;
+
+void syslog(int priority, const char *format, ...)
+{
+    (void)priority;
+    va_list ap;
+    va_start(ap, format);
+    if (diagnostic_len < sizeof(diagnostic_log) - 1) {
+        size_t room = sizeof(diagnostic_log) - diagnostic_len;
+        int n = vsnprintf(diagnostic_log + diagnostic_len, room, format, ap);
+        if (n > 0) diagnostic_len += (size_t)n < room ? (size_t)n : room - 1;
+    }
+    va_end(ap);
+}
 
 int mbedtls_ssl_write(mbedtls_ssl_context *ssl, const unsigned char *data, size_t n)
 {
@@ -55,6 +73,7 @@ int mbedtls_ssl_read(mbedtls_ssl_context *ssl, unsigned char *buf, size_t n)
     (void)ssl;
     if (!request_seen || script_pos >= script_len)
     {
+        if (request_seen && script_eof) return 0;
         return MBEDTLS_ERR_SSL_WANT_READ;
     }
 
@@ -69,6 +88,7 @@ int mbedtls_ssl_read(mbedtls_ssl_context *ssl, unsigned char *buf, size_t n)
 
     take = script_len - script_pos;
     if (take > n) take = n;
+    if (read_limit != 0 && take > read_limit) take = read_limit;
     memcpy(buf, response_script + script_pos, take);
     script_pos += take;
     return (int)take;
@@ -138,6 +158,8 @@ static void script_response(const char *text)
     memcpy(response_script, text, script_len);
     script_pos = 0;
     request_seen = 0;
+    script_eof = 0;
+    read_limit = 0;
 }
 
 static void reqlog_reset(void)
@@ -167,14 +189,20 @@ int main(void)
     int status;
     int rc;
 
+    const char diagnostic_head[] =
+        "POST / HTTP/1.1\r\nAuthorization: Bearer not-a-real-secret\r\n"
+        "X-Test: \xe5\r\n\r\n";
+    tls_dump_head("test", diagnostic_head, sizeof(diagnostic_head) - 1);
+    assert(strstr(diagnostic_log, "not-a-real-secret") == NULL);
+    assert(strstr(diagnostic_log, "Bearer") == NULL);
+    assert(strstr(diagnostic_log, "\\xe5") != NULL);
+
     /* ── keep-decision truth table ─────────────────────────────── */
 
-    assert(voice_slot_keep(0, true, false, false));
-    assert(voice_slot_keep(0, true, true, false));
-    assert(voice_slot_keep(0, false, true, true));
-    assert(!voice_slot_keep(0, false, true, false));
-    assert(!voice_slot_keep(0, false, false, true));
-    assert(!voice_slot_keep(VELA_TLS_ERR_READ, true, true, true));
+    assert(voice_slot_keep(0, true, false));
+    assert(!voice_slot_keep(0, true, true));
+    assert(!voice_slot_keep(0, false, false));
+    assert(!voice_slot_keep(VELA_TLS_ERR_READ, true, false));
 
     /* ── first request: fresh connect, keep-alive header, published ── */
 
@@ -232,8 +260,7 @@ int main(void)
         &status, &t);
     assert(rc == 0 && t.reused && net_connect_calls == 1);
 
-    /* ── a reused connection failing before any response byte is
-     * retried once on a fresh connection ───────────────────────── */
+    /* ── a failure after sending a POST is reported without replay ── */
 
     fail_next_read = 1;
     script_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
@@ -242,12 +269,11 @@ int main(void)
     rc = vela_https_request_stream_voice("fixture.invalid", "443", "POST",
         "/v1/x", NULL, NULL, NULL, NULL, resp, sizeof(resp), &out_len,
         &status, &t);
-    assert(rc == 0 && strcmp(resp, "ok") == 0);
-    assert(net_connect_calls == 2);
-    /* the failed attempt asked keep-alive; the transparent retry rides
-     * the plain entry and closes */
+    assert(rc < 0 && !s_voice_slot.valid);
+    assert(net_connect_calls == 1);
+    /* A POST was already written: no replay of an ambiguous request. */
     assert(strstr(reqlog, "Connection: keep-alive") != NULL);
-    assert(strstr(reqlog, "Connection: close") != NULL);
+    assert(strstr(reqlog, "Connection: close") == NULL);
 
     /* ── preconnect warms the slot without a request ───────────── */
 
@@ -288,8 +314,52 @@ int main(void)
 
     vela_tls_pool_cleanup();
 
+    /* An application-level end marker is not an HTTP boundary.  A quiet
+     * socket after an early sink must not publish a truncated response. */
+    {
+        vela_resp_sink_t s = { .write = early_sink, .ctx = NULL };
+        script_response("HTTP/1.1 200 OK\r\n"
+                        "Transfer-Encoding: chunked\r\n\r\n"
+                        "5\r\nhello\r\n");
+        script_eof = 1;
+        rc = vela_https_request_stream_voice("fixture.invalid", "443", "POST",
+            "/v1/x", NULL, NULL, &s, NULL, resp, sizeof(resp), &out_len,
+            &status, &t);
+        assert(rc < 0 && !s_voice_slot.valid);
+
+        /* The zero chunk still needs its trailer terminator, even when
+         * it arrives in another TLS read. */
+        script_response("HTTP/1.1 200 OK\r\n"
+                        "Transfer-Encoding: chunked\r\n\r\n"
+                        "5\r\nhello\r\n0\r\n");
+        read_limit = 1;
+        script_eof = 1;
+        rc = vela_https_request_stream_voice("fixture.invalid", "443", "POST",
+            "/v1/x", NULL, NULL, &s, NULL, resp, sizeof(resp), &out_len,
+            &status, &t);
+        assert(rc < 0 && !s_voice_slot.valid);
+
+        script_response("HTTP/1.1 200 OK\r\n"
+                        "Transfer-Encoding: chunked\r\n\r\n"
+                        "5\r\nhello\r\n0\r\nX-End: yes\r\n\r\n");
+        read_limit = 1;
+        rc = vela_https_request_stream_voice("fixture.invalid", "443", "POST",
+            "/v1/x", NULL, NULL, &s, NULL, resp, sizeof(resp), &out_len,
+            &status, &t);
+        assert(rc == 0 && s_voice_slot.valid && script_pos == script_len);
+
+        script_response("HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                        "Content-Length: 2\r\n\r\nok");
+        rc = vela_https_request_stream_voice("fixture.invalid", "443", "POST",
+            "/v1/x", NULL, NULL, NULL, NULL, resp, sizeof(resp), &out_len,
+            &status, &t);
+        assert(rc == 0 && !s_voice_slot.valid);
+    }
+
+    vela_tls_pool_cleanup();
+
     puts("test_tls_voice_slot: OK (keep truth table, sequential reuse, "
-         "keep-alive/close headers, sink-early drain, one retry, "
+         "keep-alive/close headers, verified framing, no POST replay, "
          "preconnect, plain-entry isolation)");
     return 0;
 }

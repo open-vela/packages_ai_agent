@@ -212,6 +212,12 @@ int vela_https_head_date(const char *host, const char *port, const char *path,
  */
 void vela_tls_pool_cleanup(void);
 
+/**
+ * Diagnostic: dump the exact request bytes (credential header values
+ * masked) of every HTTPS request to syslog.  Default off.
+ */
+void vela_tls_set_req_dump(int on);
+
 #ifdef __cplusplus
 }
 #endif
