@@ -294,6 +294,22 @@ config AI_AGENT_TLS_CONN_POOL_SIZE
 		reuse. Each slot uses ~12KB BSS (TLS context + raw
 		buffer). Set to 1 on memory-constrained boards.
 
+config AI_AGENT_VOICE_CONN_SLOT
+	bool "Voice-dedicated keep-alive TLS slot (ASR/TTS)"
+	default n
+	---help---
+		P2 phase 1: the voice round's ASR and TTS requests (same
+		worker thread, same endpoint) reuse one connection slot
+		instead of a full DNS+TCP+TLS handshake per request.  The
+		slot is separate from the buffered pool above so background
+		requests cannot evict the foreground connection.  A slot is
+		only kept when the response framing completed (or a bounded
+		drain reached the boundary after the TTS sink's early
+		completion); errors, cancellations and truncations destroy
+		it.  A reused connection failing before any response byte
+		is retried once on a fresh connection.  LLM requests (agent
+		loop thread) keep the plain entry in this phase.
+
 config AI_AGENT_TLS_FORENSICS
 	bool "TLS handshake forensics capture (diagnostics only)"
 	default n

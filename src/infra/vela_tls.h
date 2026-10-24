@@ -139,6 +139,36 @@ int vela_https_request_stream(
     int              *out_status,
     agent_llm_timing_t *timing);
 
+/* Voice-dedicated keep-alive variant of the streaming entry.  Under
+ * CONFIG_AI_AGENT_VOICE_CONN_SLOT a single connection slot is reused
+ * sequentially by the voice round's ASR/TTS requests (same thread);
+ * every other caller keeps vela_https_request_stream.  A reused
+ * connection that fails before any response byte is retried once on a
+ * fresh connection.  Without the config this delegates to the plain
+ * entry byte-for-byte. */
+int vela_https_request_stream_voice(
+    const char       *host,
+    const char       *port,
+    const char       *method,
+    const char       *path,
+    const vela_header_t *headers,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    const vela_req_ctl_t *ctl,
+    char             *resp_buf,
+    size_t            resp_cap,
+    size_t           *out_body_len,
+    int              *out_status,
+    agent_llm_timing_t *timing);
+
+/* Warm the voice slot with a full DNS+TCP+TLS handshake while the user
+ * is still speaking, so the ASR right after the button release does
+ * not pay it.  No HTTP request is sent.  Without the config it is a
+ * no-op.  Returns 0 or a VELA_TLS_ERR_* connect error. */
+int vela_https_voice_preconnect(const char *host, const char *port,
+                                const vela_req_ctl_t *ctl,
+                                agent_llm_timing_t *timing);
+
 /**
  * Convenience wrapper for GET with no extra headers or body.
  */

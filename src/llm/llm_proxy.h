@@ -123,6 +123,15 @@ int llm_http_call_stream(const char *post_data,
     agent_llm_timing_t *timing,
     const vela_req_ctl_t *ctl);
 
+/* Same request through the voice-dedicated keep-alive slot. */
+int llm_http_call_stream_voice(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl);
+
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).
  *  mime_type: "image/jpeg", "image/png", etc. NULL defaults to "image/jpeg". */

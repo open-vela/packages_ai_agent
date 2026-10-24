@@ -173,6 +173,26 @@ int agent_http_post_stream_timed(const char *post_data,
     agent_llm_timing_t *timing,
     const vela_req_ctl_t *ctl);
 
+/* Voice-slot variant: same request shape, but the transport rides the
+ * voice-dedicated keep-alive connection when CONFIG_AI_AGENT_VOICE_CONN_SLOT
+ * is enabled (identical to agent_http_post_stream_timed otherwise).  Only
+ * the voice round's ASR/TTS should call this — it is the sole user of the
+ * slot. */
+int agent_http_post_stream_voice_timed(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl);
+
+/* Warm the voice connection slot with a full DNS+TCP+TLS handshake while
+ * the user is still speaking.  No HTTP request is sent; no-op without
+ * CONFIG_AI_AGENT_VOICE_CONN_SLOT.  Run it on its own thread with a real
+ * stack — the handshake needs the same depth as any other request. */
+int agent_http_voice_preconnect(const vela_req_ctl_t *ctl,
+                                agent_llm_timing_t *timing);
+
 /* Explicit transport diagnostic.  Sends a fixed invalid test credential,
  * never reads configured credentials, discards the response body, and never
  * changes the product endpoint.  Not registered as an Agent tool. */

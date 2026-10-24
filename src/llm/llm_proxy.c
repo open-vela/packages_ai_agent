@@ -651,33 +651,37 @@ static int llm_mem_body_read(void *ctx, char *buf, size_t cap)
     return (int)take;
 }
 
-int llm_http_call_stream(const char *post_data,
-    const vela_body_src_t *body,
-    const vela_resp_sink_t *sink,
-    char *resp_buf, size_t resp_cap,
-    size_t *out_body_len, int *out_status,
-    agent_llm_timing_t *timing,
-    const vela_req_ctl_t *ctl)
+/* Everything a streaming request needs from the llm configuration:
+ * endpoint snapshot, auth/provider headers and the wrapped body source.
+ * Shared by the plain and the voice-slot entries so their requests are
+ * identical apart from the transport. */
+struct llm_stream_req
 {
-    char api_key[128];
     char llm_host[128];
-    char llm_path[128];
     char llm_port[8];
-    char model[64];
+    char llm_path[128];
     char auth_header[256];
-    char provider[64] = { 0 };
+    char provider[64];
     vela_header_t hdrs[4];
     struct llm_mem_body mem;
     vela_body_src_t mem_src;
-    const vela_body_src_t *src = body;
+    const vela_body_src_t *src;
+};
+
+static int llm_stream_prepare(struct llm_stream_req *r,
+                              const char *post_data,
+                              const vela_body_src_t *body)
+{
+    char api_key[128];
+    char model[64];
     const char *slash;
     int n = 0;
 
     pthread_mutex_lock(&s_llm_lock);
     memcpy(api_key, s_api_key, sizeof(api_key));
-    memcpy(llm_host, s_llm_host, sizeof(llm_host));
-    memcpy(llm_path, s_llm_path, sizeof(llm_path));
-    memcpy(llm_port, s_llm_port, sizeof(llm_port));
+    memcpy(r->llm_host, s_llm_host, sizeof(r->llm_host));
+    memcpy(r->llm_path, s_llm_path, sizeof(r->llm_path));
+    memcpy(r->llm_port, s_llm_port, sizeof(r->llm_port));
     memcpy(model, s_model, sizeof(model));
     pthread_mutex_unlock(&s_llm_lock);
 
@@ -689,47 +693,84 @@ int llm_http_call_stream(const char *post_data,
     /* The voice path is HTTPS only.  A plain-HTTP endpoint would need a
      * second streaming implementation, and there is no such endpoint. */
 
-    if (strcmp(llm_port, "443") != 0) {
+    if (strcmp(r->llm_port, "443") != 0) {
         syslog(LOG_ERR, "[%s] streaming request requires port 443\n", TAG);
         return ERROR;
     }
 
-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", api_key);
+    snprintf(r->auth_header, sizeof(r->auth_header), "Bearer %s", api_key);
 
     slash = strchr(model, '/');
     if (slash != NULL) {
         size_t plen = (size_t)(slash - model);
 
-        if (plen >= sizeof(provider)) {
-            plen = sizeof(provider) - 1;
+        if (plen >= sizeof(r->provider)) {
+            plen = sizeof(r->provider) - 1;
         }
 
-        memcpy(provider, model, plen);
+        memcpy(r->provider, model, plen);
     }
 
-    hdrs[n++] = (vela_header_t) { "Content-Type", "application/json" };
-    hdrs[n++] = (vela_header_t) { "Authorization", auth_header };
+    r->hdrs[n++] = (vela_header_t) { "Content-Type", "application/json" };
+    r->hdrs[n++] = (vela_header_t) { "Authorization", r->auth_header };
 
-    if (provider[0] != '\0') {
-        hdrs[n++] = (vela_header_t) { "X-Model-Provider-Id", provider };
+    if (r->provider[0] != '\0') {
+        r->hdrs[n++] = (vela_header_t) { "X-Model-Provider-Id", r->provider };
     }
 
-    hdrs[n] = (vela_header_t) { NULL, NULL };
+    r->hdrs[n] = (vela_header_t) { NULL, NULL };
 
-    if (src == NULL && post_data != NULL && post_data[0] != '\0') {
-        mem.p = post_data;
-        mem.len = strlen(post_data);
-        mem.off = 0;
+    r->src = body;
+    if (r->src == NULL && post_data != NULL && post_data[0] != '\0') {
+        r->mem.p = post_data;
+        r->mem.len = strlen(post_data);
+        r->mem.off = 0;
 
-        mem_src.len = mem.len;
-        mem_src.read = llm_mem_body_read;
-        mem_src.ctx = &mem;
-        src = &mem_src;
+        r->mem_src.len = r->mem.len;
+        r->mem_src.read = llm_mem_body_read;
+        r->mem_src.ctx = &r->mem;
+        r->src = &r->mem_src;
     }
 
-    return vela_https_request_stream(llm_host, llm_port, "POST", llm_path,
-        hdrs, src, sink, ctl, resp_buf, resp_cap, out_body_len, out_status,
-        timing);
+    return OK;
+}
+
+int llm_http_call_stream(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    struct llm_stream_req r;
+
+    if (llm_stream_prepare(&r, post_data, body) != OK) {
+        return ERROR;
+    }
+
+    return vela_https_request_stream(r.llm_host, r.llm_port, "POST",
+        r.llm_path, r.hdrs, r.src, sink, ctl, resp_buf, resp_cap,
+        out_body_len, out_status, timing);
+}
+
+int llm_http_call_stream_voice(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    struct llm_stream_req r;
+
+    if (llm_stream_prepare(&r, post_data, body) != OK) {
+        return ERROR;
+    }
+
+    return vela_https_request_stream_voice(r.llm_host, r.llm_port, "POST",
+        r.llm_path, r.hdrs, r.src, sink, ctl, resp_buf, resp_cap,
+        out_body_len, out_status, timing);
 }
 
 int agent_http_post_stream(const char *post_data,
@@ -753,6 +794,30 @@ int agent_http_post_stream_timed(const char *post_data,
 {
     return llm_http_call_stream(post_data, body, sink, resp_buf, resp_cap,
         out_body_len, out_status, timing, ctl);
+}
+
+int agent_http_post_stream_voice_timed(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    return llm_http_call_stream_voice(post_data, body, sink, resp_buf,
+        resp_cap, out_body_len, out_status, timing, ctl);
+}
+
+int agent_http_voice_preconnect(const vela_req_ctl_t *ctl,
+                                agent_llm_timing_t *timing)
+{
+    struct llm_stream_req r;
+
+    if (llm_stream_prepare(&r, NULL, NULL) != OK) {
+        return ERROR;
+    }
+
+    return vela_https_voice_preconnect(r.llm_host, r.llm_port, ctl, timing);
 }
 
 int agent_http_probe_post_stream(const char *host, const char *port,

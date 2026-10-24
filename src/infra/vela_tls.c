@@ -271,6 +271,144 @@ static void pool_release(conn_slot_t* s, const char* host, const char* port, boo
 
 static void tls_voice_session_clear(void);
 
+#ifdef CONFIG_AI_AGENT_VOICE_CONN_SLOT
+
+/* ── voice-dedicated keep-alive slot (P2 phase 1) ──────────────────
+ *
+ * ASR and TTS run on the voice round thread against the same endpoint,
+ * so one connection slot reused sequentially removes the per-request
+ * DNS+TCP+TLS handshake (1-2.5 s on this board).  The slot is separate
+ * from s_pool: the buffered pool serves background callers and mixing
+ * them would let a background request evict the foreground connection
+ * mid-round.  LLM requests (agent loop thread) keep the plain entry in
+ * this phase — cross-thread handoff is a separate change.
+ *
+ * Publishing rules: a connection may be kept only when the response
+ * framing completed (Content-Length satisfied or the terminating zero
+ * chunk consumed).  A sink that reported completion early — the TTS
+ * sink returns 1 on [DONE] — leaves the terminator unread and needs a
+ * bounded drain first.  Anything else (error, cancellation, EOF-
+ * delimited body, failed drain) destroys the connection. */
+
+static conn_slot_t s_voice_slot;
+static pthread_mutex_t s_voice_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Returns the slot marked in_use, or NULL when it is busy (e.g. a
+ * preconnect is still running) — the caller then goes ephemeral.  A
+ * valid slot for a different target is worthless and freed. */
+static conn_slot_t* voice_slot_try_acquire(const char* host, const char* port)
+{
+    pthread_mutex_lock(&s_voice_slot_lock);
+
+    if (s_voice_slot.in_use) {
+        pthread_mutex_unlock(&s_voice_slot_lock);
+        return NULL;
+    }
+
+    if (s_voice_slot.valid
+        && (strcmp(s_voice_slot.host, host) != 0
+            || strcmp(s_voice_slot.port, port) != 0)) {
+        tls_ctx_free(&s_voice_slot.ctx);
+        s_voice_slot.valid = false;
+        s_voice_slot.host[0] = '\0';
+    }
+
+    s_voice_slot.in_use = true;
+    pthread_mutex_unlock(&s_voice_slot_lock);
+    return &s_voice_slot;
+}
+
+/* The caller has already freed the ctx when keep is false. */
+static void voice_slot_release(const char* host, const char* port, bool keep)
+{
+    pthread_mutex_lock(&s_voice_slot_lock);
+    if (keep) {
+        strncpy(s_voice_slot.host, host, sizeof(s_voice_slot.host) - 1);
+        strncpy(s_voice_slot.port, port, sizeof(s_voice_slot.port) - 1);
+        s_voice_slot.valid = true;
+    } else {
+        s_voice_slot.valid = false;
+        s_voice_slot.host[0] = '\0';
+    }
+    s_voice_slot.in_use = false;
+    pthread_mutex_unlock(&s_voice_slot_lock);
+}
+
+/* One short read to decide whether a kept connection is still alive:
+ * WANT_READ/WANT_WRITE (the 10 ms socket timeout) means quiet and
+ * alive; 0 or PEER_CLOSE_NOTIFY means the server closed it; payload
+ * bytes mean the previous round's bookkeeping was wrong — destroy
+ * rather than guess. */
+static bool voice_slot_alive(tls_ctx_t* ctx)
+{
+    unsigned char probe[64];
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 };
+    int n;
+
+    if (ctx->net.fd < 0) {
+        return false;
+    }
+
+    setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    n = mbedtls_ssl_read(&ctx->ssl, probe, sizeof(probe));
+
+    return n == MBEDTLS_ERR_SSL_WANT_READ
+        || n == MBEDTLS_ERR_SSL_WANT_WRITE
+        || n == MBEDTLS_ERR_SSL_TIMEOUT;
+}
+
+/* Discard whatever the sink stopped reading (the final chunked
+ * terminator after the TTS sink's early completion) so the next
+ * request starts at a response boundary.  Bounded: more leftover than
+ * this is a protocol problem, not a tail. */
+static bool voice_slot_drain(tls_ctx_t* ctx, uint32_t budget_ms,
+                             size_t cap_bytes)
+{
+    unsigned char drain[512];
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 };
+    uint32_t t0 = agent_mono_ms();
+    size_t total = 0;
+    int n;
+
+    setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    for (;;) {
+        n = mbedtls_ssl_read(&ctx->ssl, drain, sizeof(drain));
+        if (n > 0) {
+            total += (size_t)n;
+            if (total > cap_bytes
+                || (uint32_t)(agent_mono_ms() - t0) > budget_ms) {
+                return false;
+            }
+            continue;
+        }
+
+        return n == MBEDTLS_ERR_SSL_WANT_READ
+            || n == MBEDTLS_ERR_SSL_WANT_WRITE
+            || n == MBEDTLS_ERR_SSL_TIMEOUT;
+    }
+}
+
+/* Pure keep-decision so the unit tests can drive the truth table
+ * without sockets.  A kept connection needs the exchange to have
+ * succeeded AND its framing to be complete (a sink that stopped early
+ * only qualifies once the drain reached the boundary). */
+static bool voice_slot_keep(int ret, bool framing_complete, bool sink_early,
+                            bool drain_ok)
+{
+    if (ret != 0) {
+        return false;
+    }
+
+    if (framing_complete) {
+        return true;
+    }
+
+    return sink_early && drain_ok;
+}
+
+#endif /* CONFIG_AI_AGENT_VOICE_CONN_SLOT */
+
 void vela_tls_pool_cleanup(void)
 {
     tls_voice_session_clear();
@@ -288,6 +426,19 @@ void vela_tls_pool_cleanup(void)
         s_pool[i].host[0] = '\0';
     }
     pthread_mutex_unlock(&s_pool_lock);
+
+#ifdef CONFIG_AI_AGENT_VOICE_CONN_SLOT
+    pthread_mutex_lock(&s_voice_slot_lock);
+    if (s_voice_slot.in_use) {
+        syslog(LOG_WARNING,
+            "[vela_tls] Voice slot still in use at shutdown, skipping\n");
+    } else if (s_voice_slot.valid) {
+        tls_ctx_free(&s_voice_slot.ctx);
+        s_voice_slot.valid = false;
+        s_voice_slot.host[0] = '\0';
+    }
+    pthread_mutex_unlock(&s_voice_slot_lock);
+#endif
 }
 
 /* Timing is optional so the other callers (Feishu, vision, web search) keep
@@ -2160,6 +2311,34 @@ static void stream_note_total(agent_llm_timing_t *timing, uint32_t t0)
     }
 }
 
+/* Outcome flags the caller of stream_exchange needs to decide whether
+ * the connection may serve another request. */
+struct stream_outcome
+{
+    bool framing_complete;  /* Content-Length satisfied or zero chunk consumed */
+    bool sink_early;        /* the sink reported completion before framing ended */
+    bool got_response_byte; /* at least one response byte arrived */
+};
+
+static int stream_exchange(
+    tls_ctx_t *ctx,
+    const char *host,
+    const char *method,
+    const char *path,
+    const vela_header_t *headers,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    const vela_req_ctl_t *ctl,
+    char *resp_buf,
+    size_t resp_cap,
+    size_t *out_body_len,
+    int *out_status,
+    agent_llm_timing_t *timing,
+    bool keep_alive,
+    struct stream_outcome *outcome,
+    uint32_t t_http0);
+
+
 int vela_https_request_stream(
     const char *host,
     const char *port,
@@ -2176,25 +2355,9 @@ int vela_https_request_stream(
     agent_llm_timing_t *timing)
 {
     tls_ctx_t ctx;
-    struct vela_emit emit;
-    struct vela_chunk_dec chunk;
-    char *hdr = NULL;
-    char tmp[8192];
-    size_t hdr_len = 0;
-    size_t body_got = 0;
-    long content_length = -1;
-    bool chunked = false;
-    bool header_done = false;
-    bool eof = false;
-    bool complete = false;
-    uint32_t mark;
-    uint32_t last_progress;
+    struct stream_outcome outcome;
     uint32_t t_http0 = agent_mono_ms();
-    uint32_t t_first_byte = 0;
-    bool ttfb_seen = false;
-    int status = 0;
-    int ret = 0;
-    int n;
+    int ret;
 
     if (host == NULL || port == NULL || method == NULL || path == NULL) {
         stream_note_total(timing, t_http0);
@@ -2219,13 +2382,6 @@ int vela_https_request_stream(
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.abort_on_close = ctl != NULL;
-    memset(&chunk, 0, sizeof(chunk));
-
-    emit.sink = sink;
-    emit.buf = resp_buf;
-    emit.cap = resp_cap;
-    emit.len = 0;
-    emit.truncated = false;
 
     if (vela_req_cancelled(ctl)) {
         stream_note_total(timing, t_http0);
@@ -2237,14 +2393,296 @@ int vela_https_request_stream(
         return VELA_TLS_ERR_TIMEOUT;
     }
 
-    last_progress = agent_mono_ms();
-
     ret = tls_ctx_connect(&ctx, host, port, timing, ctl);
     if (ret != 0) {
         tls_ctx_free(&ctx);
         stream_note_total(timing, t_http0);
         return ret;
     }
+
+    ret = stream_exchange(&ctx, host, method, path, headers, body, sink, ctl,
+        resp_buf, resp_cap, out_body_len, out_status, timing, false,
+        &outcome, t_http0);
+
+    /* Reclaim before returning, on every path.  A cancelled request must not
+     * leave a socket, a TLS context or a partially read record behind: the
+     * next request has to be able to start immediately. */
+
+    ctx.abort_on_close = ctl != NULL && ret < 0;
+    tls_ctx_free(&ctx);
+    return ret;
+}
+
+#ifdef CONFIG_AI_AGENT_VOICE_CONN_SLOT
+
+int vela_https_request_stream_voice(
+    const char *host,
+    const char *port,
+    const char *method,
+    const char *path,
+    const vela_header_t *headers,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    const vela_req_ctl_t *ctl,
+    char *resp_buf,
+    size_t resp_cap,
+    size_t *out_body_len,
+    int *out_status,
+    agent_llm_timing_t *timing)
+{
+    conn_slot_t *slot;
+    struct stream_outcome outcome;
+    uint32_t t_http0 = agent_mono_ms();
+    bool reused = false;
+    bool drain_ok = false;
+    bool need_drain = false;
+    int ret;
+
+    if (host == NULL || port == NULL || method == NULL || path == NULL) {
+        stream_note_total(timing, t_http0);
+        return VELA_TLS_ERR_CONNECT;
+    }
+
+    if (timing != NULL) {
+        timing->streamed = true;
+    }
+
+    if (out_body_len != NULL) {
+        *out_body_len = 0;
+    }
+
+    if (out_status != NULL) {
+        *out_status = 0;
+    }
+
+    if (resp_buf != NULL && resp_cap > 0) {
+        resp_buf[0] = '\0';
+    }
+
+    if (vela_req_cancelled(ctl)) {
+        stream_note_total(timing, t_http0);
+        return VELA_TLS_ERR_CANCELLED;
+    }
+
+    if (vela_req_budget_ms(ctl, agent_mono_ms()) == 0) {
+        stream_note_total(timing, t_http0);
+        return VELA_TLS_ERR_TIMEOUT;
+    }
+
+    slot = voice_slot_try_acquire(host, port);
+    if (slot == NULL) {
+        /* Busy — a preconnect is still filling it.  A plain ephemeral
+         * request keeps the round moving; the slot serves the next one. */
+
+        return vela_https_request_stream(host, port, method, path, headers,
+            body, sink, ctl, resp_buf, resp_cap, out_body_len, out_status,
+            timing);
+    }
+
+    if (slot->valid && !voice_slot_alive(&slot->ctx)) {
+        syslog(LOG_INFO, "[%s] voice_conn stale, reconnecting\n", TAG);
+        tls_ctx_free(&slot->ctx);
+        slot->valid = false;
+    }
+
+    if (slot->valid) {
+        reused = true;
+    } else {
+        memset(&slot->ctx, 0, sizeof(slot->ctx));
+        slot->ctx.abort_on_close = ctl != NULL;
+
+        ret = tls_ctx_connect(&slot->ctx, host, port, timing, ctl);
+        if (ret != 0) {
+            tls_ctx_free(&slot->ctx);
+            voice_slot_release(host, port, false);
+            stream_note_total(timing, t_http0);
+            return ret;
+        }
+    }
+
+    if (timing != NULL) {
+        timing->reused = reused;
+        if (reused) {
+            /* No handshake ran: the phases stay NA so the log shows what
+             * actually executed, and reused=1 marks the hit. */
+
+            timing->dns_tcp_ms = AGENT_T_NA;
+            timing->tls_setup_ms = AGENT_T_NA;
+            timing->tls_ms = AGENT_T_NA;
+        }
+    }
+
+    ret = stream_exchange(&slot->ctx, host, method, path, headers, body, sink,
+        ctl, resp_buf, resp_cap, out_body_len, out_status, timing, true,
+        &outcome, t_http0);
+
+    if (ret == 0 && outcome.sink_early && !outcome.framing_complete) {
+        need_drain = true;
+        drain_ok = voice_slot_drain(&slot->ctx, 2000, 65536);
+    }
+
+    if (voice_slot_keep(ret, outcome.framing_complete, outcome.sink_early,
+                        need_drain ? drain_ok : true)) {
+        voice_slot_release(host, port, true);
+        return ret;
+    }
+
+    /* Everything else destroys the connection; an aborted request
+     * resets (RST) exactly like the plain entry. */
+
+    syslog(LOG_INFO, "[%s] voice_conn drop rc=%d framing=%d sink_early=%d\n",
+           TAG, ret, outcome.framing_complete ? 1 : 0,
+           outcome.sink_early ? 1 : 0);
+    slot->ctx.abort_on_close = ctl != NULL && ret < 0;
+    tls_ctx_free(&slot->ctx);
+    slot->valid = false;
+    voice_slot_release(host, port, false);
+
+    /* A reused connection that failed before any response byte gets one
+     * transparent retry on a fresh connection: the server most likely
+     * closed it between rounds, and ASR/TTS are idempotent POSTs.  A
+     * fresh connection that fails keeps today's no-retry behavior. */
+
+    if (reused && ret < 0 && !outcome.got_response_byte
+        && !vela_req_cancelled(ctl)) {
+        syslog(LOG_INFO, "[%s] voice_conn reuse_failed rc=%d retry=1\n",
+               TAG, ret);
+        return vela_https_request_stream(host, port, method, path, headers,
+            body, sink, ctl, resp_buf, resp_cap, out_body_len, out_status,
+            timing);
+    }
+
+    return ret;
+}
+
+int vela_https_voice_preconnect(const char *host, const char *port,
+                                const vela_req_ctl_t *ctl,
+                                agent_llm_timing_t *timing)
+{
+    conn_slot_t *slot;
+    uint32_t t0;
+
+    if (host == NULL || port == NULL) {
+        return VELA_TLS_ERR_CONNECT;
+    }
+
+    slot = voice_slot_try_acquire(host, port);
+    if (slot == NULL) {
+        return 0;   /* already warming, or a request owns it */
+    }
+
+    if (slot->valid) {
+        if (voice_slot_alive(&slot->ctx)) {
+            voice_slot_release(host, port, true);
+            return 0;   /* already warm */
+        }
+
+        tls_ctx_free(&slot->ctx);
+        slot->valid = false;
+    }
+
+    t0 = agent_mono_ms();
+    memset(&slot->ctx, 0, sizeof(slot->ctx));
+
+    if (tls_ctx_connect(&slot->ctx, host, port, timing, ctl) != 0) {
+        tls_ctx_free(&slot->ctx);
+        voice_slot_release(host, port, false);
+        return VELA_TLS_ERR_CONNECT;
+    }
+
+    syslog(LOG_INFO, "[%s] voice_preconnect %s:%s ms=%u\n", TAG, host, port,
+           (unsigned)(agent_mono_ms() - t0));
+    voice_slot_release(host, port, true);
+    return 0;
+}
+
+#else /* !CONFIG_AI_AGENT_VOICE_CONN_SLOT */
+
+int vela_https_request_stream_voice(
+    const char *host,
+    const char *port,
+    const char *method,
+    const char *path,
+    const vela_header_t *headers,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    const vela_req_ctl_t *ctl,
+    char *resp_buf,
+    size_t resp_cap,
+    size_t *out_body_len,
+    int *out_status,
+    agent_llm_timing_t *timing)
+{
+    return vela_https_request_stream(host, port, method, path, headers, body,
+        sink, ctl, resp_buf, resp_cap, out_body_len, out_status, timing);
+}
+
+int vela_https_voice_preconnect(const char *host, const char *port,
+                                const vela_req_ctl_t *ctl,
+                                agent_llm_timing_t *timing)
+{
+    (void)host;
+    (void)port;
+    (void)ctl;
+    (void)timing;
+    return 0;
+}
+
+#endif /* CONFIG_AI_AGENT_VOICE_CONN_SLOT */
+
+/* One HTTP request/response over an already connected ctx.  The ctx is
+ * owned by the caller and never freed here; on return the caller closes
+ * it or, when keep_alive was requested and the outcome allows, keeps it
+ * for the next exchange.  Header build, send with per-slice timeouts,
+ * response parsing and framing detection are the original stream path
+ * unchanged. */
+static int stream_exchange(
+    tls_ctx_t *ctx,
+    const char *host,
+    const char *method,
+    const char *path,
+    const vela_header_t *headers,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    const vela_req_ctl_t *ctl,
+    char *resp_buf,
+    size_t resp_cap,
+    size_t *out_body_len,
+    int *out_status,
+    agent_llm_timing_t *timing,
+    bool keep_alive,
+    struct stream_outcome *outcome,
+    uint32_t t_http0)
+{
+    struct vela_emit emit;
+    struct vela_chunk_dec chunk;
+    char *hdr = NULL;
+    char tmp[8192];
+    size_t hdr_len = 0;
+    size_t body_got = 0;
+    long content_length = -1;
+    bool chunked = false;
+    bool header_done = false;
+    bool eof = false;
+    bool complete = false;
+    uint32_t mark;
+    uint32_t last_progress;
+    uint32_t t_first_byte = 0;
+    bool ttfb_seen = false;
+    int status = 0;
+    int ret = 0;
+    int n;
+
+    memset(&chunk, 0, sizeof(chunk));
+    memset(outcome, 0, sizeof(*outcome));
+
+    emit.sink = sink;
+    emit.buf = resp_buf;
+    emit.cap = resp_cap;
+    emit.len = 0;
+    emit.truncated = false;
+
+    last_progress = agent_mono_ms();
 
     mark = agent_mono_ms();
 
@@ -2253,9 +2691,8 @@ int vela_https_request_stream(
 
     hdr = malloc(4096);
     if (hdr == NULL) {
-        tls_ctx_free(&ctx);
-        stream_note_total(timing, t_http0);
-        return VELA_TLS_ERR_OVERFLOW;
+        ret = VELA_TLS_ERR_OVERFLOW;
+        goto out;
     }
 
     {
@@ -2265,16 +2702,14 @@ int vela_https_request_stream(
     do {                                                        \
         pos += snprintf(hdr + pos, 4096 - pos, fmt, ##__VA_ARGS__); \
         if (pos >= 4096) {                                      \
-            free(hdr);                                          \
-            tls_ctx_free(&ctx);                                 \
-            stream_note_total(timing, t_http0);                 \
-            return VELA_TLS_ERR_OVERFLOW;                       \
+            ret = VELA_TLS_ERR_OVERFLOW;                        \
+            goto out;                                           \
         }                                                       \
     } while (0)
 
         SHDR("%s %s HTTP/1.1\r\n", method, path);
         SHDR("Host: %s\r\n", host);
-        SHDR("Connection: close\r\n");
+        SHDR("Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
         SHDR("User-Agent: agent-vela/1.0\r\n");
 
         if (body != NULL && body->len > 0) {
@@ -2290,7 +2725,7 @@ int vela_https_request_stream(
         SHDR("\r\n");
 #undef SHDR
 
-        ret = stream_write_all(&ctx, "hdr", hdr, (size_t)pos, ctl);
+        ret = stream_write_all(ctx, "hdr", hdr, (size_t)pos, ctl);
     }
 
     free(hdr);
@@ -2302,19 +2737,15 @@ int vela_https_request_stream(
         if (timing != NULL) {
             timing->send_ms = agent_lap_ms(&mark);
         }
-        tls_ctx_free(&ctx);
-        stream_note_total(timing, t_http0);
-        return ret;
+        goto out;
     }
 
-    ret = stream_send_body(&ctx, body, ctl);
+    ret = stream_send_body(ctx, body, ctl);
     if (ret != 0) {
         if (timing != NULL) {
             timing->send_ms = agent_lap_ms(&mark);
         }
-        tls_ctx_free(&ctx);
-        stream_note_total(timing, t_http0);
-        return ret;
+        goto out;
     }
 
     /* send covers headers and body, the same contract as the buffered
@@ -2347,10 +2778,10 @@ int vela_https_request_stream(
             goto out;
         }
 
-        stream_set_timeout(&ctx, vela_req_io_timeout_ms(ctl, now,
+        stream_set_timeout(ctx, vela_req_io_timeout_ms(ctl, now,
             VELA_REQ_IO_SLICE_MS));
 
-        n = mbedtls_ssl_read(&ctx.ssl, (unsigned char *)tmp + hdr_len,
+        n = mbedtls_ssl_read(&ctx->ssl, (unsigned char *)tmp + hdr_len,
             sizeof(tmp) - 1 - hdr_len);
 
         if (n > 0) {
@@ -2360,6 +2791,7 @@ int vela_https_request_stream(
                  * separately.  Kept on later error paths: a reply that
                  * arrived and then broke has still paid its ttfb. */
                 ttfb_seen = true;
+                outcome->got_response_byte = true;
                 t_first_byte = agent_mono_ms();
                 if (timing != NULL) {
                     timing->ttfb_ms = agent_elapsed_ms(mark, t_first_byte);
@@ -2382,7 +2814,7 @@ int vela_https_request_stream(
         }
 
         if (stream_read_retryable(n)) {
-            ret = tls_wait_socket(ctx.net.fd,
+            ret = tls_wait_socket(ctx->net.fd,
                 n == MBEDTLS_ERR_SSL_WANT_WRITE ? POLLOUT : POLLIN, ctl);
             if (ret != 0) {
                 goto out;
@@ -2432,8 +2864,13 @@ int vela_https_request_stream(
                     ret = VELA_TLS_ERR_SINK;
                     goto out;
                 }
-                if (cf_rc > 0 || chunk.state == VELA_CHUNK_DONE) {
+                if (cf_rc > 0) {
                     complete = true;
+                    outcome->sink_early = true;
+                }
+                if (chunk.state == VELA_CHUNK_DONE) {
+                    complete = true;
+                    outcome->framing_complete = true;
                 }
             } else {
                 size_t take = initial;
@@ -2449,9 +2886,14 @@ int vela_https_request_stream(
                 }
                 if (emit_rc > 0) {
                     complete = true;
+                    outcome->sink_early = true;
                 }
 
                 body_got = take;
+                if (content_length >= 0 && body_got >= (size_t)content_length) {
+                    complete = true;
+                    outcome->framing_complete = true;
+                }
             }
         }
     }
@@ -2467,8 +2909,14 @@ int vela_https_request_stream(
 
         if (chunked) {
             complete = (chunk.state == VELA_CHUNK_DONE);
+            if (complete) {
+                outcome->framing_complete = true;
+            }
         } else if (content_length >= 0) {
             complete = (body_got >= (size_t)content_length);
+            if (complete) {
+                outcome->framing_complete = true;
+            }
         } else {
             complete = eof;
         }
@@ -2495,10 +2943,10 @@ int vela_https_request_stream(
             goto out;
         }
 
-        stream_set_timeout(&ctx, vela_req_io_timeout_ms(ctl, now,
+        stream_set_timeout(ctx, vela_req_io_timeout_ms(ctl, now,
             VELA_REQ_IO_SLICE_MS));
 
-        n = mbedtls_ssl_read(&ctx.ssl, (unsigned char *)tmp, sizeof(tmp));
+        n = mbedtls_ssl_read(&ctx->ssl, (unsigned char *)tmp, sizeof(tmp));
 
         if (n > 0) {
             last_progress = agent_mono_ms();
@@ -2509,7 +2957,12 @@ int vela_https_request_stream(
                     ret = VELA_TLS_ERR_SINK;
                     goto out;
                 }
-                if (cf_rc > 0 || chunk.state == VELA_CHUNK_DONE) {
+                if (cf_rc > 0) {
+                    outcome->sink_early = true;
+                    break;
+                }
+                if (chunk.state == VELA_CHUNK_DONE) {
+                    outcome->framing_complete = true;
                     break;
                 }
             } else {
@@ -2526,10 +2979,16 @@ int vela_https_request_stream(
                     goto out;
                 }
                 if (emit_rc > 0) {
+                    outcome->sink_early = true;
                     break;
                 }
 
                 body_got += take;
+                if (content_length >= 0
+                    && body_got >= (size_t)content_length) {
+                    outcome->framing_complete = true;
+                    break;
+                }
             }
 
             continue;
@@ -2559,7 +3018,7 @@ int vela_https_request_stream(
         }
 
         if (stream_read_retryable(n)) {
-            ret = tls_wait_socket(ctx.net.fd,
+            ret = tls_wait_socket(ctx->net.fd,
                 n == MBEDTLS_ERR_SSL_WANT_WRITE ? POLLOUT : POLLIN, ctl);
             if (ret != 0) {
                 goto out;
@@ -2594,13 +3053,8 @@ int vela_https_request_stream(
     }
 
 out:
+    free(hdr);
     stream_note_total(timing, t_http0);
-    ctx.abort_on_close = ctl != NULL && ret < 0;
-    /* Reclaim before returning, on every path.  A cancelled request must not
-     * leave a socket, a TLS context or a partially read record behind: the
-     * next request has to be able to start immediately. */
-
-    tls_ctx_free(&ctx);
     return ret;
 }
 
