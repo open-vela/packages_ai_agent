@@ -779,7 +779,11 @@ static bool frn_begin(void)
 {
     pthread_mutex_lock(&s_frn_lock);
     if (s_frn.state != 0) {
-        /* Already capturing another handshake or previously disabled. */
+        if (s_frn.state == 1) {
+            syslog(LOG_WARNING,
+                "[%s] forensics: capture slot busy, handshake proceeds uncaptured\n",
+                TAG);
+        }
         pthread_mutex_unlock(&s_frn_lock);
         return false;
     }
