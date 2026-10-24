@@ -294,6 +294,37 @@ config AI_AGENT_TLS_CONN_POOL_SIZE
 		reuse. Each slot uses ~12KB BSS (TLS context + raw
 		buffer). Set to 1 on memory-constrained boards.
 
+config AI_AGENT_TLS_FORENSICS
+	bool "TLS handshake forensics capture (diagnostics only)"
+	default n
+	---help---
+		Capture the handshake BIO byte stream into two independent
+		copies plus one send copy and, when the handshake fails with
+		a crypto error, dump the peer certificate, the failing
+		handshake message, the randoms and buffer addresses to
+		/data/forensics/tls-<n>/. Root-cause instrumentation for the
+		intermittent RSA verify / ASN.1 parse failures; never enable
+		in production images.
+
+config AI_AGENT_TLS_POOL
+	bool "Dedicated static mbedTLS allocation pool (diagnostics only)"
+	default n
+	select MBEDTLS_PLATFORM_MEMORY
+	---help---
+		Route every mbedTLS allocation through a dedicated static
+		first-fit pool with canaries instead of the general heap, so
+		TLS data lives outside the SDRAM heap region. A/B experiment
+		for locating the handshake corruption; never enable in
+		production images.
+
+config AI_AGENT_TLS_POOL_SIZE
+	int "TLS pool arena size in bytes"
+	default 102400
+	depends on AI_AGENT_TLS_POOL
+	---help---
+		Static arena size. Two concurrent TLS connections with 16 KB
+		content buffers plus certificate chains need roughly 84 KB.
+
 config AI_AGENT_BLE_GATT
 	bool "Enable BLE GATT data channel"
 	default n

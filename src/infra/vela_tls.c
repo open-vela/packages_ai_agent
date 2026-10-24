@@ -52,6 +52,15 @@
 #include <poll.h>
 #include <time.h>
 
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+#include <sys/stat.h>
+#include "mbedtls/md.h"
+#include "mbedtls/x509_crt.h"
+#endif
+#ifdef CONFIG_AI_AGENT_TLS_POOL
+#include "mbedtls/platform.h"
+#endif
+
 static int simple_entropy_func(void* data, unsigned char* output, size_t len)
 {
     (void)data;
@@ -127,6 +136,13 @@ typedef struct {
     mbedtls_ctr_drbg_context ctr_drbg;
     bool abort_on_close;
     unsigned send_pressure;
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+    /* Inner BIO pair captured by the forensic wrappers below. */
+    int (*fr_send)(void *, const unsigned char *, size_t);
+    int (*fr_recv)(void *, unsigned char *, size_t);
+    void *fr_bio;
+    bool fr_owned;   /* this connection owns the global capture slot */
+#endif
 } tls_ctx_t;
 
 /* NuttX may report temporary packet-buffer pressure as ENOMEM, including
@@ -534,11 +550,521 @@ static void tls_voice_session_save(mbedtls_ssl_context *ssl, const char *host,
 static void tls_voice_session_clear(void) {}
 #endif
 
+/* ── TLS handshake forensics (diagnostic builds only) ─────────── */
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+
+/* Root-cause instrumentation for the intermittent handshake failures
+ * (-0x4380 RSA verify failed / -0x3ae2 ASN.1 parse failed).
+ *
+ * One capture slot serves the first handshake that starts while the slot
+ * is free.  The raw BIO receive stream is copied into two independent
+ * heap buffers plus one send copy; when the handshake fails with a crypto
+ * error the evidence set is written to /data/forensics/tls-<n>/:
+ *
+ *   cert.der          peer leaf certificate exactly as parsed on board
+ *   ske-in-msg.bin    ssl->in_msg tail at the failure point
+ *   stream-rx-a.bin   receive stream, copy A (captured at recv time)
+ *   stream-rx-b.bin   receive stream, copy B (captured at recv time)
+ *   stream-tx.bin     bytes handed to send during the handshake
+ *   bundle.b64        all binaries in one base64 container (serial copy)
+ *   meta.txt          return code, fingerprints, addresses, randoms
+ *
+ * Offline comparison of these copies separates "bytes arrived corrupt
+ * from the socket" (capture corrupt) from "bytes corrupted inside mbedTLS
+ * heap residency after recv" (capture clean, ssl-side data corrupt).
+ * Canary words around each copy catch a corruptor that also hits the
+ * capture itself.
+ *
+ * Secret whitelist: only the peer certificate chain, the failing
+ * handshake message, the handshake randoms (public by definition) and
+ * the handshake BIO stream are recorded.  master_secret, keys and
+ * credentials are never touched. */
+
+#define FORENSIC_DIR     "/data/forensics"
+#define FORENSIC_RX_CAP  16384
+#define FORENSIC_TX_CAP  4096
+#define FORENSIC_CANARY  0xC0FFEE01u
+#define FORENSIC_KEEP    10
+
+typedef struct {
+    int state;                /* 0 idle, 1 capturing, -1 disabled */
+    uint8_t *rx_a, *rx_b, *tx;
+    uint32_t *can0, *can1, *can2, *can3;
+    size_t rx_len, tx_len;
+    int rx_ovf, tx_ovf;
+    unsigned seq;
+} forensics_t;
+
+static forensics_t s_frn;
+static pthread_mutex_t s_frn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const char* frn_region(uintptr_t a)
+{
+    /* STM32H750 memory map: AXI SRAM 512K @0x24000000, SRAM1/2 256K +
+     * SRAM3 32K @0x30000000, SRAM4 64K @0x38000000, DTCM 128K @0x20000000,
+     * SDRAM 8M @0xd0000000 (framebuffer + 6M heap at +2M). */
+    if (a >= 0xd0000000u && a < 0xd8000000u) return "SDRAM";
+    if (a >= 0x24000000u && a < 0x24080000u) return "AXISRAM";
+    if (a >= 0x30000000u && a < 0x30048000u) return "SRAM123";
+    if (a >= 0x38000000u && a < 0x38010000u) return "SRAM4";
+    if (a >= 0x20000000u && a < 0x20020000u) return "DTCM";
+    return "other";
+}
+
+static void frn_sha256_hex(const unsigned char* p, size_t n, char out[65])
+{
+    unsigned char d[32];
+    const mbedtls_md_info_t* mi = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (p == NULL || n == 0 || mi == NULL || mbedtls_md(mi, p, n, d) != 0) {
+        snprintf(out, 65, "-");
+        return;
+    }
+    for (int i = 0; i < 32; i++) {
+        snprintf(out + 2 * i, 3, "%02x", d[i]);
+    }
+}
+
+static bool frn_begin(void)
+{
+    pthread_mutex_lock(&s_frn_lock);
+    if (s_frn.state != 0) {
+        /* Already capturing another handshake or previously disabled. */
+        pthread_mutex_unlock(&s_frn_lock);
+        return false;
+    }
+    if (s_frn.rx_a == NULL) {
+        uint8_t* blk = malloc(2 * FORENSIC_RX_CAP + FORENSIC_TX_CAP +
+                              4 * sizeof(uint32_t));
+        if (blk == NULL) {
+            syslog(LOG_WARNING, "[%s] forensics capture alloc failed, disabled\n", TAG);
+            s_frn.state = -1;
+            pthread_mutex_unlock(&s_frn_lock);
+            return false;
+        }
+        s_frn.can0 = (uint32_t*)blk;
+        s_frn.rx_a = blk + sizeof(uint32_t);
+        s_frn.can1 = (uint32_t*)(s_frn.rx_a + FORENSIC_RX_CAP);
+        s_frn.rx_b = (uint8_t*)s_frn.can1 + sizeof(uint32_t);
+        s_frn.can2 = (uint32_t*)(s_frn.rx_b + FORENSIC_RX_CAP);
+        s_frn.tx = (uint8_t*)s_frn.can2 + sizeof(uint32_t);
+        s_frn.can3 = (uint32_t*)(s_frn.tx + FORENSIC_TX_CAP);
+        *s_frn.can0 = *s_frn.can1 = *s_frn.can2 = *s_frn.can3 = FORENSIC_CANARY;
+        syslog(LOG_INFO, "[%s] forensics capture buffer at %s\n", TAG,
+            frn_region((uintptr_t)s_frn.rx_a));
+    }
+    s_frn.rx_len = s_frn.tx_len = 0;
+    s_frn.rx_ovf = s_frn.tx_ovf = 0;
+    s_frn.state = 1;
+    pthread_mutex_unlock(&s_frn_lock);
+    return true;
+}
+
+static void frn_end(void)
+{
+    pthread_mutex_lock(&s_frn_lock);
+    if (s_frn.state == 1) {
+        s_frn.state = 0;
+    }
+    pthread_mutex_unlock(&s_frn_lock);
+}
+
+/* Both copies are written with independent memcpy calls so a corruptor
+ * striking mid-copy leaves them divergent instead of identically wrong. */
+static void frn_note_rx(const unsigned char* buf, size_t len)
+{
+    if (s_frn.state != 1) return;
+    size_t room = FORENSIC_RX_CAP - s_frn.rx_len;
+    if (len > room) {
+        memcpy(s_frn.rx_a + s_frn.rx_len, buf, room);
+        memcpy(s_frn.rx_b + s_frn.rx_len, buf, room);
+        s_frn.rx_len = FORENSIC_RX_CAP;
+        s_frn.rx_ovf = 1;
+        return;
+    }
+    memcpy(s_frn.rx_a + s_frn.rx_len, buf, len);
+    memcpy(s_frn.rx_b + s_frn.rx_len, buf, len);
+    s_frn.rx_len += len;
+}
+
+static void frn_note_tx(const unsigned char* buf, size_t len)
+{
+    if (s_frn.state != 1) return;
+    size_t room = FORENSIC_TX_CAP - s_frn.tx_len;
+    if (len > room) {
+        memcpy(s_frn.tx + s_frn.tx_len, buf, room);
+        s_frn.tx_len = FORENSIC_TX_CAP;
+        s_frn.tx_ovf = 1;
+        return;
+    }
+    memcpy(s_frn.tx + s_frn.tx_len, buf, len);
+    s_frn.tx_len += len;
+}
+
+static bool frn_canaries_ok(void)
+{
+    return s_frn.rx_a != NULL &&
+        *s_frn.can0 == FORENSIC_CANARY && *s_frn.can1 == FORENSIC_CANARY &&
+        *s_frn.can2 == FORENSIC_CANARY && *s_frn.can3 == FORENSIC_CANARY;
+}
+
+static void frn_write_file(const char* dir, const char* name,
+                           const void* p, size_t n)
+{
+    if (p == NULL || n == 0) return;
+    char path[64];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE* f = fopen(path, "w");
+    if (f == NULL) {
+        syslog(LOG_WARNING, "[%s] forensics write %s failed\n", TAG, path);
+        return;
+    }
+    fwrite(p, 1, n, f);
+    fclose(f);
+}
+
+static void frn_write_b64(FILE* f, const unsigned char* p, size_t n)
+{
+    static const char t[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char line[65];
+    size_t i = 0;
+    while (i < n) {
+        size_t take = n - i > 48 ? 48 : n - i;
+        size_t o = 0;
+        for (size_t j = 0; j < take; j += 3) {
+            uint32_t v = (uint32_t)p[i + j] << 16;
+            if (j + 1 < take) v |= (uint32_t)p[i + j + 1] << 8;
+            if (j + 2 < take) v |= (uint32_t)p[i + j + 2];
+            line[o++] = t[(v >> 18) & 63];
+            line[o++] = t[(v >> 12) & 63];
+            line[o++] = (j + 1 < take) ? t[(v >> 6) & 63] : '=';
+            line[o++] = (j + 2 < take) ? t[v & 63] : '=';
+        }
+        line[o] = '\0';
+        fprintf(f, "%s\n", line);
+        i += take;
+    }
+}
+
+static void frn_dump(mbedtls_ssl_context* ssl, int ret, const char* host)
+{
+    pthread_mutex_lock(&s_frn_lock);
+    if (s_frn.state != 1) {
+        /* The failing connection does not own the capture slot. */
+        pthread_mutex_unlock(&s_frn_lock);
+        return;
+    }
+    const mbedtls_x509_crt* cert = ssl != NULL ? mbedtls_ssl_get_peer_cert(ssl) : NULL;
+    const unsigned char* ske = ssl != NULL ? ssl->in_msg : NULL;
+    size_t ske_len = ssl != NULL ? ssl->in_msglen : 0;
+    /* Client/server randoms are not read here (ssl->handshake is an
+     * opaque type from the public headers); the offline verifier
+     * recovers both randoms from the captured ClientHello/ServerHello
+     * records in the streams. */
+    size_t cert_len = cert != NULL ? cert->raw.len : 0;
+    const unsigned char* cert_p = cert != NULL ? cert->raw.p : NULL;
+
+    bool canary = frn_canaries_ok();
+    bool rx_eq = s_frn.rx_len > 0 &&
+        memcmp(s_frn.rx_a, s_frn.rx_b, s_frn.rx_len) == 0;
+    char cert_h[65], ske_h[65], rx_h[65];
+    frn_sha256_hex(cert_p, cert_len, cert_h);
+    frn_sha256_hex(ske, ske_len, ske_h);
+    frn_sha256_hex(s_frn.rx_a, s_frn.rx_len, rx_h);
+
+    syslog(LOG_ERR,
+        "[%s] FORENSIC seq=%u ret=-0x%04x host=%s cert=%s%.16s in_msg=%u "
+        "rx=%u%s tx=%u%s rxAB=%s canary=%s\n",
+        TAG, s_frn.seq, -ret, host,
+        cert_len ? "" : "none:", cert_len ? cert_h : "-",
+        (unsigned)ske_len,
+        (unsigned)s_frn.rx_len, s_frn.rx_ovf ? "+ovf" : "",
+        (unsigned)s_frn.tx_len, s_frn.tx_ovf ? "+ovf" : "",
+        rx_eq ? "match" : "DIFFER", canary ? "ok" : "BROKEN");
+
+    char dir[48];
+    snprintf(dir, sizeof(dir), FORENSIC_DIR "/tls-%u", s_frn.seq % FORENSIC_KEEP);
+    mkdir(FORENSIC_DIR, 0755);
+    mkdir(dir, 0755);
+
+    char path[64];
+    FILE* f;
+    snprintf(path, sizeof(path), "%s/meta.txt", dir);
+    if ((f = fopen(path, "w")) != NULL) {
+        fprintf(f, "seq %u\nret -0x%04x\nhost %s\ntime %ld\n",
+            s_frn.seq, -ret, host, (long)time(NULL));
+        if (ssl != NULL) {
+            fprintf(f, "tls %s %s\n", mbedtls_ssl_get_version(ssl),
+                mbedtls_ssl_get_ciphersuite(ssl));
+        }
+        fprintf(f, "cert_len %u\ncert_sha256 %s\n",
+            (unsigned)cert_len, cert_h);
+        fprintf(f, "in_msglen %u\nin_msg_sha256 %s\n",
+            (unsigned)ske_len, ske_h);
+        fprintf(f, "rx_len %u rx_ovf %d rx_sha256 %s rx_a_eq_rx_b %d\n",
+            (unsigned)s_frn.rx_len, s_frn.rx_ovf, rx_h, rx_eq ? 1 : 0);
+        fprintf(f, "tx_len %u tx_ovf %d\n",
+            (unsigned)s_frn.tx_len, s_frn.tx_ovf);
+        fprintf(f, "randbytes recovered-offline from captured ClientHello/ServerHello\n");
+        fprintf(f, "ptr_ssl %p %s\n", (void*)ssl, frn_region((uintptr_t)ssl));
+        if (ssl != NULL) {
+            fprintf(f, "ptr_in_buf %p %s\n", (void*)ssl->in_buf,
+                frn_region((uintptr_t)ssl->in_buf));
+            fprintf(f, "ptr_in_msg %p %s\n", (void*)ssl->in_msg,
+                frn_region((uintptr_t)ssl->in_msg));
+            fprintf(f, "ptr_out_buf %p %s\n", (void*)ssl->out_buf,
+                frn_region((uintptr_t)ssl->out_buf));
+        }
+        fprintf(f, "ptr_cert %p %s\n", (void*)cert_p,
+            cert_p ? frn_region((uintptr_t)cert_p) : "-");
+        fprintf(f, "ptr_capture %p %s\n", (void*)s_frn.rx_a,
+            frn_region((uintptr_t)s_frn.rx_a));
+        fprintf(f, "secrets none; whitelist cert chain, failing message, "
+            "randoms, handshake BIO stream\n");
+        fclose(f);
+    }
+
+    frn_write_file(dir, "cert.der", cert_p, cert_len);
+    frn_write_file(dir, "ske-in-msg.bin", ske, ske_len);
+    frn_write_file(dir, "stream-rx-a.bin", s_frn.rx_a, s_frn.rx_len);
+    frn_write_file(dir, "stream-rx-b.bin", s_frn.rx_b, s_frn.rx_len);
+    frn_write_file(dir, "stream-tx.bin", s_frn.tx, s_frn.tx_len);
+
+    /* Single base64 container so a plain serial `cat` retrieves
+     * everything without binary-unaware terminals. */
+    size_t payload =
+        128 + cert_len + ske_len + 2 * s_frn.rx_len + s_frn.tx_len;
+    uint8_t* buf = malloc(payload);
+    if (buf != NULL) {
+        size_t off = (size_t)snprintf((char*)buf, payload,
+            "VGTLS1\nfile cert.der %u\nfile ske-in-msg.bin %u\n"
+            "file stream-rx-a.bin %u\nfile stream-rx-b.bin %u\n"
+            "file stream-tx.bin %u\ndata\n",
+            (unsigned)cert_len, (unsigned)ske_len,
+            (unsigned)s_frn.rx_len, (unsigned)s_frn.rx_len,
+            (unsigned)s_frn.tx_len);
+        memcpy(buf + off, cert_p, cert_len); off += cert_len;
+        memcpy(buf + off, ske, ske_len); off += ske_len;
+        memcpy(buf + off, s_frn.rx_a, s_frn.rx_len); off += s_frn.rx_len;
+        memcpy(buf + off, s_frn.rx_b, s_frn.rx_len); off += s_frn.rx_len;
+        memcpy(buf + off, s_frn.tx, s_frn.tx_len); off += s_frn.tx_len;
+        snprintf(path, sizeof(path), "%s/bundle.b64", dir);
+        if ((f = fopen(path, "w")) != NULL) {
+            frn_write_b64(f, buf, off);
+            fclose(f);
+        }
+        free(buf);
+    }
+    s_frn.seq++;
+    pthread_mutex_unlock(&s_frn_lock);
+}
+
+static int tls_forensic_send(void* arg, const unsigned char* buf, size_t len)
+{
+    tls_ctx_t* ctx = arg;
+    frn_note_tx(buf, len);
+    return ctx->fr_send(ctx->fr_bio, buf, len);
+}
+
+static int tls_forensic_recv(void* arg, unsigned char* buf, size_t len)
+{
+    tls_ctx_t* ctx = arg;
+    int r = ctx->fr_recv(ctx->fr_bio, buf, len);
+    if (r > 0) {
+        frn_note_rx(buf, (size_t)r);
+    }
+    return r;
+}
+#endif /* CONFIG_AI_AGENT_TLS_FORENSICS */
+
+/* ── Diagnostic TLS pool (阶段2A A/B experiment) ───────────────── */
+#ifdef CONFIG_AI_AGENT_TLS_POOL
+
+/* Route every mbedTLS allocation through a dedicated static first-fit
+ * pool with canaries instead of the general heap, where the 16 KB TLS
+ * buffers land in SDRAM.  If the -0x4380 handshake failures disappear
+ * while mbedTLS data lives in this AXI SRAM pool, the corruption is
+ * confined to the general-heap region used for those buffers; if the
+ * failures persist, the corruptor follows the data and is not bound to
+ * one memory region.  Requires MBEDTLS_PLATFORM_MEMORY. */
+
+/* Header must cover pool_block_t on any word size (32-bit target: 16,
+ * 64-bit host tests: 24) and keep the payload 8-byte aligned. */
+#define POOL_HDR_SIZE    (((sizeof(size_t) + sizeof(uint32_t) + \
+                            sizeof(void*) + 7u) & ~(size_t)7u))
+#define POOL_MAGIC_USED  0x0BAD0BADu
+#define POOL_MAGIC_FREE  0xF7EEF7EEu
+#define POOL_CANARY_TAIL 0x7AC0FFEEu
+#define POOL_MIN_SPLIT   32
+
+typedef struct pool_block {
+    size_t size;              /* payload size, header excluded */
+    uint32_t magic;
+    struct pool_block* next;  /* address-ordered free list */
+} pool_block_t;
+
+static uint8_t s_poolmem[CONFIG_AI_AGENT_TLS_POOL_SIZE]
+    __attribute__((aligned(32)));
+static pool_block_t* s_pool_free;
+static pthread_mutex_t s_tlsalloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t s_pool_used, s_pool_peak, s_pool_fail, s_pool_corrupt;
+static pthread_once_t s_pool_once = PTHREAD_ONCE_INIT;
+
+static void tls_pool_corruption(const char* what, pool_block_t* blk,
+                                const void* ptr)
+{
+    s_pool_corrupt++;
+    syslog(LOG_ERR,
+        "[%s] POOL CORRUPTION %s blk=%p size=%u ptr=%p arena+%u "
+        "(used=%u peak=%u fail=%u corrupt=%u)\n",
+        TAG, what, (void*)blk, (unsigned)blk->size, ptr,
+        (unsigned)((uint8_t*)blk - s_poolmem),
+        (unsigned)s_pool_used, (unsigned)s_pool_peak,
+        (unsigned)s_pool_fail, (unsigned)s_pool_corrupt);
+}
+
+static void* tls_pool_alloc(size_t n)
+{
+    if (n == 0 || n > CONFIG_AI_AGENT_TLS_POOL_SIZE) {
+        return NULL;
+    }
+    n = (n + 7u) & ~(size_t)7u;
+    pthread_mutex_lock(&s_tlsalloc_lock);
+    pool_block_t* prev = NULL;
+    pool_block_t* blk = s_pool_free;
+    /* header + payload + tail canary + pad to keep 8-byte payload
+     * alignment across splits */
+    size_t need = n + POOL_HDR_SIZE + 8;
+    while (blk != NULL) {
+        if (blk->magic != POOL_MAGIC_FREE) {
+            tls_pool_corruption("free-list magic", blk, NULL);
+            pthread_mutex_unlock(&s_tlsalloc_lock);
+            return NULL;
+        }
+        /* blk->size covers payload plus tail canary and pad; the request
+         * needs n payload bytes plus that 8-byte tail overhead. */
+        if (blk->size >= n + 8) {
+            break;
+        }
+        prev = blk;
+        blk = blk->next;
+    }
+    if (blk == NULL) {
+        s_pool_fail++;
+        pthread_mutex_unlock(&s_tlsalloc_lock);
+        syslog(LOG_ERR, "[%s] TLS pool exhausted (need %u, used %u peak %u)\n",
+            TAG, (unsigned)need, (unsigned)s_pool_used, (unsigned)s_pool_peak);
+        return NULL;
+    }
+    size_t have = blk->size;   /* payload+tail space in this free block */
+    if (have >= need - POOL_HDR_SIZE - 8 + POOL_HDR_SIZE + 8 + POOL_MIN_SPLIT) {
+        /* split off a remainder that can hold a minimal block */
+        uint8_t* split = (uint8_t*)blk + POOL_HDR_SIZE + n + 8;
+        pool_block_t* nb = (pool_block_t*)split;
+        nb->size = have - (n + 8) - POOL_HDR_SIZE - 8;
+        nb->magic = POOL_MAGIC_FREE;
+        nb->next = blk->next;
+        blk->next = nb;
+    }
+    blk->size = n + 8;
+    /* Unlink from the free list. */
+    if (prev != NULL) prev->next = blk->next;
+    else s_pool_free = blk->next;
+    blk->magic = POOL_MAGIC_USED;
+    blk->next = NULL;
+    uint8_t* payload = (uint8_t*)blk + POOL_HDR_SIZE;
+    *(uint32_t*)(payload + n) = POOL_CANARY_TAIL;
+    s_pool_used += blk->size + POOL_HDR_SIZE;
+    if (s_pool_used > s_pool_peak) s_pool_peak = s_pool_used;
+    pthread_mutex_unlock(&s_tlsalloc_lock);
+    return payload;
+}
+
+static void tls_pool_free(void* ptr)
+{
+    if (ptr == NULL) return;
+    pool_block_t* blk = (pool_block_t*)((uint8_t*)ptr - POOL_HDR_SIZE);
+    pthread_mutex_lock(&s_tlsalloc_lock);
+    if ((uint8_t*)blk < s_poolmem ||
+        (uint8_t*)blk >= s_poolmem + CONFIG_AI_AGENT_TLS_POOL_SIZE) {
+        s_pool_corrupt++;
+        syslog(LOG_ERR, "[%s] POOL CORRUPTION free outside arena ptr=%p\n",
+            TAG, ptr);
+        pthread_mutex_unlock(&s_tlsalloc_lock);
+        return;
+    }
+    if (blk->magic != POOL_MAGIC_USED) {
+        tls_pool_corruption("header magic on free", blk, ptr);
+        pthread_mutex_unlock(&s_tlsalloc_lock);
+        return;
+    }
+    uint8_t* payload = (uint8_t*)blk + POOL_HDR_SIZE;
+    /* blk->size = payload (8-aligned) + tail canary + pad */
+    if (*(uint32_t*)(payload + blk->size - 8) != POOL_CANARY_TAIL) {
+        tls_pool_corruption("tail canary", blk, ptr);
+    }
+    s_pool_used -= blk->size + POOL_HDR_SIZE;
+    blk->magic = POOL_MAGIC_FREE;
+    /* Reinsert into the address-ordered free list and coalesce. */
+    pool_block_t* prev = NULL;
+    pool_block_t* cur = s_pool_free;
+    while (cur != NULL && cur < blk) {
+        prev = cur;
+        cur = cur->next;
+    }
+    blk->next = cur;
+    if (prev != NULL) prev->next = blk;
+    else s_pool_free = blk;
+    if (cur != NULL &&
+        (uint8_t*)blk + POOL_HDR_SIZE + blk->size == (uint8_t*)cur) {
+        blk->size += POOL_HDR_SIZE + cur->size;
+        blk->next = cur->next;
+    }
+    if (prev != NULL &&
+        (uint8_t*)prev + POOL_HDR_SIZE + prev->size == (uint8_t*)blk) {
+        prev->size += POOL_HDR_SIZE + blk->size;
+        prev->next = blk->next;
+    }
+    pthread_mutex_unlock(&s_tlsalloc_lock);
+}
+
+static void* tls_pool_calloc(size_t n, size_t sz)
+{
+    if (sz != 0 && n > (size_t)-1 / sz) return NULL;
+    void* p = tls_pool_alloc(n * sz);
+    if (p != NULL) memset(p, 0, n * sz);
+    return p;
+}
+
+static void tls_pool_install_once(void)
+{
+    pool_block_t* blk = (pool_block_t*)s_poolmem;
+    blk->size = CONFIG_AI_AGENT_TLS_POOL_SIZE - POOL_HDR_SIZE - 8;
+    blk->magic = POOL_MAGIC_FREE;
+    blk->next = NULL;
+    s_pool_free = blk;
+    mbedtls_platform_set_calloc_free(tls_pool_calloc, tls_pool_free);
+    syslog(LOG_INFO,
+        "[%s] TLS pool installed: %u bytes at %p, mbedTLS allocations "
+        "redirected from the general heap\n",
+        TAG, CONFIG_AI_AGENT_TLS_POOL_SIZE, (void*)s_poolmem);
+}
+
+static void tls_pool_ensure_installed(void)
+{
+    pthread_once(&s_pool_once, tls_pool_install_once);
+}
+#else
+static void tls_pool_ensure_installed(void) {}
+#endif /* CONFIG_AI_AGENT_TLS_POOL */
+
 static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
     agent_llm_timing_t* timing, const vela_req_ctl_t *ctl)
 {
     int ret;
     uint32_t mark = agent_mono_ms();
+
+    tls_pool_ensure_installed();
 
     ctx->abort_on_close = ctl != NULL;
     ctx->send_pressure = 0;
@@ -727,6 +1253,16 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
 
     /* Use blocking recv — no select()/poll().  The read
      * timeout is enforced by the SO_RCVTIMEO socket option set above. */
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+    ctx->fr_owned = frn_begin();
+    if (ctx->fr_owned) {
+        ctx->fr_send = (ctl != NULL) ? tls_controlled_send : mbedtls_net_send;
+        ctx->fr_recv = (ctl != NULL) ? tls_controlled_recv : mbedtls_net_recv;
+        ctx->fr_bio = (ctl != NULL) ? (void*)ctx : (void*)&ctx->net;
+        mbedtls_ssl_set_bio(&ctx->ssl, ctx,
+            tls_forensic_send, tls_forensic_recv, NULL);
+    } else
+#endif
     if (ctl != NULL) {
         mbedtls_ssl_set_bio(&ctx->ssl, ctx,
             tls_controlled_send, tls_controlled_recv, NULL);
@@ -744,9 +1280,15 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
     for (;;) {
         if (ctl != NULL) {
             if (vela_req_cancelled(ctl)) {
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+                if (ctx->fr_owned) { frn_end(); ctx->fr_owned = false; }
+#endif
                 return VELA_TLS_ERR_CANCELLED;
             }
             if (vela_req_budget_ms(ctl, agent_mono_ms()) == 0) {
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+                if (ctx->fr_owned) { frn_end(); ctx->fr_owned = false; }
+#endif
                 return VELA_TLS_ERR_TIMEOUT;
             }
         }
@@ -761,6 +1303,13 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
             syslog(LOG_ERR, "[%s] ssl_handshake ret=-0x%04x: %s\n", TAG, -ret, err_buf);
 #else
             syslog(LOG_ERR, "[%s] ssl_handshake ret=-0x%04x\n", TAG, -ret);
+#endif
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+            if (ctx->fr_owned) {
+                frn_dump(&ctx->ssl, ret, host);
+                frn_end();
+                ctx->fr_owned = false;
+            }
 #endif
             /* Log if it was a fatal alert */
             if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) {
@@ -782,10 +1331,17 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port,
             ret = tls_wait_socket(ctx->net.fd,
                 ret == MBEDTLS_ERR_SSL_WANT_READ ? POLLIN : POLLOUT, ctl);
             if (ret != 0) {
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+                if (ctx->fr_owned) { frn_end(); ctx->fr_owned = false; }
+#endif
                 return ret;
             }
         }
     }
+
+#ifdef CONFIG_AI_AGENT_TLS_FORENSICS
+    if (ctx->fr_owned) { frn_end(); ctx->fr_owned = false; }
+#endif
 
 #if defined(CONFIG_VG_HMI) && defined(CONFIG_VG_VOICE_TLS_CACHE) && defined(MBEDTLS_SSL_CLI_C)
     uint32_t handshake_ms = agent_elapsed_ms(mark, agent_mono_ms());
