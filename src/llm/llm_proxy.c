@@ -1140,7 +1140,7 @@ int llm_chat_tools_controlled(const char* system_prompt, cJSON* messages,
 
     if (vg_voice_scope_model_options(body, system_prompt, llm_host, model,
                                     ctl != NULL))
-        syslog(LOG_INFO, "[%s] scoped voice model: thinking disabled, max_tokens=256\n", TAG);
+        syslog(LOG_INFO, "[%s] scoped voice model: thinking disabled, max_tokens=1024\n", TAG);
 
     /* Clone messages and prepend system message */
     cJSON* msgs = cJSON_Duplicate(messages, 1);

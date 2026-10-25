@@ -20,7 +20,9 @@ bool vg_voice_scope_tool(const char *name)
 {
     return name && (strcmp(name, "vg_point_read") == 0
         || strcmp(name, "vg_anomaly_read") == 0
-        || strcmp(name, "vg_alarm_recovery") == 0);
+        || strcmp(name, "vg_alarm_recovery") == 0
+        || strcmp(name, "vg_run_report") == 0
+        || strcmp(name, "vg_status_read") == 0);
 }
 
 char *vg_voice_scope_schema(const char *all_tools)
@@ -45,12 +47,23 @@ char *vg_voice_scope_schema(const char *all_tools)
 
 const char *vg_voice_scope_prompt(void)
 {
-    return "You are VelaGuard's read-only voice assistant. "
-        "Call the requested tool once with the exact point ID supplied by the user: "
-        "vg_point_read for readings, vg_anomaly_read for current anomalies, "
-        "vg_alarm_recovery for recovery history. Never guess values or recovery. "
-        "Do not access files, run commands, change configuration or control outputs. "
-        "The device validates and renders the tool facts. No preamble or explanation.";
+    /* The product decision of 2026-10-25: the voice channel is a device
+     * operations assistant, not a single-intent lookup.  The model picks and
+     * combines the read-only tools itself and writes both the display answer
+     * and the spoken summary; the board parses and bounds the result. */
+    return "你是 VelaGuard 网关的设备运维助手，通过语音回答运维问题。"
+        "可用只读工具：vg_point_read 查点位实时值，vg_anomaly_read 查当前全部异常，"
+        "vg_alarm_recovery 查告警是否恢复，vg_run_report 查自上电运行报告，"
+        "vg_status_read 查系统与连接概况。"
+        "请先理解用户问题，再决定查什么：可以按需多次调用不同工具；"
+        "问候闲聊可直接回应，但凡是涉及点位、数值、告警或系统状态的回答，"
+        "必须先调用工具获取本机数据，没有查到就如实说明无法获取，不得凭记忆或推测给出数值；"
+        "问题涉及多个相关点位时，把候选点位都查一遍，并列给出结果；"
+        "结合上一轮问答理解追问。"
+        "回答必须基于工具返回的真实数据，数据缺失或点位不存在时如实说明，不得编造数值；"
+        "本助手只读，不能修改配置、清除告警或控制输出。"
+        "用简体中文回答，先给结论再给数据依据；"
+        "回答的最后一行必须是：播报：<不超过60字的口语化摘要，供语音播报，不要出现Markdown格式>";
 }
 
 bool vg_voice_scope_model_options(cJSON *body, const char *prompt,
@@ -62,15 +75,18 @@ bool vg_voice_scope_model_options(cJSON *body, const char *prompt,
         strcmp(model, "mimo-v2.6-flash") != 0 ||
         (strcmp(host, "token-plan-cn.xiaomimimo.com") != 0 &&
          strcmp(host, "api.xiaomimimo.com") != 0)) return false;
-    /* MiMo API: thinking.type=disabled keeps ordinary tool calling. */
+    /* MiMo API: thinking.type=disabled keeps ordinary tool calling.  The
+     * answer is now composed by the model (display text plus the 播报 summary
+     * line), so the old 256-token cap only truncated it: 1024 leaves room for
+     * a full list-style answer while staying cheap. */
     cJSON *thinking = cJSON_CreateObject();
     if (!thinking) return false;
     cJSON_AddStringToObject(thinking, "type", "disabled");
     cJSON_AddItemToObject(body, "thinking", thinking);
     cJSON_DeleteItemFromObject(body, "max_tokens");
-    cJSON_AddNumberToObject(body, "max_tokens", 256);
+    cJSON_AddNumberToObject(body, "max_tokens", 1024);
     cJSON_DeleteItemFromObject(body, "max_completion_tokens");
-    cJSON_AddNumberToObject(body, "max_completion_tokens", 256);
+    cJSON_AddNumberToObject(body, "max_completion_tokens", 1024);
     return true;
 #else
     (void)body; (void)prompt; (void)host; (void)model; (void)controlled;
