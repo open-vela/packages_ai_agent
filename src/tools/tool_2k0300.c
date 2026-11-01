@@ -366,32 +366,6 @@ static void oled_show_char(int i2c_fd, uint8_t x, uint8_t y, char ch)
     }
 }
 
-static void oled_show_string(int i2c_fd, uint8_t x, uint8_t y,
-                             const char *str)
-{
-  if (!str)
-    {
-      return;
-    }
-
-  while (*str)
-    {
-      oled_show_char(i2c_fd, x, y, *str);
-      x += 8;
-      if (x > (OLED_WIDTH - 8))
-        {
-          x = 0;
-          y += 2;
-          if (y >= OLED_PAGES - 1)
-            {
-              break;
-            }
-        }
-
-      str++;
-    }
-}
-
 /****************************************************************************
  * Private: BH1750 light sensor via I2C1
  *

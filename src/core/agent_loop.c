@@ -688,7 +688,7 @@ static char* handle_slash_remind(const agent_msg_t* msg)
     char* reply = calloc(1, 512);
     if (reply) {
         tool_registry_execute("cron_add", input, reply, 512);
-        snprintf(reply, 512, "好的，%d 秒后提醒你：%s",
+        snprintf(reply, 512, "好的，%d 秒后提醒你：%.400s",
             secs, remind_msg);
     }
     return reply;
