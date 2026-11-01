@@ -149,6 +149,16 @@ config AI_AGENT_AUDIO_CAPTURE_GAIN
 		- 6 = Compensate for 6-channel DMIC with 1 active mic
 		- Higher values for more amplification (may clip)
 
+config AI_AGENT_VOICE_TTS
+	bool "Speak the agent reply aloud"
+	default n
+	---help---
+		Synthesize the agent's reply with the TTS backend and play it
+		out of the speaker.  With this off the reply is only shown as
+		a subtitle on the panel and printed to the terminal, which is
+		what a demo driven from the LCD wants - and it saves the
+		round trip to the TTS service.
+
 config AI_AGENT_CAMERA
 	bool "Enable camera capture tool"
 	default n

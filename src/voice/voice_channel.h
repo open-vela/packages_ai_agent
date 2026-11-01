@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -37,14 +38,29 @@ int voice_channel_stop(void);
  * If ASR returns empty text, text_out[0] is set to '\0' (not an error). */
 int voice_channel_stop_with_text(char *text_out, size_t text_cap);
 
+/* Push-to-talk edge from the panel (examples/ls_lvgl): `down` is true on
+ * the long-press and false on the release.  Non-blocking - the edge is
+ * queued to a worker that runs the session and posts progress back
+ * through ls_lvgl_set_ai_text().  ls_lvgl.c carries a weak no-op of this
+ * so the panel links without an agent; this is the strong definition. */
+void ai_agent_voice_ptt(bool down);
+
+/* Print peak / step / zero-crossing statistics per channel for a WAV on
+ * the card.  PTT_CAPTURE_RATE and PTT_CAPTURE_CHANNELS are assumed. */
+int voice_channel_analyze_file(const char *path);
+
 /* Synthesize text and play back (called from outbound dispatcher). */
 int voice_channel_speak(const char *text);
 
 /* Test TTS: synthesize text, save PCM to file. */
 int voice_channel_test_tts(const char *text, const char *out_path);
 
-/* Test ASR: read PCM file, recognize, print result. */
-int voice_channel_test_asr(const char *pcm_path);
+/* Test ASR: read an audio file, recognize, print result.  A WAV header in
+ * the file supplies the format; channels/rate override it and cover
+ * headerless captures, 0 meaning "not stated".  Either way the samples are
+ * folded to the 16kHz mono that voice_asr_recognize() declares upstream. */
+int voice_channel_test_asr(const char *pcm_path,
+                           unsigned int channels, unsigned int rate);
 
 #ifdef __cplusplus
 }

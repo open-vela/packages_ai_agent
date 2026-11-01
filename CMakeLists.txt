@@ -160,6 +160,9 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   # MQTT-C library
   set(MQTTC_INC ${NUTTX_APPS_DIR}/netutils/mqttc/MQTT-C/include)
 
+  # zlib (V3 speech APIs gzip payloads)
+  set(ZLIB_INC ${NUTTX_APPS_DIR}/system/zlib/zlib)
+
   # BES AEC (audio preprocessing: NS + AGC)
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
     set(BES_AEC_INC ${NUTTX_APPS_DIR}/vendor/xiaomi/miwear/bes_aec/inc)
@@ -176,6 +179,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     ${VIBRATOR_INC}
     ${MEDIA_INC}
     ${MQTTC_INC}
+    ${ZLIB_INC}
   )
 
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
@@ -191,6 +195,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       ${AGENT_INCDIRS}
     DEPENDS
       mqttc
+      zlib
     STACKSIZE
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_STACKSIZE}
     PRIORITY

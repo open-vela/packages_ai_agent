@@ -214,8 +214,10 @@ static void* network_watch_task(void* arg)
 
 /* ── Voice failure cooldown — prevent error-message cascade ──── */
 
+#ifdef CONFIG_AI_AGENT_VOICE_TTS
 static volatile bool s_voice_cooldown;
 static time_t s_voice_cooldown_until;
+#endif
 
 /**
  * Reads messages from the outbound queue and dispatches them to the
@@ -274,6 +276,18 @@ static void* outbound_dispatch_task(void* arg)
             mqtt_channel_send(msg.chat_id, msg.content);
 #endif
         } else if (strcmp(msg.channel, AGENT_CHAN_VOICE) == 0) {
+            /* The reply is shown as a subtitle on the panel and printed
+             * to the terminal.  Speaking it is optional: the TTS round
+             * trip is slow and costs a service call, and a demo driven
+             * from the LCD only needs the text.
+             */
+            ls_lvgl_set_ai_text("reply", msg.content);
+            pthread_mutex_lock(&g_stdout_lock);
+            printf("\n[Agent]: %s\nvela> ", msg.content);
+            fflush(stdout);
+            pthread_mutex_unlock(&g_stdout_lock);
+
+#ifdef CONFIG_AI_AGENT_VOICE_TTS
             /* Check voice cooldown — skip voice dispatch if a recent
              * speak call failed, to prevent error-message cascade. */
             if (s_voice_cooldown && time(NULL) < s_voice_cooldown_until) {
@@ -288,6 +302,11 @@ static void* outbound_dispatch_task(void* arg)
                     s_voice_cooldown_until = time(NULL) + 5;
                 }
             }
+#else
+            syslog(LOG_INFO,
+                "[%s] reply shown as subtitle and terminal only "
+                "(CONFIG_AI_AGENT_VOICE_TTS is off)\n", TAG);
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         } else if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) == 0) {
             int uret = lvgl_ui_channel_send(msg.content);
@@ -321,6 +340,10 @@ static void* outbound_dispatch_task(void* arg)
             fflush(stdout);
             pthread_mutex_unlock(&g_stdout_lock);
             syslog(LOG_INFO, "[agent] [Agent]: %s\n", msg.content);
+
+            /* Mirror the reply on the LCD panel subtitle */
+
+            ls_lvgl_set_ai_text("reply", msg.content);
         } else {
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }

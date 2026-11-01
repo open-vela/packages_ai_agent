@@ -25,12 +25,11 @@ extern "C" {
 /* Register the Volcengine ASR backend with the voice_asr framework. */
 int volc_asr_register(void);
 
-/* Legacy direct-call API (kept for backward compatibility). */
+/* Batch recognition: send the whole PCM buffer in one session and
+ * return the recognized text.  Credentials are self-loaded from the
+ * config store (volc_api_key / volc_asr_resource). */
 int volc_asr_recognize(const unsigned char *pcm_data,
                        size_t pcm_len,
-                       const char *app_id,
-                       const char *token,
-                       const char *resource_id_or_cluster,
                        char *text_out,
                        size_t text_cap);
 

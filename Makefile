@@ -33,6 +33,7 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/topics/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/system/vibrator
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/../frameworks/multimedia/media/include
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/mqttc/MQTT-C/include
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/system/zlib/zlib
 
 # Source files
 
