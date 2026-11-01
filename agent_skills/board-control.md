@@ -21,7 +21,7 @@ LOONG-HAT 开发板外设控制技能。通过自然语言控制板载 LED、蜂
 | 工具 | 功能 | 参数 |
 |------|------|------|
 | `board_led` | 红(GPIO72)/绿(GPIO73) LED | led: red/green/both; action: on/off/toggle/blink; times, interval_ms |
-| `board_pwm` | 蓝 LED PWM 亮度 (GPIO88) | duty: 0-100 (0=停), frequency: 默认 1000Hz |
+| `board_pwm` | 蓝 LED PWM 亮度/呼吸 (GPIO88) | 静态: duty 0-100 (0=停); 呼吸: action=breath, period_ms 周期ms(默认3000), cycles 次数(默认1) |
 | `board_buzzer` | 蜂鸣器 (GPIO75, 1kHz) | duration_ms: 1-5000; count: 1-10 |
 | `board_key_read` | 读按键 KEY1(87)/KEY2(86) | 无 |
 | `board_thermal_read` | CPU 片上温度 | 无 |
@@ -44,6 +44,10 @@ User: "让绿灯闪 5 下，快一点"
 User: "把蓝灯调到 30% 亮度"
 → board_pwm(duty:30)
 → "蓝灯已调至 30% 亮度"
+
+User: "让蓝灯呼吸，周期3秒，循环5次"
+→ board_pwm(action:"breath", period_ms:3000, cycles:5)
+→ "呼吸灯已运行 5 个周期（15 秒），已结束"
 
 User: "关掉所有灯"
 → board_led(led:"both", action:"off") + board_pwm(duty:0)

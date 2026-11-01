@@ -519,12 +519,21 @@ int tool_registry_init(void)
 
     REGISTER_TOOL(
         "board_pwm",
-        "Set hardware PWM2 duty cycle driving the blue LED on the board. "
-        "duty 0-100 (0 stops PWM). frequency default 1000 Hz.",
+        "Control hardware PWM2 driving the blue LED on the board. "
+        "Static mode: set duty (0-100, 0=stop), optional frequency "
+        "(default 1000 Hz). Breath mode: action=\"breath\" plays a "
+        "breathing animation - duty ramps 0->100->0 each cycle. "
+        "period_ms per full breath cycle (default 3000), cycles "
+        "count (default 1). Returns after animation finishes.",
         TOOL_SCHEMA_BEGIN()
-            TOOL_PARAM_NUM("duty", "Duty cycle percent 0-100 (0 = stop)") ","
-            TOOL_PARAM_NUM("frequency", "PWM frequency in Hz 10-100000 (default 1000)")
-            TOOL_SCHEMA_END_REQUIRED("\"duty\""),
+            TOOL_PARAM_NUM("duty", "Static mode: duty cycle percent 0-100 (0 = stop)") ","
+            TOOL_PARAM_STR("action", "Breath mode: set to \"breath\"") ","
+            TOOL_PARAM_NUM("period_ms",
+                "Breath mode: full breath cycle duration in ms, 200-60000 (default 3000)") ","
+            TOOL_PARAM_NUM("cycles",
+                "Breath mode: number of breath cycles, 1-100 (default 1)") ","
+            TOOL_PARAM_NUM("frequency", "PWM carrier frequency in Hz 10-100000 (default 1000)")
+            TOOL_SCHEMA_END(),
         tool_board_pwm_execute);
 
     REGISTER_TOOL(

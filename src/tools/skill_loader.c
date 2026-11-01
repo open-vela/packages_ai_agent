@@ -207,8 +207,11 @@ static const char *TAG = "skills";
     "## Tools\n" \
     "- board_led: LEDs. led: red|green|both, action: on|off|toggle|blink. " \
     "blink supports times (1-10) and interval_ms (50-5000).\n" \
-    "- board_pwm: blue LED brightness via PWM. duty 0-100 (0=off). " \
-    "Example: duty 30 = dim blue glow.\n" \
+    "- board_pwm: blue LED via PWM. Static: duty 0-100 (0=off). " \
+    "Breathing animation: action=breath, period_ms per full breath " \
+    "cycle (default 3000), cycles count (default 1). " \
+    "Example: breath 3s x5 -> action=breath, period_ms=3000, cycles=5. " \
+    "Animation blocks until finished, then LED is off.\n" \
     "- board_buzzer: beep. duration_ms (1-5000, default 200), count (1-10). " \
     "Alert pattern example: count:3, duration_ms:100.\n" \
     "- board_key_read: read key1/key2 state (pressed/released).\n" \

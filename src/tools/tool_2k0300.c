@@ -75,6 +75,7 @@
 #define PWM_FUNCTION      2      /* second function */
 #define PWM_FREQ_DEFAULT  1000
 #define PWM_DUTY_MAX      65536
+#define PWM_BREATH_STEPS  100    /* duty steps per half cycle */
 
 #define BUZZER_HALF_US    500    /* 1 kHz tone */
 
@@ -934,8 +935,17 @@ int tool_board_led_execute(const char *input_json,
 /****************************************************************************
  * Tool: board_pwm
  *
- * Input: { "duty": 0-100, "frequency": Hz (default 1000) }
- * duty=0 stops PWM. Controls blue LED on GPIO88.
+ * Input (static mode):
+ *   { "duty": 0-100, "frequency": Hz (default 1000) }
+ *   duty=0 stops PWM. Controls blue LED on GPIO88.
+ *
+ * Input (breath mode):
+ *   { "action": "breath", "period_ms": 3000, "cycles": 5,
+ *     "frequency": Hz }
+ *   Blocking animation: duty ramps 0->100->0 per cycle, stepping
+ *   every period_ms/200 ms (100 steps up + 100 steps down), same as
+ *   ls_driver_test/test_pwm.c. Returns after the animation ends.
+ *   period_ms 200-60000 (default 3000), cycles 1-100 (default 1).
  ****************************************************************************/
 
 int tool_board_pwm_execute(const char *input_json,
@@ -949,7 +959,13 @@ int tool_board_pwm_execute(const char *input_json,
   cJSON *root;
   cJSON *j_duty;
   cJSON *j_freq;
+  cJSON *j_action;
+  cJSON *j_period;
+  cJSON *j_cycles;
   cJSON *resp;
+  bool breath = false;
+  int period_ms = 3000;
+  int cycles = 1;
 
   if (!input_json || !output || output_size < 32)
     {
@@ -962,17 +978,33 @@ int tool_board_pwm_execute(const char *input_json,
       return json_fail(output, output_size, "{\"error\":\"cannot parse input JSON\"}", NULL);
     }
 
+  j_action = cJSON_GetObjectItem(root, "action");
+  if (cJSON_IsString(j_action))
+    {
+      if (strcmp(j_action->valuestring, "breath") == 0)
+        {
+          breath = true;
+        }
+      else
+        {
+          cJSON_Delete(root);
+          return json_fail(output, output_size,
+                           "{\"error\":\"unknown action '%s'. valid: breath\"}",
+                           j_action->valuestring);
+        }
+    }
+
   j_duty = cJSON_GetObjectItem(root, "duty");
   j_freq = cJSON_GetObjectItem(root, "frequency");
 
-  if (!cJSON_IsNumber(j_duty))
+  if (!breath && !cJSON_IsNumber(j_duty))
     {
       cJSON_Delete(root);
       return json_fail(output, output_size,
-                       "{\"error\":\"missing required field: duty (0-100)\"}", NULL);
+                       "{\"error\":\"missing required field: duty (0-100), or action=breath\"}", NULL);
     }
 
-  duty = (uint32_t)j_duty->valuedouble;
+  duty = cJSON_IsNumber(j_duty) ? (uint32_t)j_duty->valuedouble : 0;
   if (duty > 100)
     {
       duty = 100;
@@ -982,6 +1014,23 @@ int tool_board_pwm_execute(const char *input_json,
       j_freq->valuedouble <= 100000)
     {
       freq = (uint32_t)j_freq->valuedouble;
+    }
+
+  if (breath)
+    {
+      j_period = cJSON_GetObjectItem(root, "period_ms");
+      if (cJSON_IsNumber(j_period) && j_period->valuedouble >= 200 &&
+          j_period->valuedouble <= 60000)
+        {
+          period_ms = (int)j_period->valuedouble;
+        }
+
+      j_cycles = cJSON_GetObjectItem(root, "cycles");
+      if (cJSON_IsNumber(j_cycles) && j_cycles->valuedouble >= 1 &&
+          j_cycles->valuedouble <= 100)
+        {
+          cycles = (int)j_cycles->valuedouble;
+        }
     }
 
   cJSON_Delete(root);
@@ -1002,6 +1051,65 @@ int tool_board_pwm_execute(const char *input_json,
       snprintf(output, output_size,
                "{\"error\":\"open %s failed (errno %d)\"}", PWM_DEVICE, errno);
       return ERROR;
+    }
+
+  if (breath)
+    {
+      /* Breathing animation: 100 steps up + 100 steps down per cycle,
+       * step delay = period_ms / 200 so one full period matches
+       * period_ms exactly (mirrors test_pwm.c breathing loop). */
+      int step_delay_us = period_ms * 1000 / (PWM_BREATH_STEPS * 2);
+      int cycle;
+      int step;
+
+      info.frequency = freq;
+      info.duty = 0;
+      ioctl(fd, PWMIOC_SETCHARACTERISTICS,
+            (unsigned long)(uintptr_t)&info);
+      ioctl(fd, PWMIOC_START, 0);
+
+      for (cycle = 0; cycle < cycles; cycle++)
+        {
+          for (step = 1; step <= PWM_BREATH_STEPS; step++)
+            {
+              info.frequency = freq;
+              info.duty = (uint32_t)((uint64_t)step *
+                                     PWM_DUTY_MAX / PWM_BREATH_STEPS);
+              ioctl(fd, PWMIOC_SETCHARACTERISTICS,
+                    (unsigned long)(uintptr_t)&info);
+              up_udelay(step_delay_us);
+            }
+
+          for (step = PWM_BREATH_STEPS - 1; step >= 0; step--)
+            {
+              info.frequency = freq;
+              info.duty = (uint32_t)((uint64_t)step *
+                                     PWM_DUTY_MAX / PWM_BREATH_STEPS);
+              ioctl(fd, PWMIOC_SETCHARACTERISTICS,
+                    (unsigned long)(uintptr_t)&info);
+              up_udelay(step_delay_us);
+            }
+        }
+
+      /* Animation done: leave PWM stopped (LED off) */
+      info.frequency = freq;
+      info.duty = 0;
+      ioctl(fd, PWMIOC_SETCHARACTERISTICS, (unsigned long)(uintptr_t)&info);
+      ioctl(fd, PWMIOC_STOP, 0);
+      close(fd);
+
+      resp = cJSON_CreateObject();
+      cJSON_AddBoolToObject(resp, "ok", true);
+      cJSON_AddStringToObject(resp, "mode", "breath");
+      cJSON_AddNumberToObject(resp, "period_ms", period_ms);
+      cJSON_AddNumberToObject(resp, "cycles", cycles);
+      cJSON_AddNumberToObject(resp, "total_ms",
+                              (long)period_ms * cycles);
+      cJSON_AddStringToObject(resp, "state", "finished (LED off)");
+      json_reply(resp, output, output_size);
+      syslog(LOG_INFO, "[%s] pwm breath %dms x%d\n",
+             TAG, period_ms, cycles);
+      return OK;
     }
 
   info.frequency = freq;
