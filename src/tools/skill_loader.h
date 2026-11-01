@@ -59,3 +59,11 @@ bool skill_loader_check_changed(void);
  * without restarting the process.
  */
 void skill_loader_refresh(void);
+
+/**
+ * Truncate a UTF-8 string at a code point boundary, dropping any
+ * trailing incomplete multi-byte sequence. Returns the sanitized
+ * length. Use before any prompt fragment built by clamped string
+ * concatenation reaches the LLM API.
+ */
+size_t utf8_sanitize(char *s, size_t len);

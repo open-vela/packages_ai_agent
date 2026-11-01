@@ -60,6 +60,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/skill_loader.c
     src/tools/tool_guard.c
     src/tools/tool_amap.c
+    src/tools/tool_2k0300.c
     src/voice/volc_tts.c
     src/voice/volc_tts_ws.c
     src/voice/volc_asr.c

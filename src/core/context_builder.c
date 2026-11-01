@@ -169,7 +169,7 @@ int context_build_system_prompt(char *buf, size_t size)
     }
 
     /* Skills summary — use smaller stack buffer */
-    char skills_buf[1024];
+    char skills_buf[2048];
     size_t skills_len = skill_loader_build_summary(skills_buf, sizeof(skills_buf));
     if (skills_len > 0) {
         off += snprintf(buf + off, size - off,
@@ -187,6 +187,11 @@ int context_build_system_prompt(char *buf, size_t size)
             node_buf);
     }
 #endif
+
+    /* Final UTF-8 boundary guard: any clamped concatenation above
+     * could split a multi-byte code point, which the LLM API rejects
+     * with HTTP 400 "invalid unicode code point". */
+    off = utf8_sanitize(buf, size);
 
     syslog(LOG_INFO, "[%s] System prompt built: %d bytes\n", TAG, (int)off);
     return OK;

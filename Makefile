@@ -77,6 +77,7 @@ CSRCS += src/tools/mcp_client.c
 endif
 CSRCS += src/tools/skill_loader.c
 CSRCS += src/tools/tool_guard.c
+CSRCS += src/tools/tool_2k0300.c
 
 ifeq ($(CONFIG_AI_AGENT_SKILL_SYNC),y)
 CSRCS += src/tools/skill_sync.c

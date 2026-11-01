@@ -41,6 +41,7 @@
 #include "tools/tool_vision.h"
 #include "tools/tool_camera.h"
 #include "tools/tool_web_search.h"
+#include "tools/tool_2k0300.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -50,7 +51,7 @@
 
 static const char* TAG = "tools";
 
-#define MAX_TOOLS 48
+#define MAX_TOOLS 56
 #define MAX_PROVIDERS 4
 
 /* ── External tool provider registry ───────────────────────── */
@@ -496,6 +497,117 @@ int tool_registry_init(void)
     REGISTER_TOOL_NO_PARAMS("exit_quickapp",
         "Exit current QuickApp, return to home.",
         tool_exit_quickapp_execute);
+
+    /* ── LS2K0300 Board Peripheral Tools ────────────────────── */
+
+    REGISTER_TOOL(
+        "board_led",
+        "Control the on-board LEDs of the LS2K0300 board. "
+        "red LED and green LED, plus blue LED via PWM. "
+        "Actions: on, off, toggle, blink.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_ENUM("led", "Which LED(s) to control",
+                "\"red\",\"green\",\"both\"") ","
+            TOOL_PARAM_ENUM("action", "Action to perform",
+                "\"on\",\"off\",\"toggle\",\"blink\"") ","
+            TOOL_PARAM_NUM("times",
+                "Blink count 1-10 (only for blink, default 3)") ","
+            TOOL_PARAM_NUM("interval_ms",
+                "Blink interval in ms 50-5000 (only for blink, default 500)")
+            TOOL_SCHEMA_END_REQUIRED("\"led\",\"action\""),
+        tool_board_led_execute);
+
+    REGISTER_TOOL(
+        "board_pwm",
+        "Set hardware PWM2 duty cycle driving the blue LED on the board. "
+        "duty 0-100 (0 stops PWM). frequency default 1000 Hz.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_NUM("duty", "Duty cycle percent 0-100 (0 = stop)") ","
+            TOOL_PARAM_NUM("frequency", "PWM frequency in Hz 10-100000 (default 1000)")
+            TOOL_SCHEMA_END_REQUIRED("\"duty\""),
+        tool_board_pwm_execute);
+
+    REGISTER_TOOL(
+        "board_buzzer",
+        "Beep the on-board passive buzzer (1 kHz tone). "
+        "Use for alerts or notifications.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_NUM("duration_ms",
+                "Beep duration in ms 1-5000 (default 200)") ","
+            TOOL_PARAM_NUM("count", "Number of beeps 1-10 (default 1)")
+            TOOL_SCHEMA_END(),
+        tool_board_buzzer_execute);
+
+    REGISTER_TOOL_NO_PARAMS(
+        "board_key_read",
+        "Read the current state of the two on-board push buttons "
+        "(key1 and key2). Returns pressed/released for each.",
+        tool_board_key_read_execute);
+
+    REGISTER_TOOL_NO_PARAMS(
+        "board_thermal_read",
+        "Read the on-die CPU temperature sensor of the LS2K0300 "
+        "in celsius.",
+        tool_board_thermal_read_execute);
+
+    REGISTER_TOOL(
+        "board_adc_read",
+        "Read the MCP3204 SPI ADC voltage on the board. "
+        "Returns 12-bit raw value and voltage (Vref 3.3V).",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_NUM("channel", "ADC channel 0-3 (default 0)")
+            TOOL_SCHEMA_END(),
+        tool_board_adc_read_execute);
+
+    REGISTER_TOOL_NO_PARAMS(
+        "board_light_read",
+        "Read ambient light level in lux from the BH1750 I2C light "
+        "sensor on the board.",
+        tool_board_light_read_execute);
+
+    REGISTER_TOOL(
+        "board_oled_show",
+        "Display ASCII text on the 128x64 SSD1306 OLED screen. "
+        "Supports multiple lines with \\n. Max 256 chars.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("text", "Text to display (ASCII, up to 256 chars)")
+            TOOL_SCHEMA_END_REQUIRED("\"text\""),
+        tool_board_oled_show_execute);
+
+    /* ── Smart-home style aliases (mapped to real board HW) ──── */
+
+    REGISTER_TOOL(
+        "smart_light_control",
+        "Control lights mapped to real on-board LEDs: "
+        "device 'living_room' = red LED (GPIO72), "
+        "'bedroom' = green LED (GPIO73), "
+        "'kitchen' = blue LED via PWM (GPIO88). "
+        "Actions: turn_on, turn_off, set_brightness (0-100), "
+        "set_color (warm=red, cool=blue, daylight=all on).",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("device", "Device/location name, e.g. living_room, bedroom, kitchen") ","
+            TOOL_PARAM_ENUM("action", "Action to perform",
+                "\"turn_on\",\"turn_off\",\"set_brightness\",\"set_color\"") ","
+            TOOL_PARAM_NUM("brightness",
+                "Brightness level 0-100 (required for set_brightness)") ","
+            TOOL_PARAM_STR("color",
+                "Color: warm, cool, daylight (required for set_color)")
+            TOOL_SCHEMA_END_REQUIRED("\"device\",\"action\""),
+        tool_smart_light_control_execute);
+
+    REGISTER_TOOL(
+        "env_sensor_read",
+        "Read on-board sensors: temperature (CPU thermal, real), "
+        "ambient light (BH1750 lux, needs module on I2C1). "
+        "Humidity is not available on this board (returns null). "
+        "sensor_type: 'all' (default), 'temperature', 'humidity', 'light'.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("device", "Location name, informational only") ","
+            TOOL_PARAM_ENUM("sensor_type",
+                "Which sensor to read (default: all)",
+                "\"all\",\"temperature\",\"humidity\",\"light\"")
+            TOOL_SCHEMA_END(),
+        tool_env_sensor_read_execute);
 
     build_tools_json_locked();
     syslog(LOG_INFO, "[%s] Tool registry initialized\n", TAG);

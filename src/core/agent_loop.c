@@ -34,6 +34,7 @@
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
+#include "channels/nsh_commands.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -203,6 +204,11 @@ static void add_tool_result_messages(cJSON* messages,
 
         syslog(LOG_INFO, "[%s] Tool call: %s args=%.500s\n", TAG,
             call->name, call->input ? call->input : "(null)");
+        pthread_mutex_lock(&g_stdout_lock);
+        printf("\n[tool] %s(%s)\n", call->name,
+            call->input ? call->input : "");
+        fflush(stdout);
+        pthread_mutex_unlock(&g_stdout_lock);
         tool_output[0] = '\0';
         char* patched = inject_cron_context(
             call->name, call->input, msg_channel, msg_chat_id);
@@ -212,6 +218,10 @@ static void add_tool_result_messages(cJSON* messages,
         free(patched);
         syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n", TAG,
             call->name, (int)strlen(tool_output));
+        pthread_mutex_lock(&g_stdout_lock);
+        printf("[tool] -> %.160s\n", tool_output);
+        fflush(stdout);
+        pthread_mutex_unlock(&g_stdout_lock);
 
         cJSON* result_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(result_msg, "role", "tool");
