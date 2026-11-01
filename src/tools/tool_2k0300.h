@@ -66,28 +66,6 @@ int tool_board_light_read_execute(const char *input_json,
 int tool_board_oled_show_execute(const char *input_json,
                                  char *output, size_t output_size);
 
-/* ── Skill-compat interfaces (same names as smarthome skill) ────
- *
- * The agent_skills/smarthome.md skill teaches the LLM these tool
- * names; they map skill semantics onto real board hardware:
- *
- *   smart_light_control:
- *     device "living_room" -> red LED (GPIO72)
- *     device "bedroom"     -> green LED (GPIO73)
- *     device "kitchen"     -> blue LED via PWM (GPIO88)
- *     action turn_on / turn_off / set_brightness / set_color
- *
- *   env_sensor_read:
- *     temperature -> on-die thermal sensor (/dev/thermal0)
- *     light       -> BH1750 lux (I2C1)
- *     humidity    -> not available on this board (reported in JSON)
- */
-int tool_smart_light_control_execute(const char *input_json,
-                                     char *output, size_t output_size);
-
-int tool_env_sensor_read_execute(const char *input_json,
-                                 char *output, size_t output_size);
-
 #ifdef __cplusplus
 }
 #endif

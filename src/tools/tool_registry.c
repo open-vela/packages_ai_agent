@@ -591,41 +591,6 @@ int tool_registry_init(void)
             TOOL_SCHEMA_END_REQUIRED("\"text\""),
         tool_board_oled_show_execute);
 
-    /* ── Smart-home style aliases (mapped to real board HW) ──── */
-
-    REGISTER_TOOL(
-        "smart_light_control",
-        "Control lights mapped to real on-board LEDs: "
-        "device 'living_room' = red LED (GPIO72), "
-        "'bedroom' = green LED (GPIO73), "
-        "'kitchen' = blue LED via PWM (GPIO88). "
-        "Actions: turn_on, turn_off, set_brightness (0-100), "
-        "set_color (warm=red, cool=blue, daylight=all on).",
-        TOOL_SCHEMA_BEGIN()
-            TOOL_PARAM_STR("device", "Device/location name, e.g. living_room, bedroom, kitchen") ","
-            TOOL_PARAM_ENUM("action", "Action to perform",
-                "\"turn_on\",\"turn_off\",\"set_brightness\",\"set_color\"") ","
-            TOOL_PARAM_NUM("brightness",
-                "Brightness level 0-100 (required for set_brightness)") ","
-            TOOL_PARAM_STR("color",
-                "Color: warm, cool, daylight (required for set_color)")
-            TOOL_SCHEMA_END_REQUIRED("\"device\",\"action\""),
-        tool_smart_light_control_execute);
-
-    REGISTER_TOOL(
-        "env_sensor_read",
-        "Read on-board sensors: temperature (CPU thermal, real), "
-        "ambient light (BH1750 lux, needs module on I2C1). "
-        "Humidity is not available on this board (returns null). "
-        "sensor_type: 'all' (default), 'temperature', 'humidity', 'light'.",
-        TOOL_SCHEMA_BEGIN()
-            TOOL_PARAM_STR("device", "Location name, informational only") ","
-            TOOL_PARAM_ENUM("sensor_type",
-                "Which sensor to read (default: all)",
-                "\"all\",\"temperature\",\"humidity\",\"light\"")
-            TOOL_SCHEMA_END(),
-        tool_env_sensor_read_execute);
-
     build_tools_json_locked();
     syslog(LOG_INFO, "[%s] Tool registry initialized\n", TAG);
     return OK;
