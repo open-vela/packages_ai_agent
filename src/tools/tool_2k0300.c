@@ -907,6 +907,15 @@ int tool_board_led_execute(const char *input_json,
         }
     }
 
+  /* Keep the panel switches in step with the hardware. */
+
+  for (i = 0; i < count; i++)
+    {
+      ls_lvgl_set_actuator(pins[i] == LED_RED_PIN ? "LED RED"
+                                                   : "LED GREEN",
+                           led_on[i]);
+    }
+
   for (i = 0; i < count; i++)
     {
       close(fds[i]);
@@ -932,6 +941,124 @@ int tool_board_led_execute(const char *input_json,
   return OK;
 }
 
+/* ── Breathing animation ──────────────────────────────────────
+ *
+ * The blue LED breathes by ramping the PWM duty up and down.  The ramp
+ * runs in its own thread: the tool call has to return at once so the
+ * agent can report back and take the next command, and the LED has to
+ * keep breathing until it is told to stop.  Running the animation inline
+ * blocked the agent for the whole cycle and left the LED off at the end.
+ */
+
+static volatile bool s_pwm_breath_running;
+static volatile uint32_t s_pwm_breath_freq = PWM_FREQ_DEFAULT;
+static volatile int s_pwm_breath_period_ms = 3000;
+static pthread_t s_pwm_breath_thread;
+static bool s_pwm_breath_thread_valid;
+static pthread_mutex_t s_pwm_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void* pwm_breath_worker(void* arg)
+{
+  struct pwm_info_s info;
+  int fd;
+  int step_delay_us;
+  int step;
+
+  fd = open(PWM_DEVICE, O_RDONLY);
+  if (fd < 0)
+    {
+      syslog(LOG_ERR, "[%s] pwm breath: open %s failed: %d\n",
+             TAG, PWM_DEVICE, errno);
+      return NULL;
+    }
+
+  step_delay_us = s_pwm_breath_period_ms * 1000 / (PWM_BREATH_STEPS * 2);
+
+  memset(&info, 0, sizeof(info));
+  info.frequency = s_pwm_breath_freq;
+  info.duty = 0;
+  ioctl(fd, PWMIOC_SETCHARACTERISTICS, (unsigned long)(uintptr_t)&info);
+  ioctl(fd, PWMIOC_START, 0);
+
+  while (s_pwm_breath_running)
+    {
+      for (step = 1; step <= PWM_BREATH_STEPS; step++)
+        {
+          if (!s_pwm_breath_running)
+            {
+              break;
+            }
+
+          info.frequency = s_pwm_breath_freq;
+          info.duty = (uint32_t)((uint64_t)step * PWM_DUTY_MAX /
+                                 PWM_BREATH_STEPS);
+          ioctl(fd, PWMIOC_SETCHARACTERISTICS,
+                (unsigned long)(uintptr_t)&info);
+          up_udelay(step_delay_us);
+        }
+
+      for (step = PWM_BREATH_STEPS - 1; step >= 0; step--)
+        {
+          if (!s_pwm_breath_running)
+            {
+              break;
+            }
+
+          info.frequency = s_pwm_breath_freq;
+          info.duty = (uint32_t)((uint64_t)step * PWM_DUTY_MAX /
+                                 PWM_BREATH_STEPS);
+          ioctl(fd, PWMIOC_SETCHARACTERISTICS,
+                (unsigned long)(uintptr_t)&info);
+          up_udelay(step_delay_us);
+        }
+    }
+
+  /* Animation stopped: leave the PWM off. */
+  info.duty = 0;
+  ioctl(fd, PWMIOC_SETCHARACTERISTICS, (unsigned long)(uintptr_t)&info);
+  ioctl(fd, PWMIOC_STOP, 0);
+  close(fd);
+  return NULL;
+}
+
+/* Stop a running animation.  The worker checks the flag once per step,
+ * so this returns within a step delay. */
+static void pwm_breath_stop(void)
+{
+  pthread_mutex_lock(&s_pwm_lock);
+  if (s_pwm_breath_thread_valid)
+    {
+      s_pwm_breath_running = false;
+      pthread_join(s_pwm_breath_thread, NULL);
+      s_pwm_breath_thread_valid = false;
+    }
+  pthread_mutex_unlock(&s_pwm_lock);
+}
+
+static int pwm_breath_start(uint32_t freq, int period_ms)
+{
+  int ret;
+
+  pwm_breath_stop();
+
+  pthread_mutex_lock(&s_pwm_lock);
+  s_pwm_breath_freq = freq;
+  s_pwm_breath_period_ms = period_ms;
+  s_pwm_breath_running = true;
+
+  ret = pthread_create(&s_pwm_breath_thread, NULL, pwm_breath_worker, NULL);
+  if (ret != 0)
+    {
+      s_pwm_breath_running = false;
+      pthread_mutex_unlock(&s_pwm_lock);
+      return -1;
+    }
+
+  s_pwm_breath_thread_valid = true;
+  pthread_mutex_unlock(&s_pwm_lock);
+  return 0;
+}
+
 /****************************************************************************
  * Tool: board_pwm
  *
@@ -940,12 +1067,12 @@ int tool_board_led_execute(const char *input_json,
  *   duty=0 stops PWM. Controls blue LED on GPIO88.
  *
  * Input (breath mode):
- *   { "action": "breath", "period_ms": 3000, "cycles": 5,
- *     "frequency": Hz }
- *   Blocking animation: duty ramps 0->100->0 per cycle, stepping
+ *   { "action": "breath", "period_ms": 3000, "frequency": Hz }
+ *   Background animation: duty ramps 0->100->0 per cycle, stepping
  *   every period_ms/200 ms (100 steps up + 100 steps down), same as
- *   ls_driver_test/test_pwm.c. Returns after the animation ends.
- *   period_ms 200-60000 (default 3000), cycles 1-100 (default 1).
+ *   ls_driver_test/test_pwm.c.  The call returns immediately and the
+ *   animation keeps running until it is stopped with a static duty=0.
+ *   period_ms 200-60000 (default 3000).
  ****************************************************************************/
 
 int tool_board_pwm_execute(const char *input_json,
@@ -961,11 +1088,9 @@ int tool_board_pwm_execute(const char *input_json,
   cJSON *j_freq;
   cJSON *j_action;
   cJSON *j_period;
-  cJSON *j_cycles;
   cJSON *resp;
   bool breath = false;
   int period_ms = 3000;
-  int cycles = 1;
 
   if (!input_json || !output || output_size < 32)
     {
@@ -1025,12 +1150,6 @@ int tool_board_pwm_execute(const char *input_json,
           period_ms = (int)j_period->valuedouble;
         }
 
-      j_cycles = cJSON_GetObjectItem(root, "cycles");
-      if (cJSON_IsNumber(j_cycles) && j_cycles->valuedouble >= 1 &&
-          j_cycles->valuedouble <= 100)
-        {
-          cycles = (int)j_cycles->valuedouble;
-        }
     }
 
   cJSON_Delete(root);
@@ -1055,62 +1174,33 @@ int tool_board_pwm_execute(const char *input_json,
 
   if (breath)
     {
-      /* Breathing animation: 100 steps up + 100 steps down per cycle,
-       * step delay = period_ms / 200 so one full period matches
-       * period_ms exactly (mirrors test_pwm.c breathing loop). */
-      int step_delay_us = period_ms * 1000 / (PWM_BREATH_STEPS * 2);
-      int cycle;
-      int step;
-
-      info.frequency = freq;
-      info.duty = 0;
-      ioctl(fd, PWMIOC_SETCHARACTERISTICS,
-            (unsigned long)(uintptr_t)&info);
-      ioctl(fd, PWMIOC_START, 0);
-
-      for (cycle = 0; cycle < cycles; cycle++)
+      /* Start the animation in the background: the call returns at once
+       * and the LED keeps breathing until it is stopped. */
+      if (pwm_breath_start(freq, period_ms) != 0)
         {
-          for (step = 1; step <= PWM_BREATH_STEPS; step++)
-            {
-              info.frequency = freq;
-              info.duty = (uint32_t)((uint64_t)step *
-                                     PWM_DUTY_MAX / PWM_BREATH_STEPS);
-              ioctl(fd, PWMIOC_SETCHARACTERISTICS,
-                    (unsigned long)(uintptr_t)&info);
-              up_udelay(step_delay_us);
-            }
-
-          for (step = PWM_BREATH_STEPS - 1; step >= 0; step--)
-            {
-              info.frequency = freq;
-              info.duty = (uint32_t)((uint64_t)step *
-                                     PWM_DUTY_MAX / PWM_BREATH_STEPS);
-              ioctl(fd, PWMIOC_SETCHARACTERISTICS,
-                    (unsigned long)(uintptr_t)&info);
-              up_udelay(step_delay_us);
-            }
+          close(fd);
+          snprintf(output, output_size,
+                   "{\"error\":\"cannot start the breathing thread\"}");
+          return ERROR;
         }
 
-      /* Animation done: leave PWM stopped (LED off) */
-      info.frequency = freq;
-      info.duty = 0;
-      ioctl(fd, PWMIOC_SETCHARACTERISTICS, (unsigned long)(uintptr_t)&info);
-      ioctl(fd, PWMIOC_STOP, 0);
       close(fd);
 
       resp = cJSON_CreateObject();
       cJSON_AddBoolToObject(resp, "ok", true);
       cJSON_AddStringToObject(resp, "mode", "breath");
       cJSON_AddNumberToObject(resp, "period_ms", period_ms);
-      cJSON_AddNumberToObject(resp, "cycles", cycles);
-      cJSON_AddNumberToObject(resp, "total_ms",
-                              (long)period_ms * cycles);
-      cJSON_AddStringToObject(resp, "state", "finished (LED off)");
+      cJSON_AddNumberToObject(resp, "frequency_hz", freq);
+      cJSON_AddStringToObject(resp, "state", "breathing");
       json_reply(resp, output, output_size);
-      syslog(LOG_INFO, "[%s] pwm breath %dms x%d\n",
-             TAG, period_ms, cycles);
+      ls_lvgl_set_actuator("PWM BLUE", true);
+      syslog(LOG_INFO, "[%s] pwm breath %dms freq=%uHz\n",
+             TAG, period_ms, freq);
       return OK;
     }
+
+  /* A static duty takes over from the breathing animation. */
+  pwm_breath_stop();
 
   info.frequency = freq;
   info.duty = (uint32_t)((uint64_t)duty * PWM_DUTY_MAX / 100);
@@ -1141,6 +1231,7 @@ int tool_board_pwm_execute(const char *input_json,
   cJSON_AddNumberToObject(resp, "frequency_hz", freq);
   cJSON_AddStringToObject(resp, "state", duty > 0 ? "on" : "stopped");
   json_reply(resp, output, output_size);
+  ls_lvgl_set_actuator("PWM BLUE", duty > 0);
 
   syslog(LOG_INFO, "[%s] pwm duty=%u%% freq=%uHz\n", TAG, duty, freq);
   return OK;
@@ -1207,6 +1298,8 @@ int tool_board_buzzer_execute(const char *input_json,
 
   cycles = (long)duration_ms * 1000 / (BUZZER_HALF_US * 2);
 
+  ls_lvgl_set_actuator("BUZZER", true);
+
   for (n = 0; n < count; n++)
     {
       for (c = 0; c < cycles; c++)
@@ -1224,6 +1317,8 @@ int tool_board_buzzer_execute(const char *input_json,
     }
 
   close(fd);
+
+  ls_lvgl_set_actuator("BUZZER", false);
 
   resp = cJSON_CreateObject();
   cJSON_AddBoolToObject(resp, "ok", true);

@@ -510,9 +510,9 @@ int tool_registry_init(void)
 
     REGISTER_TOOL(
         "board_led",
-        "Control the on-board LEDs of the LS2K0300 board. "
-        "red LED and green LED, plus blue LED via PWM. "
-        "Actions: on, off, toggle, blink.",
+        "Control the on-board LEDs of the LS2K0300 board: the red LED "
+        "and the green LED.  Actions: on, off, toggle, blink.  The blue "
+        "LED is not here - it is driven by PWM, use board_pwm for it.",
         TOOL_SCHEMA_BEGIN()
             TOOL_PARAM_ENUM("led", "Which LED(s) to control",
                 "\"red\",\"green\",\"both\"") ","
@@ -529,17 +529,15 @@ int tool_registry_init(void)
         "board_pwm",
         "Control hardware PWM2 driving the blue LED on the board. "
         "Static mode: set duty (0-100, 0=stop), optional frequency "
-        "(default 1000 Hz). Breath mode: action=\"breath\" plays a "
-        "breathing animation - duty ramps 0->100->0 each cycle. "
-        "period_ms per full breath cycle (default 3000), cycles "
-        "count (default 1). Returns after animation finishes.",
+        "(default 1000 Hz). Breath mode: action=\"breath\" starts a "
+        "continuous breathing animation - the duty ramps 0->100->0 "
+        "repeatedly, period_ms per full cycle (default 3000). The "
+        "animation keeps running until it is stopped with duty=0.",
         TOOL_SCHEMA_BEGIN()
             TOOL_PARAM_NUM("duty", "Static mode: duty cycle percent 0-100 (0 = stop)") ","
             TOOL_PARAM_STR("action", "Breath mode: set to \"breath\"") ","
             TOOL_PARAM_NUM("period_ms",
                 "Breath mode: full breath cycle duration in ms, 200-60000 (default 3000)") ","
-            TOOL_PARAM_NUM("cycles",
-                "Breath mode: number of breath cycles, 1-100 (default 1)") ","
             TOOL_PARAM_NUM("frequency", "PWM carrier frequency in Hz 10-100000 (default 1000)")
             TOOL_SCHEMA_END(),
         tool_board_pwm_execute);

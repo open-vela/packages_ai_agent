@@ -151,3 +151,19 @@ void agent_request_shutdown(void);
 
 /** Returns true once shutdown has been requested. */
 bool agent_shutdown_requested(void);
+
+/* ── LCD panel subtitle hook ───────────────────────────────────────────────── */
+
+/** Post agent status and reply text to the LCD panel (examples/ls_lvgl).
+ *  Weak: resolved against the strong definition in ls_lvgl.c when that
+ *  app is linked; otherwise the no-op stub in stubs.c takes over. */
+void ls_lvgl_set_ai_text(const char* status, const char* text);
+
+/* ── LCD panel actuator hook ────────────────────────────────────────────────── */
+
+/** Tell the panel that an actuator changed state, so its switches show
+ *  what the hardware is really doing.  `name` is one of "LED RED",
+ *  "LED GREEN", "PWM BLUE", "BUZZER".
+ *  Weak: resolved against the strong definition in ls_lvgl.c when that
+ *  app is linked; otherwise the no-op stub in stubs.c takes over. */
+void ls_lvgl_set_actuator(const char* name, bool on);
