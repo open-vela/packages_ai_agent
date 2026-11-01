@@ -897,6 +897,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     /* XML fallback parsers for non-standard models */
     parse_xml_tool_calls(resp);
     parse_ns_xml_tool_calls(resp);
+    parse_dsml_tool_calls(resp);
 
     cJSON_Delete(root);
 

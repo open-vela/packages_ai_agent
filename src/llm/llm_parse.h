@@ -36,6 +36,7 @@ cJSON* build_openai_tools_array(const char* tools_json);
 /* XML fallback parsers for non-standard models */
 void parse_xml_tool_calls(llm_response_t* resp);
 void parse_ns_xml_tool_calls(llm_response_t* resp);
+void parse_dsml_tool_calls(llm_response_t* resp);
 
 /* Extract OpenAI tool_calls from response message */
 void extract_openai_tool_calls(cJSON* message, llm_response_t* resp);
