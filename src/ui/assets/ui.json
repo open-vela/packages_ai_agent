@@ -1,0 +1,472 @@
+{
+  "pages": {
+    "watchface": {
+      "pad": 20,
+      "layout": "column",
+      "align": "center",
+      "children": [
+        {
+          "type": "statusbar",
+          "text": "$battery",
+          "icon": "battery"
+        },
+        {
+          "type": "spacer"
+        },
+        {
+          "type": "label",
+          "text": "$time",
+          "font": "time",
+          "color": "text_primary"
+        },
+        {
+          "type": "label",
+          "text": "$date",
+          "font": "caption",
+          "color": "text_secondary"
+        },
+        {
+          "type": "spacer"
+        },
+        {
+          "type": "box",
+          "layout": "row",
+          "w": "100%",
+          "justify": "between",
+          "gap": 8,
+          "children": [
+            {
+              "type": "chip",
+              "icon": "heart",
+              "text": "$bpm",
+              "tint": "heart",
+              "action": "goto:heart"
+            },
+            {
+              "type": "chip",
+              "icon": "step",
+              "text": "$steps",
+              "tint": "step",
+              "action": "goto:apps"
+            },
+            {
+              "type": "chip",
+              "icon": "weather",
+              "text": "--",
+              "tint": "weather",
+              "action": "goto:apps"
+            }
+          ]
+        },
+        {
+          "type": "label",
+          "text": "@watchface.hint",
+          "font": "caption",
+          "color": "text_tertiary"
+        }
+      ]
+    },
+    "apps": {
+      "pad": 8,
+      "layout": "column",
+      "children": [
+        {
+          "type": "bubblegrid",
+          "w": "100%",
+          "h": "100%",
+          "apps": [
+            {
+              "icon": "app_sport",
+              "color": "step",
+              "action": "goto:about"
+            },
+            {
+              "icon": "app_timer",
+              "color": "weather",
+              "action": "goto:about"
+            },
+            {
+              "icon": "app_heart",
+              "color": "heart",
+              "action": "goto:heart"
+            },
+            {
+              "icon": "app_spo2",
+              "color": "accent",
+              "action": "goto:spo2"
+            },
+            {
+              "icon": "app_music",
+              "color": "#c2185b",
+              "action": "goto:about"
+            },
+            {
+              "icon": "app_sleep",
+              "color": "#6d3de0",
+              "action": "goto:about"
+            },
+            {
+              "icon": "app_settings",
+              "color": "#353f52",
+              "action": "goto:settings"
+            },
+            {
+              "glyph": "i",
+              "color": "accent",
+              "action": "goto:about"
+            }
+          ]
+        }
+      ]
+    },
+    "heart": {
+      "pad": 20,
+      "layout": "column",
+      "align": "center",
+      "children": [
+        {
+          "type": "label",
+          "text": "心率",
+          "font": "caption",
+          "color": "text_secondary"
+        },
+        {
+          "type": "label",
+          "text": "$bpm",
+          "font": "time",
+          "color": "text_primary"
+        },
+        {
+          "type": "label",
+          "text": "BPM",
+          "font": "caption",
+          "color": "text_secondary"
+        },
+        {
+          "type": "spacer"
+        },
+        {
+          "type": "button",
+          "text": "@heart.measure",
+          "bg": "heart",
+          "action": "measure:heart"
+        },
+        {
+          "type": "label",
+          "text": "@heart.hint",
+          "font": "caption",
+          "color": "text_tertiary"
+        }
+      ]
+    },
+    "spo2": {
+      "pad": 20,
+      "layout": "column",
+      "align": "center",
+      "children": [
+        {
+          "type": "label",
+          "text": "血氧",
+          "font": "caption",
+          "color": "text_secondary"
+        },
+        {
+          "type": "icon",
+          "name": "app_spo2",
+          "scale": 70,
+          "color": "step"
+        },
+        {
+          "type": "label",
+          "text": "$spo2",
+          "font": "time",
+          "color": "text_primary"
+        },
+        {
+          "type": "label",
+          "text": "SpO2 %",
+          "font": "caption",
+          "color": "text_secondary"
+        },
+        {
+          "type": "label",
+          "text": "正常范围 95~100",
+          "font": "caption",
+          "color": "text_secondary"
+        },
+        {
+          "type": "button",
+          "text": "@spo2.measure",
+          "bg": "step",
+          "action": "measure:spo2"
+        }
+      ]
+    },
+    "settings": {
+      "pad": 20,
+      "layout": "column",
+      "children": [
+        {
+          "type": "label",
+          "text": "@page.settings",
+          "font": "title",
+          "color": "text_primary"
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "h": 54,
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "@settings.brightness",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "@settings.brightness.v",
+              "font": "body",
+              "color": "text_secondary"
+            }
+          ]
+        },
+        {
+          "type": "divider"
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "h": 54,
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "@settings.volume",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "@settings.volume.v",
+              "font": "body",
+              "color": "text_secondary"
+            }
+          ]
+        },
+        {
+          "type": "divider"
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "h": 54,
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "@settings.bluetooth",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "@settings.bluetooth.v",
+              "font": "body",
+              "color": "text_secondary"
+            }
+          ]
+        },
+        {
+          "type": "divider"
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "h": 54,
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "@settings.dnd",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "@settings.dnd.v",
+              "font": "body",
+              "color": "text_secondary"
+            }
+          ]
+        },
+        {
+          "type": "divider"
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "h": 54,
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "@settings.ai",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "@settings.ai.v",
+              "font": "body",
+              "color": "text_secondary"
+            }
+          ]
+        }
+      ]
+    },
+    "about": {
+      "pad": 20,
+      "layout": "column",
+      "align": "center",
+      "children": [
+        {
+          "type": "label",
+          "text": "@page.about",
+          "font": "title",
+          "color": "text_primary"
+        },
+        {
+          "type": "label",
+          "text": "HerSen AI Agent",
+          "font": "body",
+          "color": "accent"
+        },
+        {
+          "type": "spacer"
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "版本",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "v1.0.0",
+              "font": "body",
+              "color": "text_primary"
+            }
+          ]
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "平台",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "SF32LB52",
+              "font": "body",
+              "color": "text_primary"
+            }
+          ]
+        },
+        {
+          "type": "box",
+          "w": "100%",
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "label",
+              "text": "队伍",
+              "font": "body",
+              "color": "text_primary"
+            },
+            {
+              "type": "label",
+              "text": "Team 181",
+              "font": "body",
+              "color": "text_primary"
+            }
+          ]
+        },
+        {
+          "type": "spacer"
+        },
+        {
+          "type": "button",
+          "text": "返回",
+          "w": 120,
+          "h": 44,
+          "bg": "surface",
+          "color": "text_primary",
+          "action": "back"
+        }
+      ]
+    },
+    "ai": {
+      "pad": 20,
+      "layout": "column",
+      "children": [
+        {
+          "type": "box",
+          "w": "100%",
+          "layout": "row",
+          "justify": "between",
+          "children": [
+            {
+              "type": "button",
+              "text": "<",
+              "w": 56,
+              "h": 56,
+              "radius": 28,
+              "bg": "surface",
+              "color": "text_primary",
+              "action": "back"
+            },
+            {
+              "type": "button",
+              "text": "≡",
+              "w": 56,
+              "h": 56,
+              "radius": 28,
+              "bg": "surface",
+              "color": "text_primary",
+              "action": "goto:settings"
+            }
+          ]
+        },
+        {
+          "type": "label",
+          "text": "早上好！今天怎么样？",
+          "font": "body",
+          "color": "text_primary"
+        },
+        {
+          "type": "spacer"
+        }
+      ]
+    }
+  }
+}

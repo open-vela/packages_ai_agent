@@ -60,6 +60,21 @@ void lvgl_ui_channel_show(void);
 void lvgl_ui_enter_pet_stage(void);
 
 /**
+ * DEMO-PHONE（2026-11-03）：把界面切回小云页（AI 页）。
+ *
+ * 手机 App 通过 BLE {"cmd":"demo"} 触发主动关怀时，用户可能正停留在表盘/
+ * 应用列表/心率等任意页面；先调本函数保证小云页出现，随后投递的气泡/表情
+ * 才看得见。
+ *
+ * 线程安全：只做 lvgl_ui_post() 入队，真正的 ui_nav_goto() 在 render 线程
+ * 执行；当前已经是 AI 页时不重复切页。可从任意线程调用，非阻塞。
+ *
+ * @return 0 已入队；-ENODEV UI 通道还没起来；-ENOMEM 入队失败
+ *         （失败时调用方照常发气泡，只是不保证切页）。
+ */
+int lvgl_ui_channel_navigate_pet(void);
+
+/**
  * 发送 Agent 回复到 UI。
  * 在 Chat View 中添加 Agent 消息气泡，并调用 voice_channel_speak() 进行 TTS 播报。
  * 首次调用时自动显示聊天界面。由 outbound_dispatch_task 调用。
@@ -117,6 +132,66 @@ int lvgl_ui_channel_send_user(const char* text);
  */
 int lvgl_ui_channel_log(const char* text, bool is_user);
 
+/****************************************************************************
+ * 流式回答显示（SPEED-B / v125）
+ *
+ * LLM 边生成边把文字显示到手表：头顶气泡 + 桌宠页 AI 文本层逐段追加，
+ * 不再等整句返回才出现。4 个函数都**线程安全、非阻塞**（内部只做
+ * malloc + lvgl_ui_post() 入队），可从任意线程调用；LVGL 对象操作全部
+ * 在 render 线程执行（LVGL 以 LV_OS_NONE 构建，调用线程绝不能碰 lv_obj）。
+ *
+ * 典型时序（LLM 流式层）：
+ *   首个非空 delta 到达： stream_begin(user_text)
+ *   每个 delta：          stream_delta(delta_utf8)   // best-effort，可丢
+ *   最终回答：            stream_end(final_text, from_local)
+ *   工具轮/失败/取消：    stream_abort()
+ *
+ * 语义要点：
+ *  - begin：把用户问题写进历史环/气泡（若 ASR/ask/BLE 已经显示过同一句则
+ *    复用，不重复写），并在桌宠页 AI 文本层放 “小云思考中…” 占位。
+ *  - delta：追加到**同一**气泡与桌宠页文本层（只 set_text，不重建页面、
+ *    不写历史）。超过气泡容量时显示尾部（前缀 …），长回答也能持续滚动。
+ *  - end：用 final_text 覆盖气泡、写历史环/桌宠页文本层，表情与
+ *    “（本地）”来源标记与既有 ui_mirror_answer() 一致；随后 agent_main 的
+ *    dispatch 镜像会被一次性去重，**同一句不会落两遍历史**。
+ *  - abort：清掉占位/未完成文本，表情回 IDLE；历史只留随后 dispatch 的
+ *    错误语。
+ *
+ * 健壮性：未收到 begin 的 delta 直接忽略；无 begin 的 end 仍会安全收尾；
+ * 重复 begin 重置上一条流；abort 之后再 end 也安全。delta 在积压
+ * （>16 条未显示）或内存不足时丢弃（只记一次日志），**end 不丢**。
+ ****************************************************************************/
+
+/**
+ * 开始一轮流式回答显示。非阻塞。
+ * @param user_text 用户问题（UTF-8，可为 NULL/空）；已在历史里则复用不重复。
+ * @return 0 已入队；-ENODEV UI 通道未就绪；-ENOMEM 内存不足/入队失败。
+ */
+int lvgl_ui_channel_stream_begin(const char *user_text);
+
+/**
+ * 追加一段增量文本到当前流式气泡。非阻塞、best-effort（压力大时丢增量）。
+ * delta_utf8 应是完整的 UTF-8 字符串；实现内部也做了字符边界防御。
+ * @return 0（包括“被丢弃”和“没有 begin 被忽略”的情况）。
+ */
+int lvgl_ui_channel_stream_delta(const char *delta_utf8);
+
+/**
+ * 结束流式：用 final_text 落历史/桌宠页文本层/最终气泡，并清流式状态。
+ * 不触发 TTS（保持原有 dispatch/TTS 路径）。
+ * @param final_text 最终完整回答（UTF-8）
+ * @param from_local true 表示端侧模型回答：历史/气泡带 “（本地）”，
+ *                   与 ui_mirror_answer() 的标记规则一致
+ * @return 0 已入队；-ENOMEM 内存不足/入队失败。
+ */
+int lvgl_ui_channel_stream_end(const char *final_text, bool from_local);
+
+/**
+ * 中止流式（工具轮/失败/取消）：清理占位与未完成文本、表情回 IDLE。
+ * 可重复调用；没有进行中的流时是安全 no-op。
+ */
+void lvgl_ui_channel_stream_abort(void);
+
 /**
  * 聊天历史条数（上限 20 条）。只能在 LVGL 线程上调用。
  */
@@ -132,6 +207,28 @@ int lvgl_ui_history_count(void);
  */
 bool lvgl_ui_history_get(int newest_first, char* buf, size_t len,
     bool* is_user);
+
+/**
+ * 把聊天历史环导出成 `chat_history` 事件的 items JSON 数组文本（旧 → 新）。
+ *
+ * 线程安全：内部 lvgl_ui_post() 把读环的动作投到 LVGL 线程，调用线程用
+ * 信号量最多等 200ms。可从任意线程调用（BLE RX 回调线程就是这么用的）。
+ * ★ 不要在 LVGL 线程内部调它：投递出去的回调要等本线程返回才跑，只会白
+ *   等 200ms 然后 -ETIMEDOUT。读环请直接用 lvgl_ui_history_count/get。
+ *
+ * 输出裁剪：历史比一帧 BLE 数据（1600B）长时，**保留最新的**若干条
+ * （最旧的先丢），单条过长则按 UTF-8 字符边界截断，保证输出始终是合法
+ * JSON 数组文本（不含外层对象，调用方自己拼 {"evt":...}）。
+ *
+ * @param out        输出缓冲；成功时是 NUL 结尾的 items 文本 {"u":1,"t":".."},{"u":0,..}
+ *                   —— **不含**外层方括号，调用方自己拼 "items":[<out>]
+ * @param cap        输出缓冲容量（>=32）
+ * @param max_items  最多导出多少条；<=0 表示不额外限制（上限仍是 20 条）
+ * @return 导出的条数（>=0，0 表示历史为空）；负值为错误
+ *         （-ENODEV LVGL 通道没起来，-ETIMEDOUT 200ms 内没等到 LVGL 线程，
+ *          -EINVAL 参数错，-ENOMEM 投递/初始化失败）
+ */
+int lvgl_ui_history_export(char* out, size_t cap, int max_items);
 
 #ifdef __cplusplus
 }

@@ -30,12 +30,14 @@
 #include <nuttx/input/buttons.h>
 
 #include "key_input.h"
+#include "ui_nav.h"
 #include "voice/voice_channel.h"
-#include "launcher_page.h"
+#include "ui_nav.h"
 #include "pet_page.h"
 #include "lvgl_ui_channel.h"
 #include "core/message_bus.h"
 #include "pet_care.h"
+#include "settings_page.h"   /* settings_page_wake_screen: 息屏时的按键逃生口(P17) */
 
 #define TAG "key"
 
@@ -117,8 +119,8 @@ static void key_open_pet_cb(void *arg)
 {
     (void)arg;
 
-    if (launcher_is_on_desktop()) {
-        launcher_enter_page(PAGE_PET);
+    if ((ui_nav_current() != UI_PAGE_AI)) {
+        ui_nav_goto(UI_PAGE_AI);
     }
 }
 
@@ -128,8 +130,8 @@ static void key_ask_shown_cb(void *arg)
     char *question = (char *)arg;
     char line[256];
 
-    if (launcher_is_on_desktop()) {
-        launcher_enter_page(PAGE_PET);
+    if ((ui_nav_current() != UI_PAGE_AI)) {
+        ui_nav_goto(UI_PAGE_AI);
     }
 
     snprintf(line, sizeof(line), "%s" KEY_THINKING, question);
@@ -224,7 +226,6 @@ static uint32_t s_key2_press_ms;
 
 static void *key_monitor_thread(void *arg)
 {
-    struct pollfd fds[1];
     btn_buttonset_t supported = 0;
     btn_buttonset_t sample = 0;
     btn_buttonset_t last = 0;
@@ -256,15 +257,13 @@ static void *key_monitor_thread(void *arg)
     srand((unsigned)time(NULL) ^ key_now_ms());
 
     for (; ; ) {
-        memset(fds, 0, sizeof(fds));
-        fds[0].fd     = fd;
-        fds[0].events = POLLIN;
-
-        if (poll(fds, 1, KEY_POLL_MS) < 0 && errno != EINTR) {
-            syslog(LOG_ERR, "[%s] poll failed: %d\n", TAG, errno);
-            break;
-        }
-
+        /* 2026-11-03 稳定性修复：不再用 poll()。
+         * 真机复现：TTS 播放期间 /dev/buttons 的 poll 拆除路径触发
+         * NuttX button_upper.c:760 断言（spin_unlock/sched_unlock 状态异常），
+         * ai_agent 被打崩 -> 看门狗 20s 后复位 —— 用户看到"黑屏重启"。
+         * 改成每 50ms 非阻塞 read 当前按键位图：功能等价、延迟 50ms、
+         * 长按逻辑不变，同时完全绕开 button_upper 的 poll 路径。 */
+        usleep(50 * 1000);
         nbytes = read(fd, &sample, sizeof(sample));
 
         if (nbytes == (ssize_t)sizeof(sample)) {
@@ -288,6 +287,13 @@ static void *key_monitor_thread(void *arg)
                 if (!s_key2_long_fired &&
                     key_now_ms() - last_event_ms >= KEY_DEBOUNCE_MS) {
                     last_event_ms = key_now_ms();
+
+                    /* P17：黑屏时语音键同样先点亮屏幕（与 KEY1 一致） */
+                    if (settings_page_wake_screen()) {
+                        pet_care_note_activity();
+                        continue;
+                    }
+
                     pet_care_note_activity();
                     key_action_voice_toggle();
                 }
@@ -296,6 +302,15 @@ static void *key_monitor_thread(void *arg)
             if (pressed & KEY_BIT_KEY1) {
                 if (key_now_ms() - last_event_ms >= KEY_DEBOUNCE_MS) {
                     last_event_ms = key_now_ms();
+
+                    /* ★ P17 逃生口：息屏状态下按键先点亮屏幕、吞掉本次
+                     * 动作。触摸 I2C 锁死时（reset/普通插拔都救不了），
+                     * 这是从黑屏恢复的唯一软件路径。 */
+                    if (settings_page_wake_screen()) {
+                        pet_care_note_activity();
+                        continue;
+                    }
+
                     /* 任何按键都算用户活动：复位空闲关怀计时（闹钟 pending
                      * 时 note_activity 内部按唤醒确认处理） */
                     pet_care_note_activity();
@@ -304,8 +319,7 @@ static void *key_monitor_thread(void *arg)
             }
         }
 
-        /* 长按判定：poll 超时(KEY_POLL_MS)也会走到这里, 所以每秒至少查一次,
-         * 按满 KEY_LONG_MS 就触发, 不必等松开。 */
+        /* 长按判定：50ms 循环里检查一次，按满 KEY_LONG_MS 就触发，不必等松开。 */
         if (s_key2_down && !s_key2_long_fired &&
             key_now_ms() - s_key2_press_ms >= KEY_LONG_MS) {
             s_key2_long_fired = true;

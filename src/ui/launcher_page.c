@@ -87,6 +87,15 @@ static char s_shown_status[64];   /* text the status label currently shows */
 static int s_no_ip_polls;         /* consecutive polls with no address */
 static lv_obj_t *s_current_page; /* page currently stacked above the desktop */
 
+/* The two periodic timers.  They MUST be kept so that a second
+ * launcher_create() can delete the previous pair: a stale timer keeps firing
+ * into labels that were destroyed together with the old desktop, which is a
+ * use-after-free.  Observed as a segfault when the launcher gets rebuilt
+ * (returning to the desktop after visiting a page, or the PC simulator
+ * switching pages). */
+static lv_timer_t *s_time_timer;
+static lv_timer_t *s_net_timer;
+
 /****************************************************************************
  * Icon Click Callbacks
  ****************************************************************************/
@@ -325,6 +334,20 @@ void launcher_create(void)
 {
     printf("[Launcher] Creating desktop page...\n");
 
+    /* Kill the timers from a previous build before their labels go away. */
+
+    if (s_time_timer != NULL)
+      {
+        lv_timer_delete(s_time_timer);
+        s_time_timer = NULL;
+      }
+
+    if (s_net_timer != NULL)
+      {
+        lv_timer_delete(s_net_timer);
+        s_net_timer = NULL;
+      }
+
     /* Create desktop container on active screen */
 
     desktop_page = lv_obj_create(lv_scr_act());
@@ -376,7 +399,7 @@ void launcher_create(void)
     lv_obj_set_style_text_font(s_time_label, &ui_font_sans_88_bold, 0);
     lv_obj_set_style_text_color(s_time_label, lv_color_hex(0xffffff), 0);
     time_update_cb(NULL);
-    lv_timer_create(time_update_cb, 1000, NULL);
+    s_time_timer = lv_timer_create(time_update_cb, 1000, NULL);
 
     /* ── 第二层：中间栏（flex-grow 占满剩余空间），标题绝对居中于屏幕 ── */
     lv_obj_t *mid = lv_obj_create(desktop_page);
@@ -405,7 +428,7 @@ void launcher_create(void)
     s_shown_status[0] = '\0';
     s_no_ip_polls = 0;
     net_update_cb(NULL);
-    lv_timer_create(net_update_cb, LAUNCHER_NET_PERIOD, NULL);
+    s_net_timer = lv_timer_create(net_update_cb, LAUNCHER_NET_PERIOD, NULL);
 
     /* ── 第三层：column 布局，占 30% ── */
     lv_obj_t *col3 = lv_obj_create(desktop_page);

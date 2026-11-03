@@ -65,4 +65,44 @@ void settings_page_update_key(const char *key);
  */
 void settings_page_delete(void);
 
+/**
+ * 若当前处于息屏状态则点亮屏幕（物理按键的逃生口，P17）。
+ * 返回 true = 本次按键被用于唤醒、调用方应吞掉它不执行原动作；
+ * 返回 false = 本来就亮着，调用方正常处理。
+ */
+bool settings_page_wake_screen(void);
+
+/****************************************************************************
+ * 亮度档位（98 号文 FW-B；BLE settings_get / settings_set 用）
+ *
+ * 档位是设置页「亮度」那一行的 UI 档位索引，0..max 连续，
+ * 对应 20%..100%（现有 s_bright_levels 数组，本次不改档位值）。
+ * 任何线程可调：硬件亮度同步生效，页面标签经 render 线程异步刷新。
+ ****************************************************************************/
+
+/**
+ * 当前亮度档位索引（0..settings_page_brightness_max()）。
+ *
+ * @return 档位索引；设置页从未创建过时返回默认档位（100%，即 max）
+ */
+int settings_page_brightness_get(void);
+
+/**
+ * 设置亮度档位并立即应用。
+ *
+ * 越界自动钳位到 [0, max]；复用设置页现有的 brightness_apply() 通路，
+ * 页面「亮度」行文案随档位更新（跨线程安全）。
+ *
+ * @param level 目标档位索引，0..max
+ * @return 实际生效的档位索引（钳位后的值）
+ */
+int settings_page_brightness_set(int level);
+
+/**
+ * 最大亮度档位索引（现有档位数组长度 - 1，当前为 4 ↔ 100%）。
+ *
+ * @return 最大档位索引
+ */
+int settings_page_brightness_max(void);
+
 #endif /* __SETTINGS_PAGE_H */

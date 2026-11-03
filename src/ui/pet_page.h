@@ -82,6 +82,9 @@ void pet_page_update_status(const char *text);
  */
 void pet_page_schedule_greeting_restore(uint32_t delay_ms);
 
+/** 打开「对话记录」全屏浮层（仅 LVGL 线程；串口调试/演示用）。 */
+void pet_page_open_history(void);
+
 /**
  * Delete the pet page and free resources
  *
