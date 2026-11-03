@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 
 #define VOICE_TTS_MAX_BACKENDS 4
 
@@ -300,12 +301,50 @@ static int tts_run_stream(int (*fn)(const char*, voice_tts_chunk_cb, void*),
 
 /* ── Streaming TTS with fallback chain ───────────────────────── */
 
+/* v125 P0-B（2026-11-03）：把播放回调包一层计数，用于"可播即播"判定。
+ * 只要某个后端已经把 PCM 交给播放器，整条链结束时就不能再判失败：
+ * 旧实现里 MiMo 已解出 164 736 B PCM，却因一次性缓冲 -28 被整句丢弃，
+ * 最终 0 字节播出（serial_perf_session.log:1938-1966）。 */
+typedef struct {
+    voice_tts_chunk_cb cb;
+    void* user_data;
+    size_t bytes;
+    int chunks;
+} tts_deliver_t;
+
+static void tts_deliver_cb(const unsigned char* pcm, size_t len,
+    int is_last, void* user_data)
+{
+    tts_deliver_t* d = (tts_deliver_t*)user_data;
+
+    if (pcm != NULL && len > 0) {
+        d->bytes += len;
+        d->chunks++;
+    }
+
+    if (d->cb != NULL) {
+        d->cb(pcm, len, is_last, d->user_data);
+    }
+}
+
+/* 单轮 TTS 计时：相对本次 speak 起点的毫秒差，不累计历史。 */
+static long tts_elapsed_ms(const struct timespec* t0)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - t0->tv_sec) * 1000
+        + (now.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
 int voice_tts_speak_stream(const char* text,
     voice_tts_chunk_cb cb,
     void* user_data)
 {
     int ret = -EIO;
     unsigned int play_rate;
+    tts_deliver_t deliver;
+    struct timespec step_t0;
 
     if (!s_active) {
         syslog(LOG_ERR, "[%s] No TTS backend for streaming\n", TAG);
@@ -315,6 +354,11 @@ int voice_tts_speak_stream(const char* text,
     if (!text || !cb) {
         return -EINVAL;
     }
+
+    deliver.cb = cb;
+    deliver.user_data = user_data;
+    deliver.bytes = 0;
+    deliver.chunks = 0;
 
     /* Rate the caller's playback device was opened with. */
     play_rate = voice_tts_get_sample_rate();
@@ -330,10 +374,21 @@ int voice_tts_speak_stream(const char* text,
 
     /* 1) Whatever backend is active, if it can stream natively. */
     if (s_active->synthesize_stream) {
-        ret = tts_run_stream(s_active->synthesize_stream, text, cb, user_data,
-            tts_rate_of(s_active), play_rate);
+        clock_gettime(CLOCK_MONOTONIC, &step_t0);
+        ret = tts_run_stream(s_active->synthesize_stream, text,
+            tts_deliver_cb, &deliver, tts_rate_of(s_active), play_rate);
 
         if (ret == 0) {
+            syslog(LOG_INFO, "[%s] step1 '%s' stream ok (%ldms, %zu bytes)\n",
+                TAG, s_active->name, tts_elapsed_ms(&step_t0), deliver.bytes);
+            return 0;
+        }
+
+        /* 已播出过 PCM：不再判失败，也不让别的后端把同一句重念一遍。 */
+        if (deliver.bytes > 0) {
+            syslog(LOG_WARNING,
+                "[%s] step1 '%s' failed (%d) after %zu bytes; keeping played audio\n",
+                TAG, s_active->name, ret, deliver.bytes);
             return 0;
         }
 
@@ -345,70 +400,160 @@ int voice_tts_speak_stream(const char* text,
      *    llm_backend_0).  Skipped when step 1 already ran it, i.e. when it
      *    is the active backend. */
     if (s_active->synthesize_stream != minimax_tts_synthesize_stream) {
-        ret = tts_run_stream(minimax_tts_synthesize_stream, text, cb,
-            user_data, AGENT_MINIMAX_TTS_SAMPLE_RATE, play_rate);
+        clock_gettime(CLOCK_MONOTONIC, &step_t0);
+        ret = tts_run_stream(minimax_tts_synthesize_stream, text,
+            tts_deliver_cb, &deliver,
+            AGENT_MINIMAX_TTS_SAMPLE_RATE, play_rate);
 
         if (ret == 0) {
+            syslog(LOG_INFO, "[%s] minimax stream ok (%ldms, %zu bytes)\n",
+                TAG, tts_elapsed_ms(&step_t0), deliver.bytes);
             return 0;
         }
 
-        syslog(LOG_WARNING, "[%s] minimax stream failed (%d), trying Edge TTS\n",
-            TAG, ret);
+        if (deliver.bytes > 0) {
+            syslog(LOG_WARNING,
+                "[%s] minimax failed (%d) after %zu bytes; keeping played audio\n",
+                TAG, ret, deliver.bytes);
+            return 0;
+        }
+
+        syslog(LOG_WARNING,
+            "[%s] minimax stream failed (%d, %ldms), trying Edge TTS\n",
+            TAG, ret, tts_elapsed_ms(&step_t0));
     }
 
     /* 3) Microsoft Edge online TTS - free, no credentials (currently 403 on
      *    every call). */
     if (s_active->synthesize_stream != edge_tts_synthesize_stream) {
-        ret = tts_run_stream(edge_tts_synthesize_stream, text, cb, user_data,
-            AGENT_EDGE_TTS_SAMPLE_RATE, play_rate);
+        clock_gettime(CLOCK_MONOTONIC, &step_t0);
+        ret = tts_run_stream(edge_tts_synthesize_stream, text,
+            tts_deliver_cb, &deliver, AGENT_EDGE_TTS_SAMPLE_RATE, play_rate);
 
         if (ret == 0) {
+            syslog(LOG_INFO, "[%s] edge stream ok (%ldms, %zu bytes)\n",
+                TAG, tts_elapsed_ms(&step_t0), deliver.bytes);
+            return 0;
+        }
+
+        if (deliver.bytes > 0) {
+            syslog(LOG_WARNING,
+                "[%s] edge failed (%d) after %zu bytes; keeping played audio\n",
+                TAG, ret, deliver.bytes);
             return 0;
         }
 
         syslog(LOG_WARNING,
-            "[%s] edge stream failed (%d), trying Volcengine TTS\n",
-            TAG, ret);
+            "[%s] edge stream failed (%d, %ldms), trying Volcengine TTS\n",
+            TAG, ret, tts_elapsed_ms(&step_t0));
     }
 
     /* 4) Volcengine WebSocket streaming (classic appid+token interface). */
     if (s_active->synthesize_stream != volc_tts_ws_synthesize_stream) {
-        ret = tts_run_stream(volc_tts_ws_synthesize_stream, text, cb,
-            user_data, AGENT_TTS_WS_SAMPLE_RATE, play_rate);
+        clock_gettime(CLOCK_MONOTONIC, &step_t0);
+        ret = tts_run_stream(volc_tts_ws_synthesize_stream, text,
+            tts_deliver_cb, &deliver, AGENT_TTS_WS_SAMPLE_RATE, play_rate);
 
         if (ret == 0) {
+            syslog(LOG_INFO, "[%s] volc ws stream ok (%ldms, %zu bytes)\n",
+                TAG, tts_elapsed_ms(&step_t0), deliver.bytes);
             return 0;
         }
 
-        syslog(LOG_WARNING, "[%s] volc ws stream failed (%d), trying HTTP TTS\n",
-            TAG, ret);
+        if (deliver.bytes > 0) {
+            syslog(LOG_WARNING,
+                "[%s] volc ws failed (%d) after %zu bytes; keeping played audio\n",
+                TAG, ret, deliver.bytes);
+            return 0;
+        }
+
+        syslog(LOG_WARNING,
+            "[%s] volc ws stream failed (%d, %ldms), trying HTTP TTS\n",
+            TAG, ret, tts_elapsed_ms(&step_t0));
     }
 
-    /* 5) Active backend's one-shot synthesize (Volcengine V3 HTTP, needs only
-     *    an API key).  Backends whose one-shot path is the same transport as
-     *    their streaming path (Edge, MiniMax) are skipped here - steps 2/3
-     *    cover them. */
-    if (s_active->synthesize
+    /* 5) 最后一搏 A（v125 P0-B）：把 active backend 的**流式**路径再放一次。
+     * 旧代码这里调 s_active->synthesize()（one-shot）：MiMo 的实现会先把整句
+     * PCM 收进 128 KB 定长缓冲再一次性发出，长回答必然 -ENOSPC 并被整句丢弃
+     * ——真机 164 736 B PCM → 0 字节播出（log:1938-1966）。
+     * 流式重放没有整句缓冲上限，解码一块播一块（"可播即播"），
+     * 也不需要按句子切文本、不需要承担多段请求的失败/拼接复杂度。
+     * Edge/MiniMax 的流式同传输已在第 2/3 步各试过一次，这里不再重复。 */
+    if (s_active->synthesize_stream
         && s_active->synthesize_stream != edge_tts_synthesize_stream
         && s_active->synthesize_stream != minimax_tts_synthesize_stream) {
+        clock_gettime(CLOCK_MONOTONIC, &step_t0);
+        ret = tts_run_stream(s_active->synthesize_stream, text,
+            tts_deliver_cb, &deliver, tts_rate_of(s_active), play_rate);
+
+        if (ret == 0) {
+            syslog(LOG_INFO,
+                "[%s] retry '%s' stream ok (%ldms, %zu bytes)\n",
+                TAG, s_active->name, tts_elapsed_ms(&step_t0), deliver.bytes);
+            return 0;
+        }
+
+        if (deliver.bytes > 0) {
+            syslog(LOG_WARNING,
+                "[%s] retry '%s' failed (%d) after %zu bytes; keeping played audio\n",
+                TAG, s_active->name, ret, deliver.bytes);
+            return 0;
+        }
+
+        syslog(LOG_WARNING,
+            "[%s] retry '%s' stream failed (%d, %ldms), trying one-shot TTS\n",
+            TAG, s_active->name, ret, tts_elapsed_ms(&step_t0));
+    }
+
+    /* 6) 最后一搏 B：只有 one-shot 实现的后端（当前只有 Volcengine V3 HTTP，
+     *    它的 ops 没有 synthesize_stream）。采样率用后端声明值；未声明(0)
+     *    时退回 AGENT_VOICE_SAMPLE_RATE —— 那正是 volc HTTP 请求里的
+     *    sample_rate（16 kHz）。不能在这里硬编码 16 kHz：MiMo/Edge/MiniMax
+     *    是 24 kHz，按 16k 重采样会把整句放慢/降调 1.5 倍。 */
+    if (s_active->synthesize && s_active->synthesize_stream == NULL) {
         unsigned char* buf = malloc(AGENT_VOICE_PCM_BUF_SIZE);
+        unsigned int one_shot_rate;
+        size_t len = 0;
 
         if (!buf) {
             return -ENOMEM;
         }
 
-        size_t len = 0;
-
+        clock_gettime(CLOCK_MONOTONIC, &step_t0);
         ret = s_active->synthesize(text, buf, AGENT_VOICE_PCM_BUF_SIZE, &len);
 
+        one_shot_rate = (s_active->sample_rate > 0)
+            ? s_active->sample_rate : AGENT_VOICE_SAMPLE_RATE;
+
         if (ret == 0 && len > 0) {
-            tts_emit_buffer(cb, user_data, buf, len, AGENT_VOICE_SAMPLE_RATE,
-                play_rate);
+            tts_emit_buffer(tts_deliver_cb, &deliver, buf, len,
+                one_shot_rate, play_rate);
             free(buf);
-            return 0;
+            syslog(LOG_INFO, "[%s] one-shot '%s' ok (%ldms, %zu bytes)\n",
+                TAG, s_active->name, tts_elapsed_ms(&step_t0), len);
+            return deliver.bytes > 0 ? 0 : -EIO;
         }
 
         free(buf);
+
+        if (deliver.bytes > 0) {
+            syslog(LOG_WARNING,
+                "[%s] one-shot failed (%d) after %zu bytes; keeping played audio\n",
+                TAG, ret, deliver.bytes);
+            return 0;
+        }
+
+        syslog(LOG_WARNING, "[%s] one-shot '%s' failed (%d, %ldms)\n",
+            TAG, s_active->name, ret, tts_elapsed_ms(&step_t0));
+    }
+
+    /* 兜底：只要播放器收到过 PCM，就不是"全失败"（否则 voice_channel 会
+     * 把它当没出声退款，真机表现就是"有声音却报 -28"）。 */
+    if (deliver.bytes > 0) {
+        syslog(LOG_WARNING,
+            "[%s] backends returned %d but %zu PCM bytes were already played\n",
+            TAG, ret, deliver.bytes);
+        return 0;
     }
 
     syslog(LOG_ERR, "[%s] all TTS backends failed (%d)\n", TAG, ret);

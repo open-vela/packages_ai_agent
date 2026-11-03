@@ -41,14 +41,28 @@
 
 #define VAD_FRAME_SAMPLES   320          /* 20ms @16kHz */
 #define VAD_PREROLL_FRAMES  15           /* 300ms */
-#define VAD_POSTROLL_FRAMES 25           /* 500ms */
+#define VAD_POSTROLL_FRAMES 10           /* v114b10：500ms→200ms，省 ~0.3s 等待（B 报告 P8） */
 #define VAD_START_FRAMES    2            /* 连续 2 帧才算起说 */
-#define VAD_ON_NUM          3            /* 超过底噪 3 倍算语音 */
+/* 超过底噪多少倍算"这一帧有语音"。
+ *
+ * ★ 这个值**与增益无关** —— 底噪是自适应跟踪的, 数字增益把信号和底噪等比
+ *   放大, 比值不变。所以"说话轻就识别不到"**不能靠加大增益解决**,
+ *   只能把这里的倍数调小。
+ *
+ * 真机 2026-10-16 的数据(增益已修正为 x1):
+ *   正常音量: e_max=12363, noise=470 -> 26 倍, 3x 阈值轻松通过 ✅
+ *   轻声/偏远: e_max=2596,  noise=349 -> 7.4 倍, 但只放行 41 帧(0.8s),
+ *             整句约 1.5s -> 语音被截断 -> 识别结果空串 ❌
+ * 3 -> 2 之后, 轻声那句的阈值从 1047 降到 698, 能放行更完整的语音。
+ *
+ * 误触发风险可控: 起说要求**连续 2 帧**超阈值, 收尾要求 1.2 秒静音,
+ * 偶发噪声毛刺不足以凑成一次"说话"。 */
+#define VAD_ON_NUM          2
 #define VAD_NOISE_SHIFT     5            /* EMA: alpha = 1/32 */
 #define VAD_NOISE_INIT      200          /* 标定没跑完时的临时值(几乎用不到) */
 #define VAD_NOISE_MIN       8            /* 防止底噪被压到 0 后疯狂触发 */
 #define VAD_CALIB_FRAMES    15           /* 标定用的帧数(300ms) */
-#define VAD_CALIB_SKIP      5            /* 先跳过 100ms 启动瞬态再开始标定 */
+#define VAD_CALIB_SKIP      15           /* v114：跳过 300ms 启动瞬态，避免标定窗口压在瞬态尾巴上 */
 #define VAD_NOISE_MAX       6000         /* 底噪封顶, 免得标定坏了直接废掉 VAD */
 #define VAD_MIN_UTTER_FRAMES 15          /* 至少 300ms 语音才算"一句话", 防咳嗽误触发 */
 
@@ -59,7 +73,7 @@
  *   真机 2026-10-14 踩到: 两件事都用 500ms, 而说话人在「小云手表」和
  *   「现在几点了」之间自然停顿了一下 -> VAD 以为说完了 -> 只放行 0.8 秒
  *   -> 识别结果为空串。 */
-#define VAD_ENDPOINT_FRAMES  60          /* 1.2s 连续静音才算说完 */
+#define VAD_ENDPOINT_FRAMES  80          /* 1.6s 连续静音才算说完（1.2s 会把带停顿的句子截断） */
 
 /* ★ 教训(真机 2026-10-14): 底噪**不能拍脑袋给初值**。
  *   第一版把初值写成 200, 而实际环境帧能量远高于 3x200, 于是第一帧就被判成

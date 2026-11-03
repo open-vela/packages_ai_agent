@@ -46,7 +46,9 @@
 #define MM_ASR_PATH       "/v1/speech_to_text"
 #define MM_ASR_MODEL      "asr-1.0"
 #define MM_ASR_BOUNDARY   "----VelaMiniMaxAsrBoundary4b7c"
-#define MM_ASR_TIMEOUT_MS 40000
+/* 8s：原 40s 在弱网下会卡 46 秒才失败（真机 2026-10-25），
+ * 用户完全不知道发生了什么。宁可快速失败并提示重说。 */
+#define MM_ASR_TIMEOUT_MS 8000
 #define MM_ASR_RESP_MAX   4096
 #define MM_ASR_KEY_MAX    256
 

@@ -79,14 +79,28 @@ static void pcm_delay_ms(unsigned ms)
 
 #  define PCM_DEV_DEFAULT "/dev/audio/pcm0p"
 #  define PCM_OUT_RATE    16000
-#  define PCM_RING_BYTES  (96 * 1024)
+/* v114b13：TTS 语速提升 10%（用户反馈"说话速度太慢"）。
+ * 线性插值步进放大 10%，输出时长缩短 1/1.1；音调随之略升，属可接受折中。 */
+#  define PCM_TTS_SPEED_PCT  110
+/* 2026-10-26: 96KB -> 256KB。TTS 现在下载快了(15KB/s 链路)，
+ * 整段 PCM 会在 decode 完成后**一次性**推给播放器，例如 100KB MP3 解出
+ * 500KB/24kHz PCM(>300KB/16kHz)，96KB 环会直接丢最旧数据 —— 真机日志
+ * dropped=28800(=57.6KB≈1.8s 语音)，用户听到的就是"话说不完整"。
+ * 环放在 heap(PSRAM) 上，扩到 256KB 可容纳 8s@16kHz。 */
+#  define PCM_RING_BYTES  (256 * 1024)
 #  define PCM_MAX_APBS    8
-#  define PCM_MQ_NAME     "/pcm_media_q"
+/* 2026-11-01 v102a：固定 mq 名 + 16 格会被"2 客户端 × 8 APB = 16 条
+ * DEQUEUE"恰好塞满 → audio_sendmsg 在关中断临界区里 file_mq_send 永久
+ * 睡眠 → 整机停摆。改为每个 player 实例唯一名字 + 加大队列，并让客户端
+ * mq 带 O_NONBLOCK（满时立即返回 EAGAIN，绝不阻塞上层）。 */
+#  define PCM_MQ_NAME_FMT "/pcm_media_q%d"
+#  define PCM_MQ_MAXMSG   64
 
 struct pcm_media_s
 {
     int      fd;
     mqd_t    mq;
+    char     mq_name[32];
     pthread_t worker;
     pthread_mutex_t lock;
     pthread_cond_t  cv;
@@ -107,6 +121,13 @@ struct pcm_media_s
     unsigned long written;
     unsigned long dropped;
     unsigned long underruns;
+    /* 2026-11-01 诊断计数：定位"暂停后声音卡死/大量丢数据"的断点 */
+    unsigned long enq_apbs;       /* 成功入队的 APB 数 */
+    unsigned long reap_deqs;      /* 回收到的 DEQUEUE 数 */
+    unsigned long foreign_deqs;   /* 广播收到的非本 player APB 数 */
+    unsigned long ring_max;       /* ring 最高水位 */
+    unsigned long wait_ms_total;  /* write_data 背压总等待毫秒 */
+    unsigned long reap_empty;     /* 没有可回收 DEQUEUE 的次数 */
     char     dev[64];
 };
 
@@ -125,6 +146,7 @@ static void pcm_ring_push(struct pcm_media_s* p, const unsigned char* src,
         p->ring[p->rhead] = src[i];
         p->rhead = (p->rhead + 1) % PCM_RING_BYTES;
         p->rbytes++;
+        if (p->rbytes > p->ring_max) p->ring_max = p->rbytes;
     }
 }
 
@@ -155,6 +177,7 @@ static size_t pcm_resample(struct pcm_media_s* p, const short* in, size_t in_n,
 
     size_t out_n = 0;
     double step = (double)p->rate_in / (double)p->rate_out;
+    step = step * (double)PCM_TTS_SPEED_PCT / 100.0;   /* v114b13 语速 */
     for (double pos = 0.0; out_n < out_cap; pos += step)
     {
         size_t i0 = (size_t)pos;
@@ -199,7 +222,25 @@ static void pcm_reap(struct pcm_media_s* p)
             return;
         if (msg.msg_id == AUDIO_MSG_DEQUEUE && msg.u.ptr != NULL)
         {
+            /* 2026-11-01: upper 的 DEQUEUE 是"广播"给所有注册客户端，
+             * 可能收到别的 player 的 APB —— 只回收自己池子里的，防止
+             * 把别人的缓冲塞进自己的 freeq 造成串音/重复入队。 */
+            int own = 0;
+            for (int i = 0; i < p->napbs; i++)
+            {
+                if (p->apbs[i] == (struct ap_buffer_s*)msg.u.ptr)
+                {
+                    own = 1;
+                    break;
+                }
+            }
+            if (!own)
+            {
+                p->foreign_deqs++;
+                continue;
+            }
             pcm_put_free(p, (struct ap_buffer_s*)msg.u.ptr);
+            p->reap_deqs++;
         }
     }
 }
@@ -263,10 +304,45 @@ static void* pcm_worker(void* arg)
             pcm_put_free(p, apb);
             break;
         }
+        p->enq_apbs++;
         p->written += n;
         pcm_reap(p);
+
+        /* 诊断：每 5 秒打一次内部状态 */
+        {
+            static uint32_t dbg_last;
+            static uint32_t dbg_ticks;
+            uint32_t now = clock_systime_ticks();
+
+            if (dbg_last == 0) dbg_last = now;
+            if ((uint32_t)(now - dbg_last) >= (uint32_t)(5 * CLK_TCK))
+              {
+                dbg_last = now;
+                syslog(LOG_INFO,
+                       "[pcm_media] dbg rbytes=%u nfree=%d enq=%lu reap=%lu "
+                       "written=%lu dropped=%lu ring_max=%lu wait_ms=%lu "
+                       "rate=%d/%d\n",
+                       (unsigned)p->rbytes, p->nfree, p->enq_apbs,
+                       p->reap_deqs, p->written, p->dropped,
+                       p->ring_max, p->wait_ms_total,
+                       p->rate_in, p->rate_out);
+                (void)dbg_ticks;
+              }
+        }
     }
 
+    /* ★ 关键：worker 退出前自己清 running。
+     *
+     * 原来的 media_player_stop() 里是
+     *     for (int i = 0; i < 500 && p->running; i++) pcm_delay_ms(10);
+     *     p->running = 0;
+     * 而 p->running 只由 stop 自己在循环之后清 —— worker 从不写它，
+     * 于是循环条件恒为真，**每一次停止都固定空转 5 秒**。
+     * 这 5 秒里它仍持有设备 fd、8 个 APB 和已注册的 mqueue，
+     * 是"连点几次歌就有几个播放器重叠"的直接原因。
+     *
+     * 在这里清掉之后，stop 的等待会在 worker 真正退出时立刻结束。 */
+    p->running = 0;
     return NULL;
 }
 
@@ -276,6 +352,11 @@ void* media_player_open(const char* url)
     (void)url;
     if (!p) return NULL;
     p->fd = -1;
+    /* calloc 之后 mq 是 0，但 close 里的哨兵是 (mqd_t)-1。
+     * 不显式置 -1 的话，任何在 mq_open 之前失败的 prepare 路径都会走到
+     *     mq_close(0)  ->  close(0)
+     * 把进程的 fd 0 关掉，并且 mq_unlink 一个自己没创建的队列。 */
+    p->mq = (mqd_t)-1;
     p->rate_in = PCM_OUT_RATE;
     p->rate_out = PCM_OUT_RATE;
     snprintf(p->dev, sizeof(p->dev), "%s", PCM_DEV_DEFAULT);
@@ -344,14 +425,22 @@ int media_player_prepare(void* player, const char* url, const char* opts)
     if (binfo.nbuffers > PCM_MAX_APBS) binfo.nbuffers = PCM_MAX_APBS;
 
     memset(&attr, 0, sizeof(attr));
-    attr.mq_maxmsg  = 16;
+    attr.mq_maxmsg  = PCM_MQ_MAXMSG;
     attr.mq_msgsize = sizeof(struct audio_msg_s);
-    p->mq = mq_open(PCM_MQ_NAME, O_RDWR | O_CREAT, 0666, &attr);
+    {
+        /* 唯一队列名：避免多播放器共用同一 mq 互相丢/串 DEQUEUE */
+        static volatile int s_mq_seq;
+        int seq = (int)__sync_fetch_and_add(&s_mq_seq, 1);
+        snprintf(p->mq_name, sizeof(p->mq_name), PCM_MQ_NAME_FMT, seq);
+    }
+    p->mq = mq_open(p->mq_name, O_RDWR | O_CREAT | O_NONBLOCK, 0666, &attr);
     if (p->mq == (mqd_t)-1)
     {
-        syslog(LOG_ERR, "[pcm_media] mq_open failed: %d\n", errno);
+        syslog(LOG_ERR, "[pcm_media] mq_open(%s) failed: %d\n", p->mq_name, errno);
         return -errno;
     }
+    syslog(LOG_INFO, "[pcm_media] mq %s opened (maxmsg=%d, NONBLOCK)\n",
+           p->mq_name, PCM_MQ_MAXMSG);
     if (ioctl(p->fd, AUDIOIOC_REGISTERMQ, (unsigned long)p->mq) < 0)
     {
         syslog(LOG_ERR, "[pcm_media] REGISTERMQ failed: %d\n", errno);
@@ -377,6 +466,18 @@ int media_player_prepare(void* player, const char* url, const char* opts)
 
     syslog(LOG_INFO, "[pcm_media] prepared: %s, in=%dHz out=%dHz, %d x %d B\n",
         p->dev, p->rate_in, p->rate_out, p->napbs, binfo.buffer_size);
+
+    /* 诊断：音频上半部是设备级共享的，第二个客户端 prepare 会打断正在播的流。
+     * 音乐播放期间如果有别人（TTS 等）也来 prepare，这里一定要叫出来，
+     * 否则又会出现"30 秒只有一小段卡住的声音"却找不到原因。 */
+    if (p->rate_in != p->rate_out)
+      {
+        syslog(LOG_WARNING,
+               "[pcm_media] ★ 有第二个客户端在准备音频设备（in=%dHz out=%dHz）——"
+               "若此时音乐在播，会被打断\n",
+               p->rate_in, p->rate_out);
+      }
+
     return 0;
 }
 
@@ -420,8 +521,41 @@ ssize_t media_player_write_data(void* player, const void* data, size_t len)
 
     out_n = pcm_resample(p, (const short*)data, in_n, tmp, cap);
 
+    /* 满环时**背压等待**而不是丢数据(2026-10-26 修"语音不完整"主因)。
+     * TTS 回调是独立线程，这里最多等 ~200ms 让 worker 把数据喂给设备；
+     * 仍然满才退回"丢最旧"的保底策略(计数 dropped, 便于诊断)。 */
+    size_t need = out_n * sizeof(short);
+    int waited_ms = 0;
+
     pthread_mutex_lock(&p->lock);
-    pcm_ring_push(p, (const unsigned char*)tmp, out_n * sizeof(short));
+    while (p->rbytes > 0 && p->rbytes + need > PCM_RING_BYTES
+           && waited_ms < 200 && !p->failed)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 10 * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&p->cv, &p->lock, &ts);
+        waited_ms += 10;
+    }
+    if (waited_ms > 0)
+      {
+        static uint32_t last_log;
+
+        p->wait_ms_total += (unsigned long)waited_ms;
+        if ((uint32_t)(clock_systime_ticks() - last_log) >=
+            (uint32_t)(2 * CLK_TCK))
+          {
+            last_log = clock_systime_ticks();
+            syslog(LOG_WARNING,
+                   "[pcm_media] backpressure waited=%dms rbytes=%u "
+                   "nfree=%d enq=%lu reap=%lu dropped=%lu\n",
+                   waited_ms, (unsigned)p->rbytes, p->nfree,
+                   p->enq_apbs, p->reap_deqs, p->dropped);
+          }
+      }
+
+    pcm_ring_push(p, (const unsigned char*)tmp, need);
     pthread_cond_broadcast(&p->cv);
     pthread_mutex_unlock(&p->lock);
 
@@ -434,6 +568,21 @@ int media_player_stop(void* player)
     struct pcm_media_s* p = (struct pcm_media_s*)player;
     if (!p) return -EINVAL;
 
+    int worker_hung = 0;
+    int pending_ms;
+
+    /* v114b8（C 报告）：按积压估算收尾预算。
+     * pending = 环里字节 / 32KB/s + 设备队列 APB × 128ms；预算 = pending + 1500ms，
+     * clamp 3–20s；worker 与设备两段等待共用同一预算，避免长 TTS 固定 4s 被切尾。 */
+    pthread_mutex_lock(&p->lock);
+    pending_ms = (int)(p->rbytes / 32) + (int)((p->napbs - p->nfree) * 128);
+    pthread_mutex_unlock(&p->lock);
+
+    int budget_ms = pending_ms + 1500;
+    if (budget_ms < 3000) budget_ms = 3000;
+    if (budget_ms > 20000) budget_ms = 20000;
+    int budget_iters = budget_ms / 10;
+
     if (p->worker_started)
     {
         pthread_mutex_lock(&p->lock);
@@ -441,17 +590,65 @@ int media_player_stop(void* player)
         pthread_cond_broadcast(&p->cv);
         pthread_mutex_unlock(&p->lock);
 
-        for (int i = 0; i < 500 && p->running; i++) pcm_delay_ms(10);
+        for (int i = 0; i < budget_iters && p->running; i++) pcm_delay_ms(10);
+
+        /* v113：worker 若在 pipe/网络里挂住，绝不能在这里无限 join ——
+         * 那样 ioctl(STOP) 永远发不出去，DMA 会永久循环重播最后 128ms。
+         * 超时后放弃 join（线程泄漏优于整机冻死），继续走 STOP。 */
+        if (p->running)
+        {
+            worker_hung = 1;
+            syslog(LOG_ERR,
+                "[pcm_media] worker still running after 5s, skip join (leak) "
+                "enq=%lu reap=%lu running=%d\n",
+                p->enq_apbs, p->reap_deqs, (int)p->running);
+        }
         p->running = 0;
         pthread_cond_broadcast(&p->cv);
-        pthread_join(p->worker, NULL);
+        if (!worker_hung)
+        {
+            pthread_join(p->worker, NULL);
+        }
         p->worker_started = 0;
     }
 
-    if (p->fd >= 0) ioctl(p->fd, AUDIOIOC_STOP, 0);
+    /* 等设备把已入队的 APB 全部播完再 STOP: worker 退出只代表"喂完"，
+     * 设备队列里通常还有 ~0.5-1s 音频，直接 STOP 会把尾音切掉 —— 这是
+     * 2026-10-26 用户反馈"语音不能完整全部出来"的第二个原因。 */
+    if (p->fd >= 0 && p->napbs > 0)
+    {
+        int iters = budget_iters;
+        int waited = 0;
+        for (int i = 0; i < iters; i++)
+        {
+            int free_all;
+            pthread_mutex_lock(&p->lock);
+            free_all = (p->nfree == p->napbs);
+            pthread_mutex_unlock(&p->lock);
+            if (free_all) break;
+            pcm_reap(p);
+            pcm_delay_ms(10);
+            waited += 10;
+        }
+        syslog(LOG_INFO,
+               "[pcm_media] stop wait reason=%s waited=%dms pending=%dms rbytes=%u\n",
+               (p->nfree == p->napbs) ? "free" : "timeout",
+               waited, pending_ms, (unsigned)p->rbytes);
+    }
 
-    syslog(LOG_INFO, "[pcm_media] stopped (written=%lu dropped=%lu)\n",
-        p->written, p->dropped);
+    /* v114b4：APB 全部 reap 只代表 DMA/上层消费完，DAC/PA 里还有最后一点
+     * 采样没放完；用户实测"最后两个字没说出来"。STOP 前留 150ms。 */
+    if (p->fd >= 0)
+    {
+        pcm_delay_ms(150);
+        ioctl(p->fd, AUDIOIOC_STOP, 0);
+    }
+
+    syslog(LOG_INFO,
+        "[pcm_media] stopped (written=%lu dropped=%lu enq=%lu reap=%lu "
+        "ring_max=%lu wait_ms=%lu)\n",
+        p->written, p->dropped, p->enq_apbs, p->reap_deqs,
+        p->ring_max, p->wait_ms_total);
     return 0;
 }
 
@@ -477,9 +674,13 @@ int media_player_close(void* player, int dummy)
     {
         if (p->fd >= 0) ioctl(p->fd, AUDIOIOC_UNREGISTERMQ, 0);
         mq_close(p->mq);
-        mq_unlink(PCM_MQ_NAME);
+        if (p->mq_name[0]) mq_unlink(p->mq_name);
     }
-    if (p->fd >= 0) close(p->fd);
+    if (p->fd >= 0)
+    {
+        close(p->fd);
+        p->fd = -1;      /* 防止释放后仍被 media_player_set_volume 读到旧 fd */
+    }
 
     pthread_mutex_destroy(&p->lock);
     pthread_cond_destroy(&p->cv);
@@ -518,6 +719,31 @@ int media_player_get_duration(void* player, unsigned int* msec)
     (void)player;
     if (msec) *msec = 0;
     return -ENOTSUP;
+}
+
+/* 用**播放器自己的 fd** 设音量。
+ *
+ * 为什么必须这样：audio_tx 驱动的 tx_configure 会把音量写进设备级的
+ * g_tx.volume，但"又来一个 open"会让它重新初始化通路 —— 实测在播放过程中
+ * 另开一个 /dev/audio/pcm0p 去发音量 ioctl，会直接把正在播的声音打断
+ * （表现就是"改个音量，歌没了"）。所以音量只能走已经在用的那个 fd。 */
+int media_player_set_volume(void* player, int volume)
+{
+    struct pcm_media_s* p = (struct pcm_media_s*)player;
+    struct audio_caps_s caps;
+
+    if (!p || p->fd < 0) return -EINVAL;
+
+    memset(&caps, 0, sizeof(caps));
+    caps.ac_len            = sizeof(caps);
+    caps.ac_type           = AUDIO_TYPE_FEATURE;
+    caps.ac_format.hw      = AUDIO_FU_VOLUME;
+    caps.ac_controls.hw[0] = (uint16_t)(int16_t)volume;
+
+    if (ioctl(p->fd, AUDIOIOC_CONFIGURE, (unsigned long)&caps) < 0)
+        return -errno;
+
+    return 0;
 }
 
 int media_policy_set_stream_volume(const char* stream, int volume)
