@@ -39,6 +39,18 @@ static const char *MONTHS[] = {
 };
 
 /* Parse "Sat, 01 Feb 2025 10:25:00 GMT" → set system clock, return formatted string */
+/* v106：本地时间人话格式化（RTC 里存的就是本地时间，不再二次 +8h） */
+static void format_time_cn(time_t local_epoch, char* out, size_t cap)
+{
+    static const char* wd[] = { "周日", "周一", "周二", "周三",
+                                "周四", "周五", "周六" };
+    struct tm tm_local;
+    gmtime_r(&local_epoch, &tm_local);
+    snprintf(out, cap, "现在是 %d月%d日 %02d:%02d（%s）",
+             tm_local.tm_mon + 1, tm_local.tm_mday,
+             tm_local.tm_hour, tm_local.tm_min, wd[tm_local.tm_wday]);
+}
+
 static bool parse_and_set_time(const char *date_str, char *out, size_t out_size)
 {
     int day, year, hour, min, sec;
@@ -84,19 +96,12 @@ static bool parse_and_set_time(const char *date_str, char *out, size_t out_size)
 #endif
     if (t < 0) return false;
 
-    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+    /* v106：与 time_sync 的约定一致——RTC 里存本地时间（UTC+8），
+     * 不再存 UTC 再格式化时 +8（那样会和 time_sync 路径差 8 小时）。 */
+    struct timeval tv = { .tv_sec = t + 8 * 3600, .tv_usec = 0 };
     settimeofday(&tv, NULL);
 
-    /* Format in local time (TZ=CST-8 → UTC+8) using gmtime to avoid
-     * zoneinfo lookup errors on NuttX romfs */
-    struct tm local;
-    time_t local_epoch = t + 8 * 3600;
-    gmtime_r(&local_epoch, &local);
-
-    char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S (%A)", &local);
-    snprintf(out, out_size, "%s CST (UTC+8), UNIX epoch: %lld", time_str, (long long)t);
-
+    format_time_cn(t + 8 * 3600, out, out_size);
     return true;
 }
 
@@ -169,15 +174,9 @@ int tool_get_time_execute(const char *input_json, char *output, size_t output_si
          * NuttX's localtime_r tries to open zoneinfo/<TZ> from romfs,
          * which fails for POSIX TZ strings like "CST-8" and spams
          * ERROR logs.  We bypass this by computing UTC+8 manually. */
-        struct tm utc_tm;
-        time_t local_epoch = now + 8 * 3600;  /* UTC+8 */
-        gmtime_r(&local_epoch, &utc_tm);
-
-        char time_str[64];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &utc_tm);
-        snprintf(output, output_size,
-                 "%s CST (UTC+8), UNIX epoch: %lld",
-                 time_str, (long long)now);
+        /* v106：time(NULL) 已经是本地时间（time_sync 已写入 +8），
+         * 旧代码又 +8 导致多 8 小时；这里直接用 now 格式化。 */
+        format_time_cn(now, output, output_size);
         syslog(LOG_INFO, "[%s] Time (local clock): %s\n", TAG, output);
         return OK;
     }

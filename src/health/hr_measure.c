@@ -23,6 +23,12 @@
  *  4) 结束时**一定**发 stop（成功、失败、提前放弃三条路径都走同一个出口），
  *     保证 LED 灭、总线释放。
  *
+ *  5) **静默模式**（hr_measure_start_silent，后台守护 hr_watch 用）：
+ *     与按钮路径共用同一套 worker/采集/质量判据/收尾，仅跳过全部
+ *     UI 与语音 —— 不上「测量中」进度、结果不上屏、不进 TTS、失败
+ *     也不弹错误文案。后台周期测量不能打扰用户；所有 printf 探测
+ *     日志保留（串口排障仍可复盘）。
+ *
  * 质量判据：algo_heartrate 只有 timestamp_us / bpm / heartrate_section[3]
  * 五个字段，**没有 q/gate**（质量门控全在发布端 max30102.c 内部，不外露），
  * 所以用「非零 bpm + 同量级的值在 3s 内再次到达」这一可用判据，
@@ -39,6 +45,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/types.h>
@@ -47,11 +54,310 @@
 
 #include "health/hr_measure.h"
 
+#include "cJSON.h"
+#include "infra/health_store.h"
+
 #if defined(CONFIG_UORB) && defined(CONFIG_FITNESS_ALGO)
 #  if __has_include(<fitness/algo_heartrate.h>)
 #    define HR_MEASURE_HAVE_TOPIC 1
 #  endif
 #endif
+
+/****************************************************************************
+ * 心率历史（持久化环形缓冲）
+ *
+ * 288 条 ≈ 后台 hr_watch 每 10 分钟一轮的两天数据。每次测量成功
+ * （手动 / 静默两条路径都经过 hr_report_ok）追加一条并立即落盘：
+ *
+ *   {"items":[{"t":1730000000,"bpm":88},{"t":...}]}
+ *
+ * 失败语义全部是「从空开始 / 不崩」：
+ *  - 文件不存在、读失败、JSON 损坏、字段类型不对：跳过该条或整体当空；
+ *  - 保存失败（/data 还没挂好、盘满）：只告警。RAM 环照常可用并继续
+ *    累积，下一次成功保存会把整段历史补写进去 —— 一次写盘失败不会
+ *    丢掉历史。
+ *
+ * 锁：s_hist_lock 保护环形缓冲和 s_hist_loaded。
+ *   load：整个「读文件 + cJSON 解析」在锁内完成，其它线程等它读完，
+ *     不会看到半截数据；只在首次 start 或首次查询时做一次。
+ *   save：组装 JSON 在锁内，**写文件在锁外** —— littlefs 写入可能几十
+ *     毫秒，不能把 render 线程的 snapshot 堵在盘上。
+ ****************************************************************************/
+
+#define HR_HISTORY_FILE "hr_history"
+
+static pthread_mutex_t s_hist_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t s_hist_ts[HR_MEASURE_HISTORY_CAP];
+static int      s_hist_bpm[HR_MEASURE_HISTORY_CAP];
+static int      s_hist_next;    /* 下一个写入位置 */
+static int      s_hist_count;   /* 有效条数 0..HR_MEASURE_HISTORY_CAP */
+static bool     s_hist_loaded;  /* 是否已尝试过读盘（失败也只试一次） */
+
+/* 逻辑下标（0 = 最旧）-> 物理下标。调用者必须持有 s_hist_lock。 */
+static int hr_hist_slot(int i)
+{
+    if (s_hist_count < HR_MEASURE_HISTORY_CAP) {
+        return i;   /* 还没绕过一圈，物理顺序就是时间顺序 */
+    }
+    return (s_hist_next + i) % HR_MEASURE_HISTORY_CAP;
+}
+
+/* 追加一条（锁内调用）。满了就覆盖最旧的一条。 */
+static void hr_hist_push(uint32_t t, int bpm)
+{
+    s_hist_ts[s_hist_next] = t;
+    s_hist_bpm[s_hist_next] = bpm;
+    s_hist_next = (s_hist_next + 1) % HR_MEASURE_HISTORY_CAP;
+    if (s_hist_count < HR_MEASURE_HISTORY_CAP) {
+        s_hist_count++;
+    }
+}
+
+/* 读盘并重建环形缓冲。调用者必须持有 s_hist_lock。 */
+static void hr_hist_load(void)
+{
+    char *buf;
+    cJSON *root;
+    cJSON *items;
+    cJSON *it;
+    int n;
+
+    s_hist_loaded = true;   /* 只尝试一次：/data 未就绪也不反复读盘 */
+
+    buf = (char *)malloc(HR_MEASURE_HISTORY_JSON_MAX);
+    if (buf == NULL) {
+        printf("[hr_measure] history load n=0 (no memory)\n");
+        return;
+    }
+
+    n = health_store_load(HR_HISTORY_FILE, buf, HR_MEASURE_HISTORY_JSON_MAX);
+    if (n < 0) {
+        printf("[hr_measure] history load n=0 (no file rc=%d)\n", n);
+        free(buf);
+        return;
+    }
+    if (n >= HR_MEASURE_HISTORY_JSON_MAX - 1) {
+        printf("[hr_measure] history load n=0 (file too large)\n");
+        free(buf);
+        return;
+    }
+
+    root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL) {
+        printf("[hr_measure] history load n=0 (bad json)\n");
+        return;
+    }
+
+    items = cJSON_GetObjectItemCaseSensitive(root, "items");
+    if (cJSON_IsArray(items)) {
+        cJSON_ArrayForEach(it, items) {
+            cJSON *jt = cJSON_GetObjectItemCaseSensitive(it, "t");
+            cJSON *jb = cJSON_GetObjectItemCaseSensitive(it, "bpm");
+            int bpm;
+
+            if (!cJSON_IsNumber(jt) || !cJSON_IsNumber(jb)) {
+                continue;
+            }
+
+            bpm = (int)cJSON_GetNumberValue(jb);
+            if (bpm <= 0 || bpm > 300) {
+                continue;   /* 垃圾值不进曲线，也不进工具输出 */
+            }
+
+            hr_hist_push((uint32_t)cJSON_GetNumberValue(jt), bpm);
+        }
+    }
+
+    cJSON_Delete(root);
+    printf("[hr_measure] history load n=%d\n", s_hist_count);
+}
+
+/* 首次使用时 load 一次。任何线程可调。 */
+static void hr_hist_ensure_loaded(void)
+{
+    pthread_mutex_lock(&s_hist_lock);
+    if (!s_hist_loaded) {
+        hr_hist_load();
+    }
+    pthread_mutex_unlock(&s_hist_lock);
+}
+
+#ifdef HR_MEASURE_HAVE_TOPIC
+
+/* 组装完整历史并落盘。返回 0 成功，负数失败（RAM 数据不受影响）。
+ * 只有测量成功收尾会调它（两条路径共用 hr_report_ok），低频。 */
+static int hr_hist_save(void)
+{
+    cJSON *root;
+    cJSON *items;
+    char *json;
+    int i;
+    int ret = 0;
+
+    root = cJSON_CreateObject();
+    if (root == NULL) {
+        return -ENOMEM;
+    }
+
+    items = cJSON_AddArrayToObject(root, "items");
+    if (items == NULL) {
+        cJSON_Delete(root);
+        return -ENOMEM;
+    }
+
+    pthread_mutex_lock(&s_hist_lock);
+    for (i = 0; i < s_hist_count; i++) {
+        int slot = hr_hist_slot(i);
+        cJSON *obj = cJSON_CreateObject();
+
+        if (obj == NULL) {
+            ret = -ENOMEM;
+            break;
+        }
+
+        cJSON_AddNumberToObject(obj, "t", (double)s_hist_ts[slot]);
+        cJSON_AddNumberToObject(obj, "bpm", (double)s_hist_bpm[slot]);
+        cJSON_AddItemToArray(items, obj);
+    }
+    pthread_mutex_unlock(&s_hist_lock);
+
+    if (ret == 0) {
+        json = cJSON_PrintUnformatted(root);
+        if (json == NULL) {
+            ret = -ENOMEM;
+        } else {
+            ret = health_store_save(HR_HISTORY_FILE, json);
+            free(json);
+        }
+    }
+
+    cJSON_Delete(root);
+
+    if (ret != 0) {
+        printf("[hr_measure] history save failed: %d\n", ret);
+    }
+    return ret;
+}
+
+/* 追加一条并立即落盘（测量成功收尾调用，低频：后台 10 分钟一次）。 */
+static void hr_hist_append(uint32_t t, int bpm)
+{
+    int n;
+    int ret;
+
+    /* 必须先 load：否则第一次保存会用「只有新条目」的 RAM 环覆盖掉
+     * 磁盘上的旧历史。 */
+    hr_hist_ensure_loaded();
+
+    pthread_mutex_lock(&s_hist_lock);
+    hr_hist_push(t, bpm);
+    n = s_hist_count;
+    pthread_mutex_unlock(&s_hist_lock);
+
+    ret = hr_hist_save();
+
+    printf("[hr_measure] history append t=%u bpm=%d n=%d save=%d\n",
+           (unsigned)t, bpm, n, ret);
+}
+
+#endif /* HR_MEASURE_HAVE_TOPIC */
+
+/****************************************************************************
+ * 历史 Public API（无 uORB 时也要能链接，所以放在 topic 守卫外面）
+ ****************************************************************************/
+
+int hr_measure_history_snapshot(uint32_t *ts, int *bpm, int max)
+{
+    int i;
+    int n;
+    int start;
+
+    if (ts == NULL || bpm == NULL) {
+        return -EINVAL;
+    }
+    if (max <= 0) {
+        return 0;
+    }
+
+    hr_hist_ensure_loaded();
+
+    pthread_mutex_lock(&s_hist_lock);
+    n = (s_hist_count < max) ? s_hist_count : max;
+    start = s_hist_count - n;   /* 取最近 n 条（旧 -> 新） */
+    for (i = 0; i < n; i++) {
+        int slot = hr_hist_slot(start + i);
+
+        ts[i] = s_hist_ts[slot];
+        bpm[i] = s_hist_bpm[slot];
+    }
+    pthread_mutex_unlock(&s_hist_lock);
+
+    return n;
+}
+
+int hr_measure_history_json(char *out, size_t cap)
+{
+    cJSON *root;
+    cJSON *items;
+    char *json;
+    int i;
+    int ret = 0;
+
+    if (out == NULL || cap == 0) {
+        return -EINVAL;
+    }
+    out[0] = '\0';
+
+    hr_hist_ensure_loaded();
+
+    root = cJSON_CreateObject();
+    if (root == NULL) {
+        return -ENOMEM;
+    }
+
+    items = cJSON_AddArrayToObject(root, "items");
+    if (items == NULL) {
+        cJSON_Delete(root);
+        return -ENOMEM;
+    }
+
+    pthread_mutex_lock(&s_hist_lock);
+    for (i = 0; i < s_hist_count; i++) {
+        int slot = hr_hist_slot(i);
+        cJSON *obj = cJSON_CreateObject();
+
+        if (obj == NULL) {
+            ret = -ENOMEM;
+            break;
+        }
+
+        cJSON_AddNumberToObject(obj, "t", (double)s_hist_ts[slot]);
+        cJSON_AddNumberToObject(obj, "bpm", (double)s_hist_bpm[slot]);
+        cJSON_AddItemToArray(items, obj);
+    }
+    pthread_mutex_unlock(&s_hist_lock);
+
+    if (ret == 0) {
+        json = cJSON_PrintUnformatted(root);
+        if (json == NULL) {
+            ret = -ENOMEM;
+        } else {
+            size_t len = strlen(json);
+
+            if (len >= cap) {
+                ret = -ENOSPC;
+            } else {
+                memcpy(out, json, len + 1);
+            }
+            free(json);
+        }
+    }
+
+    cJSON_Delete(root);
+    return ret;
+}
+
 
 #ifdef HR_MEASURE_HAVE_TOPIC
 
@@ -66,6 +372,11 @@
 /* hr_sensor 内建程序的入口（apps/packages/demos/.../sensors/max30102.c 的 main，
  * 由 -Dmain=hr_sensor_main 改名而来；nm nuttx 里是 T hr_sensor_main）。 */
 extern int hr_sensor_main(int argc, FAR char *argv[]);
+
+/* max30102.c 暴露的采集状态查询/中止入口（另一个任务组里的 static 状态，
+ * 只能通过这两个函数访问）。用途见下面 start 失败路径的注释。 */
+extern void max30102_hr_abort(void);
+extern int  max30102_hr_running(void);
 
 /****************************************************************************
  * Private Data
@@ -94,10 +405,14 @@ static bool s_busy;
  * 会在 ~1s 时把旧值重播一遍。 */
 #define HR_STOP_SETTLE_MS  200
 
-/* 结果被接受前的最短测量窗口。max30102.c 的 have_bpm 由 start 进程的 memset
- * 清零，正常一轮测量是干净的；这里的下限一是挡住上面那条重启竞态的残余值，
- * 二是给算法留出重新锁定真值的时间（warmup 0.8s + 3 个 RR + 连续确认）。 */
-#define HR_MEASURE_MIN_MS  4000
+/* 结果被接受前的最短测量窗口。
+ *
+ * 2026-10 从 4s 提到 15s: 24.13 真机实测连测三次得 143 / 136 / 85 bpm,
+ * 而算法侧 pk5s=6 rr_med=700ms 明明指向 85 —— 前两次是手指刚接触时的暂态。
+ * 4s 窗口在算法还没收敛时就放行, 于是把暂态报给了用户。
+ * 上限 HR_MEASURE_MAX_S = 30s, 所以 15s 仍留出一半余量给"手指刚放上去 /
+ * 信号弱"的场合。 */
+#define HR_MEASURE_MIN_MS  15000
 /* 合理心率区间（发布端已按 40..200 校验过，这里只是兜底） */
 #define HR_BPM_SANE_MIN    30
 #define HR_BPM_SANE_MAX    220
@@ -112,6 +427,22 @@ typedef enum {
 
 static volatile hr_state_t s_state = HR_ST_IDLE;
 static volatile uint32_t  s_last_bpm;   /* 最后一次成功 copy 到的 bpm */
+
+/* 本轮是否为静默测量（hr_measure_start_silent 起的）。
+ * worker 启动时置位、结束时不清除 —— hr_measure_start() 的按钮路径
+ * 每轮开头都会把它重新写成 false，两个模式不会串。 */
+static volatile bool s_silent;
+
+/* ★ 最近一轮测量**有没有测到**（成功 = 出过被接受的 median）。
+ *
+ * 为什么需要它：失败轮（信号弱提前放弃 / 30s 超时）里 s_last_bpm
+ * 可能残留「最后一次 copy 到的非零值」（hr_measure_worker 里
+ * s_last_bpm = hr.bpm 那行 —— copy 到过但没通过质量判据）。
+ * 只看 last_bpm()!=0 判断成败会把失败轮当成功轮：hr_watch 的后台
+ * 分诊会拿这个残留值去触发心率告警 —— 正是「拿噪声告警」这条
+ * 诚实性红线。所以把「本轮成败」显式记下来，读结果的一方
+ * 先看它、再看数值。 */
+static volatile bool s_last_ok;
 
 /* 进度文本：worker 写，render 线程在 progress_async_cb 里读。单生产者 +
  * 每秒一次 + render 线程 5ms 一圈，不需要额外同步。 */
@@ -378,6 +709,27 @@ static void hr_report_ok(uint32_t bpm)
     char text[64];
 
     s_state = HR_ST_DONE;
+    s_last_ok = true;   /* 本轮测到了：hr_watch 据此放行数值 */
+    /* 把缓存同步成**被接受的 median**（入参），而不是留最后一次原始
+     * copy 值（可能与 median 差 ±15%）。这样语音念的、界面上显示的、
+     * hr_watch 拿去判阈值的是同一个数 —— 三个入口一个口径。 */
+    s_last_bpm = bpm;
+
+    printf("[hr_measure] success: bpm=%u%s\n", (unsigned)bpm,
+           s_silent ? " (silent)" : "");
+
+    /* 历史落盘：手动轮和静默轮都经过这里，一次测量一条。
+     * 时间用墙上时间（time(NULL)），页面/工具按它排序展示；系统时间
+     * 还没同步时写 0，不编造时间戳。 */
+    {
+        time_t now = time(NULL);
+
+        hr_hist_append(now > 0 ? (uint32_t)now : 0u, (int)bpm);
+    }
+
+    if (s_silent) {
+        return;   /* 静默轮：不上屏、不进 TTS，只留串口日志 */
+    }
 
     /* 一次完成：气泡 + 历史 + 桌宠表情 + 语音播报。
      * AGENT_MSG_KIND_FINAL 是唯一会出声的类别（P2a 的显示/播报解耦点）。 */
@@ -386,7 +738,6 @@ static void hr_report_ok(uint32_t bpm)
              "\xe6\x82\xa8\xe7\x9a\x84\xe5\xbf\x83\xe7\x8e\x87\xe6\x98\xaf"
              " %u",
              (unsigned)bpm);
-    printf("[hr_measure] success: bpm=%u\n", (unsigned)bpm);
     lvgl_ui_channel_send_kind(text, AGENT_MSG_KIND_FINAL);
     lvgl_ui_post(greeting_restore_async_cb, NULL);
 }
@@ -394,9 +745,14 @@ static void hr_report_ok(uint32_t bpm)
 static void hr_report_fail(const char *text, const char *why)
 {
     s_state = HR_ST_FAILED;
+    s_last_ok = false;  /* 本轮没测到：残留的 s_last_bpm 不算数 */
 
-    printf("[hr_measure] failed: %s (last bpm=%u)\n",
-           why, (unsigned)s_last_bpm);
+    printf("[hr_measure] failed: %s (last bpm=%u)%s\n",
+           why, (unsigned)s_last_bpm, s_silent ? " (silent)" : "");
+
+    if (s_silent) {
+        return;   /* 静默轮：不弹错误文案打扰用户，hr_watch 只计失败 */
+    }
     /* 非 FINAL：上屏 + 表情，但不念（避免吵） */
     lvgl_ui_channel_send_kind(text, AGENT_MSG_KIND_ERROR);
     lvgl_ui_post(greeting_restore_async_cb, NULL);
@@ -421,13 +777,67 @@ static void hr_report_fail(const char *text, const char *why)
  *   不更新**，从 t=0 起算 3s 会把每一次正常测量都判死。这段时间由 15s
  *   硬上限兜底（手指没放上去时就是走这条路）。
  */
+/* ── 滑动窗口中位数 ──────────────────────────────────────────────
+ *
+ * 为什么不再用"第一个候选值"上报: 24.13 真机连测三次得到 143 / 136 / 85,
+ * 算法侧的 pk5s=6 rr_med=700ms 指向 85 —— 143/136 是手指刚接触时的暂态。
+ * 旧逻辑 hr_report_ok(first_bpm) 恰好把这个暂态报了出去。
+ *
+ * 改成: 每个通过 sanity 的值推进一个长度 HR_RECENT_N 的窗口, 跑满最短窗口
+ * 之后取**中位数**上报。中位数对单个异常值免疫, 而接触暂态只会出现在窗口
+ * 前段, 会被后续的真值稀释掉。
+ */
+#define HR_RECENT_N 7
+static uint32_t s_recent[HR_RECENT_N];
+static int      s_recent_cnt;
+static int      s_recent_pos;
+
+static void hr_recent_reset(void)
+{
+    memset(s_recent, 0, sizeof(s_recent));
+    s_recent_cnt = 0;
+    s_recent_pos = 0;
+}
+
+static void hr_recent_push(uint32_t bpm)
+{
+    s_recent[s_recent_pos] = bpm;
+    s_recent_pos = (s_recent_pos + 1) % HR_RECENT_N;
+    if (s_recent_cnt < HR_RECENT_N) {
+        s_recent_cnt++;
+    }
+}
+
+static uint32_t hr_recent_median(void)
+{
+    uint32_t v[HR_RECENT_N];
+    int i, j;
+
+    if (s_recent_cnt <= 0) {
+        return 0;
+    }
+
+    memcpy(v, s_recent, sizeof(uint32_t) * (size_t)s_recent_cnt);
+
+    /* 插入排序, 最多 7 个元素 */
+    for (i = 1; i < s_recent_cnt; i++) {
+        uint32_t key = v[i];
+        j = i - 1;
+        while (j >= 0 && v[j] > key) {
+            v[j + 1] = v[j];
+            j--;
+        }
+        v[j + 1] = key;
+    }
+
+    return v[s_recent_cnt / 2];
+}
+
 static void hr_measure_worker(void)
 {
     struct pollfd pfd;
     uint32_t t0;
     uint32_t last_update = 0;
-    uint32_t first_ms = 0;
-    uint32_t first_bpm = 0;
     int last_left = -1;
     int fd = -1;
     int exitcode = 0;
@@ -436,10 +846,17 @@ static void hr_measure_worker(void)
     bool started = false;
 
     s_state = HR_ST_STARTING;
+
+    /* 首次测量（手动 / 静默都走这里）把持久化历史装进 RAM。放在 worker
+     * 线程而不是 hr_spawn：读盘 + JSON 解析不能卡 render 线程的点击回调。 */
+    hr_hist_ensure_loaded();
+
     /* 只统计本轮: s_last_bpm 是文件级 static, 不清的话失败信息里的
      * "last bpm=" 会带上**上一轮的旧值**, 真机排查时被它误导过
      * (看到 last bpm=171 以为本轮收到过数据, 其实一次都没收到)。 */
     s_last_bpm = 0;
+    s_last_ok = false;   /* 本轮成败从零开始，结束时由 report_ok/fail 落笔 */
+    hr_recent_reset();
 
     /* ── 1) 起采集（既有 CLI 路径） ─────────────────────────────── */
     rc = hr_sensor_cmd("hr_start", "start", HR_START_WAIT_MS, &exitcode);
@@ -450,6 +867,29 @@ static void hr_measure_worker(void)
      * 因为拿不到数据被 15s 上限兜住。只有**明确非零**的退出码才提前判定
      * 传感器没接上（hr_start 打不开总线/初始化失败时就是这条路）。 */
     if (rc != 0 || exitcode > 0) {
+        /* start 失败/超时后的**真实回收**（对抗审查 2026-10-19）。
+         *
+         * 原来这里是直接 goto out —— 而 out 里只在 started==true 时才发 stop，
+         * 所以"被 spawn 的采集线程稍后才起来"这种情况就彻底没人管了。
+         *
+         * 但"补发一个 stop 就算清理"也不够：start 超时最常见的原因是采集进程
+         * 还卡在 max30102_init 里，此时 g_hr.running 还是 false，stop 走过去
+         * 只会打印"未运行"立即返回。真正有效的三步：
+         *   1) 置 abort 标志，让那个进程在 task_create 之前自己退出；
+         *   2) 仍然发一次 stop，覆盖"采样线程已经起来"的那种情况；
+         *   3) 轮询 running 直到 false —— 只有它真的为 false 才算清理干净。
+         */
+        int tries;
+
+        max30102_hr_abort();
+        exitcode = 0;
+        (void)hr_sensor_cmd("hr_stop", "stop", HR_STOP_WAIT_MS, &exitcode);
+        for (tries = 0; tries < 40 && max30102_hr_running() != 0; tries++) {
+            usleep(50 * 1000);
+        }
+        printf("[hr_measure] start failed, reclaim: running=%d after %dms\n",
+               max30102_hr_running(), tries * 50);
+        started = false;
         hr_report_fail(HR_MSG_NO_SENSOR, "start failed");
         goto out;
     }
@@ -488,12 +928,13 @@ static void hr_measure_worker(void)
         uint32_t elapsed = now - t0;
         int left;
 
-        /* 每秒刷一次进度（走 lvgl_ui_post，不写历史环） */
+        /* 每秒刷一次进度（走 lvgl_ui_post，不写历史环）。
+         * 静默轮不上进度 —— 后台测量对用户完全不可见。 */
         left = (int)(HR_MEASURE_MAX_S - elapsed / 1000u);
         if (left < 0) {
             left = 0;
         }
-        if (left != last_left) {
+        if (!s_silent && left != last_left) {
             last_left = left;
             hr_post_progress(left);
         }
@@ -534,30 +975,32 @@ static void hr_measure_worker(void)
 
             if (hr.bpm == 0 ||
                 hr.bpm < HR_BPM_SANE_MIN || hr.bpm > HR_BPM_SANE_MAX) {
-                first_bpm = 0;
+                /* 不推进窗口: 越界值(算法没收敛/无数据)不能污染中位数。 */
                 continue;
             }
 
-            if (first_bpm == 0) {
-                first_bpm = hr.bpm;
-                first_ms = stamp;
-                printf("[hr_measure] candidate bpm=%u at %ums\n",
-                       (unsigned)first_bpm, (unsigned)(stamp - t0));
-                continue;
-            }
+            /* 推进滑动窗口。不再用"第一个候选值"上报 —— 见 hr_recent_median
+             * 上方的注释: 那个值在真机上就是手指刚接触时的暂态(143)。 */
+            hr_recent_push(hr.bpm);
 
-            if (!hr_same_scale(hr.bpm, first_bpm)) {
-                /* 值跳变：重新计时，等下一条确认 */
-                first_bpm = hr.bpm;
-                first_ms = stamp;
-                continue;
-            }
-
-            /* 新鲜度确认：同一量级的值在 3s 内再次到达 */
-            if ((stamp - first_ms) <= HR_MEASURE_STALL_MS &&
+            if (s_recent_cnt >= HR_RECENT_N &&
                 (stamp - t0) >= HR_MEASURE_MIN_MS) {
-                hr_report_ok(first_bpm);
-                goto out;
+                uint32_t med = hr_recent_median();
+
+                /* 中位数本身要合理, 且与最新值同量级 —— 证明算法仍锁着、
+                 * 没有在窗口末尾跳走(跳走说明这段数据不可信, 继续等)。 */
+                if (med >= HR_BPM_SANE_MIN && med <= HR_BPM_SANE_MAX &&
+                    hr_same_scale(med, hr.bpm)) {
+                    printf("[hr_measure] accept median=%u latest=%u n=%d at %ums\n",
+                           (unsigned)med, (unsigned)hr.bpm, s_recent_cnt,
+                           (unsigned)(stamp - t0));
+                    hr_report_ok(med);
+                    goto out;
+                }
+
+                printf("[hr_measure] hold: median=%u latest=%u n=%d at %ums\n",
+                       (unsigned)med, (unsigned)hr.bpm, s_recent_cnt,
+                       (unsigned)(stamp - t0));
             }
         }
     }
@@ -601,7 +1044,9 @@ static void *hr_measure_thread(void *arg)
  * Public API
  ****************************************************************************/
 
-int hr_measure_start(void)
+/* 公共起测实现：silent=true 走后台静默轮（hr_watch 用），两个入口
+ * 共用同一套单飞互斥与线程参数，只差 s_silent 一个标志。 */
+static int hr_spawn(bool silent)
 {
     pthread_attr_t attr;
     pthread_t tid;
@@ -610,10 +1055,12 @@ int hr_measure_start(void)
     pthread_mutex_lock(&s_lock);
     if (s_busy) {
         pthread_mutex_unlock(&s_lock);
-        printf("[hr_measure] already measuring, click ignored\n");
+        printf("[hr_measure] already measuring, %s ignored\n",
+               silent ? "silent start" : "click");
         return -EBUSY;
     }
     s_busy = true;
+    s_silent = silent;   /* 锁内写：worker 起跑前就能看到本轮模式 */
     pthread_mutex_unlock(&s_lock);
 
     pthread_attr_init(&attr);
@@ -632,8 +1079,40 @@ int hr_measure_start(void)
         return -ENOMEM;
     }
 
-    printf("[hr_measure] measurement started (max %ds)\n", HR_MEASURE_MAX_S);
+    printf("[hr_measure] measurement started (max %ds, silent=%d)\n",
+           HR_MEASURE_MAX_S, (int)silent);
     return 0;
+}
+
+int hr_measure_start(void)
+{
+    return hr_spawn(false);
+}
+
+int hr_measure_start_silent(void)
+{
+    return hr_spawn(true);
+}
+
+bool hr_measure_last_ok(void)
+{
+    return s_last_ok;
+}
+
+int hr_measure_last_bpm(void)
+{
+    return (int)s_last_bpm;
+}
+
+bool hr_measure_is_running(void)
+{
+    bool busy;
+
+    pthread_mutex_lock(&s_lock);
+    busy = s_busy;
+    pthread_mutex_unlock(&s_lock);
+
+    return busy;
 }
 
 #else /* 没有 uORB / fitness 话题：给个明确失败的桩，保证 UI 侧能链接 */
@@ -642,6 +1121,28 @@ int hr_measure_start(void)
 {
     printf("[hr_measure] algo_heartrate topic not available\n");
     return -ENOSYS;
+}
+
+int hr_measure_start_silent(void)
+{
+    /* 后台静默轮同样没有数据源；返回失败让 hr_watch 计失败次数 */
+    printf("[hr_measure] algo_heartrate topic not available (silent)\n");
+    return -ENOSYS;
+}
+
+bool hr_measure_last_ok(void)
+{
+    return false;
+}
+
+int hr_measure_last_bpm(void)
+{
+    return 0;
+}
+
+bool hr_measure_is_running(void)
+{
+    return false;
 }
 
 #endif /* HR_MEASURE_HAVE_TOPIC */

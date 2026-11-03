@@ -25,6 +25,10 @@
 /* 麦克风自检 (health/mic_selfcheck.c): 工具层只做 JSON 转手 */
 #include "health/mic_selfcheck.h"
 
+/* 血氧单次测量 (health/spo2_measure.c): 异步起 worker 线程, 19s 采集,
+ * 结束后自己上屏 + 语音播报, 不走工具返回值 */
+#include "health/spo2_measure.h"
+
 #if defined(CONFIG_UORB) && defined(CONFIG_FITNESS_ALGO)
 #include <uORB/uORB.h>
 #if __has_include(<fitness/algo_heartrate.h>) && __has_include(<fitness/algo_pedometer.h>)
@@ -140,3 +144,57 @@ int tool_mic_selfcheck_execute(const char *input_json, char *output,
     (void)input_json;
     return mic_selfcheck_run_json(output, output_size);
 }
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+
+/* max30102.c 暴露的最近一次血氧结果（flat build 跨库符号可见，
+ * spo2_measure.c:38 也是这么 extern 的） */
+extern float g_max30102_spo2_pct;
+extern int   g_max30102_spo2_ok;
+
+/* ── Blood oxygen (SpO2) ───────────────────────────────────────────
+ *
+ * "我血氧多少" 的落点。血氧没有 uORB 话题, 真实路径是 spo2_measure_start()
+ * 异步起线程采 19 秒 —— 工具绝不能同步等它(会把 agent worker 卡住 20 秒):
+ *
+ *   有历史值   -> 直接报上次结果, 不再测;
+ *   无历史值   -> 起一次测量, 由 spo2_measure.c 的 worker 在结束时
+ *                 自己上屏 + 语音播报("您的血氧是 NN%"), 工具只回提示语;
+ *   -EBUSY     -> 上一轮还在采, 提示稍等。
+ *
+ * 返回文本会被 TTS 直接念出来(也用 ui_font_cjk_18 上屏), 所以措辞口语、
+ * 简短, 并提醒测量期间手指要贴稳传感器。
+ */
+int tool_get_spo2_execute(const char *input_json, char *output, size_t output_size)
+{
+    int ret;
+
+    (void)input_json;
+
+    /* 上次测量留有有效值: 直接报数(取整方式与 spo2_measure.c 上屏一致) */
+    if (g_max30102_spo2_ok) {
+        snprintf(output, output_size, "您上次测的血氧是%d%%",
+                 (int)(g_max30102_spo2_pct + 0.5f));
+        return OK;
+    }
+
+    /* 无有效历史值: 起一次异步测量, 结果稍后由 spo2_measure.c 播报 */
+    ret = spo2_measure_start();
+    if (ret == 0) {
+        snprintf(output, output_size,
+                 "血氧测量已开始，约20秒后播报结果，请把手指贴稳传感器");
+        return OK;
+    }
+
+    if (ret == -EBUSY) {
+        snprintf(output, output_size,
+                 "上一次测量还在进行中，请把手指贴稳传感器");
+        return OK;
+    }
+
+    syslog(LOG_WARNING, "[health] spo2_measure_start failed: %d\n", ret);
+    snprintf(output, output_size, "血氧测量启动失败，请稍后再试");
+    return ERROR;
+}
+
+#endif /* CONFIG_AI_AGENT_LVGL_UI */

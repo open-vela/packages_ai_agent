@@ -26,13 +26,45 @@
 #include "infra/http_proxy.h"
 #include "infra/config_store.h"
 #include "infra/vela_tls.h"
+#include "infra/weather_cache.h"   /* 进程级共享天气缓存（天气页/后台预取共用） */
 
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <time.h>
 #include "cJSON.h"
 
 static const char *TAG = "web_search";
+
+/* ── 天气结果 10 分钟缓存 ────────────────────────────────────────
+ * 天气是低速变化数据; 现场演示时同一句会反复问, 而慢网(TLS+HTTP 往返)
+ * 一次要 30s+。命中缓存直接返回上次的中文结果, 零网络开销。
+ * 只缓存"同一 location"的最终文本。 */
+#define WS_WX_TTL_MS (10u * 60u * 1000u)
+static char     s_wx_cache_key[128];
+static char     s_wx_cache_out[512];
+static uint32_t s_wx_cache_at_ms;
+static int      s_wx_cache_valid;
+
+static uint32_t ws_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
+}
+
+static void ws_wx_cache_store(const char *location, const char *text)
+{
+    if (location == NULL || text == NULL || text[0] == '\0') {
+        return;
+    }
+
+    strncpy(s_wx_cache_key, location, sizeof(s_wx_cache_key) - 1);
+    strncpy(s_wx_cache_out, text, sizeof(s_wx_cache_out) - 1);
+    s_wx_cache_at_ms = ws_now_ms();
+    s_wx_cache_valid = 1;
+}
 
 static char s_serp_key[128]   = {0};
 static char s_exa_key[128]    = {0};
@@ -548,6 +580,117 @@ int tool_web_search_set_news_key(const char *key)
  *   Backends: Tavily → SerpAPI
  * ──────────────────────────────────────────────────────────────*/
 
+/* ──────────────────────────────────────────────────────────────
+ * Open-Meteo fallback（免 key）
+ *
+ * 天气页本来就走 api.open-meteo.com（免 key），而 get_weather 只走
+ * Tavily/SerpAPI（都要 key）。没配 key 时语音问天气会返回英文错误并被
+ * TTS 念出来（真机 2026-10-25 实测 "Error: Could not fetch weather..."）。
+ * 这里补一条与天气页同源的兜底：固定北京坐标（手表没有定位）。
+ * ──────────────────────────────────────────────────────────────*/
+#define OM_WX_HOST     "api.open-meteo.com"
+#define OM_WX_PORT     "443"
+#define OM_WX_PATH     "/v1/forecast?latitude=39.9042&longitude=116.4074" \
+                       "&current_weather=true"
+#define OM_WX_RESP_CAP 2048
+
+static const char *om_weather_desc(int code)
+{
+    if (code == 0)  return "晴";
+    if (code <= 2)  return "多云";
+    if (code == 3)  return "阴";
+    if (code <= 48) return "有雾";
+    if (code <= 57) return "毛毛雨";
+    if (code <= 67) return "下雨";
+    if (code <= 77) return "下雪";
+    if (code <= 82) return "阵雨";
+    if (code <= 86) return "阵雪";
+    return "雷雨";
+}
+
+/* 只做"取数 + 解析"，把温度 / WMO 天气码 / 风速交出去。
+ *
+ * 为什么不和下面的格式化放在一起：后台预取线程（infra/weather_prefetch.c）
+ * 与共享缓存要的是**数字**，不是一句中文。网络请求与 JSON 解析只留这一份，
+ * 两个调用方各自决定怎么用（拼句子 / 写缓存）。
+ *
+ * resp 由调用方分配（OM_WX_RESP_CAP 字节）：这样 open_meteo_weather() 的
+ * "内存不够"文案还在原来那一处，行为一点没变。 */
+static int om_weather_fetch_raw(char *resp, size_t cap,
+                                float *temp_c, int *code, float *wind_kmh)
+{
+    int status = vela_https_get(OM_WX_HOST, OM_WX_PORT, OM_WX_PATH,
+                                resp, cap);
+    if (status != 200) {
+        syslog(LOG_WARNING, "[%s] Open-Meteo failed: %d\n", TAG, status);
+        return ERROR;
+    }
+
+    cJSON *root = cJSON_Parse(resp);
+    if (root == NULL) {
+        return ERROR;
+    }
+
+    cJSON *cur  = cJSON_GetObjectItem(root, "current_weather");
+    cJSON *jt   = cur ? cJSON_GetObjectItem(cur, "temperature") : NULL;
+    cJSON *jc   = cur ? cJSON_GetObjectItem(cur, "weathercode") : NULL;
+    cJSON *jw   = cur ? cJSON_GetObjectItem(cur, "windspeed") : NULL;
+    if (!cJSON_IsNumber(jt) || !cJSON_IsNumber(jc)) {
+        cJSON_Delete(root);
+        return ERROR;
+    }
+
+    *temp_c   = (float)jt->valuedouble;
+    *code     = (int)jc->valuedouble;
+    *wind_kmh = cJSON_IsNumber(jw) ? (float)jw->valuedouble : 0.0f;
+    cJSON_Delete(root);
+    return OK;
+}
+
+static int open_meteo_weather(const char *location,
+                              char *output, size_t output_size)
+{
+    float t  = 0.0f;
+    int   wc = 0;
+    float ws = 0.0f;
+    char *resp = malloc(OM_WX_RESP_CAP);
+
+    if (resp == NULL) {
+        snprintf(output, output_size, "抱歉，内存不够，暂时查不了天气。");
+        return ERROR;
+    }
+
+    if (om_weather_fetch_raw(resp, OM_WX_RESP_CAP, &t, &wc, &ws) != OK) {
+        free(resp);
+        return ERROR;
+    }
+    free(resp);
+
+    /* 手表无定位：坐标固定北京；问别的城市时如实说明 */
+    if (location != NULL && location[0] != '\0' &&
+        strstr(location, "北京") == NULL &&
+        strstr(location, "Beijing") == NULL &&
+        strstr(location, "beijing") == NULL) {
+        snprintf(output, output_size,
+                 "手表没有定位，只能查北京：北京当前气温 %.1f 度，%s，"
+                 "风速 %.1f 公里/小时。", t, om_weather_desc(wc), ws);
+    } else {
+        snprintf(output, output_size,
+                 "北京当前气温 %.1f 度，%s，风速 %.1f 公里/小时。",
+                 t, om_weather_desc(wc), ws);
+    }
+    syslog(LOG_INFO, "[%s] Weather via Open-Meteo OK (%.1f C, code %d)\n",
+           TAG, t, wc);
+
+    /* 共享缓存：与天气页、后台预取同一份（source="tool"）。
+     * 只多写一份数据，不影响本工具的输出/自己的 10 分钟文本缓存；
+     * 收益是语音问完天气以后，天气页进页面直接有数据可渲染。
+     * 只有这一路会写：上面 Tavily/SerpAPI 返回的是自由文本，提不出温度/
+     * 天气码，硬解析等于猜。 */
+    weather_cache_update(t, wc, ws, "tool");
+    return OK;
+}
+
 int tool_get_weather_execute(const char *input_json, char *output, size_t output_size)
 {
     cJSON *input = cJSON_Parse(input_json);
@@ -569,6 +712,15 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
 
     syslog(LOG_INFO, "[%s] Weather query: %s\n", TAG, location);
 
+    /* 10 分钟缓存命中: 直接回上次的中文结果, 不联网 */
+    if (s_wx_cache_valid && s_wx_cache_out[0] != '\0'
+        && strcmp(location, s_wx_cache_key) == 0
+        && (uint32_t)(ws_now_ms() - s_wx_cache_at_ms) < WS_WX_TTL_MS) {
+        snprintf(output, output_size, "%s", s_wx_cache_out);
+        syslog(LOG_INFO, "[%s] Weather cache hit: %s\n", TAG, location);
+        return OK;
+    }
+
     char search_query[300];
     snprintf(search_query, sizeof(search_query), "%s weather today", location);
 
@@ -576,6 +728,7 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
         int err = tavily_search(search_query, output, output_size);
         if (err == OK && output[0] && strncmp(output, "Error:", 6) != 0) {
             syslog(LOG_INFO, "[%s] Weather via Tavily OK\n", TAG);
+            ws_wx_cache_store(location, output);
             return OK;
         }
         syslog(LOG_WARNING, "[%s] Tavily weather failed, trying SerpAPI\n", TAG);
@@ -585,13 +738,20 @@ int tool_get_weather_execute(const char *input_json, char *output, size_t output
         int err = serpapi_search(search_query, output, output_size);
         if (err == OK && output[0] && strncmp(output, "Error:", 6) != 0) {
             syslog(LOG_INFO, "[%s] Weather via SerpAPI OK\n", TAG);
+            ws_wx_cache_store(location, output);
             return OK;
         }
     }
 
+    /* 没配搜索 key（或两个后端都失败）时走免 key 的 Open-Meteo 兜底。
+     * 中文输出：它会被直接播报，英文错误用户听不懂。 */
+    if (open_meteo_weather(location, output, output_size) == OK) {
+        ws_wx_cache_store(location, output);
+        return OK;
+    }
+
     snprintf(output, output_size,
-             "Error: Could not fetch weather for '%s'. Set key via set_tavily_key or set_search_key.",
-             location);
+             "抱歉，现在查不到%s的天气（网络或数据源不可用）。", location);
     return ERROR;
 }
 
@@ -600,3 +760,49 @@ int tool_web_search_set_key(const char *api_key)
 {
     return tool_web_search_set_serp_key(api_key);
 }
+
+/* ──────────────────────────────────────────────────────────────
+ * 共享缓存入口：给后台预取线程（infra/weather_prefetch.c）用
+ *
+ * 只拉北京这一份 Open-Meteo 数据，写进 infra/weather_cache；成功/失败都
+ * 记录 —— last_ok 就是给这一步用的（"有没有成功数据" 和 "最近一次成功
+ * 没有"是两件事：天气页缓存过期时照样能拿旧数据显示）。
+ *
+ * 参数 desc_out 只是给日志用的中文描述（"晴"/"多云"…），预取线程不需要
+ * 一整句话，所以这里只回一个词，不拼句子、不写 output 缓冲区。
+ *
+ * 失败不重试：天气是低速数据，30 分钟后再来，别和语音/LLM 的 TLS 抢 IOB。
+ * ────────────────────────────────────────────────────────────── */
+int tool_weather_fetch_now(char *desc_out, size_t cap)
+{
+    char *resp;
+    float t  = 0.0f;
+    int   wc = 0;
+    float ws = 0.0f;
+
+    if (desc_out != NULL && cap > 0) {
+        desc_out[0] = '\0';
+    }
+
+    resp = malloc(OM_WX_RESP_CAP);
+    if (resp == NULL) {
+        weather_cache_mark_fail();
+        return ERROR;
+    }
+
+    if (om_weather_fetch_raw(resp, OM_WX_RESP_CAP, &t, &wc, &ws) != OK) {
+        free(resp);
+        weather_cache_mark_fail();
+        return ERROR;
+    }
+    free(resp);
+
+    weather_cache_update(t, wc, ws, "prefetch");
+
+    if (desc_out != NULL && cap > 0) {
+        snprintf(desc_out, cap, "%s", om_weather_desc(wc));
+    }
+
+    return OK;
+}
+
