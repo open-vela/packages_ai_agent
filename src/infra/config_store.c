@@ -141,12 +141,73 @@ static cJSON *load_json_ex(bool *bad_json)
     return NULL;
 }
 
+/* ── 最后一份好配置(.good) ────────────────────────────────────
+ *
+ * 背景(docs_ble/24 号文 §24.8): config.json 曾多次被"写成只剩 net.dns_*
+ * 两项" —— 一次坏写 / 一次手工 echo 写坏之后, 网络组件启动时用
+ * load_json_for_write() 把坏文件隔离成 .bad 并从空对象重建, 于是所有
+ * **其它**键(LLM 后端、API key)静默消失, 云端对话退化成端侧兜底。
+ *
+ * 对策: 每次保存成功后留一份 .good; 读/写路径发现主文件坏掉时, 先用
+ * .good 把键恢复回来, 再继续合并写。这样坏写最多丢"最后一次修改",
+ * 不会再出现"整套配置一次性消失"。 */
+#define AGENT_CONFIG_GOOD AGENT_CONFIG_FILE ".good"
+
+static cJSON *load_good_copy(void)
+{
+    FILE *f = fopen(AGENT_CONFIG_GOOD, "r");
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return NULL; }
+
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root) {
+        syslog(LOG_WARNING, "[%s] primary config unusable; restored keys "
+               "from last-known-good %s\n", TAG, AGENT_CONFIG_GOOD);
+    }
+    return root;
+}
+
 static cJSON *load_json(void)
 {
-    return load_json_ex(NULL);
+    cJSON *root = load_json_ex(NULL);
+    if (root == NULL) {
+        root = load_good_copy();   /* 只读恢复: 主文件原样留着 */
+    }
+    return root;
 }
 
 #define AGENT_CONFIG_TMP AGENT_CONFIG_FILE ".tmp"
+
+/* 写一个小文件(截断写, 0600)。用于 .good 备份。 */
+static int write_blob(const char *path, const char *data)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return ERROR;
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); return ERROR; }
+
+    int rc = OK;
+    if (fputs(data, f) == EOF || fflush(f) != 0) {
+        rc = ERROR;
+    }
+    if (fclose(f) != 0) {
+        rc = ERROR;
+    }
+    return rc;
+}
 
 static int save_json(cJSON *root)
 {
@@ -187,6 +248,19 @@ static int save_json(cJSON *root)
                TAG, AGENT_CONFIG_TMP, AGENT_CONFIG_FILE, errno);
         unlink(AGENT_CONFIG_TMP);
         return ERROR;
+    }
+
+    /* 留一份最后已知良好的配置。写失败不影响本次保存的结果(主文件已经
+     * 成功落盘), 只是下一次坏写时少一层保险, 所以只警告不报错。 */
+    {
+        char *good = cJSON_PrintUnformatted(root);
+        if (good) {
+            if (write_blob(AGENT_CONFIG_GOOD, good) != OK) {
+                syslog(LOG_WARNING, "[%s] could not refresh %s\n",
+                       TAG, AGENT_CONFIG_GOOD);
+            }
+            free(good);
+        }
     }
     return OK;
 }
@@ -242,6 +316,18 @@ static cJSON *load_json_for_write(void)
     s_bad_json_last_size = -1;
     s_bad_json_suppressed = 0;
 
+    /* ★ 不要从空对象重建 —— 那正是 "配置只剩 DNS 两项" 的形成路径:
+     * 坏文件 → 空对象 + 本次调用者的键 → 其它键全丢。先用 .good 把
+     * 上一份好配置找回来, 再让调用者把这次的修改合并进去。 */
+    {
+        cJSON *good = load_good_copy();
+        if (good != NULL) {
+            syslog(LOG_WARNING,
+                   "[%s] rebuilt config from %s (keys preserved)\n",
+                   TAG, AGENT_CONFIG_GOOD);
+            return good;
+        }
+    }
     return cJSON_CreateObject();
 }
 
@@ -310,6 +396,9 @@ int config_erase_all(void)
     cJSON *empty = cJSON_CreateObject();
     int ret = save_json(empty);
     cJSON_Delete(empty);
+    /* 用户显式清空时, 备份也要一起清掉, 否则下次坏写会把旧配置"复活"。 */
+    unlink(AGENT_CONFIG_GOOD);
+    unlink(AGENT_CONFIG_BAD);
     pthread_mutex_unlock(&s_lock);
     return ret;
 }

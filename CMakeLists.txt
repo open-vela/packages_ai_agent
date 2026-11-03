@@ -34,6 +34,11 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/infra/config_store.c
     src/infra/time_sync.c
     src/infra/network_manager.c
+    src/infra/cell_net.c
+    # 2026-10-31: 健康数据(步数/心率历史)持久化 + 天气共享缓存/后台预取
+    src/infra/health_store.c
+    src/infra/weather_cache.c
+    src/infra/weather_prefetch.c
     src/infra/cron_service.c
     src/infra/heartbeat.c
     src/infra/hangwatch.c
@@ -55,6 +60,11 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_shell.c
     src/tools/tool_system.c
     src/tools/tool_health.c
+    # 2026-10-31: 步数历史工具(步数持久化/每日重置由 health/pedometer.c 提供)
+    src/tools/tool_steps_history.c
+    # persona: 三种可切换人格（温柔/毒舌/元气）的 set_persona 工具。
+    # 状态和持久化在 src/ui/persona.c，这里只是薄工具层。
+    src/tools/tool_persona.c
     # mic_selfcheck: "ask 麦克风自检" 的诊断后端 + 开机自检探针。
     # 采集序列照抄 contest 仓 audio_rec_test_main.c; 放 health/ 与
     # hr_measure.c 同目录, 两者都是"设备侧自检服务 + 上屏结论"。
@@ -71,6 +81,8 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/edge_mp3.c
     src/voice/minimax_tts.c
     src/voice/minimax_asr.c
+    src/voice/mimo_tts.c
+    src/voice/mimo_asr.c
     src/voice/opus_ogg.c
     src/voice/vad_trim.c
     src/voice/pcm_media_recorder.c
@@ -81,8 +93,12 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/audio_playback.c
     src/voice/voice_channel.c
     src/voice/pcm_media_player.c
+    src/voice/pcm_file_player.c
     src/voice/boot_chime.c
     src/stubs.c
+    # persona: 桌宠人格状态 + 三种 system prompt（纯文本，无 LVGL 依赖）。
+    # system prompt 构建、set_persona 工具、persona NSH 命令共用这一份状态。
+    src/ui/persona.c
     src/ui/qrcode_display.c
   )
 
@@ -127,10 +143,61 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     # Owns its own worker thread; drives the real sensor through the existing
     # hr_sensor CLI path (task_spawn) and renders via lvgl_ui_post.
     list(APPEND AGENT_SRCS src/health/hr_measure.c)
-    list(APPEND AGENT_SRCS src/ui/launcher_page.c)
-    list(APPEND AGENT_SRCS src/ui/about_page.c)
-    list(APPEND AGENT_SRCS src/ui/pet_page.c)
+    # spo2_measure: one-shot "测血氧" measurement behind the pet page button.
+    # 与 hr_measure 同构(自己的 worker 线程 + lvgl_ui_post 上屏), 但血氧不走
+    # uORB —— 框架没有 algo_spo2 话题, 结果由 max30102.c 的全局变量交出来。
+    list(APPEND AGENT_SRCS src/health/spo2_measure.c)
+    # 计步器：25 Hz 读 /dev/mpu0。数据源是内核 mpu60x0 驱动，
+    # 板级在 I2C3(PA39/PA40) 上 register 出 /dev/mpu0。
+    list(APPEND AGENT_SRCS src/health/pedometer.c)
+    # hr_watch: 后台静默心率守护（10 分钟一轮），超阈值走 pet_care_hr_report。
+    # 真·心率告警的数据源；测量本身复用 hr_measure（start_silent）。
+    list(APPEND AGENT_SRCS src/health/hr_watch.c)
+    # 第一梯队 5 页（2026-10-19 重做，深色主题 + 全局设计令牌）
+    # 导航中枢：所有页面切换的唯一入口，负责先删旧页再建新页
+    list(APPEND AGENT_SRCS src/ui/ui_theme.c)   # 设计令牌的公共控件
+    # bubble_grid.c（Apple Watch 蜂窝气泡网格）2026-11-02 起不再被 applist 使用：
+    # 应用入口改成 2x3 宫格（见 src/ui/applist_page.c 文件头）。源码保留未删。
+    list(APPEND AGENT_SRCS src/ui/ui_icon_runtime.c)  # 运行时图标覆盖（真机只用内置）
+    list(APPEND AGENT_SRCS src/ui/assets/ui_json_embedded.c)  # 设计稿烘焙成的 JSON
+    list(APPEND AGENT_SRCS src/ui/assets/ui_user_icons.c)     # 设计师导入的图标
+    list(APPEND AGENT_SRCS src/ui/ui_engine.c)        # 数据驱动界面引擎
+    list(APPEND AGENT_SRCS src/ui/ui_text_runtime.c)  # 运行时文案（真机无文件则用默认）
+    list(APPEND AGENT_SRCS src/ui/ui_gesture.c)   # 统一手势识别
+    list(APPEND AGENT_SRCS src/ui/ui_nav.c)
+    list(APPEND AGENT_SRCS src/ui/watchface_page.c)   # 表盘
+    list(APPEND AGENT_SRCS src/ui/applist_page.c)     # 应用列表
+    list(APPEND AGENT_SRCS src/ui/heart_page.c)       # 心率
+    # 心率历史工具：依赖 hr_measure.c(仅 LVGL_UI 下编译)，必须同条件
+    list(APPEND AGENT_SRCS src/tools/tool_hr_history.c)
+    # 2026-10-31: 自动休息时段检测 + 每日健康摘要（都依赖 pedometer/UI 通道）
+    list(APPEND AGENT_SRCS src/health/rest_track.c)
+    list(APPEND AGENT_SRCS src/ui/health_summary.c)
+    list(APPEND AGENT_SRCS src/tools/tool_rest.c)
+    list(APPEND AGENT_SRCS src/tools/tool_health_summary.c)
+    list(APPEND AGENT_SRCS src/ui/spo2_page.c)        # 血氧
+    # 音乐页：语音能播但屏幕进不去，这个页面把已有的 8 个音乐工具接出来
+    list(APPEND AGENT_SRCS src/ui/music_page.c)
+    # 本地音乐：在线搜索受版权限制放不出来，本地文件是唯一能保证出声的路径
+    list(APPEND AGENT_SRCS src/ui/music_local.c)
+    # 播放操作的后台执行器：播放器接口是阻塞的，绝不能在 UI 线程上调
+    list(APPEND AGENT_SRCS src/ui/music_worker.c)
+    # 计时器页：应用列表里一直有这个图标，但之前点下去只打印 not implemented
+    list(APPEND AGENT_SRCS src/ui/timer_page.c)
+    list(APPEND AGENT_SRCS src/ui/sport_page.c)       # 运动：真实计步数据
+    list(APPEND AGENT_SRCS src/ui/sleep_page.c)       # 静止/休息：如实显示静止时长
+    list(APPEND AGENT_SRCS src/ui/alarm_page.c)       # 闹钟：列 cron 持久化任务
+    list(APPEND AGENT_SRCS src/ui/weather_page.c)     # 天气：北京 Open-Meteo（免 key）
+    # 内嵌的 60 秒演示曲（首次开机写到 /data/music/）
+    list(APPEND AGENT_SRCS src/ui/assets/audio/demo_music.c)
+    list(APPEND AGENT_SRCS src/ui/pet_page.c)         # AI 对话
     list(APPEND AGENT_SRCS src/ui/settings_page.c)
+    list(APPEND AGENT_SRCS src/ui/about_page.c)
+    # 2026-11-02 批次 3：小云表情（状态 + 持久化 + 选择页 + 位图资产）
+    list(APPEND AGENT_SRCS src/ui/expression.c)
+    list(APPEND AGENT_SRCS src/ui/expression_page.c)
+    # launcher_page.c 已由 watchface_page 取代，不再编译
+    # （保留源码备查；它里面还有定时器泄漏的修复记录）
     if(CONFIG_INPUT_BUTTONS)
       list(APPEND AGENT_SRCS src/ui/key_input.c)
     endif()
@@ -138,14 +205,27 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     # sans_88 were never used (gc-sections was already dropping them) and
     # sans_16_bold was a second full 3,879-glyph CJK face used for bold on two
     # labels -- 279 KB of flash for a weight change.
+    # 字体：
+    #   cjk_24 = 按 UI 实际用字烘焙（349 字符，68 KB）—— 中文全部走它
+    #   sans_88_bold = 只有 15 个数字字形，给表盘大时间用
+    #   cjk_18 = 旧的全集字体，仍被 lvgl_ui_channel / pet_care 引用
+    list(APPEND AGENT_SRCS src/ui/assets/ui_font_cjk_24.c)
     list(APPEND AGENT_SRCS src/ui/assets/ui_font_cjk_18.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_16.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_24.c)
-    list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_32.c)
     list(APPEND AGENT_SRCS src/ui/assets/ui_font_sans_88_bold.c)
     # pet_cloud_open / pet_cloud_blink (2 x 300x300 ARGB8888, 720 KB) are gone:
     # the mascot is drawn with LVGL primitives now.
-    list(APPEND AGENT_SRCS src/ui/assets/img_background_watch.c)
+    # 界面图标（从官方 bandx demo 的 PNG 烘焙成 RGB565A8，128 KB）
+    list(APPEND AGENT_SRCS src/ui/assets/ui_icons.c)
+    # 小云表情位图（8 款 RGB565A8，209.2 KiB）—— 构建产物，见文件头
+    list(APPEND AGENT_SRCS src/ui/assets/ui_expressions.c)
+    # ★ 2026-11-02：壁纸（390x450 RGB565 = 351,000 B）已下线。
+    # 浅色云光主题改用纯色底（src/ui/ui_theme.c 的 ui_page_apply_bg()），
+    # 全树已无任何符号引用 img_background_watch_px：
+    #   - ui_theme.c 的 s_wallpaper 已删
+    #   - pet_page.c 的 s_bg_dsc 已删
+    #   - launcher_page.c 本就不参与编译（见上面第 195 行）
+    # 源文件 src/ui/assets/img_background_watch.c 保留在磁盘作历史参考，
+    # 但不再加入编译 —— 这是 docs_ble/92 号文资源表里的 -342.8 KiB。
   endif()
 
   if(CONFIG_AI_AGENT_CAMERA)
@@ -170,15 +250,20 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   endif()
 
   if(CONFIG_AI_AGENT_BLE_GATT)
+    # 2026-11-02 BLE 数据通道：只编 GATT 透传 + JSON 命令处理。
+    # ble_gatt_net.c 是 "BLE 网络代理"（TUN/IP 桥），额外占 4KB 静态缓冲
+    # 并且自己会调 ble_gatt_init() 抢实例；本方案不用它，挪到 BLE_NET 下。
     list(APPEND AGENT_SRCS
       src/infra/ble_gatt.c
-      src/infra/ble_gatt_net.c
       src/infra/ble_cmd_handler.c
     )
   endif()
 
   if(CONFIG_AI_AGENT_BLE_NET)
-    list(APPEND AGENT_SRCS src/infra/ble_net.c)
+    list(APPEND AGENT_SRCS
+      src/infra/ble_gatt_net.c
+      src/infra/ble_net.c
+    )
   endif()
 
   if(CONFIG_AI_AGENT_REST_API)
@@ -248,6 +333,34 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   set(AGENT_DEPENDS mqttc)
   set(AGENT_DEFS "")
+
+  # DEMO-FW（2026-11-03）：演示"固定短语本地极速回复"编译开关。
+  # 默认 ON（演示构建）；正式构建执行 cmake -DDEMO_FAST_REPLY=OFF 重新
+  # configure 即关闭（等价于把 agent_loop.c 顶部 #define DEMO_FAST_REPLY
+  # 改成 0）。关闭后 handle_demo_fast_path() 整段不参与编译。
+  option(DEMO_FAST_REPLY
+    "DEMO-FW: local fast replies for fixed demo phrases" ON)
+  if(DEMO_FAST_REPLY)
+    list(APPEND AGENT_DEFS DEMO_FAST_REPLY=1)
+  else()
+    list(APPEND AGENT_DEFS DEMO_FAST_REPLY=0)
+  endif()
+
+  # DEMO-VOICE-A（2026-11-03）：固定演示台词「预合成音频缓存」编译开关。
+  # 默认 ON：把 demo_voice_cache.c + demo_voice_data.c 编进主 app，PCM 数组是
+  # const -> 链接进 .rodata（flash XIP），不占 SRAM；约 1.15 MB。
+  # 正式构建 cmake -DDEMO_VOICE_CACHE=OFF 关闭：数据文件不参与编译，镜像
+  # 回到原大小，agent_main/pet_care 走 static inline 桩自动回落云端 TTS。
+  option(DEMO_VOICE_CACHE
+    "DEMO-VOICE-A: pre-synthesized demo voice cache in flash" ON)
+  if(DEMO_VOICE_CACHE)
+    list(APPEND AGENT_SRCS
+      src/voice/demo_voice_cache.c
+      src/voice/demo_voice_data.c)
+    list(APPEND AGENT_DEFS DEMO_VOICE_CACHE=1)
+  else()
+    list(APPEND AGENT_DEFS DEMO_VOICE_CACHE=0)
+  endif()
 
   # libopus: 语音识别上传前的编码(见 src/voice/opus_ogg.c)。
   # 必要性是实测出来的: 蓝牙 PAN 上行结构上限约 12KB/s, 而 16kHz/16bit 原始
@@ -333,8 +446,50 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       100
   )
 
-  # "hr_set" exists only with the UI/care scheduler that owns hr_monitor.
+  # "persona" NSH builtin: 查看/切换人格，方便串口演示。
+  # 只写 1 字节的 /data/persona；与 UI 无关，任何构建都可用来验证。
+  nuttx_add_application(
+    NAME
+      persona
+    SRCS
+      src/ui/persona_cmd.c
+    INCLUDE_DIRECTORIES
+      ${AGENT_INCDIRS}
+    COMPILE_FLAGS
+      -Wno-error
+    # 8192 而不是 2048：写 /data/persona 要走 littlefs -> NOR 擦写，调用栈
+    # 比只读路径深得多。2048 在真机上直接 hard fault —— 2026-10-20 实测：
+    # 不带参数的 persona 正常，persona sassy 崩在 persona_main 入口
+    # （arm_hardfault.c:186）。NSH 应用只在人敲命令时短暂存在，多 6KB 栈
+    # 没有内存压力。
+    STACKSIZE
+      8192
+    PRIORITY
+      100
+  )
+
+  # "ui" NSH builtin: 从串口切页 / 切表情（演示与无触摸验证用）。
+  # 只在有 LVGL UI 的构建里存在；实现见 src/ui/ui_cmd.c 文件头。
   if(CONFIG_AI_AGENT_LVGL_UI)
+    nuttx_add_application(
+      NAME
+        ui
+      SRCS
+        src/ui/ui_cmd.c
+      INCLUDE_DIRECTORIES
+        ${AGENT_INCDIRS}
+      COMPILE_FLAGS
+        -Wno-error
+      # DEMO-FW：4096 -> 8192。ui demo alarm 会走 cron_add_job() ->
+      # cron_save_jobs() -> fopen/fwrite(/data)，littlefs/NOR 写调用栈较深；
+      # 同仓 persona 应用有实测：2048 栈写 /data 直接 hard fault，8192 正常
+      # （CMakeLists persona 段注释）。NSH 应用只在该命令运行期间占栈。
+      STACKSIZE
+        8192
+      PRIORITY
+        100
+    )
+
     nuttx_add_application(
       NAME
         hr_set

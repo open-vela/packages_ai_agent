@@ -16,6 +16,7 @@
 
 #include "network_manager.h"
 #include "agent_compat.h"
+#include "infra/vela_tls.h" /* v125: 上行断开时作废旧 TLS 连接池（pool invalidate） */
 
 #include <nuttx/net/dns.h>
 #include <arpa/inet.h>
@@ -434,6 +435,42 @@ static bool check_btpan_has_ip(void)
 }
 
 /**
+ * Check if 4G PPP interface has a valid IPv4 address.
+ *
+ * 2026-10-26: 新增蜂窝(合宙 Air780E + netutils/pppd)通道。pppd 自己建
+ * tun 网卡(名字固定 ppp0)并配 IP, 所以这里只按名字前缀 "ppp" + 有效 IPv4
+ * 判定, 优先级设为最高(4G > bt-pan > BLE 备用)。
+ */
+static bool check_ppp_has_ip(void)
+{
+    struct ifaddrs* ifa_list = NULL;
+    bool found = false;
+
+    if (getifaddrs(&ifa_list) != 0) {
+        return false;
+    }
+
+    for (struct ifaddrs* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        if (!ifa->ifa_name || strncmp(ifa->ifa_name, "ppp", 3) != 0) {
+            continue;
+        }
+
+        struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+        uint32_t addr = ntohl(sin->sin_addr.s_addr);
+        if (addr != 0 && (addr >> 24) != 127) {
+            found = true;
+            break;
+        }
+    }
+
+    freeifaddrs(ifa_list);
+    return found;
+}
+
+/**
  * Check if any non-bt-pan interface has a valid IPv4 address
  * (for BLE GATT NUS+TUN backup channel detection).
  */
@@ -602,23 +639,28 @@ static void* iface_poll_thread(void* arg)
     clock_gettime(CLOCK_MONOTONIC, &start);
     bool startup_warned = false;
 
-    /* Dual-channel tracking: bt-pan (primary) vs BLE GATT (backup) */
+    /* 三通道优先级: 4G(ppp0) > bt-pan > BLE GATT(备用) */
     const char* active_channel = "none";
 
     while (g_poll_running) {
         /*
-         * Dual-channel priority switching (ported from xiaozhi-sf32):
-         *   Primary:  bt-pan (BR/EDR PAN via phone Bluetooth tethering)
-         *   Backup:   BLE GATT NUS+TUN proxy (via phone companion app)
-         *
-         * bt-pan is preferred because it provides standard IP networking
-         * with DHCP. BLE GATT is a fallback when PAN is unavailable.
+         * Priority: 4G cellular (ppp0, Air780E via netutils/pppd) > bt-pan >
+         * BLE GATT. 4G 独立于手机, 是"离开手机也能上网"的主通道; bt-pan 作为
+         * 手机在附近时的备用通道; BLE GATT 是最后的兜底。
          */
+        bool ppp_ready = check_ppp_has_ip();
         bool btpan_ready = check_btpan_has_ip();
         bool backup_ready = false;
         bool has_ip = false;
 
-        if (btpan_ready) {
+        if (ppp_ready) {
+            /* Highest priority: 4G cellular */
+            has_ip = true;
+            if (active_channel != "4g") {
+                active_channel = "4g";
+                syslog(LOG_INFO, "[%s] Active channel: 4G cellular (ppp0)\n", TAG);
+            }
+        } else if (btpan_ready) {
             /* Primary channel (bt-pan) is up — use it */
             has_ip = true;
             if (active_channel != "bt-pan") {
@@ -630,7 +672,7 @@ static void* iface_poll_thread(void* arg)
 #ifdef CONFIG_AI_AGENT_BLE_NET
             backup_ready = backup_ready || ble_net_is_connected();
 #endif
-#ifdef CONFIG_AI_AGENT_BLE_GATT
+#ifdef CONFIG_AI_AGENT_BLE_NET
             backup_ready = backup_ready || ble_gatt_net_is_connected();
 #endif
             if (backup_ready && check_backup_channel_has_ip()) {
@@ -652,6 +694,15 @@ static void* iface_poll_thread(void* arg)
             set_net_state(NET_STATE_CONNECTED);
             startup_warned = false;
         } else {
+            /* v125：上行（bt-pan/4G）掉线时作废 TLS 连接池。
+             * 池里的 keep-alive 连接此时已静默失效；空闲门限从 10s 放宽到
+             * 120s 后，下一次请求很可能"复用一条死连接"：写可能进内核缓冲，
+             * 读要等 SO_RCVTIMEO（network_get_read_timeout()=30s）才失败，
+             * 用户侧就是一次 30s 卡顿。这里只在下线迁移时置一次标志，
+             * 真正的 mbedtls 释放在下一次请求线程里做（见 vela_tls.c）。 */
+            if (network_get_state() == NET_STATE_CONNECTED) {
+                vela_tls_pool_invalidate();
+            }
             set_net_state(NET_STATE_DISCONNECTED);
 
             /* Check startup timeout */
@@ -737,41 +788,78 @@ int network_get_active_conns(void)
     return conns;
 }
 
+/* v125：IOB 水位读取（不加锁，供 network_acquire_resource 在持锁时调用）。
+ *
+ * 路径修正：NuttX 的 IOB 统计节点是 /proc/iobinfo，不是 /proc/net/iob。
+ *   注册见 nuttx/fs/procfs/fs_procfs.c:145（"iobinfo" -> g_iobinfo_operations）；
+ *   输出格式见 nuttx/fs/procfs/fs_procfsiobinfo.c:192-209：
+ *       ntotal    nfree     nwait nthrottle
+ *           64       48          0         0
+ *   旧代码 fopen("/proc/net/iob") 永远打不开（真机日志
+ *   .v3_work/perf/serial_perf_session.log:1112 起多处
+ *   "[netmgr] Cannot open /proc/net/iob"），network_get_iob_usage() 恒返回 0，
+ *   于是 NET_IOB_HIGH_WATERMARK=75 的限流（network_manager.h:78）一直没生效。
+ *
+ * 另外旧实现会在 fopen 成功后 pthread_mutex_lock(&g_net_mutex)，而唯一调用
+ * 它的 network_acquire_resource() 本身就持有 g_net_mutex（非递归 mutex）——
+ * 修好路径的同时必须拆掉这个自死锁，所以这里提供不加锁的读函数。
+ *
+ * 拿不到统计时返回 0（降级为非阻塞），保持原有"不因水位失败而卡网络"的语义。 */
+static int iob_usage_pct_read(void)
+{
+    static const char* const k_paths[] = { "/proc/iobinfo", "/proc/net/iob" };
+    static bool s_iob_warned;
+    char line[80];
+    int usage_pct = 0;
+
+    for (size_t i = 0; i < sizeof(k_paths) / sizeof(k_paths[0]); i++) {
+        int total = 0;
+        int free_cnt = 0;
+        FILE* fp = fopen(k_paths[i], "r");
+
+        if (!fp) {
+            continue;
+        }
+
+        /* 表头行（"ntotal nfree ..."）不满足 4 个整数，会被自然跳过。 */
+        while (fgets(line, sizeof(line), fp)) {
+            int ntotal;
+            int nfree;
+            int nwait;
+            int nthrottle;
+
+            if (sscanf(line, "%d %d %d %d", &ntotal, &nfree, &nwait, &nthrottle) == 4) {
+                total = ntotal;
+                free_cnt = nfree;
+                break;
+            }
+        }
+        fclose(fp);
+
+        if (total > 0) {
+            usage_pct = ((total - free_cnt) * 100) / total;
+            if (usage_pct < 0) {
+                usage_pct = 0;
+            }
+            if (usage_pct > 100) {
+                usage_pct = 100;
+            }
+            return usage_pct;
+        }
+    }
+
+    if (!s_iob_warned) {
+        s_iob_warned = true;
+        syslog(LOG_WARNING,
+            "[%s] IOB stats unavailable (%s), IOB watermark disabled\n",
+            TAG, k_paths[0]);
+    }
+    return 0;
+}
+
 int network_get_iob_usage(void)
 {
-    FILE* fp = NULL;
-    int usage_pct = 0;
-    char line[128];
-    int total = 0;
-    int free_cnt = 0;
-
-    fp = fopen("/proc/net/iob", "r");
-    if (!fp) {
-        syslog(LOG_DEBUG, "[%s] Cannot open /proc/net/iob\n", TAG);
-        return 0;
-    }
-
-    /* Parse IOB stats — look for total and free counts.
-     * Format varies by NuttX version; try common patterns. */
-    while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "  total:%d", &total) == 1) {
-            /* found total */
-        } else if (sscanf(line, "  free:%d", &free_cnt) == 1) {
-            /* found free */
-        }
-    }
-
-    fclose(fp);
-
-    if (total > 0) {
-        usage_pct = ((total - free_cnt) * 100) / total;
-        if (usage_pct < 0) {
-            usage_pct = 0;
-        }
-        if (usage_pct > 100) {
-            usage_pct = 100;
-        }
-    }
+    int usage_pct = iob_usage_pct_read();
 
     pthread_mutex_lock(&g_net_mutex);
     g_net_status.iob_usage_pct = usage_pct;
@@ -810,7 +898,39 @@ int network_set_dns(const char* primary, const char* secondary)
      * without this the domain lookup fails with
      * MBEDTLS_ERR_NET_UNKNOWN_HOST on every HTTPS request. */
     const char* servers[2] = { primary, secondary };
-    for (int i = 0; i < 2; i++) {
+    int nservers = 2;
+
+    /* v125：resolver 只有 1 个槽位时，先 primary 后 secondary 会把 primary 覆盖掉。
+     *
+     * 依据：本板 CONFIG_NETDB_DNSSERVER_NAMESERVERS=1
+     *   （out/ble_align/.config:2189、out/ble_align/include/nuttx/config.h:593）。
+     *   NuttX 无 CONFIG_NETDB_RESOLVCONF 分支的 dns_add_nameserver() 在槽满时
+     *   直接覆盖 idx=0（nuttx/libs/libc/netdb/lib_dnsaddserver.c:319-328，写入
+     *   见 :394-398）。所以 network_set_dns("223.5.5.5","8.8.8.8") 执行完后，
+     *   resolver 里实际只剩 8.8.8.8 —— 国内手机 PAN 出口对 8.8.8.8 的 UDP/53
+     *   通常不可达（本次无抓包证据），而 223.5.5.5 有实测可达性：
+     *   serial_perf_session.log:139-145 ping 223.5.5.5 200/330ms（丢 1/3）；
+     *   time_sync.c:50-52 也记录"223.5.5.5 是这条链路上稳定可达的解析器"。
+     * 症状证据：resolver 失败时 nslookup fresh 域名报 "getaddrinfo failed: 1"
+     *   （serial_perf_session.log:160；NuttX 把任何解析失败都折叠成
+     *   HOST_NOT_FOUND=1，见 lib_gethostentbynamer.c:786-789），而已解析过的
+     *   LLM 域名命中 DNS 缓存（NETDB_DNSCLIENT_ENTRIES=8 / LIFESEC=3600）仍能通
+     *   （log:2543）。
+     *
+     * 单槽时只注册 primary（223.5.5.5）。PAN 起来后 panu_service.c:430-440 仍会
+     * 用 DHCP 下发的 192.168.44.1 覆盖这个槽（这是正常且更优的顺序：实际出口的
+     * DNS 最终生效），本改动只保证"DHCP DNS 尚未注册/没有 DNS 选项"的窗口里
+     * resolver 指向的是可达的 223.5.5.5，而不是 8.8.8.8。
+     * 多槽配置的行为保持不变。 */
+#if defined(CONFIG_NETDB_DNSSERVER_NAMESERVERS) && (CONFIG_NETDB_DNSSERVER_NAMESERVERS < 2)
+    nservers = 1;
+    syslog(LOG_INFO,
+        "[%s] DNS: resolver has %d slot, register primary %s only (skip %s)\n",
+        TAG, CONFIG_NETDB_DNSSERVER_NAMESERVERS, primary,
+        (secondary && secondary[0]) ? secondary : "-");
+#endif
+
+    for (int i = 0; i < nservers; i++) {
         struct sockaddr_in addr;
 
         if (!servers[i] || servers[i][0] == '\0') {
@@ -926,7 +1046,7 @@ int network_rpmsg_init(void)
     }
 #endif
 
-#ifdef CONFIG_AI_AGENT_BLE_GATT
+#ifdef CONFIG_AI_AGENT_BLE_NET
     /* Start BLE GATT NUS + TUN proxy channel (phone companion app).
      * Retry with backoff: bluetoothd may still be starting here (no BT
      * instance yet, or gatts registration fails), and without the
@@ -997,8 +1117,12 @@ int network_acquire_resource(uint32_t timeout_ms)
         deadline.tv_nsec -= 1000000000L;
     }
 
+    /* v125：这里必须用不加锁的 iob_usage_pct_read()。本函数已持有 g_net_mutex
+     * （上面 pthread_mutex_lock），而公开的 network_get_iob_usage() 会再次
+     * lock 同一把非递归 mutex → 自死锁。旧代码因为 /proc/net/iob 打不开、
+     * 在读锁之前就 return 0，才没有暴露；路径修好后若继续调用会直接卡死。 */
     while (g_net_status.active_conns >= NET_MAX_TCP_CONNS
-        || network_get_iob_usage() >= NET_IOB_HIGH_WATERMARK) {
+        || iob_usage_pct_read() >= NET_IOB_HIGH_WATERMARK) {
         int rc = pthread_cond_timedwait(&g_net_cond, &g_net_mutex, &deadline);
         if (rc == ETIMEDOUT) {
             pthread_mutex_unlock(&g_net_mutex);

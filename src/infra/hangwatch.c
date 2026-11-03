@@ -36,7 +36,10 @@
 
 #define HW_POLL_MS      1000    /* 采样周期 */
 #define HW_ALIVE_MS     5000    /* [alive] 打印周期 */
-#define HW_STALL_MS     8000    /* UI 心跳停多久判为卡死 */
+/* 2026-11-01 v102a：实测硬件 IWDT 空窗仅 ~5.5–7s（配置写 20s，时钟口径存疑），
+ * HW_STALL_MS=8000 比它还长 → [stall] 任务转储永远来不及打印（现场 0 条 [stall]）。
+ * 先降到 3000ms，保证下次冻死能在复位前留下栈。 */
+#define HW_STALL_MS     3000    /* UI 心跳停多久判为卡死 */
 #define HW_STALL_RELOG  10000   /* [stall] 重复打印的限流间隔 */
 #define HW_STACK        3072
 #define HW_NSTATES      16      /* tstate_t 的桶数(只用低 4 位, 足够) */

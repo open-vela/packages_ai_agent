@@ -91,7 +91,19 @@ static bool cron_sanitize_destination(cron_job_t* job)
 
 static void cron_generate_id(char* id_buf)
 {
-    uint32_t r = ((uint32_t)rand());
+    /* ★ 2026-11-03 实测：本构建没有任何 srand()，NuttX 的 rand() 未播种时
+     * 第一次返回 0，导致所有 cron 任务 id 都是 "00000000" —— App 同步闹钟后
+     * 无法唯一定位/删除某一条。改用「时间高位 + 自增序号」混合，并保证非 0。
+     * 调用方持有 s_cron_lock，静态计数器无需原子操作。 */
+    static uint32_t s_id_seq;
+    uint32_t r;
+
+    s_id_seq++;
+    r = (((uint32_t)time(NULL) & 0xffff0000u) | (s_id_seq & 0xffffu));
+    r ^= (s_id_seq * 2654435761u);
+    if (r == 0) {
+        r = 1;
+    }
 
     snprintf(id_buf, AGENT_CRON_ID_LEN, "%08x", (unsigned int)r);
 }

@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -109,7 +110,12 @@ typedef struct {
 } tx_slot_t;
 
 static struct {
-    tx_slot_t slots[TX_SLOT_COUNT];
+    /* 2026-11-02：TX 槽从 .bss 静态数组改为 init 时从堆（PSRAM）分配。
+     * 原来 8 x 1604 = 12,836B 直接压在 SRAM 里，而本板 SRAM 静态占用已
+     * 96.6%（_ebss 到顶只剩 ~17KB），把这段挪到 PSRAM 后 SRAM 增量≈0，
+     * 是开启 BLE GATT 的前提（否则链接/开机即失败）。 */
+    tx_slot_t* slots;    /* heap (PSRAM) 分配，init 时申请、deinit 时释放 */
+    uint8_t slot_count;  /* 实际槽数；0 = 尚未分配 */
     uint8_t head;        /* next slot to transmit */
     uint8_t tail;        /* next free slot */
     uint8_t count;
@@ -118,6 +124,8 @@ static struct {
     bool inflight;       /* a notify is awaiting its completion */
     pthread_mutex_t lock;
 } g_txq = {
+    .slots = NULL,
+    .slot_count = 0,
     .head = 0,
     .tail = 0,
     .count = 0,
@@ -251,14 +259,14 @@ static void on_notify_complete(gatts_handle_t srv_handle, bt_address_t* addr,
             "dropping slot\n", TAG, attr_handle, status);
         if (g_txq.count > 0) {
             g_txq.count--;
-            g_txq.head = (g_txq.head + 1) % TX_SLOT_COUNT;
+            g_txq.head = (g_txq.head + 1) % g_txq.slot_count;
         }
         g_txq.off = 0;
     } else if (g_txq.count > 0
         && g_txq.off >= g_txq.slots[g_txq.head].len) {
         /* Current slot fully notified: pop it and move to the next. */
         g_txq.count--;
-        g_txq.head = (g_txq.head + 1) % TX_SLOT_COUNT;
+        g_txq.head = (g_txq.head + 1) % g_txq.slot_count;
         g_txq.off = 0;
     }
 
@@ -312,7 +320,7 @@ static void tx_pump_locked(void)
             syslog(LOG_ERR, "[%s] Notify submit failed (%d), "
                 "dropping slot\n", TAG, status);
             g_txq.count--;
-            g_txq.head = (g_txq.head + 1) % TX_SLOT_COUNT;
+            g_txq.head = (g_txq.head + 1) % g_txq.slot_count;
             g_txq.off = 0;
             continue;
         }
@@ -610,6 +618,23 @@ int ble_gatt_init(const ble_gatt_config_t* config)
     }
     pthread_mutex_unlock(&g_gatt.lock);
 
+    /* 2026-11-02：TX 槽在 init 时一次性从堆（PSRAM 优先）分配。
+     * 失败则直接拒绝开启 GATT（不影响 bt-pan / 语音主链路）。 */
+    pthread_mutex_lock(&g_txq.lock);
+    if (g_txq.slots == NULL) {
+        g_txq.slots = calloc(TX_SLOT_COUNT, sizeof(tx_slot_t));
+        if (g_txq.slots == NULL) {
+            pthread_mutex_unlock(&g_txq.lock);
+            syslog(LOG_ERR, "[%s] TX slot alloc failed (%u B)\n", TAG,
+                (unsigned)(TX_SLOT_COUNT * sizeof(tx_slot_t)));
+            return -ENOMEM;
+        }
+        g_txq.slot_count = TX_SLOT_COUNT;
+        syslog(LOG_INFO, "[%s] TX slots: %u x %u B from heap\n", TAG,
+            (unsigned)TX_SLOT_COUNT, (unsigned)sizeof(tx_slot_t));
+    }
+    pthread_mutex_unlock(&g_txq.lock);
+
     printf("[ble_gatt] step 1: get BT instance\n");
 
     g_gatt.config = *config;
@@ -698,6 +723,11 @@ int ble_gatt_deinit(void)
     g_txq.head = g_txq.tail = 0;
     g_txq.off = 0;
     g_txq.inflight = false;
+    if (g_txq.slots != NULL) {
+        free(g_txq.slots);
+        g_txq.slots = NULL;
+        g_txq.slot_count = 0;
+    }
     pthread_mutex_unlock(&g_txq.lock);
 
     adv_stop();
@@ -742,7 +772,7 @@ int ble_gatt_send(const uint8_t* data, uint16_t len)
     pthread_mutex_unlock(&g_gatt.lock);
 
     pthread_mutex_lock(&g_txq.lock);
-    if (g_txq.count == TX_SLOT_COUNT) {
+    if (g_txq.slot_count == 0 || g_txq.count >= g_txq.slot_count) {
         pthread_mutex_unlock(&g_txq.lock);
         syslog(LOG_WARNING, "[%s] TX queue full, dropping frame (%u B)\n",
             TAG, len);
@@ -752,7 +782,7 @@ int ble_gatt_send(const uint8_t* data, uint16_t len)
     slot = &g_txq.slots[g_txq.tail];
     memcpy(slot->data, data, len);
     slot->len = len;
-    next = (g_txq.tail + 1) % TX_SLOT_COUNT;
+    next = (g_txq.tail + 1) % g_txq.slot_count;
     g_txq.tail = next;
     g_txq.count++;
 

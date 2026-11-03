@@ -155,8 +155,14 @@
 
 /* ── LLM ────────────────────────────────────────────────────── */
 #define AGENT_LLM_DEFAULT_MODEL ""
-#define AGENT_LLM_MAX_TOKENS 4096
-#define AGENT_LLM_MAX_TOKENS_OPENAI 16384
+/* 手表场景：屏幕小、TTS 时长/流量与字数成正比（真机 445 字节回答 =
+ * 269KB PCM/21s，会把 BT H4 接收队列打爆）。2026-10-31 用户反馈"输出太多"：
+ * 硬上限从 1024 收到 256 tokens（约 120~150 汉字），配合 system prompt 的
+ * 1~2 句约束；只有用户明确要求"详细说说"时 prompt 才允许展开。 */
+#define AGENT_LLM_MAX_TOKENS 256
+#define AGENT_LLM_MAX_TOKENS_OPENAI 256
+/* v114b10：语音通道回答上限（≈70–90 汉字，能被 cap 120 完整念完，也更快更省配额） */
+#define AGENT_LLM_MAX_TOKENS_VOICE 110   /* v114b14：语音回答≤110 tokens≈85 字，落在 TTS cap120 内，保证完整播报 */
 #define AGENT_LLM_API_HOST ""
 #define AGENT_LLM_API_PATH "/v1/chat/completions"
 #ifndef AGENT_LLM_API_URL
@@ -286,7 +292,7 @@
 #define AGENT_VISION_MAX_IMAGE_SIZE \
     (256 * 1024) /* max JPEG file size: 256 KB */
 #define AGENT_VISION_MAX_B64_SIZE (350 * 1024) /* base64 ≈ 4/3 × raw */
-#define AGENT_VISION_MAX_TOKENS 4096
+#define AGENT_VISION_MAX_TOKENS 512   /* 看图说话同样要短：手表屏幕放不下长文 */
 #define AGENT_VISION_DEFAULT_PROMPT                                      \
     "Please analyze this image in detail. If it contains text, tables, or " \
     "documents, extract and describe the content accurately."

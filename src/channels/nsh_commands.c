@@ -35,6 +35,7 @@
 #include "core/memory_store.h"
 #include "core/session_mgr.h"
 #include "infra/network_manager.h"
+#include "infra/cell_net.h"
 #include "infra/http_proxy.h"
 #include "infra/vela_tls.h"
 #include "tools/tool_get_time.h"
@@ -43,6 +44,11 @@
 #include "tools/tool_web_search.h"
 #include "agent_compat.h"
 #include "agent_config.h"
+#include "voice/pcm_file_player.h"
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+#include "ui/music_worker.h"
+#include "ui/music_local.h"
+#endif
 
 #if AGENT_SKILL_SYNC_ENABLED
 #include "tools/skill_sync.h"
@@ -61,6 +67,11 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <fcntl.h>
+#ifdef CONFIG_SERIAL_TERMIOS
+#include <termios.h>
+#endif
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -87,6 +98,72 @@ static int tokenise(char* line, char** argv, int max_argc)
     return argc;
 }
 
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+/* 音乐/播放诊断命令（2026-11-01，用于远程复现"暂停后声音卡死"）。
+ * 走的是和音乐页完全相同的 music_worker 队列 + pcm_file 播放器。 */
+static void cmd_music_demo(void)
+{
+    int rc = music_worker_post(MUSIC_CMD_PLAY, MUSIC_LOCAL_DEMO_PATH);
+
+    printf("music_demo: post rc=%d (playing=%d paused=%d)\n",
+           rc, pcm_file_is_playing(), pcm_file_is_paused());
+}
+
+static void cmd_music_pause(void)
+{
+    int rc = music_worker_post(MUSIC_CMD_PAUSE, NULL);
+
+    printf("music_pause: post rc=%d (now playing=%d paused=%d)\n",
+           rc, pcm_file_is_playing(), pcm_file_is_paused());
+}
+
+static void cmd_music_resume(void)
+{
+    int rc = music_worker_post(MUSIC_CMD_RESUME, NULL);
+
+    printf("music_resume: post rc=%d (now playing=%d paused=%d)\n",
+           rc, pcm_file_is_playing(), pcm_file_is_paused());
+}
+
+static void cmd_music_stop(void)
+{
+    int rc = music_worker_post(MUSIC_CMD_STOP, NULL);
+
+    printf("music_stop: post rc=%d (now playing=%d paused=%d)\n",
+           rc, pcm_file_is_playing(), pcm_file_is_paused());
+}
+
+static void cmd_music_vol(int argc, char **argv)
+{
+    char arg[16];
+    int rc;
+
+    if (argc < 2)
+      {
+        printf("Usage: music_vol <0-100>\n");
+        return;
+      }
+
+    snprintf(arg, sizeof(arg), "%s", argv[1]);
+    rc = music_worker_post(MUSIC_CMD_VOLUME, arg);
+    printf("music_vol: post rc=%d arg=%s\n", rc, arg);
+}
+
+static void cmd_music_info(void)
+{
+    music_snapshot_t snap;
+
+    music_worker_snapshot(&snap);
+    printf("music_info: valid=%d state=%s pos=%dms dur=%dms vol=%d\n",
+           (int)snap.valid, snap.state, snap.position_ms, snap.duration_ms,
+           snap.volume);
+    printf("music_info: pcm_file playing=%d paused=%d pos=%dms dur=%dms last=%d\n",
+           pcm_file_is_playing(), pcm_file_is_paused(),
+           pcm_file_position_ms(), pcm_file_duration_ms(),
+           pcm_file_last_result());
+}
+#endif
+
 static void cmd_help(void)
 {
     printf(
@@ -108,6 +185,12 @@ static void cmd_help(void)
         "  clear_proxy          - Remove proxy config\n"
         "  set_wifi <ssid> <pw> - Connect to WiFi (real hardware; saved for reboot)\n"
         "  wifi_reconnect       - Re-join WiFi using saved credentials\n"
+        "  cell_at <AT...>      - Send a raw AT command to the 4G module (UART2)\n"
+        "  cell_status          - Show 4G UART/PPP status\n"
+        "  cell_ppp_start       - Start PPP data connection (Air780E)\n"
+        "  cell_ppp_stop        - Stop PPP connection\n"
+        "  cell_apn [apn]       - Show or set APN (default cmnet)\n"
+        "  cell_listen [sec]    - Dump raw UART2 bytes (check 4G boot/RDY, default 5s)\n"
         "  set_search_key <key> - Set SerpAPI (Google) key\n"
         "  set_exa_key <key>    - Set Exa AI search key\n"
         "  set_tavily_key <key> - Set Tavily search key\n"
@@ -133,6 +216,10 @@ static void cmd_help(void)
         "  set_volc_speaker <id>  - Set TTS voice (e.g. zh_female_cancan)\n"
         "  voice_start            - Start voice channel\n"
         "  voice_stop             - Stop voice channel\n"
+        "  music_demo             - Play built-in demo music (same path as UI)\n"
+        "  music_pause/resume/stop - Music playback diagnostics\n"
+        "  music_vol <0-100>      - Set music volume\n"
+        "  music_info             - Dump music/pcm player state\n"
         "  voice_test_tts <text> [out.pcm] - Test TTS synthesis\n"
         "  voice_test_asr <file>  - Test ASR recognition\n"
         "  set_voice_tts <name>   - Switch TTS backend (volcengine|edge)\n"
@@ -877,6 +964,196 @@ static void cmd_skill_sync(void)
 }
 #endif
 
+/* ── 4G 蜂窝（合宙 Air780E，UART2 /dev/ttyS0） ───────────────── */
+
+static void cmd_cell_at(int argc, char** argv)
+{
+    char cmd[128];
+    char rsp[512];
+    size_t off = 0;
+    int i;
+    int rc;
+
+    if (argc < 2) {
+        printf("Usage: cell_at <AT command...>\n"
+               "  example: cell_at AT  |  cell_at ATI  |  cell_at AT+CSQ\n");
+        return;
+    }
+
+    cmd[0] = '\0';
+    for (i = 1; i < argc; i++) {
+        int n = snprintf(cmd + off, sizeof(cmd) - off, "%s%s",
+                         i > 1 ? " " : "", argv[i]);
+        if (n < 0 || (size_t)n >= sizeof(cmd) - off) {
+            printf("Command too long (max %u bytes)\n",
+                   (unsigned)(sizeof(cmd) - 1));
+            return;
+        }
+        off += (size_t)n;
+    }
+
+    rc = cell_at(cmd, rsp, sizeof(rsp));
+    printf("cell_at: %s\n", cmd);
+    printf("rc=%d\n", rc);
+    printf("%s\n", rsp[0] != '\0' ? rsp : "(no response)");
+
+    if (rc == -EBUSY) {
+        printf("UART2 is owned by pppd; run cell_ppp_stop (reboot if pppd "
+               "refuses to exit) before sending AT commands\n");
+    }
+}
+
+static void cmd_cell_status(void)
+{
+    char status[768];
+    int rc = cell_get_status(status, sizeof(status));
+
+    if (rc < 0) {
+        printf("cell_get_status failed: %d\n", rc);
+        return;
+    }
+
+    printf("%s", status);
+}
+
+static void cmd_cell_ppp_start(void)
+{
+    int rc = cell_ppp_start();
+
+    if (rc == 0) {
+        printf("PPP start requested; watch 'cell_status' / 'ifconfig' "
+               "for ppp0\n");
+    } else if (rc == -ENOSYS) {
+        printf("PPP support not built (CONFIG_NETUTILS_PPPD=n)\n");
+    } else {
+        printf("cell_ppp_start failed: %d\n", rc);
+    }
+}
+
+static void cmd_cell_ppp_stop(void)
+{
+    int rc = cell_ppp_stop();
+
+    if (rc == 0) {
+        printf("PPP stop requested\n");
+    } else if (rc == -EBUSY) {
+        printf("PPP stop requested, but pppd is still running (this pppd has "
+               "no cancel hook); UART2 stays busy until reboot\n");
+    } else if (rc == -ENOSYS) {
+        printf("PPP support not built (CONFIG_NETUTILS_PPPD=n)\n");
+    } else {
+        printf("cell_ppp_stop failed: %d\n", rc);
+    }
+}
+
+static void cmd_cell_apn(int argc, char** argv)
+{
+    int rc;
+
+    if (argc < 2) {
+        printf("APN: %s\n", cell_get_apn());
+        return;
+    }
+
+    if (argc > 2) {
+        printf("Usage: cell_apn [apn]\n");
+        return;
+    }
+
+    rc = cell_set_apn(argv[1]);
+    if (rc == 0) {
+        printf("APN set to: %s\n", cell_get_apn());
+    } else {
+        printf("cell_set_apn failed: %d (APN must be 1-63 printable chars, "
+               "no spaces/quotes/backslashes)\n", rc);
+    }
+}
+
+/* cell_listen: 不做任何 AT 事务, 只把 UART2 (/dev/ttyS0) 上的原始字节
+ * 打出来。用途: 4G 模块是否真的开机/是否吐 RDY/开机日志, 以及粗看 UART
+ * 电平是否兼容 —— 不依赖模块 LED, 也不需要万用表(2026-10-27 调试用)。 */
+static void cmd_cell_listen(int argc, char** argv)
+{
+    int secs = (argc >= 2) ? atoi(argv[1]) : 5;
+    int baud = (argc >= 3) ? atoi(argv[2]) : 0;   /* 0 = 保持驱动默认 115200 */
+    int fd;
+    unsigned char buf[256];
+    time_t t0;
+    int total = 0;
+
+    if (secs <= 0 || secs > 30) {
+        printf("Usage: cell_listen [seconds 1..30] [baud]\n"
+               "  e.g. cell_listen 10        (driver default 115200)\n"
+               "       cell_listen 10 9600   (scan other baud rates)\n");
+        return;
+    }
+
+    fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        printf("open /dev/ttyS0 failed: %d\n", errno);
+        return;
+    }
+
+#ifdef CONFIG_SERIAL_TERMIOS
+    if (baud > 0) {
+        struct termios tio;
+        if (tcgetattr(fd, &tio) == 0) {
+            cfsetispeed(&tio, (speed_t)baud);
+            cfsetospeed(&tio, (speed_t)baud);
+            tio.c_cflag |= (CLOCAL | CREAD);
+            tio.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
+            tio.c_cflag = (tio.c_cflag & ~(tcflag_t)CSIZE) | CS8;
+            tio.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+            tio.c_oflag &= ~OPOST;
+            tio.c_cc[VMIN] = 0;
+            tio.c_cc[VTIME] = 0;
+            if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+                printf("tcsetattr(%d) failed: %d (driver may ignore baud)\n",
+                       baud, errno);
+            } else {
+                printf("cell_listen: baud set to %d\n", baud);
+            }
+        } else {
+            printf("tcgetattr failed: %d\n", errno);
+        }
+    }
+#else
+    if (baud > 0) {
+        printf("WARN: baud arg ignored (CONFIG_SERIAL_TERMIOS=n)\n");
+    }
+#endif
+    printf("cell_listen: %d s on /dev/ttyS0 (UART2, %d baud)...\n",
+           secs, baud > 0 ? baud : 115200);
+    t0 = time(NULL);
+    while ((time(NULL) - t0) < secs) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            printf("[cell_rx] %d bytes:", (int)n);
+            for (ssize_t i = 0; i < n; i++) {
+                printf(" %02x", buf[i]);
+            }
+            printf("  |");
+            for (ssize_t i = 0; i < n; i++) {
+                unsigned char c = buf[i];
+                putchar((c >= 32 && c < 127) ? (char)c : '.');
+            }
+            printf("|\n");
+            fflush(stdout);
+            total += (int)n;
+        } else {
+            usleep(50000);
+        }
+    }
+
+    close(fd);
+    if (total == 0) {
+        printf("cell_listen done: 0 bytes. 可能原因: 模块没开机 / TX 没接 / "
+               "TX 电平不兼容(1.8V) / 接线错\n");
+    } else {
+        printf("cell_listen done: %d bytes total\n", total);
+    }
+}
+
 /* ── CLI thread ───────────────────────────────────────────────── */
 
 static void* cli_thread(void* arg)
@@ -952,6 +1229,18 @@ static void* cli_thread(void* arg)
             cmd_set_wifi(argc, argv);
         else if (strcmp(cmd, "wifi_reconnect") == 0)
             cmd_wifi_reconnect();
+        else if (strcmp(cmd, "cell_at") == 0)
+            cmd_cell_at(argc, argv);
+        else if (strcmp(cmd, "cell_status") == 0)
+            cmd_cell_status();
+        else if (strcmp(cmd, "cell_ppp_start") == 0)
+            cmd_cell_ppp_start();
+        else if (strcmp(cmd, "cell_ppp_stop") == 0)
+            cmd_cell_ppp_stop();
+        else if (strcmp(cmd, "cell_apn") == 0)
+            cmd_cell_apn(argc, argv);
+        else if (strcmp(cmd, "cell_listen") == 0)
+            cmd_cell_listen(argc, argv);
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
         else if (strcmp(cmd, "net_diag") == 0)
             cmd_net_diag(argc, argv);
@@ -1007,6 +1296,20 @@ static void* cli_thread(void* arg)
             cmd_voice_start();
         else if (strcmp(cmd, "voice_stop") == 0)
             cmd_voice_stop();
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+        else if (strcmp(cmd, "music_demo") == 0)
+            cmd_music_demo();
+        else if (strcmp(cmd, "music_pause") == 0)
+            cmd_music_pause();
+        else if (strcmp(cmd, "music_resume") == 0)
+            cmd_music_resume();
+        else if (strcmp(cmd, "music_stop") == 0)
+            cmd_music_stop();
+        else if (strcmp(cmd, "music_vol") == 0)
+            cmd_music_vol(argc, argv);
+        else if (strcmp(cmd, "music_info") == 0)
+            cmd_music_info();
+#endif
         else if (strcmp(cmd, "voice_test_tts") == 0)
             cmd_voice_test_tts(argc, argv);
         else if (strcmp(cmd, "voice_test_asr") == 0)

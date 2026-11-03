@@ -212,11 +212,31 @@ int session_get_history_json(const char *chat_id, char *buf, size_t size, int ma
         cJSON *entry = cJSON_CreateObject();
         cJSON *role    = cJSON_GetObjectItem(src, "role");
         cJSON *content = cJSON_GetObjectItem(src, "content");
-        if (role && content) {
+        if (role && content && role->valuestring && content->valuestring
+            && content->valuestring[0] != '\0') {
+            /* ★ 2026-11-01 修复"记忆跑偏"：
+             * 丢掉**没有得到回答的孤儿 user 消息**（连续两条 user 时前一条作废）。
+             * 真机案例：语音问"如果有一天世界毁灭了"，该轮回答失败没有落库，
+             * 这条无回答的 user 一直留在最近 20 条历史里，之后每句普通提问
+             * 都被模型带回"末日"话题（用户反馈"怎么在说末日"）。
+             * 孤儿消息不承载有效上下文，清掉才能让会话回到正题。 */
+            if (strcmp(role->valuestring, "user") == 0) {
+                int n = cJSON_GetArraySize(arr);
+                if (n > 0) {
+                    cJSON *last = cJSON_GetArrayItem(arr, n - 1);
+                    cJSON *last_role = cJSON_GetObjectItem(last, "role");
+                    if (last_role && last_role->valuestring
+                        && strcmp(last_role->valuestring, "user") == 0) {
+                        cJSON_DeleteItemFromArray(arr, n - 1);
+                    }
+                }
+            }
             cJSON_AddStringToObject(entry, "role",    role->valuestring);
             cJSON_AddStringToObject(entry, "content", content->valuestring);
+            cJSON_AddItemToArray(arr, entry);
+        } else {
+            cJSON_Delete(entry);
         }
-        cJSON_AddItemToArray(arr, entry);
     }
 
     /* Cleanup ring buffer */

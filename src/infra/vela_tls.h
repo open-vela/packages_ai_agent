@@ -110,6 +110,51 @@ int vela_https_head_date(const char *host, const char *port, const char *path,
                          char *date_out, size_t date_cap);
 
 /**
+ * Streaming response body callback (used by vela_https_post_json_stream).
+ *
+ * Invoked with raw, already de-chunked body bytes (`len` may be 0; data is not
+ * NUL-terminated). Return:
+ *   0  — continue reading
+ *   >0 — caller got what it needed, stop early (the call still returns the HTTP
+ *        status; the connection is NOT reused because the rest was unread)
+ *   <0 — abort the request; that negative value is returned to the caller.
+ *
+ * Runs on the calling thread (blocking TLS read loop), so it must not block.
+ */
+typedef int (*vela_http_stream_cb_t)(const char *data, size_t len, void *arg);
+
+/**
+ * Streaming variant of vela_https_post_json(): sends the POST and hands each
+ * response-body fragment to `cb` as it arrives instead of buffering the whole
+ * body. Handles both Transfer-Encoding: chunked and Content-Length framing.
+ *
+ * The global POST lock is held for the whole stream (LLM/TTS serialisation),
+ * so a stream can run for seconds without another HTTPS POST interleaving.
+ * A mid-stream uplink loss (BT PAN / 4G down) or socket timeout fails the call
+ * with a negative VELA_TLS_ERR_* instead of hanging.
+ *
+ * @param timeout_ms  overall deadline for the whole request+stream; 0 = default.
+ * @return HTTP status code on success (even if cb stopped early), negative
+ *         VELA_TLS_ERR_* on transport failure.
+ */
+int vela_https_post_json_stream(
+    const char       *host,
+    const char       *port,
+    const char       *path,
+    const vela_header_t *extra_headers,
+    const char       *json_body,
+    vela_http_stream_cb_t cb,
+    void             *cb_arg,
+    uint32_t          timeout_ms);
+
+/**
+ * Mark all pooled TLS connections as stale (call when the network uplink
+ * goes down: BT PAN / 4G). Cheap and safe from any thread — it only sets a
+ * flag; idle connections are freed on the next pool acquisition.
+ */
+void vela_tls_pool_invalidate(void);
+
+/**
  * Release all TLS connection pool resources.
  * Call during shutdown to free mbedtls contexts.
  */

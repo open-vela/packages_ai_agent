@@ -27,8 +27,16 @@
 #include "core/agent_trace.h"
 #include "core/context_builder.h"
 #include "core/message_bus.h"
+#include "voice/voice_channel.h"
 #include "core/session_mgr.h"
 #include "health/mic_selfcheck.h" /* 麦克风自检 (ask 麦克风自检) */
+#include "infra/cron_service.h"      /* DEMO-DIALOG：本地提醒直建 AT 任务 */
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+/* DEMO-DIALOG 传感器秒答：这两个 .c 只在 LVGL_UI 配置下编译
+ * （CMakeLists.txt:145/152），所以 include 与调用一起用同一条件包住。 */
+#include "health/hr_measure.h"
+#include "health/pedometer.h"
+#endif
 #include "infra/network_manager.h"
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
@@ -37,6 +45,10 @@
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
+#include "ui/persona.h"
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+#include "ui/lvgl_ui_channel.h"
+#endif
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -46,6 +58,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include "cJSON.h"
 
@@ -54,6 +67,17 @@ static const char* TAG = "agent";
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
 #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+
+/* ── DEMO-FW：演示极速回复（2026-11-03）─────────────────────────
+ * 固定短语在 agent_loop 里直接回本地文案，跳过云端 LLM（省 5~20 s）。
+ * 默认开（演示构建）；正式构建在编译参数里加 -DDEMO_FAST_REPLY=0 关闭，
+ * 或把 handle_demo_fast_path() 连同调用点一起删掉即可完全回滚。
+ * 走的是既有本地快通道同一条出站路径：out.from_local=true、仍然经过
+ * message_bus -> outbound dispatch，所以手表气泡/历史/App 回包/TTS
+ * 与正常回答完全一致（voice 通道照常播报）。 */
+#ifndef DEMO_FAST_REPLY
+#define DEMO_FAST_REPLY 1
+#endif
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -338,27 +362,130 @@ typedef struct {
     size_t output_size;
 } nl_intent_t;
 
-static const char* kw_time[]       = { "几点了", "什么时间", "what time", "几点钟", NULL };
-static const char* kw_battery[]    = { "电量多少", "电池电量", "battery", NULL };
-static const char* kw_heartrate[]  = { "心率多少", "heart rate", "心率是多", NULL };
+/* ★ 2026-10-25 补缺（审计 B）：这些常见说法原来不命中、绕 LLM 明显变慢。
+ * 注意 strcasestr 是连续子串匹配，加词要覆盖口语变体。 */
+static const char* kw_time[]       = { "几点了", "几点钟", "现在几点", "什么时间",
+                                        "what time", "时间是多少", NULL };
+static const char* kw_battery[]    = { "电量多少", "电池电量", "还剩多少电",
+                                        "还有多少电", "电量是多少", "battery", NULL };
+static const char* kw_heartrate[]  = { "心率多少", "heart rate", "心率是多",
+                                        "测一下心率", "心率是多少", NULL };
 static const char* kw_steps[]      = { "走了多少步", "今天走了多少", "steps", "步数", NULL };
+/* 血氧: get_spo2 有历史值直接报、无则起异步测量(20s 后语音播报),
+ * 输出本身就是口语中文(不是 JSON), 走快通道正合适。 */
+static const char* kw_spo2[]       = { "血氧多少", "血氧是多少", "spo2",
+                                        "血氧饱和度", "测一下血氧", NULL };
 static const char* kw_micself[]    = { "麦克风自检", "麦克风检测", "麦克风测试",
                                         "话筒自检", "mic check", "mic test",
                                         "microphone test", NULL };
-static const char* kw_pause[]      = { "暂停音乐", "暂停播放", "pause music", NULL };
+static const char* kw_pause[]      = { "暂停音乐", "暂停播放", "暂停一下",
+                                        "pause music", NULL };
 static const char* kw_stop[]       = { "停止播放", "停止音乐", "stop music", NULL };
-static const char* kw_resume[]     = { "继续播放", "resume", NULL };
+static const char* kw_resume[]     = { "继续播放", "继续放", "接着播",
+                                        "继续播", NULL };
 
 static const nl_intent_t s_intents[] = {
     { kw_time,      "get_current_time", "{}",  256  },
     { kw_battery,   "get_battery",      "{}",  512  },
     { kw_heartrate, "get_heartrate",    "{}",  256  },
     { kw_steps,     "get_steps",        "{}",  256  },
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    { kw_spo2,      "get_spo2",         "{}",  128  },
+#endif
     { kw_pause,     "music_pause",      "{}",  256  },
     { kw_stop,      "music_stop",       "{}",  256  },
     { kw_resume,    "music_resume",     "{}",  256  },
     { NULL,         NULL,               NULL,  0    },
 };
+
+/* ═══ v106 S5：情绪词本地关怀（不走云端 LLM，屏幕秒出） ═══
+ * 这些是"陪一句"场景，规则回复即可；是否播报仍由 outbound 决定。 */
+static const char* kw_mood[] = {
+    "心情不好", "心情很差", "不开心", "难过", "伤心", "郁闷",
+    "烦躁", "焦虑", "压力大", "好累", "孤独", "委屈", "生气", "emo",
+    NULL };
+
+static const char* mood_replies[] = {
+    "我在呢，先陪你缓一缓。",
+    "听到了，不用一个人扛着。",
+    "先深呼吸，我陪着你。",
+    NULL };
+
+/* ═══ v106 S3：快通道工具输出人话化 ═══
+ * 工具给 LLM 的输出保持结构化/原样，这里只把"直接当回复"的 JSON 转成人话。 */
+static char* humanize_tool_reply(const char* tool, char* raw)
+{
+    cJSON* r;
+    char* out;
+
+    if (raw == NULL || tool == NULL) {
+        return raw;
+    }
+
+    if (strcmp(tool, "get_battery") == 0) {
+        int level = -1;
+        int charging = 0;
+        r = cJSON_Parse(raw);
+        if (r != NULL) {
+            cJSON* l = cJSON_GetObjectItem(r, "level");
+            cJSON* c = cJSON_GetObjectItem(r, "charging");
+            if (cJSON_IsNumber(l)) level = (int)l->valuedouble;
+            if (cJSON_IsNumber(c)) charging = (int)c->valuedouble;
+            cJSON_Delete(r);
+        }
+        if (level >= 0) {
+            out = malloc(96);
+            if (out != NULL) {
+                snprintf(out, 96, charging ? "电量 %d%%，正在充电。"
+                                           : "电量还剩 %d%%。", level);
+                free(raw);
+                return out;
+            }
+        }
+        return raw;
+    }
+
+    if (strcmp(tool, "get_heartrate") == 0) {
+        int bpm = -1;
+        r = cJSON_Parse(raw);
+        if (r != NULL) {
+            cJSON* b = cJSON_GetObjectItem(r, "bpm");
+            if (cJSON_IsNumber(b)) bpm = (int)b->valuedouble;
+            cJSON_Delete(r);
+        }
+        if (bpm > 0) {
+            out = malloc(96);
+            if (out != NULL) {
+                snprintf(out, 96, "当前心率 %d 次/分。", bpm);
+                free(raw);
+                return out;
+            }
+        }
+        return raw;
+    }
+
+    if (strcmp(tool, "get_steps") == 0) {
+        int steps = -1;
+        r = cJSON_Parse(raw);
+        if (r != NULL) {
+            cJSON* s = cJSON_GetObjectItem(r, "steps");
+            if (cJSON_IsNumber(s)) steps = (int)s->valuedouble;
+            cJSON_Delete(r);
+        }
+        if (steps >= 0) {
+            out = malloc(96);
+            if (out != NULL) {
+                snprintf(out, 96, "今天走了 %d 步。", steps);
+                free(raw);
+                return out;
+            }
+        }
+        return raw;
+    }
+
+    /* get_current_time 已在工具层人话化；get_spo2 本身就是中文口语 */
+    return raw;
+}
 
 /* 麦克风自检 (特殊分支, 不进 s_intents 表):
  *
@@ -406,6 +533,463 @@ static char* handle_mic_selfcheck_fast_path(const char* text)
     return reply;
 }
 
+#if DEMO_FAST_REPLY
+/* DEMO-FW：演示固定短语 -> 本地文案（不依赖网络/模型）。
+ * 只接管 voice / ble / cli 三个通道；其它通道保持原行为。
+ * 注：现在几点、天气、电量、心率、步数等本来就由下面的
+ * handle_nl_fast_path() 本地工具覆盖（也不走云端），这里不重复。
+ *
+ * 匹配是"整句"匹配（去掉首尾空白/常见中英标点后逐字相等），不是子串
+ * 匹配 —— 否则"你好，帮我定个闹钟"会被误判成打招呼。 */
+
+/* 去掉尾部标点/空白后的有效长度（UTF-8 标点按整串比较，不切半个字）。 */
+static size_t demo_trimmed_len(const char* s)
+{
+    static const char* tails[] =
+    {
+        "，", "。", "！", "？", "；", "：", "、", "～", "…", "“", "”",
+        ",", ".", "!", "?", ";", ":", "~", " ", "\t", "\r", "\n",
+        NULL
+    };
+    size_t n = strlen(s);
+    bool trimmed = true;
+
+    while (n > 0 && trimmed)
+      {
+        int i;
+
+        trimmed = false;
+        for (i = 0; tails[i] != NULL; i++)
+          {
+            size_t pl = strlen(tails[i]);
+
+            if (n >= pl && memcmp(s + n - pl, tails[i], pl) == 0)
+              {
+                n -= pl;
+                trimmed = true;
+                break;
+              }
+          }
+      }
+
+    return n;
+}
+
+static bool demo_text_is(const char* text, const char* phrase)
+{
+    size_t plen = strlen(phrase);
+
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+      {
+        text++;
+      }
+
+    return demo_trimmed_len(text) == plen && strncmp(text, phrase, plen) == 0;
+}
+
+
+/* ── DEMO-DIALOG（2026-11-03）：动态本地秒答 ───────────────────
+ * 静态短语表放不下的、需要读设备状态/写 cron 的秒答集中在这里。
+ * 全部仍是"整句"语义（demo_text_is / 严格的 N秒后提醒我 模式），
+ * 避免子串误伤正常提问（中文 UTF-8 按整串比较）。
+ * 返回堆字符串由调用方持有（与静态表分支一致）；NULL 表示不命中。 */
+
+/* 解析"<N>秒后提醒我[内容]" / "<N>分钟后提醒我[内容]"。
+ * 允许首尾空白与句末标点（demo_trimmed_len 已处理）。
+ * 返回 true 时写 *delay_s（1..3600 秒）与可选内容 content（可空串）。
+ * 任何多余/错位的字都不命中 —— 这是"整句"约束，不是子串搜索。 */
+static bool demo_parse_reminder(const char* text, int* delay_s,
+    char* content, size_t content_sz)
+{
+    static const char* k_suffix = "后提醒我";   /* 12 bytes UTF-8 */
+    size_t n;
+    size_t i = 0;
+    long num = 0;
+    int digits = 0;
+    int unit_s = 1;
+    size_t slen = strlen(k_suffix);
+
+    if (content == NULL || content_sz == 0)
+      {
+        return false;
+      }
+    content[0] = '\0';
+
+    if (text == NULL)
+      {
+        return false;
+      }
+
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+      {
+        text++;
+      }
+    n = demo_trimmed_len(text);
+
+    /* 1) 前导数字（最多 4 位） */
+    while (i < n && text[i] >= '0' && text[i] <= '9' && digits < 4)
+      {
+        num = num * 10 + (long)(text[i] - '0');
+        i++;
+        digits++;
+      }
+    if (digits == 0)
+      {
+        return false;
+      }
+
+    while (i < n && (text[i] == ' ' || text[i] == '\t'))
+      {
+        i++;
+      }
+
+    /* 2) 单位：分钟/秒钟/秒/分（UTF-8 字节数：分=3, 分钟=6, 秒=3, 秒钟=6） */
+    if (i + 6 <= n && memcmp(text + i, "分钟", 6) == 0)
+      {
+        unit_s = 60;
+        i += 6;
+      }
+    else if (i + 6 <= n && memcmp(text + i, "秒钟", 6) == 0)
+      {
+        unit_s = 1;
+        i += 6;
+      }
+    else if (i + 3 <= n && memcmp(text + i, "秒", 3) == 0)
+      {
+        unit_s = 1;
+        i += 3;
+      }
+    else if (i + 3 <= n && memcmp(text + i, "分", 3) == 0)
+      {
+        unit_s = 60;
+        i += 3;
+      }
+    else
+      {
+        return false;
+      }
+
+    while (i < n && (text[i] == ' ' || text[i] == '\t'))
+      {
+        i++;
+      }
+
+    /* 3) 必须紧跟"后提醒我" */
+    if (i + slen > n || memcmp(text + i, k_suffix, slen) != 0)
+      {
+        return false;
+      }
+    i += slen;
+
+    /* 4) 剩余是可选提醒内容（如"10秒后提醒我喝水"里的"喝水"）。
+     * 允许一个分隔逗号/空格（"10秒后提醒我，喝水"）。 */
+    while (i < n && (text[i] == ' ' || text[i] == '\t'))
+      {
+        i++;
+      }
+    if (i + 3 <= n && memcmp(text + i, "，", 3) == 0)
+      {
+        i += 3;
+        while (i < n && (text[i] == ' ' || text[i] == '\t'))
+          {
+            i++;
+          }
+      }
+    if (i < n)
+      {
+        size_t clen = n - i;
+
+        if (clen >= content_sz)
+          {
+            clen = content_sz - 1;
+          }
+        memcpy(content, text + i, clen);
+        content[clen] = '\0';
+      }
+
+    *delay_s = (int)(num * unit_s);
+    return *delay_s >= 1 && *delay_s <= 3600;
+}
+
+/* 人格切换关键词：整句匹配。返回回复文案（已 strdup），未命中返回 NULL。 */
+static char* demo_persona_reply(const char* channel, const char* text)
+{
+    persona_id_t id;
+    const char* ok_reply;
+    const char* action;
+
+    if (demo_text_is(text, "温柔一点") || demo_text_is(text, "温柔点")
+        || demo_text_is(text, "切换到温柔模式") || demo_text_is(text, "温柔模式")
+        || demo_text_is(text, "恢复温柔") || demo_text_is(text, "恢复温柔模式"))
+      {
+        id = PERSONA_GENTLE;
+        ok_reply = "好呀，我温柔一点～";
+        action = "persona_gentle";
+      }
+    else if (demo_text_is(text, "毒舌一点") || demo_text_is(text, "毒舌点")
+        || demo_text_is(text, "恢复毒舌") || demo_text_is(text, "恢复到毒舌")
+        || demo_text_is(text, "切换到毒舌模式") || demo_text_is(text, "毒舌模式"))
+      {
+        id = PERSONA_SASSY;
+        ok_reply = "行，那我可就不留情面了～";
+        action = "persona_sassy";
+      }
+    else if (demo_text_is(text, "元气一点") || demo_text_is(text, "元气点")
+        || demo_text_is(text, "恢复元气") || demo_text_is(text, "切换到元气模式")
+        || demo_text_is(text, "元气模式"))
+      {
+        id = PERSONA_CHEER;
+        ok_reply = "好耶，元气满满！";
+        action = "persona_cheer";
+      }
+    else
+      {
+        return NULL;
+      }
+
+    {
+        int ret = persona_set(id);
+
+        s_fast_path_count++;
+        syslog(LOG_INFO,
+               "[demo-fast] chan=%s action=%s -> persona %s (set=%d, "
+               "fast=%d llm=%d)\n",
+               channel ? channel : "?", action,
+               persona_name(id) ? persona_name(id) : "?", ret,
+               s_fast_path_count, s_llm_path_count);
+        return strdup(ret == OK ? ok_reply : "人格切换失败，稍后再试一次吧。");
+    }
+}
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+/* 传感器秒答：只读设备当前值，不发起测量（测量要 8~30s，破坏"秒答"）。
+ * 没测到过就如实说"还没测到"，绝不显示 0（健康数据诚实性红线）。
+ * hr_measure.c / pedometer.c 只在 CONFIG_AI_AGENT_LVGL_UI 下编译
+ * （CMakeLists.txt:145/152），所以整个函数跟着条件编译。 */
+static char* demo_sensor_reply(const char* channel, const char* text)
+{
+    char buf[96];
+
+    if (demo_text_is(text, "我走了多少步") || demo_text_is(text, "今天走了多少步")
+        || demo_text_is(text, "我现在走了多少步")
+        || demo_text_is(text, "我走了几步") || demo_text_is(text, "今天走了几步")
+        || demo_text_is(text, "走了多少步"))
+      {
+        uint32_t steps = pedometer_get_steps();
+        bool alive = pedometer_is_alive();
+
+        s_fast_path_count++;
+        syslog(LOG_INFO,
+               "[demo-fast] chan=%s action=steps steps=%u alive=%d "
+               "(fast=%d llm=%d)\n",
+               channel ? channel : "?", (unsigned)steps, alive,
+               s_fast_path_count, s_llm_path_count);
+        if (!alive)
+          {
+            return strdup("计步还没跑起来，走几步再问我一次～");
+          }
+        /* 不声称"今天"：pedometer_get_steps() 是本次开机累计的实时值，
+         * 断电重启会清零，说"今天"会高估（对账口径见 pedometer.h）。 */
+        snprintf(buf, sizeof(buf), "你已经走了 %u 步。", (unsigned)steps);
+        return strdup(buf);
+      }
+
+    if (demo_text_is(text, "现在心率多少") || demo_text_is(text, "我心率多少")
+        || demo_text_is(text, "我的心率是多少") || demo_text_is(text, "心率多少")
+        || demo_text_is(text, "我现在心率多少")
+        || demo_text_is(text, "我心率是多少"))
+      {
+        int bpm = hr_measure_last_bpm();
+        bool ok = hr_measure_last_ok();
+        bool running = hr_measure_is_running();
+
+        s_fast_path_count++;
+        syslog(LOG_INFO,
+               "[demo-fast] chan=%s action=heartrate bpm=%d ok=%d running=%d "
+               "(fast=%d llm=%d)\n",
+               channel ? channel : "?", bpm, ok, running,
+               s_fast_path_count, s_llm_path_count);
+        if (running)
+          {
+            return strdup("正在测心率，稍等一下～");
+          }
+        if (!ok || bpm <= 0)
+          {
+            return strdup("还没测到心率，按一下心率页的“测心率”吧。");
+          }
+        /* 说"最近一次测到"而不是"当前"：last_bpm 可能是上一轮的值，
+         * 健康数据不夸大（hr_measure.h 的诚实性约定）。 */
+        snprintf(buf, sizeof(buf), "最近一次测到的心率是 %d 次/分。", bpm);
+        return strdup(buf);
+      }
+
+    return NULL;
+}
+#endif /* CONFIG_AI_AGENT_LVGL_UI */
+
+/* 提醒类："10秒后提醒我" / "1分钟后提醒我" / "30秒后提醒我喝水"。
+ * 直接建一条 CRON_KIND_AT 一次性任务，走与 cron_add 工具相同的
+ * cron_service（到点从 outbound 下发 FINAL，voice 通道会播报）。 */
+static char* demo_reminder_reply(const char* channel, const char* chat_id,
+    const char* text)
+{
+    char content[80];
+    char message[160];
+    char buf[96];
+    cron_job_t job;
+    int delay_s = 0;
+    int err;
+
+    if (!demo_parse_reminder(text, &delay_s, content, sizeof(content)))
+      {
+        return NULL;
+      }
+
+    if (content[0] != '\0')
+      {
+        snprintf(message, sizeof(message), "提醒你：%s", content);
+      }
+    else
+      {
+        snprintf(message, sizeof(message), "时间到啦，这是你刚才设的提醒～");
+      }
+
+    memset(&job, 0, sizeof(job));
+    strncpy(job.name, "demo_remind", sizeof(job.name) - 1);
+    strncpy(job.message, message, sizeof(job.message) - 1);
+    job.kind = CRON_KIND_AT;
+    job.at_epoch = (int64_t)time(NULL) + delay_s;
+    job.delete_after_run = true;
+    if (channel != NULL)
+      {
+        strncpy(job.channel, channel, sizeof(job.channel) - 1);
+      }
+    if (chat_id != NULL)
+      {
+        strncpy(job.chat_id, chat_id, sizeof(job.chat_id) - 1);
+      }
+
+    err = cron_add_job(&job);
+    s_fast_path_count++;
+    syslog(LOG_INFO,
+           "[demo-fast] chan=%s action=remind delay=%ds add=%d msg=\"%s\" "
+           "(fast=%d llm=%d)\n",
+           channel ? channel : "?", delay_s, err, message,
+           s_fast_path_count, s_llm_path_count);
+
+    if (err != OK)
+      {
+        return strdup("提醒任务太多啦，先删掉几个再试吧。");
+      }
+
+    if (delay_s >= 60 && (delay_s % 60) == 0)
+      {
+        snprintf(buf, sizeof(buf), "好，%d 分钟后提醒你。", delay_s / 60);
+      }
+    else
+      {
+        snprintf(buf, sizeof(buf), "好，%d 秒后提醒你。", delay_s);
+      }
+    return strdup(buf);
+}
+
+/* 动态秒答总入口：人格 / 传感器 / 提醒。未命中返回 NULL，
+ * 交回静态短语表（最后才轮到 handle_nl_fast_path）。 */
+static char* demo_dynamic_reply(const char* channel, const char* chat_id,
+    const char* text)
+{
+    char* reply;
+
+    reply = demo_persona_reply(channel, text);
+    if (reply != NULL)
+      {
+        return reply;
+      }
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    reply = demo_sensor_reply(channel, text);
+    if (reply != NULL)
+      {
+        return reply;
+      }
+#endif
+
+    return demo_reminder_reply(channel, chat_id, text);
+}
+
+static char* handle_demo_fast_path(const char* channel, const char* chat_id,
+    const char* text)
+{
+    static const struct
+    {
+        const char* keywords[6];
+        const char* reply;
+    } demo_replies[] =
+    {
+        { { "你好", "您好", "你好呀", "你好啊", "嗨", NULL },
+          "你好呀！我是小云，很高兴见到你～" },
+        { { "你是谁", "你是哪位", "你叫什么", "你叫什么名字",
+            "介绍一下你自己", "自我介绍" },
+          "我是小云，你的随身 AI 小助手，可以陪聊天、报时间天气、记提醒。" },
+        { { "讲个笑话", "说个笑话", "来个笑话", "讲笑话", "笑话", NULL },
+          "为什么程序员总分不清万圣节和圣诞节？因为 Oct 31 等于 Dec 25。" },
+        /* DEMO-DIALOG 4)：第二条笑话（避免与第一条重复；整句匹配） */
+        { { "再讲一个", "再来一个", "再来一个笑话", "再讲一个笑话",
+            "换个笑话", NULL },
+          "我朋友说他减肥成功了，我问他怎么做到的，他说：我把体重秤调了。" },
+        { { "我有点累", "有点累", "好累", "累了", "想休息", NULL },
+          "累的话就先停下来歇一会儿吧，我陪着你。" },
+        { { NULL, NULL, NULL, NULL, NULL, NULL }, NULL },
+    };
+    int i;
+
+    if (channel == NULL || text == NULL)
+      {
+        return NULL;
+      }
+
+    if (strcmp(channel, AGENT_CHAN_VOICE) != 0
+        && strcmp(channel, AGENT_CHAN_CLI) != 0
+        && strcmp(channel, "ble") != 0)
+      {
+        return NULL;
+      }
+
+    /* DEMO-DIALOG：动态秒答优先（人格切换 / 步数 / 心率 / 提醒）。
+     * 这些需要读设备状态或写 cron，放不进静态短语表。 */
+    {
+        char* dynamic_reply = demo_dynamic_reply(channel, chat_id, text);
+
+        if (dynamic_reply != NULL)
+          {
+            return dynamic_reply;
+          }
+    }
+
+    for (i = 0; demo_replies[i].reply != NULL; i++)
+      {
+        int k;
+
+        for (k = 0; k < 6 && demo_replies[i].keywords[k] != NULL; k++)
+          {
+            if (demo_text_is(text, demo_replies[i].keywords[k]))
+              {
+                s_fast_path_count++;
+                syslog(LOG_INFO,
+                       "[demo-fast] chan=%s kw=\"%s\" -> local reply "
+                       "(%d bytes, fast=%d llm=%d)\n",
+                       channel, demo_replies[i].keywords[k],
+                       (int)strlen(demo_replies[i].reply),
+                       s_fast_path_count, s_llm_path_count);
+                return strdup(demo_replies[i].reply);
+              }
+          }
+      }
+
+    return NULL;
+}
+#endif /* DEMO_FAST_REPLY */
+
 static char* handle_nl_fast_path(const char* text)
 {
     /* 麦克风自检先看: 它的关键词不进 s_intents 表, 需要自定义回复文案 */
@@ -414,6 +998,17 @@ static char* handle_nl_fast_path(const char* text)
         if (mic) {
             return mic;
         }
+    }
+
+    /* v106 S5：情绪词优先（本地规则，秒出） */
+    if (contains_any(text, kw_mood)) {
+        static int mood_idx;
+        const char* mr = mood_replies[mood_idx % 3];
+        mood_idx++;
+        s_fast_path_count++;
+        syslog(LOG_INFO, "[%s] NL fast path: mood (fast=%d llm=%d)\n",
+               TAG, s_fast_path_count, s_llm_path_count);
+        return strdup(mr);
     }
 
     /* Table-driven: scan intents, first match wins */
@@ -426,6 +1021,12 @@ static char* handle_nl_fast_path(const char* text)
                     s_intents[i].output_size);
             }
             if (reply) {
+                reply = humanize_tool_reply(s_intents[i].tool_name, reply);
+                if (reply != NULL && reply[0] == '\0') {
+                    /* v108：工具空输出防呆，避免空 FINAL → 空气泡 + speak -EINVAL */
+                    free(reply);
+                    reply = strdup("没拿到数据，稍后再试。");
+                }
                 s_fast_path_count++;
                 syslog(LOG_INFO,
                     "[%s] NL fast path: %s (fast=%d llm=%d)\n",
@@ -454,14 +1055,31 @@ static char* handle_nl_fast_path(const char* text)
         strncpy(safe_city, "Beijing", sizeof(safe_city) - 1);
         safe_city[sizeof(safe_city) - 1] = '\0';
 
+        /* 取"天气"之前的文字当地名 —— 但 "今天天气怎么样" 会把"今天"当前
+         * 城市(真机 2026-10-26 日志: Weather query: 今天)。时间词/疑问词
+         * 一律丢弃, 回退固定北京(手表没有定位, 数据源也只有北京坐标)。 */
         const char* p = strstr(text, "天气");
-        if (p && p > text && (size_t)(p - text) < sizeof(safe_city) - 1) {
+        if (p && p > text && (size_t)(p - text) <= sizeof(safe_city) - 1) {
+            char cand[64];
             int ci = 0;
             for (const char* s = text; s < p && ci < 62; s++) {
                 if (*s != '"' && *s != '\\' && *s != ' ')
-                    safe_city[ci++] = *s;
+                    cand[ci++] = *s;
             }
-            if (ci > 0) safe_city[ci] = '\0';
+            cand[ci] = '\0';
+
+            static const char* k_bad[] = {
+                "今天", "明天", "后天", "现在", "今日", "早上", "上午",
+                "中午", "下午", "晚上", "夜里", "最近", "这边", "那里",
+                NULL };
+            int bad = (ci == 0);
+            for (int k = 0; !bad && k_bad[k]; k++) {
+                if (strstr(cand, k_bad[k])) bad = 1;
+            }
+            if (!bad) {
+                strncpy(safe_city, cand, sizeof(safe_city) - 1);
+                safe_city[sizeof(safe_city) - 1] = '\0';
+            }
         }
 
         char input[256];
@@ -909,8 +1527,13 @@ static void dispatch_response(const agent_msg_t* msg,
     char* final_text)
 {
     if (final_text && final_text[0]) {
-        session_append(msg->chat_id, "user", msg->content);
-        session_append(msg->chat_id, "assistant", final_text);
+        syslog(LOG_INFO, "[%s] probe: append_user_begin\n", TAG);
+        /* v114b2：暂停会话持久化写 /data(NOR/littlefs)。
+         * 依据 B 报告：trace END 后只做两次 session_append 即整机停摆，且重启后
+         * 出现 NOR 写校验失败；flash 写在 up_irq_save 内无超时。演示期先不落盘。 */
+        syslog(LOG_INFO, "[%s] probe: append_user_skipped (persist disabled)\n", TAG);
+        syslog(LOG_INFO, "[%s] probe: append_asst_begin\n", TAG);
+        syslog(LOG_INFO, "[%s] probe: append_asst_skipped (persist disabled)\n", TAG);
 
         agent_msg_t out = { 0 };
         strncpy(out.channel, msg->channel,
@@ -921,9 +1544,11 @@ static void dispatch_response(const agent_msg_t* msg,
         out.from_local = s_answer_from_local;
         /* 真正的回答：只有这一类允许被念出来 (P2a)。 */
         out.kind = AGENT_MSG_KIND_FINAL;
+        syslog(LOG_INFO, "[%s] probe: push_begin\n", TAG);
         if (message_bus_push_outbound(&out) != OK) {
             free(final_text);
         }
+        syslog(LOG_INFO, "[%s] probe: push_done\n", TAG);
     } else {
         free(final_text);
         agent_msg_t out = { 0 };
@@ -931,7 +1556,10 @@ static void dispatch_response(const agent_msg_t* msg,
             sizeof(out.channel) - 1);
         strncpy(out.chat_id, msg->chat_id,
             sizeof(out.chat_id) - 1);
-        out.content = strdup("Sorry, I encountered an error.");
+        /* 中文诚实兜底。英文报错直接显示在手表屏幕上是演示事故
+         * (2026-10-25 现场: 关怀 L2 失败时屏幕上出现
+         * "Sorry, I encountered an error.")。 */
+        out.content = strdup("抱歉，这个我暂时答不上来，等会儿再问我一次吧。");
         /* 错误提示不是回答：上屏/上手机，但绝不进 TTS。 */
         out.kind = AGENT_MSG_KIND_ERROR;
         if (out.content) {
@@ -1085,6 +1713,67 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
     return result;
 }
 
+/* 构造 LLM 响应缓存键：人格 id + 用户文本。
+ *
+ * 缓存值只按这个键做 djb2（前 LLM_CACHE_KEY_LEN 字节），所以人格必须在
+ * 前几位，否则切换人格后同一句话仍会命中旧人格的回复。 */
+static void build_llm_cache_key(char* key, size_t size,
+                                persona_id_t persona, const char* content)
+{
+    snprintf(key, size, "%d:%s", (int)persona,
+        content ? content : "");
+}
+
+/* 2026-11-03 SPEED-A：本轮（run_react_loop）流式统计，供 agent_loop_task
+ * 的 [turn] 日志打印 first_token_ms / stream_deltas（验收用）。
+ * agent_loop 是单线程循环，用普通静态变量即可。
+ *   deltas = 本轮所有流式 LLM 调用收到的非空 delta 总数（工具轮失败重发会累加）
+ *   first_ms = 本轮第一次"LLM 请求开始 → 首个 delta"的毫秒数；-1 表示未流式
+ */
+static int s_turn_stream_deltas;
+static long s_turn_stream_first_ms = -1;
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+/* 2026-11-03 SPEED-A 最小集成：把 LLM 的 SSE 增量回答实时投到手表屏幕。
+ * 只负责“生成过程中先看见文字”；最终回答仍走 outbound 镜像（历史/气泡一致），
+ * 因此在 LLM 返回后立刻 abort 掉流式占位，避免与最终消息重复。 */
+typedef struct {
+    const char* user_text;
+    bool  started;
+    bool  first;
+    int   deltas;
+    long  first_ms;
+    struct timeval t0;
+} agent_stream_ctx_t;
+
+static void agent_llm_stream_delta(const char* delta, void* arg)
+{
+    agent_stream_ctx_t* c = (agent_stream_ctx_t*)arg;
+    struct timeval tv;
+
+    if (!c || !delta || delta[0] == '\0') {
+        return;
+    }
+
+    if (!c->first) {
+        c->first = true;
+        gettimeofday(&tv, NULL);
+        c->first_ms = (long)calc_elapsed_ms(&c->t0, &tv);
+    }
+
+    if (!c->started) {
+        if (lvgl_ui_channel_stream_begin(c->user_text) == 0) {
+            c->started = true;
+        }
+    }
+
+    if (c->started) {
+        (void)lvgl_ui_channel_stream_delta(delta);
+    }
+    c->deltas++;
+}
+#endif
+
 /* Run the ReAct tool-calling loop. Returns final_text (caller owns). */
 static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     const char* tools_json, char* tool_output, size_t tool_size,
@@ -1104,6 +1793,22 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     name_repeat = 0;
     int last_total_tokens = 0;
     bool watchdog_fired = false;
+    persona_id_t cache_persona;
+
+    s_turn_stream_deltas = 0;
+    s_turn_stream_first_ms = -1;
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    agent_stream_ctx_t stream_ctx;
+    bool stream_enabled;
+
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    stream_ctx.user_text = msg->content;
+    stream_enabled = (msg->channel[0] != '\0')
+        && (strcmp(msg->channel, "voice") == 0
+            || strcmp(msg->channel, "ble") == 0
+            || strcmp(msg->channel, "cli") == 0);
+#endif
 
     /* Router: select and apply best backend before first LLM call.
      * Estimate complexity from the last user message. */
@@ -1122,9 +1827,23 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     agent_trace_begin(&trace, msg->chat_id, msg->channel);
     trace.backend_idx = router_idx;
 
-    /* Cache check: for simple queries, try cache before LLM call */
+    /* Cache check: for simple queries, try cache before LLM call.
+     *
+     * 缓存键必须带人格：llm_cache 只按用户文本做 djb2，若把人格漏掉，
+     * 切到毒舌后再问同一句话会命中温柔人格的缓存（TTL 300s），
+     * 「同一句话三种风格」的演示就失效了。
+     *
+     * 用本轮开始时的快照：set_persona 可能在本轮工具调用中改了全局状态，
+     * 但这条回复仍由旧 prompt 生成，缓存 get/put 必须用同一个人格 id。 */
+    cache_persona = persona_get();
+
     if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
-        char* cached = llm_cache_get(msg->content, strlen(msg->content));
+        char cache_key[LLM_CACHE_KEY_LEN + 8];
+        char* cached;
+
+        build_llm_cache_key(cache_key, sizeof(cache_key), cache_persona,
+            msg->content);
+        cached = llm_cache_get(cache_key, strlen(cache_key));
         if (cached) {
             syslog(LOG_INFO, "[%s] Cache hit, skipping LLM call\n", TAG);
             final_text = cached;
@@ -1134,11 +1853,37 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         }
     }
 
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    /* 2026-11-03：不等第一个 delta —— 回合一开始先切 AI 页并显示
+     * 小云思考中…，让用户立刻看到反馈；后续 delta 再追加到同一气泡。 */
+    if (stream_enabled) {
+        gettimeofday(&stream_ctx.t0, NULL);
+        stream_ctx.first = false;
+        stream_ctx.deltas = 0;
+        if (lvgl_ui_channel_stream_begin(msg->content) == 0) {
+            stream_ctx.started = true;
+        }
+    }
+#endif
+
     for (iteration = 0; iteration < AGENT_AI_AGENT_MAX_TOOL_ITER;
          iteration++) {
         send_working_status(msg, iteration);
 
+        /* ★ 必须清零再用。
+         *
+         * 2026-10-20 真机定位的崩溃：断网时 network_get_state() 直接判错，
+         * llm_chat_tools() **根本没被调用**，resp 里是栈上的垃圾；而下面的
+         * 失败路径照样执行 llm_response_free(&resp)，于是 free() 了一个
+         * 不属于堆的指针，撞上 mm_free.c:315 的
+         *     DEBUGASSERT(mm_heapmember(heap, mem))
+         * 整个 ai_agent 任务被 assert 打死并复位。
+         *
+         * 触发条件很常见：没有网络 + 主动关怀(pet_care L2)调用 LLM —— 也就是
+         * 手表离了手机几分钟后必崩。清零之后 llm_response_free() 释放的是
+         * 一堆 NULL，安全。 */
         llm_response_t resp;
+        memset(&resp, 0, sizeof(resp));
         struct timeval tv_start, tv_end;
         bool uplink_down = false;
         int err;
@@ -1155,8 +1900,55 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 "[%s] no uplink, answering on-device (cloud skipped)\n", TAG);
             err = ERROR;
             uplink_down = true;
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* 回合开始已放的"思考中"占位必须收回：这条路径根本不会发起
+             * 流式请求，也没有 delta 去触发 begin/end 的配对。 */
+            if (stream_enabled && stream_ctx.started) {
+                lvgl_ui_channel_stream_abort();
+                stream_ctx.started = false;
+            }
+#endif
         } else {
-            err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            if (stream_enabled) {
+                gettimeofday(&stream_ctx.t0, NULL);
+                stream_ctx.first = false;
+                stream_ctx.deltas = 0;
+                err = llm_chat_tools_stream(sys_prompt, messages, tools_json,
+                    &resp, agent_llm_stream_delta, &stream_ctx);
+
+                /* 只有"确定不是最终回答"的情况在这里立刻 abort：
+                 *  - 调用失败（后面可能 failover / 端侧兜底）
+                 *  - 工具调用轮（不显示半成品）
+                 *  - 空文本（最终会走错误兜底）
+                 * 最终回答的 stream_end 延后到下面 !resp.tool_use 分支：
+                 * cascade 重试可能换成另一段文本，先落历史会写错一条。 */
+                if (stream_ctx.started
+                    && (err != OK || resp.tool_use || resp.text == NULL
+                        || resp.text[0] == '\0')) {
+                    lvgl_ui_channel_stream_abort();
+                    stream_ctx.started = false;
+                }
+                /* 本轮累计（[turn] llm_done 行会汇总打印，验收直接 grep） */
+                s_turn_stream_deltas += stream_ctx.deltas;
+                if (s_turn_stream_first_ms < 0 && stream_ctx.first)
+                    s_turn_stream_first_ms = stream_ctx.first_ms;
+
+                if (stream_ctx.first) {
+                    syslog(LOG_INFO,
+                        "[%s] [turn] chan=%s first_token_ms=%ld stream_deltas=%d\n",
+                        TAG, msg->channel, stream_ctx.first_ms,
+                        stream_ctx.deltas);
+                } else {
+                    syslog(LOG_INFO,
+                        "[%s] [turn] chan=%s stream no-delta (fallback/empty)\n",
+                        TAG, msg->channel);
+                }
+            } else
+#endif
+            {
+                err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+            }
         }
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
@@ -1232,6 +2024,12 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
             llm_response_free(&resp);
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            if (stream_ctx.started) {
+                lvgl_ui_channel_stream_abort();
+                stream_ctx.started = false;
+            }
+#endif
             final_text = strdup(LLM_TIMEOUT_MSG);
             watchdog_fired = true;
             break;
@@ -1270,6 +2068,15 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             }
 
             if (cascade_retry) {
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+                /* 重试会换成另一段文本：先撤销流式半成品（不落历史），
+                 * 最终文本由随后 outbound 镜像落历史 —— 否则历史里会留下
+                 * cheap 文本 + premium 文本两条。 */
+                if (stream_ctx.started) {
+                    lvgl_ui_channel_stream_abort();
+                    stream_ctx.started = false;
+                }
+#endif
                 syslog(LOG_INFO,
                     "[%s] Cascade: cheap response inadequate, "
                     "retrying with PREMIUM\n",
@@ -1337,6 +2144,15 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             if (resp.text && resp.text_len > 0 && !final_text) {
                 final_text = strdup(resp.text);
             }
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+            /* 真正的最终回答：用完整文本收尾流式气泡（原地落历史/气泡，
+             * SPEED-B 会对随后 outbound 镜像做一次性去重 → 历史只有一份）。
+             * 用户看到的流式文字不会被清空再重建。 */
+            if (stream_ctx.started) {
+                lvgl_ui_channel_stream_end(resp.text ? resp.text : "", false);
+                stream_ctx.started = false;
+            }
+#endif
             agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
             llm_response_free(&resp);
             break;
@@ -1461,12 +2277,17 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
 
 send_reply:
-    /* Cache store: save simple query responses for future reuse */
+    /* Cache store: save simple query responses for future reuse.
+     * 键的构造与上面的 cache check 一致，必须带上人格。 */
     if (final_text && msg->content
         && complexity == LLM_COMPLEXITY_SIMPLE) {
-        llm_cache_put(msg->content, strlen(msg->content), final_text);
+        char cache_key[LLM_CACHE_KEY_LEN + 8];
+
+        build_llm_cache_key(cache_key, sizeof(cache_key), cache_persona,
+            msg->content);
+        llm_cache_put(cache_key, strlen(cache_key), final_text);
         if (last_total_tokens > 0) {
-            llm_cache_put_tokens(msg->content, strlen(msg->content),
+            llm_cache_put_tokens(cache_key, strlen(cache_key),
                 last_total_tokens);
         }
     }
@@ -1516,6 +2337,16 @@ static void inject_session_context(char* sys_prompt, size_t size,
         "those users. Do NOT include the [mentioned_users: ...] "
         "block in your reply text.\n",
         channel, chat_id);
+
+    /* v114b5：语音通道强制短答（屏幕可显示全文，但只念前 60 字）。 */
+    if (strcmp(channel, AGENT_CHAN_VOICE) == 0) {
+        size_t l2 = strlen(sys_prompt);
+        snprintf(sys_prompt + l2, size - l2,
+            "\nIMPORTANT: This reply is spoken aloud on a watch. "
+            "Answer in ONE short paragraph of at most 90 Chinese characters. "
+            "Be complete but concise; no lists, no markdown. If the full answer "
+            "would be longer, summarize it to fit.\n");
+    }
 }
 
 /* ── Main agent loop task ─────────────────────────────────── */
@@ -1584,6 +2415,70 @@ static void* agent_loop_task(void* arg)
             break;
         }
 
+        /* ★ 2026-11-01 v102c：串行化"用户回合"。
+         * 真机复现：上一轮回答的 TTS 还在拉流（mimo POST / TLS）时，下一条
+         * 消息立刻发起第二个 LLM 请求，两条 TLS 流并发把 BT PAN 的 zblue
+         * 缓冲打爆 → 整机冻死（无断言、看门狗复位）。
+         *
+         * ★ 2026-11-03 v125 P0-B：只有 voice 通道才需要"等上一轮播报结束"。
+         * 非语音通道（ble/cli/ws/lvgl_ui/...）不再被上一轮 TTS 播报阻塞：
+         * perf-net 实测 ask2 因本门禁多等 25 s、ask3 多等 46 s
+         * （serial_perf_session.log:1315/1640，报告 §2.4）。
+         *
+         * 为什么跳过不产生并发 TLS 风险：HTTPS POST 已经有**全局串行锁**
+         * vela_https_post_json()（infra/vela_tls.c，LLM 与 MiMo TTS 都走它），
+         * TTS 侧另有 voice_channel_llm_begin() 媒体回合互斥；两条 POST 不会
+         * 并发。非语音通道最多等 500 ms（仅为避开正在 close/drain 的播放器，
+         * 不抢音频设备），超时立即处理。 */
+        struct timeval turn_gate_t0;
+        gettimeofday(&turn_gate_t0, NULL);
+
+        if (voice_channel_is_busy())
+          {
+            int waited;
+            /* v127（2026-11-03 稳定性优先回滚）：非语音通道恢复等待上一轮 TTS。
+             * v125 为提速把非语音上限压到 500ms，但现场出现播放期间新 LLM 请求
+             * 与 TTS 网络并发 → BT PAN 小缓冲压力/看门狗风险（v102c 同类问题）。
+             * 速度优化改用后续「流式 LLM + 可中止 TTS」方案，不再靠放开互斥。 */
+            int is_voice = (strcmp(msg.channel, AGENT_CHAN_VOICE) == 0);
+            int max_wait_ms = is_voice ? 30000 : 300;
+
+            if (!is_voice)
+              {
+                /* v130（2026-11-03）：非语音新消息优先。直接打断上一句 TTS，
+                 * 不再傻等 30s —— 既提升 App 聊天响应，也避免“旧 TTS 网络 +
+                 * 新 LLM POST”并发（v102c 曾因此看门狗复位）。 */
+                voice_channel_tts_abort();
+                syslog(LOG_INFO,
+                   "[%s] previous TTS busy -> aborted for non-voice msg (chan=%s)\n",
+                   TAG, msg.channel);
+              }
+            else
+              {
+                syslog(LOG_INFO,
+                   "[%s] previous TTS still busy: waiting up to %dms (chan=%s)\n",
+                   TAG, max_wait_ms, msg.channel);
+              }
+
+            for (waited = 0; waited < max_wait_ms
+                && voice_channel_is_busy(); waited += 100)
+              {
+                usleep(100 * 1000);
+              }
+            syslog(LOG_INFO,
+                   "[%s] turn gate: waited %dms (chan=%s)\n",
+                   TAG, waited, msg.channel);
+          }
+
+        /* v125 P0-B：per-turn 计时起点。下面打印的所有毫秒差都相对**本轮**
+         * 起点重新算，不累加历史（旧 [voice] "LLM latency" 打的是陈旧累计值，
+         * 见 perf-net §2.5，已在 voice_channel.c 修掉）。 */
+        struct timeval turn_t0;
+        gettimeofday(&turn_t0, NULL);
+        long gate_ms = (long)calc_elapsed_ms(&turn_gate_t0, &turn_t0);
+        syslog(LOG_INFO, "[%s] [turn] chan=%s begin gate_ms=%ld\n",
+            TAG, msg.channel, gate_ms);
+
         syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
             TAG, msg.channel, msg.chat_id);
 
@@ -1606,6 +2501,12 @@ static void* agent_loop_task(void* arg)
                     free(out.content);
                 }
             }
+            struct timeval lowmem_t;
+            gettimeofday(&lowmem_t, NULL);
+            syslog(LOG_INFO,
+                "[%s] [turn] chan=%s low_memory total_ms=%ld\n",
+                TAG, msg.channel,
+                (long)calc_elapsed_ms(&turn_t0, &lowmem_t));
             free(msg.content);
             continue;
         }
@@ -1625,6 +2526,15 @@ static void* agent_loop_task(void* arg)
                 continue;
             }
         }
+
+        /* DEMO-FW：固定短语本地极速回复，先于（且独立于）NL 规则表；
+         * 开关见文件顶部 DEMO_FAST_REPLY。 */
+#if DEMO_FAST_REPLY
+        if (!reply) {
+            reply = handle_demo_fast_path(msg.channel, msg.chat_id,
+                msg.content);
+        }
+#endif
 
         /* NL fast path — after injection check, before LLM */
         if (!reply) {
@@ -1648,6 +2558,14 @@ static void* agent_loop_task(void* arg)
             if (message_bus_push_outbound(&out) != OK) {
                 free(reply);
             }
+            /* v125 P0-B per-turn：端侧快通道（slash/时间/电量/天气…）同样
+             * 打印本轮耗时，单轮差值、不累加。 */
+            struct timeval fast_t;
+            gettimeofday(&fast_t, NULL);
+            syslog(LOG_INFO,
+                "[%s] [turn] chan=%s fast_path llm_ms=0 total_ms=%ld\n",
+                TAG, msg.channel,
+                (long)calc_elapsed_ms(&turn_t0, &fast_t));
             free(msg.content);
             continue;
         }
@@ -1658,16 +2576,25 @@ static void* agent_loop_task(void* arg)
             skill_loader_refresh();
         }
 
+        syslog(LOG_INFO, "[%s] ctx probe: begin (chan=%s)\n", TAG, msg.channel);
         context_build_system_prompt(sys_prompt, ctx_size);
+        syslog(LOG_INFO, "[%s] ctx probe: after_ctx (sys_len=%d)\n",
+               TAG, (int)strlen(sys_prompt));
         inject_session_context(sys_prompt, ctx_size,
             msg.channel, msg.chat_id);
+        syslog(LOG_INFO, "[%s] ctx probe: after_inject (sys_len=%d)\n",
+               TAG, (int)strlen(sys_prompt));
 
         /* Refresh tools JSON — Node tools are dynamic */
         free(tools_json);
         tools_json = tool_registry_get_tools_json();
+        syslog(LOG_INFO, "[%s] ctx probe: after_tools_json (len=%d)\n",
+               TAG, tools_json ? (int)strlen(tools_json) : -1);
 
         cJSON* messages = build_messages(msg.chat_id, msg.content,
             history_json, hist_size);
+        syslog(LOG_INFO, "[%s] ctx probe: after_messages (ok=%d)\n",
+               TAG, messages != NULL);
 
         char* final_text = NULL;
 
@@ -1676,14 +2603,43 @@ static void* agent_loop_task(void* arg)
         if (final_text) {
             cJSON_Delete(messages);
         } else {
+            /* v114b10：语音通道限制回答长度（≈70–90 汉字，完整可播且更快） */
+            llm_proxy_set_max_tokens(
+                strcmp(msg.channel, AGENT_CHAN_VOICE) == 0
+                    ? AGENT_LLM_MAX_TOKENS_VOICE : 0);
+
             /* ReAct loop */
             s_llm_path_count++;
             final_text = run_react_loop(sys_prompt, messages,
                 tools_json, tool_output, tool_size, &msg);
+            syslog(LOG_INFO, "[%s] probe: react_return (txt=%d)\n",
+                   TAG, final_text ? (int)strlen(final_text) : -1);
             cJSON_Delete(messages);
+            syslog(LOG_INFO, "[%s] probe: messages_freed\n", TAG);
         }
 
+        /* v125 P0-B per-turn：LLM 完成（含 ReAct 多轮）与派发耗时的单轮差值。
+         * TTS 起始/结束的差值由 voice_channel.c 在自己的 speak 时间轴里打印
+         * （TTS start after ASR / first chunk / network done / speak done）。 */
+        struct timeval llm_done_t;
+        gettimeofday(&llm_done_t, NULL);
+        long llm_ms = (long)calc_elapsed_ms(&turn_t0, &llm_done_t);
+        syslog(LOG_INFO,
+            "[%s] [turn] chan=%s llm_done llm_ms=%ld first_token_ms=%ld stream_deltas=%d\n",
+            TAG, msg.channel, llm_ms, s_turn_stream_first_ms,
+            s_turn_stream_deltas);
+
+        syslog(LOG_INFO, "[%s] probe: dispatch_begin\n", TAG);
         dispatch_response(&msg, final_text);
+        syslog(LOG_INFO, "[%s] probe: dispatch_end\n", TAG);
+
+        struct timeval turn_end_t;
+        gettimeofday(&turn_end_t, NULL);
+        long dispatch_ms = (long)calc_elapsed_ms(&llm_done_t, &turn_end_t);
+        syslog(LOG_INFO,
+            "[%s] [turn] chan=%s done llm_ms=%ld dispatch_ms=%ld total_ms=%ld\n",
+            TAG, msg.channel, llm_ms, dispatch_ms,
+            gate_ms + llm_ms + dispatch_ms);
 
         /* Free image_b64 if not already freed by vision path */
         free(msg.image_b64);
