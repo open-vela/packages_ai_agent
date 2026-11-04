@@ -33,6 +33,7 @@
 #include "tools/tool_fetch_url.h"
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
+#include "tool_weather.h"
 #include "tools/tool_health.h"
 #include "tools/tool_media.h"
 #include "tools/tool_proxyquickapp.h"
@@ -41,6 +42,7 @@
 #include "tools/tool_vision.h"
 #include "tools/tool_camera.h"
 #include "tools/tool_web_search.h"
+#include "tools/tool_mijia.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -50,7 +52,7 @@
 
 static const char* TAG = "tools";
 
-#define MAX_TOOLS 48
+#define MAX_TOOLS 56   /* [W962] was 48; +2 for the Mi-home tools */
 #define MAX_PROVIDERS 4
 
 /* ── External tool provider registry ───────────────────────── */
@@ -83,6 +85,7 @@ void tool_registry_register_provider(const char* name,
     s_providers[s_provider_count].get_tools = get_tools;
     s_providers[s_provider_count].execute = execute;
     s_provider_count++;
+    s_tools_dirty = true;   /* [V853] same reasoning as register_tool() */
     syslog(LOG_INFO, "[%s] Registered tool provider: %s\n", TAG, name);
 }
 
@@ -93,6 +96,11 @@ static void register_tool(const agent_tool_t* tool)
         return;
     }
     s_tools[s_tool_count++] = *tool;
+    /* [V853] Invalidate the cached JSON: build_tools_json_locked() short-
+     * circuits on !s_tools_dirty, so without this the first reader froze
+     * whatever had been registered at that instant and the rebuild at the
+     * end of tool_registry_init() became a no-op. */
+    s_tools_dirty = true;
     syslog(LOG_INFO, "[%s] Registered tool: %s\n", TAG, tool->name);
 }
 
@@ -161,8 +169,72 @@ static void build_tools_json_locked(void)
 
 void tool_registry_rebuild_json(void) { build_tools_json_locked(); }
 
+/* ══ [V398] ui_control ── 语音控制屏幕 ══════════════════════════════════
+ *
+ * 让 LLM 能翻页 / 回主界面。工具只写命令文件 /tmp/ui_cmd，由 info_screen
+ * 消费，这样按键和语音共用同一个 UI 状态。
+ */
+
+static int ui_control_exec(const char *input_json, char *output,
+                           size_t output_size)
+{
+  const char *p;
+  char        cmd[32];
+  int         fd;
+  size_t      i;
+
+  cmd[0] = '\0';
+
+  p = input_json ? strstr(input_json, "\"action\"") : NULL;
+  if (p)
+    {
+      p = strchr(p, ':');
+      if (p)
+        {
+          p++;
+          while (*p == ' ' || *p == '\"') p++;
+          for (i = 0; i < sizeof(cmd) - 1 && *p && *p != '\"' && *p != ',';
+               i++, p++)
+            {
+              cmd[i] = *p;
+            }
+          cmd[i] = '\0';
+        }
+    }
+
+  if (cmd[0] == '\0')
+    {
+      snprintf(output, output_size,
+               "{\"ok\":false,\"error\":\"action required\"}");
+      return -1;
+    }
+
+  fd = open("/tmp/ui_cmd", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0)
+    {
+      snprintf(output, output_size,
+               "{\"ok\":false,\"error\":\"cannot write ui_cmd\"}");
+      return -1;
+    }
+
+  write(fd, cmd, strlen(cmd));
+  close(fd);
+
+  snprintf(output, output_size, "{\"ok\":true,\"action\":\"%s\"}", cmd);
+  return 0;
+}
+
 int tool_registry_init(void)
 {
+    REGISTER_TOOL("ui_control",
+                  "Control the screen pages by voice: next page, "
+                  "previous page, or back to the clock page.",
+                  TOOL_SCHEMA_BEGIN()
+                  TOOL_PARAM_ENUM("action", "next | prev | home",
+                                  "\"next\",\"prev\",\"home\"")
+                  TOOL_SCHEMA_END_REQUIRED("\"action\""),
+                  ui_control_exec);
+
     s_tool_count = 0;
 
 #ifdef CONFIG_AI_AGENT_MCP
@@ -209,6 +281,64 @@ int tool_registry_init(void)
         "get_current_time",
         "Get current date, time, and UNIX epoch.",
         tool_get_time_execute);
+
+    REGISTER_TOOL(
+        "refresh_weather",
+        "Fetch current weather via Open-Meteo (no API key) and write it to /tmp/weather.txt for the info screen.",
+        TOOL_NO_PARAMS,
+        tool_refresh_weather_execute);
+    /* [W962] Mi-home control.  Both tools read everything they need
+     * (gateway host/token and the device list) from /data/mijia/config.json
+     * at call time, so no credential is baked into the image. */
+    REGISTER_TOOL_NO_PARAMS(
+        "mijia_list",
+        "List the Mi-home (Mi Home / Xiaomi smart home) devices that can "
+        "be controlled from this device.",
+        tool_mijia_list_execute);
+
+    REGISTER_TOOL(
+        "mijia_set",
+        "Turn a Mi-home device on or off, or set its level. Use "
+        "mijia_list first to get the device name.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("name",
+                "Device name or entity id, e.g. 'desk lamp' or "
+                "'light.desk'") ","
+            TOOL_PARAM_STR("action",
+                "'on', 'off', 'toggle', or 'set' (set needs value)") ","
+            TOOL_PARAM_NUM("value",
+                "Level 0..100 percent, used with action='set'")
+            TOOL_SCHEMA_END_REQUIRED("\"name\""),
+        tool_mijia_set_execute);
+
+    weather_tool_init();
+
+    /* Todo tool: the info screen carousel shows /tmp/todo.txt */
+    REGISTER_TOOL(
+        "todo",
+        "Manage the desktop companion's todo list shown on its face screen. "
+        "action=add to remember a new todo (item required), action=list to "
+        "show all todos, action=clear to clear the list.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("action", "add | list | clear") "," TOOL_PARAM_STR(
+                "item", "todo text (required only for add)")
+                TOOL_SCHEMA_END_REQUIRED("\"action\""),
+        tool_todo_execute);
+
+    /* Servo tool: 语音控制脑袋转向（pan=/dev/pwm0, tilt=/dev/pwm1） */
+    REGISTER_TOOL(
+        "servo",
+        "Move the robot head (servo) when the user asks to turn the head, "
+        "look left/right/up/down, shake or nod. "
+        "action=center (look straight), action=shake, action=pan with angle "
+        "(10-170), action=tilt with angle (10-170), action=look with "
+        "direction (left|right|up|down).",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("action", "center | shake | pan | tilt | look") "," TOOL_PARAM_NUM(
+                "angle", "Target angle 10-170 (pan/tilt only)") "," TOOL_PARAM_STR(
+                "direction", "left|right|up|down (look only)")
+                TOOL_SCHEMA_END_REQUIRED("\"action\""),
+        tool_servo_execute);
 
     /* File tools */
     REGISTER_TOOL("read_file",
@@ -601,3 +731,6 @@ int tool_registry_execute(const char *name, const char *input_json,
     snprintf(output, output_size, "Error: unknown tool '%s'", name);
     return ERROR;
 }
+
+/* weather tool implementation is compiled into this translation unit */
+#include "tool_weather.c"

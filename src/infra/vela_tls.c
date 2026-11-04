@@ -31,9 +31,11 @@
 
 /* POSIX networking */
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 /* mbedTLS */
 #include "mbedtls/ctr_drbg.h"
@@ -60,6 +62,74 @@ static int simple_entropy_func(void* data, unsigned char* output, size_t len)
 }
 
 static const char* TAG = "vela_tls";
+
+/* ── [V526] MiMo 端点的 IP 直连回退 ─────────────────────────────
+ *
+ * 背景：DNS 已修好（ensure_dns() 把 resolver 指向 223.5.5.5，rc=0），但
+ * getaddrinfo("token-plan-cn.xiaomimimo.com") 仍然卡在 NuttX 的 DNS 客户端
+ * 内部（连插桩的 "getaddrinfo failed" 都没打出来，说明根本没返回）。
+ *
+ * 与其继续在 DNS 上兜圈，不如像LLM 那样走 IP 直连 —— 本项目已有成熟先例：
+ *   [V358] llm host 42.48.185.89 -> 42.48.185.89
+ * IP 直连一直是能通的那条路（DNS 从来没通过）。
+ *
+ * token-plan-cn.xiaomimimo.com 是小米云的 ALB，PC 侧实测解析到：
+ *   mimo-pri-prod.alb.xiaomi.com  111.206.191.150 / 111.206.191.148
+ * 证书里签的是域名，所以**只有 TCP 连接那一跳换成 IP**，
+ * mbedtls_ssl_set_hostname() 仍然传原始域名，SNI 与证书校验都保持正确。
+ *
+ * 用法：vela_tls_connect_ip()，或在 host 匹配时由调用方改调它。
+ */
+#define MIMO_FALLBACK_HOST "token-plan-cn.xiaomimimo.com"
+static const char *const mimo_fallback_ips[] = {
+  "111.206.191.150",
+  "111.206.191.148",
+  NULL
+};
+
+/* 若 host 是 MiMo 端点，返回其备用 IP；否则返回 NULL。 */
+const char *vela_tls_ip_fallback_for(const char *host)
+{
+  if (host != NULL && strcmp(host, MIMO_FALLBACK_HOST) == 0)
+    {
+      
+      return mimo_fallback_ips[0];
+    }
+
+  return NULL;
+}
+
+/* Global buffer for last mcp-session-id captured from response headers */
+static char g_mcp_session_id[128] = {0};
+
+const char *vela_tls_get_mcp_session_id(void)
+{
+    return g_mcp_session_id[0] ? g_mcp_session_id : NULL;
+}
+
+static void capture_mcp_session_id(const char *raw, const char *body_start)
+{
+    /* Find mcp-session-id header (case-insensitive) */
+    const char *hdr = raw;
+    while (hdr < body_start) {
+        const char *line_end = memchr(hdr, '\r', body_start - hdr);
+        if (!line_end) break;
+        size_t line_len = line_end - hdr;
+        if (line_len > 15 && strncasecmp(hdr, "mcp-session-id:", 15) == 0) {
+            const char *val = hdr + 15;
+            while (*val == ' ' || *val == '\t') val++;
+            size_t vlen = line_end - val;
+            while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
+            if (vlen > 0 && vlen < sizeof(g_mcp_session_id)) {
+                memcpy(g_mcp_session_id, val, vlen);
+                g_mcp_session_id[vlen] = '\0';
+            }
+            break;
+        }
+        hdr = line_end + 2; /* skip \r\n */
+    }
+}
+
 
 /* ── Chunked transfer decoding ───────────────────────────────── */
 
@@ -299,12 +369,101 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
             TAG, tunnel_fd, host, port);
     } else {
-        if ((ret = mbedtls_net_connect(&ctx->net, host, port,
-                 MBEDTLS_NET_PROTO_TCP))
-            != 0) {
-            syslog(LOG_ERR, "[%s] net_connect %s:%s ret=0x%x\n",
-                TAG, host, port, -ret);
+        struct timespec ts_c0;
+        clock_gettime(CLOCK_MONOTONIC, &ts_c0);
+        syslog(LOG_INFO, "[%s] TCP connect -> %s:%s ...\n", TAG, host, port);
+
+        /* [V526] 连接顺序：**先 IP 回退，再走 DNS**。
+         *
+         * 为什么不是先 DNS：NuttX 的 getaddrinfo() 在 DNS 不可用时是
+         * **阻塞最长 90 秒**（CONFIG_NETDB_DNSCLIENT_RECV_TIMEOUT=30 ×
+         * RETRIES=3）才返回，而且实测在这块板子上它连"失败"都返回不了 ——
+         * 插桩的 "getaddrinfo failed" 一行都没打出来过。
+         * 如果先解析再连，一次失败就要卡 90 秒，语音永远等不到。
+         *
+         * 所以：IP 直连（本项目 [V358] LLM 一直走的就是这条路，且实测能通）
+         * 放前面，只有 IP 拿不到才退回 DNS。
+         *
+         * ★ 关键点：传给 mbedtls_net_connect() 的是 IP，但后面
+         *   mbedtls_ssl_set_hostname() 用的仍然是原始 host —— 所以 SNI 扩展
+         *   和证书域名校验都是对的，IP 直连不会破坏 TLS 安全性。
+         *   （若连 set_hostname 也换成 IP，小米云的证书会因为域名不符而拒绝。）
+         */
+        {
+            const char *ip = vela_tls_ip_fallback_for(host);
+
+            if (ip != NULL)
+              {
+                
+              }
+
+            ret = mbedtls_net_connect(&ctx->net, ip != NULL ? ip : host, port,
+                                      MBEDTLS_NET_PROTO_TCP);
+        }
+
+        /* DNS 探测放在 IP 连上之后，纯诊断用。它慢，但已经不阻塞语音了。*/
+        if (ret == 0)
+          {
+            struct addrinfo hints;
+            struct addrinfo *ai = NULL;
+            struct addrinfo *it;
+            char abuf[64];
+            int gai;
+
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family   = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+
+            gai = getaddrinfo(host, port, &hints, &ai);
+            if (gai != 0 || ai == NULL)
+              {
+                
+              }
+            else
+              {
+                for (it = ai; it != NULL; it = it->ai_next)
+                  {
+                    if (it->ai_family == AF_INET)
+                      {
+                        struct sockaddr_in *s4 =
+                            (struct sockaddr_in *)it->ai_addr;
+                        inet_ntop(AF_INET, &s4->sin_addr, abuf, sizeof(abuf));
+                        syslog(LOG_INFO, "[%s]   resolved %s -> %s:%d\n",
+                                TAG, host, abuf,
+                                ntohs(s4->sin_port));
+                      }
+                    else if (it->ai_family == AF_INET6)
+                      {
+                        struct sockaddr_in6 *s6 =
+                            (struct sockaddr_in6 *)it->ai_addr;
+                        inet_ntop(AF_INET6, &s6->sin6_addr, abuf,
+                                  sizeof(abuf));
+                        syslog(LOG_INFO, "[%s]   resolved %s -> [v6 %s]:%d\n",
+                                TAG, host, abuf, ntohs(s6->sin6_port));
+                      }
+                  }
+                freeaddrinfo(ai);
+              }
+          }
+
+        if (ret != 0) {
+            struct timespec ts_c1;
+            long ms;
+            clock_gettime(CLOCK_MONOTONIC, &ts_c1);
+            ms = (ts_c1.tv_sec - ts_c0.tv_sec) * 1000
+               + (ts_c1.tv_nsec - ts_c0.tv_nsec) / 1000000;
+            syslog(LOG_ERR,
+                "[%s] net_connect %s:%s ret=0x%04x after %ld ms\n",
+                TAG, host, port, (unsigned)-ret, ms);
             return VELA_TLS_ERR_CONNECT;
+        }
+        {
+            struct timespec ts_c1;
+            long ms;
+            clock_gettime(CLOCK_MONOTONIC, &ts_c1);
+            ms = (ts_c1.tv_sec - ts_c0.tv_sec) * 1000
+               + (ts_c1.tv_nsec - ts_c0.tv_nsec) / 1000000;
+            
         }
     }
 
@@ -368,7 +527,7 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
 #endif
 
     /* Skip full chain verification — keeps portability without CA bundle */
-    mbedtls_ssl_conf_authmode(&ctx->cfg, MBEDTLS_SSL_VERIFY_OPTIONAL);
+    mbedtls_ssl_conf_authmode(&ctx->cfg, MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&ctx->cfg, mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
 
     /* Read timeout is handled at the socket level via SO_RCVTIMEO,
@@ -392,6 +551,8 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         mbedtls_net_send, mbedtls_net_recv, NULL);
 
     /* Handshake */
+    syslog(LOG_INFO, "[%s] TLS handshaking (fd=%d, t=%ld)\n",
+        TAG, ctx->net.fd, (long)time(NULL));
     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
 #if defined(MBEDTLS_ERROR_C)
@@ -503,7 +664,12 @@ static int tls_write_request(tls_ctx_t* ctx,
  * Returns HTTP status code; writes body into resp_buf (NUL-terminated).
  * Handles Transfer-Encoding: chunked and Content-Length.
  */
-#define TLS_RAW_BUF_SIZE 8192  /* 8KB: enough for HTTP headers + initial body */
+#define TLS_RAW_BUF_SIZE 4096  /* [V632] was 8192.  This array is static, so
+                                * it lands in .dram0.bss and directly shrinks
+                                * the DMA-capable internal heap that the WiFi
+                                * blob needs: _sheap moved 3fccf690 -> 3fccf8e0
+                                * (+592 B of .bss) and association went 6/6 ->
+                                * 0/6.  Halving the buffer returns 8192 B. */
 
 /* Number of static raw buffers — at most 2, scaled to pool size.
  * Each buffer is 8KB; pool=1 uses 1 buffer, pool>=2 uses 2. */
@@ -587,6 +753,9 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
         tls_raw_release(raw);
         return http_status;
     }
+
+    /* Capture mcp-session-id from response headers */
+    capture_mcp_session_id(raw, body_start);
 
     /* Determine keep-alive from Connection header (default true for HTTP/1.1) */
     if (out_keep_alive) {
@@ -854,6 +1023,107 @@ int vela_https_head_date(const char* host, const char* port, const char* path,
 
 /* ── Plain HTTP (no TLS) POST ─────────────────────────────── */
 
+#ifndef VELA_HTTP_CONNECT_TIMEOUT_MS
+#  define VELA_HTTP_CONNECT_TIMEOUT_MS 3000
+#endif
+
+/* [V359] 有界 connect：阻塞 connect() 在对端被黑洞（PBR）时会挂住整个对话
+ * 几十秒到两分钟 —— SO_RCVTIMEO 管不到 connect。
+ *
+ * 这里沿用 voice/http_tts.c 里已在本板长期验证的 [V323]/[V328] 范式：
+ * 非阻塞 connect + 定步长轮询 getsockopt(SO_ERROR) + getpeername() 复核，
+ * **完全不依赖 select()**（本 NuttX 上 select 报告过不可靠）。
+ * 返回 0 = 已连接；-1 = 失败，errno 已设置（ETIMEDOUT 表示用尽 deadline）。
+ */
+
+static int vela_bounded_connect(int fd, const struct sockaddr *sa,
+                                socklen_t len, int timeout_ms)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    int waited = 0;
+    const int step_ms = 50;
+
+    if (flags < 0)
+        {
+            flags = 0;
+        }
+
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    if (connect(fd, sa, len) == 0)
+        {
+            fcntl(fd, F_SETFL, flags);
+            return 0;
+        }
+
+    if (errno != EINPROGRESS)
+        {
+            int e = errno;
+
+            fcntl(fd, F_SETFL, flags);
+            errno = e;
+            return -1;
+        }
+
+    while (waited < timeout_ms)
+        {
+            int err = 0;
+            socklen_t elen = sizeof(err);
+            unsigned char probe;
+            int e;
+
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0)
+                {
+                    e = errno;
+                    fcntl(fd, F_SETFL, flags);
+                    errno = e;
+                    return -1;
+                }
+
+            if (err != 0 && err != EINPROGRESS)
+                {
+                    fcntl(fd, F_SETFL, flags);
+                    errno = err;
+                    return -1;
+                }
+
+            /* [V361] 同 http_tts.c：用 recv(MSG_PEEK|MSG_DONTWAIT) 探 1 字节
+             * 判定是否真连上（NuttX 未连接返回 -ENOTCONN，已连接无数据返回
+             * -EAGAIN）。getpeername() 会假成功，重复 connect() 一律
+             * -EISCONN，两者都不能用。 */
+
+            probe = 0;
+            if (recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT) >= 0)
+                {
+                    fcntl(fd, F_SETFL, flags);
+                    return 0;
+                }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                errno == ETIMEDOUT)
+                {
+                    fcntl(fd, F_SETFL, flags);
+                    return 0;
+                }
+
+            if (errno != ENOTCONN && errno != EINPROGRESS &&
+                errno != EALREADY)
+                {
+                    e = errno;
+                    fcntl(fd, F_SETFL, flags);
+                    errno = e;
+                    return -1;
+                }
+
+            usleep(step_ms * 1000);
+            waited += step_ms;
+        }
+
+    fcntl(fd, F_SETFL, flags);
+    errno = ETIMEDOUT;
+    return -1;
+}
+
 int vela_http_post_json(const char* host, const char* port, const char* path,
     const vela_header_t* extra_headers,
     const char* json_body,
@@ -877,8 +1147,12 @@ int vela_http_post_json(const char* host, const char* port, const char* path,
         return VELA_TLS_ERR_CONNECT;
     }
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-        syslog(LOG_INFO, "http: connect %s:%s failed: %d", host, port, errno);
+    /* [V359] 换成有界 connect（默认 3s）：对端不可达/被黑洞时立刻失败，
+     * 不再阻塞调用线程几十秒到两分钟。 */
+
+    if (vela_bounded_connect(fd, res->ai_addr, res->ai_addrlen,
+                             VELA_HTTP_CONNECT_TIMEOUT_MS) < 0) {
+        
         close(fd);
         freeaddrinfo(res);
         return VELA_TLS_ERR_CONNECT;

@@ -45,6 +45,13 @@ void audio_playback_stop(audio_playback_t* pb);
 /* Stop playback and release all resources. */
 void audio_playback_close(audio_playback_t* pb);
 
+/* [V846] True while the speaker is producing sound, and for 400 ms after it
+ * stops.  The capture loop must drop those chunks instead of passing them to
+ * the VAD: the microphone hears the speaker on this board, so otherwise every
+ * TTS reply is transcribed as the next utterance and the device answers
+ * itself in a loop. */
+int audio_playback_echo_active(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -80,6 +80,12 @@ static int parse_url(const char* url, parsed_url_t* out)
 
     if (slash) {
         strncpy(out->path, slash, sizeof(out->path) - 1);
+        /* Auto-append trailing slash if missing (MCP streamable HTTP requires it) */
+        size_t plen = strlen(out->path);
+        if (plen > 0 && plen < sizeof(out->path) - 1 && out->path[plen-1] != '/') {
+            out->path[plen] = '/';
+            out->path[plen+1] = '\0';
+        }
     } else {
         strncpy(out->path, "/", sizeof(out->path) - 1);
     }
@@ -115,8 +121,11 @@ static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
 static bool s_inited = false;
 static atomic_int s_req_id = 1;
 
-/* Response buffer size for MCP HTTP calls */
-#define MCP_RESP_BUF_SIZE 8192
+/* Response buffer size for MCP HTTP calls.
+ * Bumped from 8192 -> 32768: streamable-HTTP returns SSE (text/event-stream)
+ * and tool lists with large inputSchemas can exceed 8KB. A truncated body
+ * makes cJSON_Parse fail -> discover_server_tools() silently returns 0 tools. */
+#define MCP_RESP_BUF_SIZE 32768
 
 /* ── JSON-RPC request builder ───────────────────────────── */
 
@@ -164,7 +173,7 @@ static int mcp_http_post(mcp_remote_server_t* srv, const char* body,
     h++;
 
     if (srv->session_id[0]) {
-        headers[h].name = "Mcp-Session";
+        headers[h].name = "mcp-session-id";
         headers[h].value = srv->session_id;
         h++;
     }
@@ -216,9 +225,80 @@ static int mcp_http_post(mcp_remote_server_t* srv, const char* body,
 
 /* ── Parse JSON-RPC response ────────────────────────────── */
 
+/*
+ * SSE response parser: extract JSON from "data:" lines.
+ * Returns malloc'd string or NULL. Caller must free().
+ */
+static char* extract_sse_json(const char* resp, size_t resp_len)
+{
+    const char* p = resp;
+    const char* end = resp + resp_len;
+    size_t cap = 256;
+    char* out = malloc(cap);
+    if (!out) return NULL;
+    size_t out_len = 0;
+    out[0] = '\0';
+
+    while (p < end) {
+        const char* line_end = memchr(p, '\n', end - p);
+        if (!line_end) line_end = end;
+        size_t line_len = line_end - p;
+
+        if (line_len >= 5 && memcmp(p, "data:", 5) == 0) {
+            const char* data = p + 5;
+            size_t data_len = line_len - 5;
+            /* Skip optional single leading space after "data:" */
+            while (data < line_end && *data == ' ') { data++; data_len--; }
+            if (data_len >= 6 && memcmp(data, "[DONE]", 6) == 0) {
+                p = line_end + 1; continue;
+            }
+            /* Concatenate this data frame (handles JSON split across
+             * multiple SSE "data:" lines). Grow the buffer as needed. */
+            if (out_len + data_len + 1 > cap) {
+                size_t ncap = out_len + data_len + 1;
+                if (ncap < cap * 2) ncap = cap * 2;
+                char* nb = realloc(out, ncap);
+                if (!nb) { free(out); return NULL; }
+                out = nb; cap = ncap;
+            }
+            memcpy(out + out_len, data, data_len);
+            out_len += data_len;
+            out[out_len] = '\0';
+        }
+        p = line_end + 1;
+    }
+
+    /* Trim trailing whitespace */
+    while (out_len > 0 && (out[out_len-1] == '\r' ||
+           out[out_len-1] == '\n' || out[out_len-1] == ' '))
+        out[--out_len] = '\0';
+
+    if (out_len == 0) { free(out); return NULL; }
+    return out;
+}
+
 static cJSON* parse_jsonrpc_result(const char* resp_json)
 {
-    cJSON* root = cJSON_Parse(resp_json);
+    /* Handle SSE format: extract JSON from data: lines */
+    cJSON* root = NULL;
+    size_t rlen = strlen(resp_json);
+    if (rlen > 6 && (memcmp(resp_json, "event:", 6) == 0 ||
+                      strstr(resp_json, "data:") != NULL)) {
+        char* json_str = extract_sse_json(resp_json, rlen);
+        if (json_str) {
+            root = cJSON_Parse(json_str);
+            if (!root) {
+                syslog(LOG_ERR, "[%s] SSE extracted JSON failed to parse "
+                    "(len=%zu, head='%.200s')\n", TAG, strlen(json_str), json_str);
+            }
+            free(json_str);
+        } else {
+            syslog(LOG_ERR, "[%s] SSE response but extract_sse_json returned NULL "
+                "(raw_len=%zu, head='%.200s')\n", TAG, rlen, resp_json);
+        }
+    } else {
+        root = cJSON_Parse(resp_json);
+    }
     if (!root)
         return NULL;
 
@@ -320,17 +400,36 @@ static int mcp_client_handshake(mcp_remote_server_t* srv)
 
     cJSON_Delete(result);
 
-    /* MCP spec says client SHOULD send notifications/initialized, but it's
-     * a notification (no response expected). Some servers (e.g. DiDi) return
-     * HTTP 202 with empty body, which causes vela_tls to hang waiting for
-     * response data. Since this notification is optional and no server we
-     * support requires it, skip it to avoid compatibility issues. */
+    /* Capture mcp-session-id from response headers (now available via
+     * vela_tls global getter after tls_read_response parses headers) */
+    extern const char *vela_tls_get_mcp_session_id(void);
+    const char *sid = vela_tls_get_mcp_session_id();
+    if (sid && sid[0]) {
+        strncpy(srv->session_id, sid, sizeof(srv->session_id) - 1);
+        srv->session_id[sizeof(srv->session_id) - 1] = '\0';
+        syslog(LOG_INFO, "[%s] %s: captured mcp-session-id: %s\n",
+               TAG, srv->name, srv->session_id);
+    }
 
-    /* FIX #3: session_id extraction — NOTE: vela_https_post_json does not
-     * expose response headers. We set a TODO marker. For servers that require
-     * Mcp-Session (stateful transport), the TLS layer would need to be
-     * extended to return headers. Most MCP servers (including Amap) work
-     * without session tracking in stateless mode. */
+    /* Send notifications/initialized (REQUIRED by FastMCP streamable-HTTP).
+     * This is a JSON-RPC notification (no id field, no response expected).
+     * Without this, FastMCP session manager crashes and all subsequent
+     * requests return 500. */
+    {
+        char* notif_body = strdup("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}");
+        if (notif_body) {
+            char notif_resp[512];
+            int notif_status = mcp_http_post(srv, notif_body, notif_resp, sizeof(notif_resp));
+            free(notif_body);
+            if (notif_status >= 200 && notif_status < 300) {
+                syslog(LOG_INFO, "[%s] %s: notifications/initialized sent (HTTP %d)\n",
+                       TAG, srv->name, notif_status);
+            } else {
+                syslog(LOG_WARNING, "[%s] %s: notifications/initialized failed: HTTP %d\n",
+                       TAG, srv->name, notif_status);
+            }
+        }
+    }
 
     srv->initialized = true;
     syslog(LOG_INFO, "[%s] %s handshake complete\n", TAG, srv->name);
@@ -369,10 +468,26 @@ static int discover_server_tools(mcp_remote_server_t* srv,
         return -1;
     }
 
+    /* Update session_id from response headers */
+    extern const char *vela_tls_get_mcp_session_id(void);
+    const char *new_sid = vela_tls_get_mcp_session_id();
+    if (new_sid && new_sid[0]) {
+        strncpy(srv->session_id, new_sid, sizeof(srv->session_id) - 1);
+        srv->session_id[sizeof(srv->session_id) - 1] = '\0';
+    }
+
+    /* TEMP DEBUG (mcp-researcher): log raw response size + head to diagnose
+     * 0-tools issue. Remove after verification. */
+    syslog(LOG_INFO, "[%s] %s tools/list HTTP %d, raw_len=%zu, head='%.200s'\n",
+        TAG, srv->name, status, strlen(resp_buf), resp_buf);
+
     cJSON* result = parse_jsonrpc_result(resp_buf);
     free(resp_buf);
-    if (!result)
+    if (!result) {
+        syslog(LOG_ERR, "[%s] %s tools/list: parse_jsonrpc_result returned NULL\n",
+            TAG, srv->name);
         return -1;
+    }
 
     cJSON* tools = cJSON_GetObjectItem(result, "tools");
     if (!tools || !cJSON_IsArray(tools)) {

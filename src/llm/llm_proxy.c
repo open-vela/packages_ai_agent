@@ -36,6 +36,7 @@
 
 #include "cJSON.h"
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 static const char* TAG = "llm";
@@ -385,6 +386,13 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
 }
 
 /* Proxy path via CONNECT tunnel */
+/* [V795] defined at the end of this file; declared here so the call
+ * inside llm_http_via_proxy() is not an implicit non-static one. */
+static void __attribute__((noinline)) v795_report(const char *host,
+                                                unsigned long t_open_ms,
+                                                unsigned long t_read_ms,
+                                                unsigned long t_parse_ms);
+
 static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
     int* out_status)
 {
@@ -402,7 +410,11 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
     if (port <= 0)
         port = 443;
 
+    /* [V795] TCP + CONNECT + TLS handshake, every single call. */
+    struct timeval v795_t0, v795_t1, v795_t2, v795_t3;
+    gettimeofday(&v795_t0, NULL);
     proxy_conn_t* conn = proxy_conn_open(llm_host, port, 30000);
+    gettimeofday(&v795_t1, NULL);
     if (!conn)
         return ERROR;
 
@@ -435,6 +447,8 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
         llm_path, llm_host, auth_header, provider_hdr, body_len);
 
     if (proxy_conn_write(conn, header, hlen) < 0 || proxy_conn_write(conn, post_data, body_len) < 0) {
+        /* [V795] request written, response read to EOF. */
+        gettimeofday(&v795_t2, NULL);
         proxy_conn_close(conn);
         return ERROR;
     }
@@ -474,6 +488,15 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
         rb->data[rb->len] = '\0';
     }
 
+    /* [V795] header stripped; report the split. */
+    gettimeofday(&v795_t3, NULL);
+    v795_report(llm_host,
+                 (unsigned long)((v795_t1.tv_sec - v795_t0.tv_sec) * 1000 +
+                                 (v795_t1.tv_usec - v795_t0.tv_usec) / 1000),
+                 (unsigned long)((v795_t2.tv_sec - v795_t1.tv_sec) * 1000 +
+                                 (v795_t2.tv_usec - v795_t1.tv_usec) / 1000),
+                 (unsigned long)((v795_t3.tv_sec - v795_t2.tv_sec) * 1000 +
+                                 (v795_t3.tv_usec - v795_t2.tv_usec) / 1000));
     return OK;
 }
 
@@ -535,9 +558,52 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
     }
     return ERROR;
 #else
-    if (use_tls && http_proxy_is_enabled())
-        return llm_http_via_proxy(post_data, rb, out_status);
-    return llm_http_direct(post_data, rb, out_status);
+    {
+        struct timespec t0;
+        struct timespec t1;
+        char host[128];
+        char path[128];
+        char port[8];
+        long ms;
+        int  ret;
+        int  saved_errno = 0;
+
+        pthread_mutex_lock(&s_llm_lock);
+        strncpy(host, s_llm_host, sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
+        strncpy(path, s_llm_path, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+        strncpy(port, s_llm_port, sizeof(port) - 1);
+        port[sizeof(port) - 1] = '\0';
+        pthread_mutex_unlock(&s_llm_lock);
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        if (use_tls && http_proxy_is_enabled())
+          {
+            ret = llm_http_via_proxy(post_data, rb, out_status);
+          }
+        else
+          {
+            ret = llm_http_direct(post_data, rb, out_status);
+          }
+
+        saved_errno = errno;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+        if (ret != OK)
+          {
+            
+          }
+        else
+          {
+            
+          }
+
+        return ret;
+    }
 #endif
 }
 
@@ -560,6 +626,11 @@ void extract_text(cJSON* root, char* buf, size_t size)
         return;
 
     cJSON* content = cJSON_GetObjectItem(message, "content");
+    if (!content || !cJSON_IsString(content) ||
+        content->valuestring[0] == ' ')
+        /* Reasoning models (Qwen3.x) may return an empty "content" and
+         * put the whole answer into "reasoning". Fall back to it. */
+        content = cJSON_GetObjectItem(message, "reasoning");
     if (!content || !cJSON_IsString(content))
         return;
 
@@ -582,9 +653,11 @@ int llm_chat(const char* system_prompt, const char* messages_json,
     memcpy(llm_host, s_llm_host, sizeof(llm_host));
     pthread_mutex_unlock(&s_llm_lock);
 
+    /* [V359] 自建 vLLM 没设 --api-key，空 key 是合法场景：
+     * 只告警、不再直接 ERROR（否则对话永远出不来）。 */
+
     if (api_key[0] == '\0') {
-        snprintf(response_buf, buf_size, "Error: No API key configured");
-        return ERROR;
+        
     }
 
     cJSON* body = cJSON_CreateObject();
@@ -607,6 +680,24 @@ int llm_chat(const char* system_prompt, const char* messages_json,
     cJSON_AddStringToObject(sys_msg, "content", system_prompt);
     cJSON_InsertItemInArray(messages, 0, sys_msg);
 
+    /* Ask reasoning models to answer directly: some servers otherwise
+     * return an empty "content" (all tokens spent on "reasoning"). */
+    {
+        cJSON* ctk = cJSON_CreateObject();
+        cJSON_AddBoolToObject(ctk, "enable_thinking", 0);
+        cJSON_AddItemToObject(body, "chat_template_kwargs", ctk);
+    }
+
+    /* MiMo is OpenAI-compatible and ignores chat_template_kwargs; it honours
+     * the standard "thinking" field.  Without this mimo-v2.5-pro spends the
+     * token budget on reasoning_content and returns an empty "content",
+     * i.e. the device would stay silent. */
+    if (strstr(llm_host, "xiaomimimo") != NULL) {
+        cJSON* th = cJSON_CreateObject();
+        cJSON_AddStringToObject(th, "type", "disabled");
+        cJSON_AddItemToObject(body, "thinking", th);
+    }
+
     cJSON_AddItemToObject(body, "messages", messages);
 
     char* post_data = cJSON_PrintUnformatted(body);
@@ -618,6 +709,11 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 
     syslog(LOG_INFO, "[%s] Calling LLM API (model: %s, host: %s, %d bytes)\n",
         TAG, model, llm_host, (int)strlen(post_data));
+
+    /* [V359] 留痕：把请求体前 240 字节打出来，用来确认
+     * chat_template_kwargs.enable_thinking=false 真的进了 body。 */
+
+    
 
     resp_buf_t rb = { 0 };
     int status = 0;
@@ -698,8 +794,10 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     memcpy(llm_host, s_llm_host, sizeof(llm_host));
     pthread_mutex_unlock(&s_llm_lock);
 
+    /* [V359] 同上：空 api_key 允许继续 */
+
     if (api_key[0] == '\0') {
-        return ERROR;
+        
     }
 
     cJSON* body = cJSON_CreateObject();
@@ -722,6 +820,23 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     cJSON_AddStringToObject(sys_msg, "role", "system");
     cJSON_AddStringToObject(sys_msg, "content", system_prompt);
     cJSON_InsertItemInArray(msgs, 0, sys_msg);
+    /* Ask reasoning models to answer directly (see llm_chat above). */
+    {
+        cJSON* ctk = cJSON_CreateObject();
+        cJSON_AddBoolToObject(ctk, "enable_thinking", 0);
+        cJSON_AddItemToObject(body, "chat_template_kwargs", ctk);
+    }
+
+    /* MiMo is OpenAI-compatible and ignores chat_template_kwargs; it honours
+     * the standard "thinking" field.  Without this mimo-v2.5-pro spends the
+     * token budget on reasoning_content and returns an empty "content",
+     * i.e. the device would stay silent. */
+    if (strstr(llm_host, "xiaomimimo") != NULL) {
+        cJSON* th = cJSON_CreateObject();
+        cJSON_AddStringToObject(th, "type", "disabled");
+        cJSON_AddItemToObject(body, "thinking", th);
+    }
+
     cJSON_AddItemToObject(body, "messages", msgs);
 
     /* Convert tools to OpenAI format */
@@ -906,4 +1021,20 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
         resp->tool_use ? "tool_calls" : "end_turn");
 
     return OK;
+}
+
+
+
+/* [V795] Millisecond accounting for one proxied LLM call.  Purely a
+ * measurement: it reads a struct the caller already filled in and prints.
+ */
+static void __attribute__((noinline)) v795_report(const char *host,
+                                                unsigned long t_open_ms,
+                                                unsigned long t_read_ms,
+                                                unsigned long t_parse_ms)
+{
+  syslog(LOG_INFO,
+         "[V795] llm %s open=%lu read=%lu parse=%lu total=%lu ms\n",
+         host, t_open_ms, t_read_ms, t_parse_ms,
+         t_open_ms + t_read_ms + t_parse_ms);
 }

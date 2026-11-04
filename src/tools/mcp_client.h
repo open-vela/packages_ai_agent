@@ -34,7 +34,7 @@ extern "C" {
 #ifdef CONFIG_AI_AGENT_MCP_MAX_TOOLS
 #define MCP_CLIENT_MAX_TOOLS CONFIG_AI_AGENT_MCP_MAX_TOOLS
 #else
-#define MCP_CLIENT_MAX_TOOLS 16
+#define MCP_CLIENT_MAX_TOOLS 4  /* [V860e] 16->4: reclaim 5.3 KB DRAM bss */
 #endif
 
 /**

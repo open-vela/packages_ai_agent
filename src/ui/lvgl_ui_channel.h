@@ -57,6 +57,16 @@ void lvgl_ui_channel_show(void);
  */
 int lvgl_ui_channel_send(const char* text);
 
+/**
+ * BOOT 物理按键的语音状态文字提示（V315）。
+ * 可在任意线程调用：内部通过 lv_async_call 转到 LVGL 线程更新。
+ * 按下 BOOT 显示"开始聆听..."（红色），松开显示"正在思考..."（橙色），
+ * 收到回复或会话结束时传 0 清除。
+ *
+ * @param state  0 = 隐藏, 1 = 开始聆听, 2 = 正在思考
+ */
+void lvgl_ui_channel_set_voice_status(int state);
+
 #ifdef __cplusplus
 }
 #endif

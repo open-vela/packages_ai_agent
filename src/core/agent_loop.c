@@ -1069,6 +1069,12 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+        /* [V791] This value was already computed and used only for the
+         * timeout check; on the success path it was never reported, so
+         * "the reply is slow" had no attributable cause.  Print it. */
+        syslog(LOG_INFO,
+               "[%s] [V791] LLM iteration %d latency=%u ms (err=%d)\n",
+               TAG, iteration, (unsigned)latency_ms, err);
 
         /* Router failover: on LLM call failure, try next backend */
         if (err != OK && router_idx >= 0) {
@@ -1343,6 +1349,12 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         agent_trace_end(&trace, AGENT_TRACE_FAIL);
     }
 
+/* [V791] turn budget: everything before the reply is handed to
+ * TTS.  Compare against the ASR and LLM stamps to see whether
+ * the time is accounted for or lost between them. */
+syslog(LOG_INFO,
+       "[%s] [V791] turn ready for TTS after %d tool iteration(s)\n",
+       TAG, iteration);
 send_reply:
     /* Cache store: save simple query responses for future reuse */
     if (final_text && msg->content

@@ -18,6 +18,7 @@
 # packages/agent/Makefile
 ############################################################################
 
+CSRCS += src/sensor_chat.c
 include $(APPDIR)/Make.defs
 
 MODULE = $(CONFIG_EXAMPLES_AI_AGENT_VELA)
@@ -75,6 +76,7 @@ CSRCS += src/tools/tool_health.c
 CSRCS += src/tools/tool_control.c
 CSRCS += src/tools/tool_media.c
 CSRCS += src/tools/tool_proxyquickapp.c
+CSRCS += src/tools/tool_mijia.c
 ifeq ($(CONFIG_AI_AGENT_MCP),y)
 CSRCS += src/tools/mcp_bridge.c
 CSRCS += src/tools/mcp_server.c
@@ -116,13 +118,73 @@ CSRCS += src/channels/ws_server.c
 
 # voice/ - 语音管线
 CSRCS += src/voice/voice_channel.c
+# K230 face-tracking gimbal (UDP 3333).  MUST stay above
+# "include $(APPDIR)/Application.mk" or the rules are already
+# generated and the file never compiles.
+CSRCS += src/companion_face.c
+CSRCS += src/servo.c
+CSRCS += src/companion_mood.c
 CSRCS += src/voice/voice_tts.c
 CSRCS += src/voice/voice_asr.c
 CSRCS += src/voice/volc_tts.c
+# [vox] ai_vox protocol: message parsing and the conversation state machine.
+# Deliberately free of transport, cJSON and platform headers so it can be
+# unit-tested on a host -- vox/tests/run_tests.sh.  See the note above about
+# placement relative to Application.mk.
+CSRCS += src/voice/vox/vox_ws_protocol.c
+# Framing and the opening handshake: pure string/byte functions so both
+# can be unit-tested on a host (vox_ws_frame 105 tests, vox_ws_handshake
+# 75 including the RFC 6455 accept vector).
+CSRCS += src/voice/vox/vox_ws_frame.c
+CSRCS += src/voice/vox/vox_ws_handshake.c
+# Transport needs sockets, threads and mbedTLS; it is the only vox file
+# that touches platform code.
+CSRCS += src/voice/vox/vox_ws_transport.c
+# Event-to-action mapping: pure functions, host-tested (43 tests).
+CSRCS += src/voice/vox/vox_ws_action.c
+# Ogg framing -> Opus packets.  Pure byte parsing, no codec, host-tested
+# (31 tests).  Layout from 78/xiaozhi-esp32 audio/demuxer/ogg_demuxer.cc.
+CSRCS += src/voice/vox/vox_ogg_opus.c
+# Opus decode wrapper with an injected backend (host-tested, 30 tests).
+# 48 kHz -> 16 kHz for the decoded audio.  Phase is carried across
+# packets so consecutive 60 ms blocks join without a step (25 tests).
+CSRCS += src/voice/vox/vox_resample.c
+CSRCS += src/voice/vox/vox_opus_dec.c
+# libopus itself is cross-compiled out of tree into /opt/opus-xtensa
+# (see backend/README-opus.md) and linked below; this is the only file
+# that includes <opus.h>.
+CSRCS += src/voice/vox/vox_opus_libopus.c
+
+# Cross-compiled libopus for this target.
+CFLAGS += ${INCDIR_PREFIX}/opt/opus-xtensa/include
+CFLAGS += ${INCDIR_PREFIX}/opt/opus-xtensa/include/opus
+LDLIBS += /opt/opus-xtensa/lib/libopus.a
+LDLIBS += -lm
+# Orchestration: owns the transport and calls the existing voice entry
+# points.  Not enabled by default; the REST path stays until Opus is
+# decoded.
+CSRCS += src/voice/vox/vox_ws_channel.c
 CSRCS += src/voice/volc_tts_ws.c
+# Self-hosted HTTP ASR/TTS are always compiled in (no paid cloud
+# credentials required).  The URL falls back to the on-device default in
+# http_asr.c / http_tts.c if CONFIG_AI_AGENT_*_HTTP_URL is not set, so
+# voice keeps working even after a clean_context reconfigure that drops
+# the Kconfig flags.
+CSRCS += src/voice/http_tts.c
+CSRCS += src/voice/http_asr.c
 CSRCS += src/voice/volc_asr.c
+# Xiaomi MiMo cloud speech backends (mimo-v2.5-tts / mimo-v2.5-asr).
+# NOTE: these MUST stay ABOVE `include $(APPDIR)/Application.mk` below,
+# otherwise the rules are already generated and the files never compile.
+CSRCS += src/voice/mimo_tts.c
+CSRCS += src/voice/mimo_asr.c
 CSRCS += src/voice/audio_capture.c
 CSRCS += src/voice/audio_playback.c
+ifeq ($(CONFIG_AI_AGENT_AUDIO_NATIVE),y)
+CSRCS += src/voice/audio_native.c
+CSRCS += src/voice/audio_playback_native.c
+CSRCS += src/voice/audio_capture_native.c
+endif
 
 # infra/ - 基础设施
 CSRCS += src/infra/config_store.c

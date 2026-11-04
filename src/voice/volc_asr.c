@@ -1074,7 +1074,7 @@ void volc_asr_stream_abort(volc_asr_stream_t* s)
 
 /* ── Ops-based wrapper (simplified signature for framework) ──── */
 
-static int volc_asr_recognize_ops(const unsigned char* pcm_data,
+int volc_asr_recognize_ops(const unsigned char* pcm_data,
     size_t pcm_len,
     char* text_out,
     size_t text_cap)

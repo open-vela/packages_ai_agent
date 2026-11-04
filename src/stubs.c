@@ -33,35 +33,13 @@ __attribute__((weak)) pid_t gettid(void) { return 0; }
 
 __attribute__((weak)) void arm_netinitialize(void) { }
 
-/* Voice channel stubs for sim build */
-#ifndef CONFIG_MEDIA
-__attribute__((weak)) int voice_channel_init(void) { return 0; }
-__attribute__((weak)) int voice_channel_start(void) { return -1; }
-__attribute__((weak)) int voice_channel_stop(void) { return 0; }
-__attribute__((weak)) int voice_channel_speak(const char* text)
-{
-    (void)text;
-    return -1;
-}
-__attribute__((weak)) int voice_channel_test_tts(const char* text)
-{
-    (void)text;
-    return -1;
-}
-__attribute__((weak)) int voice_channel_test_asr(void) { return -1; }
-__attribute__((weak)) const char* voice_tts_get_backend(void) { return "none"; }
-__attribute__((weak)) int voice_tts_set_backend(const char* name)
-{
-    (void)name;
-    return -1;
-}
-__attribute__((weak)) const char* voice_asr_get_backend(void) { return "none"; }
-__attribute__((weak)) int voice_asr_set_backend(const char* name)
-{
-    (void)name;
-    return -1;
-}
-#endif
+/* NOTE (task #32): the voice_channel/voice_tts/voice_asr weak
+ * stubs that used to live here were removed.  The real strong
+ * definitions ship inside the same package (src/voice/), and
+ * these weak duplicates made GNU ld bind references to stubs.o
+ * (already extracted from the archive) instead of extracting
+ * voice_channel.o -- so the whole voice -> audio -> native
+ * chain silently vanished from the final ELF. */
 
 /* MQTT stubs for sim build */
 #ifndef CONFIG_NETUTILS_MQTTC

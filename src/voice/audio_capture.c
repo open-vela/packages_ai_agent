@@ -14,16 +14,29 @@
  * limitations under the License.
  */
 
-/* audio_capture.c - Audio capture via direct ALSA or media_recorder fallback.
+/* audio_capture.c - Audio capture via native NuttX audio device, direct
+ * ALSA, or media_recorder fallback.
  *
- * The direct ALSA backend is gated behind CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
- * because it pulls in chip-specific ALSA headers (aw-alsa-lib) that are only
- * available on boards shipping that SDK. When the option is disabled (the
- * default), the agent uses the portable media_recorder backend that works on
- * any board with the Vela media framework. */
+ * Backend selection (first that opens wins; later ones are fallbacks):
+ *
+ *  1. native (CONFIG_AI_AGENT_AUDIO_NATIVE): standard NuttX audio
+ *     character device via AUDIOIOC_* ioctls (see audio_capture_native.c).
+ *     Works on any board whose bring-up registers raw audio devices
+ *     (e.g. esp32s3-eye + ES8311 -> /dev/audio/pcm0c).
+ *  2. direct ALSA: gated behind CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT because
+ *     it pulls in chip-specific ALSA headers (aw-alsa-lib) that are only
+ *     available on boards shipping the Allwinner R528 SDK.
+ *  3. media_recorder: the portable Vela media framework backend; a weak
+ *     stub that always fails when CONFIG_MEDIA is not enabled
+ *     (packages/ai_agent/src/stubs.c).
+ */
 
 #include "voice/audio_capture.h"
 #include "agent_config.h"
+
+#ifdef CONFIG_AI_AGENT_AUDIO_NATIVE
+#include "audio_native.h"
+#endif
 
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
 #include <aw-alsa-lib/pcm.h>
@@ -36,6 +49,20 @@
 #include <string.h>
 #include <syslog.h>
 #include <unistd.h>
+
+/* [V1024] Probe gate -- see fortify_stubs.c. */
+#ifdef __cplusplus
+extern "C" int g_v1024_quiet;
+#else
+extern int g_v1024_quiet;
+#endif
+
+#ifndef V1024_QUIET
+#define V1024_QUIET 1
+#endif
+#define V1024P(...) do { if (V1024_QUIET == 0) printf(__VA_ARGS__); } while (0)
+#define V1024S(lvl, ...) do { if (V1024_QUIET == 0) syslog(lvl, __VA_ARGS__); } while (0)
+
 
 static const char* TAG = "audio_cap";
 
@@ -50,10 +77,16 @@ static const char* TAG = "audio_cap";
 #define AGENT_AUDIO_CAPTURE_GAIN 6
 #endif
 
+/* [V845] Highest absolute sample value the capture path is allowed to emit.
+ * 31500 leaves ~4% headroom under the int16 rail so the clamp below never
+ * actually fires. */
+#define V845_CEILING 31500
+
 enum audio_capture_backend {
     AUDIO_CAPTURE_BACKEND_NONE = 0,
     AUDIO_CAPTURE_BACKEND_ALSA,
     AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER,
+    AUDIO_CAPTURE_BACKEND_NATIVE,
 };
 
 struct audio_capture {
@@ -64,6 +97,7 @@ struct audio_capture {
 #endif
         void* recorder;
     } handle;
+    void* native;   /* native_cap_t (native backend) */
     unsigned int bits_per_sample;
     unsigned int requested_channels;
     unsigned int hw_channels;
@@ -76,20 +110,90 @@ struct audio_capture {
 
 static audio_capture_t* s_active_capture;
 
+/* [V79] Cross-module diagnostic.  diag_report() lives in voice/http_tts.c and
+ * only issues "GET /diag?m=<tag>", which the bridge logs and answers with two
+ * bytes.  It is declared here rather than included so this file keeps its own
+ * dependencies.
+ *
+ * The listen loop reopens and restarts capture on every session, so the probe
+ * is gated: the first six calls always report, then every 25th.  Unconditional
+ * probes saturated the single reachable port (2301) and starved the TTS path
+ * they were meant to observe. */
+
+extern int diag_report(const char *msg);
+
+static void ac_probe(const char *tag)
+{
+    static int s_n;
+
+    s_n++;
+    if (s_n <= 6 || (s_n % 25) == 0) {
+        diag_report(tag);
+    }
+}
+
 static void apply_capture_gain(void* buf, size_t len)
 {
 #if AGENT_AUDIO_CAPTURE_GAIN > 1
     int16_t* samples = (int16_t*)buf;
     int count = (int)len / (int)sizeof(int16_t);
+    int i;
+    int32_t peak = 0;
+    int32_t g = AGENT_AUDIO_CAPTURE_GAIN;
+    int32_t safe;
 
-    for (int i = 0; i < count; i++) {
-        int32_t v = (int32_t)samples[i] * AGENT_AUDIO_CAPTURE_GAIN;
+    /* [V845] Measure the chunk before amplifying it.
+     *
+     * The old version multiplied by AGENT_AUDIO_CAPTURE_GAIN (6) unconditionally
+     * and clamped the overflow, which turned the top of every syllable into a
+     * square wave -- see peak=32768 min=-32768 on chunk#1/#50/#100/#150 of any
+     * capture log from this board.  A recogniser fed that answers nothing. */
+
+    for (i = 0; i < count; i++) {
+        int32_t a = (int32_t)samples[i];
+
+        if (a < 0) {
+            a = -a;
+        }
+
+        if (a > peak) {
+            peak = a;
+        }
+    }
+
+    /* Largest multiplier that still fits this chunk under the ceiling. */
+    safe = (peak > 0) ? (V845_CEILING / peak) : AGENT_AUDIO_CAPTURE_GAIN;
+    if (safe < 1) {
+        safe = 1;
+    }
+
+    if (g > safe) {
+        g = safe;
+    }
+
+    for (i = 0; i < count; i++) {
+        int32_t v = (int32_t)samples[i] * g;
+
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {
             v = -32768;
         }
+
         samples[i] = (int16_t)v;
+    }
+
+    /* One line per 8 chunks (512 ms): enough to tune the gain from a log,
+     * not enough to bury everything else in it. */
+    {
+        static int s_v845_n;
+
+        if ((s_v845_n++ % 8) == 0) {
+            V1024S(LOG_ERR, "[V845]] capture gain g=%d raw_peak=%d out_peak=%d %s\n",
+                   (int)g, (int)peak, (int)(peak * g),
+                   (g < AGENT_AUDIO_CAPTURE_GAIN) ? "(backed off)"
+                                                  : "(full gain)");
+        }
     }
 #else
     (void)buf;
@@ -387,6 +491,30 @@ audio_capture_t* audio_capture_open(const char* dev_path,
     }
 
     int ret = -ENOTSUP;
+#ifdef CONFIG_AI_AGENT_AUDIO_NATIVE
+    native_cap_t* ncap = NULL;
+
+    if (native_capture_open(&ncap, dev_path, sample_rate,
+        channels, bits_per_sample) == 0) {
+        cap->native = ncap;
+        cap->backend = AUDIO_CAPTURE_BACKEND_NATIVE;
+        cap->bits_per_sample = bits_per_sample;
+        cap->requested_channels = channels;
+        cap->hw_channels = channels;
+        cap->out_frame_bytes = (bits_per_sample / 8) * channels;
+        cap->hw_frame_bytes = cap->out_frame_bytes;
+        s_active_capture = cap;
+        syslog(LOG_INFO, "[%s] opened native capture (%s, %uHz %uch %ubit)\n",
+            TAG, dev_path ? dev_path : "", sample_rate, channels,
+            bits_per_sample);
+        ac_probe("AC_BK_NATIVE");
+        return cap;
+    }
+
+    syslog(LOG_WARNING,
+        "[%s] native capture unavailable (%s), falling back to media recorder\n",
+        TAG, dev_path ? dev_path : "");
+#endif
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
     ret = open_alsa_capture(cap, dev_path, sample_rate, channels,
         bits_per_sample);
@@ -403,9 +531,23 @@ audio_capture_t* audio_capture_open(const char* dev_path,
         ret = open_media_recorder_capture(cap, sample_rate, channels,
             bits_per_sample);
         if (ret < 0) {
+            ac_probe("AC_BK_NONE");
             free(cap);
             return NULL;
         }
+    }
+
+    /* [V79] Report the backend that actually won.  audio_capture_start() never
+     * returns on this board and open() has three silent fallbacks, so without
+     * this the arm we are debugging is a guess. */
+    if (cap->backend == AUDIO_CAPTURE_BACKEND_ALSA) {
+        ac_probe("AC_BK_ALSA");
+    } else if (cap->backend == AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER) {
+        ac_probe("AC_BK_MR");
+    } else if (cap->backend == AUDIO_CAPTURE_BACKEND_NATIVE) {
+        ac_probe("AC_BK_NATIVE");
+    } else {
+        ac_probe("AC_BK_NONE");
     }
 
     s_active_capture = cap;
@@ -418,7 +560,14 @@ int audio_capture_start(audio_capture_t* cap)
         return -EINVAL;
     }
 
+    /* [V79] B7_VC_PRESTARTCAP lands and then nothing at all: the hang is
+     * inside one of the three arms below. */
+    ac_probe("AC_ST_BEG");
+
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NATIVE:
+        return native_capture_start(cap->native);
+
     case AUDIO_CAPTURE_BACKEND_ALSA:
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         if (!cap->handle.pcm) {
@@ -429,12 +578,15 @@ int audio_capture_start(audio_capture_t* cap)
             return 0;
         }
 
+        ac_probe("AC_ST_ALSA_PRE");
         if (snd_vela_pcm_prepare(cap->handle.pcm) < 0) {
             syslog(LOG_ERR, "[%s] ALSA prepare failed\n", TAG);
+            ac_probe("AC_ST_ALSA_FAIL");
             return -EIO;
         }
 
         cap->started = 1;
+        ac_probe("AC_ST_ALSA_OK");
         syslog(LOG_INFO, "[%s] ALSA capture prepared\n", TAG);
         return 0;
 #else
@@ -448,12 +600,15 @@ int audio_capture_start(audio_capture_t* cap)
             return -EINVAL;
         }
 
+        ac_probe("AC_ST_MR_PRE");
         ret = media_recorder_start(cap->handle.recorder);
         if (ret < 0) {
             syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
+            ac_probe("AC_ST_MR_FAIL");
             return ret;
         }
 
+        ac_probe("AC_ST_MR_OK");
         syslog(LOG_INFO, "[%s] media recorder capture started\n", TAG);
         return 0;
     }
@@ -470,6 +625,14 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
     }
 
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NATIVE: {
+        int n = native_capture_read(cap->native, buf, len);
+        if (n > 0 && cap->bits_per_sample == 16) {
+            apply_capture_gain(buf, (size_t)n);
+        }
+        return n;
+    }
+
     case AUDIO_CAPTURE_BACKEND_ALSA: {
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         snd_pcm_uframes_t frames;
@@ -548,6 +711,9 @@ int audio_capture_abort(audio_capture_t* cap)
     }
 
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NATIVE:
+        return native_capture_abort(cap->native);
+
     case AUDIO_CAPTURE_BACKEND_ALSA:
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         if (cap->handle.pcm && cap->started) {
@@ -581,6 +747,11 @@ void audio_capture_close(audio_capture_t* cap)
     }
 
     switch (cap->backend) {
+    case AUDIO_CAPTURE_BACKEND_NATIVE:
+        native_capture_close(cap->native);
+        cap->native = NULL;
+        break;
+
     case AUDIO_CAPTURE_BACKEND_ALSA:
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
         if (cap->handle.pcm) {

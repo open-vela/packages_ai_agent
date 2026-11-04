@@ -91,6 +91,16 @@ void cmd_voice_test_asr(int argc, char** argv)
     voice_channel_test_asr(argv[1]);
 }
 
+void cmd_voice_speak(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: voice_speak <text>\n");
+        return;
+    }
+    int ret = voice_channel_speak(argv[1]);
+    printf("voice_channel_speak('%s') -> %d\n", argv[1], ret);
+}
+
 void cmd_set_voice_tts(int argc, char** argv)
 {
     if (argc < 2) {

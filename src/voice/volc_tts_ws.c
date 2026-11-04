@@ -500,7 +500,8 @@ static int send_tts_request(tts_tls_ctx_t* ctx, const char* text)
     cJSON_AddStringToObject(audio, "voice_type", s_speaker);
     cJSON_AddStringToObject(audio, "encoding", "pcm");
     cJSON_AddNumberToObject(audio, "sample_rate", AGENT_TTS_WS_SAMPLE_RATE);
-    cJSON_AddNumberToObject(audio, "speed_ratio", 1.0);
+    /* [CALM-VOICE 2026-10-27] 1.0 -> 0.9：语速放慢，语气更平静。 */
+    cJSON_AddNumberToObject(audio, "speed_ratio", 0.9);
 
     /* request */
     cJSON* req = cJSON_AddObjectToObject(root, "request");
