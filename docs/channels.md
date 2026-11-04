@@ -107,6 +107,35 @@ vela> voice_test_asr /data/agent/tts_out.pcm
 
 实现 `voice_tts_ops_t` 或 `voice_asr_ops_t` 接口（`init/synthesize/deinit` 或 `init/recognize/deinit`），在 `voice_channel_init()` 中调用 `register()`，即可通过 CLI 切换。
 
+### 内置后端与回退链
+
+| 后端 | 凭证 | 音频格式 | 说明 |
+|---|---|---|---|
+| `volcengine`（默认） | `volc_appkey`+`volc_token`（WS）/ `volc_api_key`（HTTP） | 24kHz（WS）/ 16kHz（HTTP） | 豆包语音合成 |
+| `edge` | **不需要** | 24kHz MP3 → 设备端 minimp3 解码成 24kHz 裸 PCM | Microsoft Edge 在线朗读（非官方接口） |
+
+`voice_tts_speak_stream()` 的回退顺序：**当前激活后端 → 火山 WS → 火山 HTTP → Edge**，
+只有全部失败才返回错误，每一步失败都有 syslog 说明。播放设备按“激活后端”的采样率打开
+（`voice_tts_get_sample_rate()`），回退后端采样率不同时由 `voice_tts.c` 内的线性插值
+重采样补齐（16kHz ↔ 24kHz）。Edge 与火山 WS 同为 24kHz，接管时无需重采样。
+
+Edge 端点的格式阶梯（真机确认它只肯输出 MP3，PCM 档会被 close 1007 拒绝）：
+`raw-24khz-16bit-mono-pcm` → `riff-24khz-16bit-mono-pcm` → `audio-24khz-48kbitrate-mono-mp3`，
+最后一档由 `src/voice/edge_mp3.c`（minimp3，CC0-1.0，见 `src/voice/thirdparty/`）流式解码成
+PCM 后走同一条播放链路，命中档会缓存，后续语句不再重试前两档。
+
+```bash
+# 强制使用 Edge（免凭证）后端
+vela> set_voice_tts edge
+vela> set_voice_tts            # 查看当前后端
+# 可选：指定音色（默认 zh-CN-XiaoxiaoNeural）
+vela> set_edge_voice zh-CN-YunxiNeural
+```
+
+Edge 走公网 WSS（`speech.platform.bing.com:443`），需要时钟大致正确（`time_sync`
+已经校时）；若该域名被网络阻断（直连 TLS 被 RST / 403），先用 `set_proxy <host> <port>`
+配置代理，Edge 与火山路径共用同一个代理设置。
+
 ## 多节点架构
 
 AI Agent 支持两种多节点协作模式：

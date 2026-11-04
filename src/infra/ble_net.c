@@ -24,6 +24,7 @@
 #include "ble_net.h"
 
 #include <errno.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <net/if.h>
 #include <pthread.h>
@@ -36,6 +37,7 @@
 
 #include <bluetooth.h>
 #include <bt_addr.h>
+#include <bt_adapter.h>
 #include <bt_spp.h>
 #include <bt_uuid.h>
 #include <euv_pipe.h>
@@ -46,11 +48,26 @@
 /* TUN device name */
 #define TUN_DEV_NAME "bt-net"
 
+/* Static IP for the TUN device (device side). The companion phone
+ * app must use the same subnet on its end of the SPP link. */
+#define TUN_DEV_IPADDR "192.168.55.2"
+#define TUN_DEV_NETMASK "255.255.255.0"
+
 /* SPP server channel number (1-28) */
 #define SPP_SCN 3
 
+/* Local Bluetooth name shown to phones when pairing */
+#define BLE_NET_BT_NAME "Agent-Watch"
+
 /* Read buffer size */
 #define READ_BUF_SIZE 2048
+
+/* SPP frame protocol: [len_hi][len_lo][payload...] big-endian 16-bit length.
+ * SPP is a stream socket, so framing lets the receiver reassemble full IP
+ * packets before writing them to the TUN device (half/multi-packet reads
+ * from the stream would corrupt the TUN packet boundary). */
+#define SPP_FRAME_HDR_SIZE 2
+#define RX_FRAME_BUF_SIZE 4096
 
 /* -- State --------------------------------------------------- */
 
@@ -70,6 +87,10 @@ static struct {
     /* SPP Proxy Pipe */
     euv_pipe_t* pipe_handle;
     bool pipe_connected;
+
+    /* SPP RX frame reassembly buffer (libuv callback thread only) */
+    uint8_t rx_frame_buf[RX_FRAME_BUF_SIZE];
+    size_t rx_frame_len;
 
     /* State */
     bool initialized;
@@ -157,8 +178,15 @@ static int tun_get_mtu(void)
 static void tun_set_up(bool up)
 {
     if (up) {
+        /* Configure static IP (idempotent) before bringing iface up */
+        struct in_addr addr;
+        addr.s_addr = inet_addr(TUN_DEV_IPADDR);
+        netlib_set_ipv4addr(TUN_DEV_NAME, &addr);
+        addr.s_addr = inet_addr(TUN_DEV_NETMASK);
+        netlib_set_ipv4netmask(TUN_DEV_NAME, &addr);
         netlib_ifup(TUN_DEV_NAME);
-        syslog(LOG_INFO, "[%s] TUN %s up\n", TAG, TUN_DEV_NAME);
+        syslog(LOG_INFO, "[%s] TUN %s up (%s)\n", TAG, TUN_DEV_NAME,
+            TUN_DEV_IPADDR);
     } else {
         netlib_ifdown(TUN_DEV_NAME);
         syslog(LOG_INFO, "[%s] TUN %s down\n", TAG, TUN_DEV_NAME);
@@ -260,6 +288,51 @@ static void tun_poll_stop(void)
 
 /* -- SPP Proxy Pipe ------------------------------------------ */
 
+static void pipe_disconnect(void);
+
+/* Reassemble framed SPP stream data into full IP packets and write them
+ * to the TUN device. Called from the libuv callback thread only. */
+static void ble_net_handle_rx_stream(const uint8_t* data, size_t size)
+{
+    if (!g_ble_net.initialized) {
+        return;
+    }
+
+    /* Append to reassembly buffer */
+    if (g_ble_net.rx_frame_len + size > sizeof(g_ble_net.rx_frame_buf)) {
+        syslog(LOG_WARNING, "[%s] RX frame buffer overflow, resyncing\n", TAG);
+        g_ble_net.rx_frame_len = 0;
+        return;
+    }
+    memcpy(g_ble_net.rx_frame_buf + g_ble_net.rx_frame_len, data, size);
+    g_ble_net.rx_frame_len += size;
+
+    /* Extract complete frames */
+    size_t off = 0;
+    while (g_ble_net.rx_frame_len - off >= SPP_FRAME_HDR_SIZE) {
+        uint16_t plen = ((uint16_t)g_ble_net.rx_frame_buf[off] << 8)
+            | g_ble_net.rx_frame_buf[off + 1];
+        if (plen == 0 || plen > g_ble_net.tun_mtu) {
+            syslog(LOG_ERR, "[%s] Invalid frame length %u, resyncing\n",
+                TAG, plen);
+            g_ble_net.rx_frame_len = 0;
+            return;
+        }
+        if (g_ble_net.rx_frame_len - off < SPP_FRAME_HDR_SIZE + plen) {
+            break; /* wait for more data */
+        }
+        ble_net_receive(g_ble_net.rx_frame_buf + off + SPP_FRAME_HDR_SIZE,
+            plen);
+        off += SPP_FRAME_HDR_SIZE + plen;
+    }
+
+    if (off > 0) {
+        memmove(g_ble_net.rx_frame_buf, g_ble_net.rx_frame_buf + off,
+            g_ble_net.rx_frame_len - off);
+        g_ble_net.rx_frame_len -= off;
+    }
+}
+
 static void pipe_write_cb(euv_pipe_t* handle, uint8_t* buf, int status)
 {
     (void)handle;
@@ -276,8 +349,8 @@ static void pipe_read_cb(euv_pipe_t* handle, const uint8_t* buf, ssize_t size)
 {
     (void)handle;
     if (size > 0) {
-        /* Received data from phone, write to TUN */
-        ble_net_receive(buf, (uint16_t)size);
+        /* Received framed data from phone: reassemble full IP packets */
+        ble_net_handle_rx_stream(buf, (size_t)size);
     } else if (size == 0) {
         /* EOF - peer closed the pipe */
         syslog(LOG_WARNING, "[%s] Pipe read EOF, disconnecting\n", TAG);
@@ -484,6 +557,8 @@ static int spp_server_start(void)
 {
     bt_uuid_t uuid;
     bt_status_t status;
+    bt_adapter_state_t state;
+    int wait_ms = 0;
 
     /* Get bluetooth instance */
     g_ble_net.bt_ins = bluetooth_get_instance();
@@ -491,6 +566,49 @@ static int spp_server_start(void)
         syslog(LOG_ERR, "[%s] Failed to get BT instance\n", TAG);
         return -ENODEV;
     }
+
+    /* SPP is a BREDR profile: the service is only "started" (registered
+     * with the stack) after the BREDR stack is up, i.e. adapter state ON.
+     * Enable the adapter and wait for it. */
+    state = bt_adapter_get_state(g_ble_net.bt_ins);
+    if (state != BT_ADAPTER_STATE_ON) {
+        syslog(LOG_INFO, "[%s] Enabling BT adapter (state=%d)\n", TAG, state);
+        status = bt_adapter_enable(g_ble_net.bt_ins);
+        if (status != BT_STATUS_SUCCESS) {
+            syslog(LOG_ERR, "[%s] bt_adapter_enable failed: %d\n", TAG, status);
+            return -EIO;
+        }
+        while (wait_ms < 30000) {
+            usleep(500 * 1000);
+            wait_ms += 500;
+            state = bt_adapter_get_state(g_ble_net.bt_ins);
+            if (state == BT_ADAPTER_STATE_ON) {
+                break;
+            }
+        }
+        if (state != BT_ADAPTER_STATE_ON) {
+            syslog(LOG_ERR, "[%s] BT adapter enable timeout (state=%d)\n",
+                TAG, state);
+            return -ETIMEDOUT;
+        }
+        syslog(LOG_INFO, "[%s] BT adapter ON\n", TAG);
+    }
+
+    /* Make the device discoverable + connectable so the phone can see it
+     * in the system Bluetooth settings and pair over classic BT (SPP).
+     * Default scan mode is NONE (invisible). */
+    status = bt_adapter_set_scan_mode(g_ble_net.bt_ins,
+        BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE, true);
+    if (status != BT_STATUS_SUCCESS) {
+        syslog(LOG_WARNING, "[%s] set_scan_mode failed: %d\n", TAG, status);
+    }
+
+    /* Set a recognizable local name (default is CONFIG_BT_DEVICE_NAME) */
+    status = bt_adapter_set_name(g_ble_net.bt_ins, BLE_NET_BT_NAME);
+    if (status != BT_STATUS_SUCCESS) {
+        syslog(LOG_WARNING, "[%s] set_name failed: %d\n", TAG, status);
+    }
+    syslog(LOG_INFO, "[%s] BT discoverable as %s\n", TAG, BLE_NET_BT_NAME);
 
     /* Register SPP app */
     g_ble_net.spp_handle = bt_spp_register_app(g_ble_net.bt_ins, &g_spp_cbs);
@@ -616,6 +734,9 @@ int ble_net_deinit(void)
         g_ble_net.tun_buf = NULL;
     }
 
+    /* Reset SPP RX reassembly state */
+    g_ble_net.rx_frame_len = 0;
+
     tun_close();
 
     syslog(LOG_INFO, "[%s] BLE network channel stopped\n", TAG);
@@ -635,7 +756,7 @@ int ble_net_send(const uint8_t* data, uint16_t len)
 {
     euv_pipe_t* pipe;
 
-    if (!data) {
+    if (!data || len == 0) {
         return -EINVAL;
     }
 
@@ -647,19 +768,22 @@ int ble_net_send(const uint8_t* data, uint16_t len)
     pipe = g_ble_net.pipe_handle;
     pthread_mutex_unlock(&g_ble_net.lock);
 
-    /* Allocate buffer for async write (freed in pipe_write_cb) */
-    uint8_t* buf = malloc(len);
+    /* Frame the payload: [len_hi][len_lo][payload] (freed in pipe_write_cb) */
+    uint8_t* buf = malloc(SPP_FRAME_HDR_SIZE + len);
     if (!buf) {
         return -ENOMEM;
     }
-    memcpy(buf, data, len);
+    buf[0] = (uint8_t)(len >> 8);
+    buf[1] = (uint8_t)(len & 0xff);
+    memcpy(buf + SPP_FRAME_HDR_SIZE, data, len);
 
     /*
      * euv_pipe_write: on success the callback frees buf.
      * On synchronous failure, callback is NOT invoked (confirmed by
      * euv_pipe.c:268), so we must free buf here.
      */
-    int ret = euv_pipe_write(pipe, buf, len, pipe_write_cb);
+    int ret = euv_pipe_write(pipe, buf, SPP_FRAME_HDR_SIZE + len,
+        pipe_write_cb);
     if (ret != 0) {
         syslog(LOG_ERR, "[%s] Pipe write failed: %d\n", TAG, ret);
         free(buf);

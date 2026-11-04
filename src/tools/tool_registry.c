@@ -27,6 +27,7 @@
 #endif
 #include "tools/tool_guard.h"
 #include "tools/tool_control.h"
+#include "tools/tool_alarm.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_feishu_chat.h"
 #include "tools/tool_feishu_doc.h"
@@ -34,7 +35,14 @@
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
 #include "tools/tool_health.h"
+#include "tools/tool_steps_history.h"
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+#include "tools/tool_hr_history.h"
+#include "tools/tool_rest.h"
+#include "tools/tool_health_summary.h"
+#endif
 #include "tools/tool_media.h"
+#include "tools/tool_persona.h"
 #include "tools/tool_proxyquickapp.h"
 #include "tools/tool_shell.h"
 #include "tools/tool_system.h"
@@ -210,6 +218,25 @@ int tool_registry_init(void)
         "Get current date, time, and UNIX epoch.",
         tool_get_time_execute);
 
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    /* Watch alarm: the device previews one minute ahead, wakes the user at
+     * the set time, and escalates if nobody reacts. */
+    REGISTER_TOOL("set_alarm",
+        "Remind the user ON THE WATCH after N minutes. PREFER THIS over "
+        "cron_add whenever the request came from the watch or the user "
+        "should be alerted on the device: the watch previews 1 minute "
+        "before, speaks up at the set time and escalates until the user "
+        "touches it. cron_add only appends a silent line to the history.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_NUM("minutes", "Whole minutes from now, 1-1440")
+                TOOL_SCHEMA_END_REQUIRED("\"minutes\""),
+        tool_set_alarm_execute);
+
+    REGISTER_TOOL_NO_PARAMS("cancel_alarm",
+        "Cancel the currently armed watch alarm.",
+        tool_cancel_alarm_execute);
+#endif
+
     /* File tools */
     REGISTER_TOOL("read_file",
         "Read a file. Path must start with " AGENT_DATA_DIR "/.",
@@ -347,6 +374,19 @@ int tool_registry_init(void)
         "Check if screen is on or off.",
         tool_get_screen_state_execute);
 
+    /* 人格切换：只改「怎么说」，不改变工具权限和事实。中文名也接受，
+     * 持久化/节流/降级都在 ui/persona.c，工具层只做解析和调用。 */
+    REGISTER_TOOL(
+        "set_persona",
+        "Switch your speaking persona between gentle (温柔), sassy (毒舌) "
+        "and cheer (元气). Use when the user asks for a different tone.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_ENUM("persona",
+                "Persona: gentle, sassy or cheer (中文: 温柔/毒舌/元气)",
+                "\"gentle\",\"sassy\",\"cheer\",\"温柔\",\"毒舌\",\"元气\"")
+            TOOL_SCHEMA_END_REQUIRED("\"persona\""),
+        tool_set_persona_execute);
+
     /* Health / fitness tools */
     REGISTER_TOOL_NO_PARAMS(
         "get_heartrate",
@@ -356,6 +396,60 @@ int tool_registry_init(void)
     REGISTER_TOOL_NO_PARAMS("get_steps",
         "Get step count and step frequency.",
         tool_get_steps_execute);
+
+    /* 步数历史: 落盘的那一份(今天 + 最近 7 天)。get_steps 只有 uORB 实时值，
+     * 重启/隔天的问题要靠这个工具回答。 */
+    REGISTER_TOOL_NO_PARAMS("get_steps_history",
+        "Get today's steps plus the last 7 days of step history "
+        "(JSON: date/steps/history). Use when the user asks about steps "
+        "over multiple days (这几天/上周走了多少步).",
+        tool_get_steps_history_execute);
+
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+    /* 心率历史: 后台静默测量(10 分钟一次)落盘的那一份，回答"最近心率/趋势"。
+     * get_heartrate 只给 uORB 实时值。 */
+    REGISTER_TOOL_NO_PARAMS("get_heartrate_history",
+        "Get recorded heart-rate history: latest bpm with timestamp, total "
+        "count, and up to 20 recent {t,bpm} samples (oldest to newest). "
+        "Use when the user asks about heart rate over time (最近/这几天心率).",
+        tool_get_heartrate_history_execute);
+
+    /* 休息/睡眠时段: 体动估算（不是医疗级睡眠），回答"昨晚睡得怎么样/休息了多久"。 */
+    REGISTER_TOOL_NO_PARAMS("get_rest",
+        "Get rest/sleep periods estimated from motion only (NOT medical-grade "
+        "sleep staging): current state (awake/quiet/night), current continuous "
+        "still seconds, and last night's rest window {start,end,dur_s}. "
+        "Use when the user asks how they slept / how long they rested (昨晚休息/睡眠).",
+        tool_get_rest_execute);
+
+    /* 每日健康摘要: 昨日步数 + 24h 心率 min/max + 昨夜休息 + 天气，一段中文可直接念。 */
+    REGISTER_TOOL_NO_PARAMS("get_health_summary",
+        "Get the daily health summary card: yesterday's steps, min/max heart "
+        "rate over the last 24h, last night's rest duration, current weather, "
+        "and a ready-to-speak Chinese sentence. On-device caches only (no "
+        "network request). Use when the user asks for a health recap "
+        "(昨天健康小结/昨晚休息/最近心率).",
+        tool_get_health_summary_execute);
+
+    /* 血氧: 异步测量(约 20s 后语音播报结果), 有上次值则直接报。 */
+    REGISTER_TOOL_NO_PARAMS("get_spo2",
+        "Get blood oxygen (SpO2) in percent. Returns the last measurement "
+        "if one exists, otherwise STARTS a new ~20s measurement and tells "
+        "the user to keep a finger on the sensor; the result is announced "
+        "by voice when ready.",
+        tool_get_spo2_execute);
+#endif
+
+    /* 麦克风自检: 录 3 秒 PCM 并判定 mic OK / mic NO-RESPONSE。
+     * 设备节点没注册时自己补注册, 所以不依赖 audio_setup 有没有跑过。 */
+    REGISTER_TOOL_NO_PARAMS(
+        "mic_selfcheck",
+        "Record 3s from the microphone and diagnose whether the mic responds "
+        "to sound. Prints RMS, peak, distinct sample values, exact 0 / -1 "
+        "share, longest {0,-1} run and the current ADC gain in dB. Verdict is "
+        "mic OK or mic NO-RESPONSE. Use when the user asks to test/check the "
+        "microphone (麦克风自检).",
+        tool_mic_selfcheck_execute);
 
     /* Device control tools */
     REGISTER_TOOL(

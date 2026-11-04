@@ -93,6 +93,23 @@ config EXAMPLES_AI_AGENT_VELA_SHELL_DENY
 
 endchoice
 
+config AI_AGENT_SPEAK_WS_REPLIES
+	bool "Speak WebSocket (phone app) replies aloud"
+	default n
+	---help---
+		Route replies that go to the phone app through the TTS + playback chain
+		so the watch says its answers out loud, using the same cooldown as the
+		voice channel.
+
+config AI_AGENT_BOOT_CHIME
+	bool "Play a short boot chime (speaker self-test)"
+	default y
+	---help---
+		Plays three short rising tones through the verified playback path
+		(media_player -> /dev/audio/pcm0p -> AUDPRC -> AUDCODEC DAC -> PA) right
+		after the audio devices are registered, so the speaker can be confirmed
+		audible without touching the serial console.
+
 config AI_AGENT_LVGL_UI
 	bool "Enable LVGL UI channel"
 	default n
@@ -101,6 +118,65 @@ config AI_AGENT_LVGL_UI
 		Enable the LVGL-based chat UI channel for AI Agent.
 		Provides a chat-bubble interface on a round watch screen
 		with PTT (Push-to-Talk) voice input.
+
+config AI_AGENT_LCD_PATH
+	string "LVGL display device path"
+	default "/dev/lcd0"
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Framebuffer/LCD device used by the LVGL UI.
+		/dev/lcd0 on SF32LB52-DevKit-LCD, /dev/fb0 on the
+		goldfish emulator. Lets UI iterate in the emulator
+		without touching the real board.
+
+config AI_AGENT_TOUCH_PATH
+	string "LVGL touch input device path"
+	default "/dev/input0"
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Framebuffer/LCD device used by the LVGL UI.
+		/dev/input0 on both SF32LB52 and the goldfish emulator.
+
+config AI_AGENT_CARE_IDLE_MIN
+	int "Idle minutes before proactive care"
+	default 5
+	range 1 120
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_COOLDOWN_MIN
+	int "Minimum minutes between proactive care messages"
+	default 10
+	range 1 240
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_QUIET_START
+	int "Quiet hours start (local hour)"
+	default 22
+	range 0 23
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_CARE_QUIET_END
+	int "Quiet hours end (local hour)"
+	default 7
+	range 0 23
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_HR_HIGH
+	int "Simulated heart-rate reminder threshold (bpm)"
+	default 120
+	range 90 180
+	depends on AI_AGENT_LVGL_UI
+
+config AI_AGENT_HR_ALERT_COOLDOWN_S
+	int "Heart-rate alert cooldown (seconds)"
+	default 60
+	range 10 3600
+	depends on AI_AGENT_LVGL_UI
+	---help---
+		Seconds between two heart-rate reminders during sustained
+		high readings. Kept short (60s) so back-to-back demo
+		injections are not swallowed; a single injected event still
+		only alerts once thanks to the per-event latch in hr_monitor.
 
 config AI_AGENT_FEISHU
 	bool "Enable Feishu bot channel"

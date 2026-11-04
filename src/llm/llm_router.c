@@ -31,6 +31,44 @@
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 
+/* 编译进 .rodata 的 MiniMax 账号 key(与 TTS 共用同一个 key, 同一份头文件;
+ * 该头文件由开发者树从 .v3_work/.llm_key 生成, 干净 checkout 里不存在).
+ * 用途见 llm_router_init() 末尾的"config 为空时兜底后端". */
+#if defined(__has_include)
+#  if __has_include("voice/minimax_tts_key_local.h")
+#    include "voice/minimax_tts_key_local.h"
+#  endif
+#endif
+#ifndef MINIMAX_TTS_KEY_LOCAL
+#  define MINIMAX_TTS_KEY_LOCAL ""
+#endif
+
+/* 2026-10-26: 主账号换成 Xiaomi MiMo Token Plan(LLM/TTS/ASR 同一把 key)。
+ * 头文件由开发者树生成, 干净 checkout 里不存在 -> 退回 MiniMax 常量。 */
+#if defined(__has_include)
+#  if __has_include("voice/mimo_key_local.h")
+#    include "voice/mimo_key_local.h"
+#  endif
+#endif
+#ifndef MIMO_API_KEY_LOCAL
+#  define MIMO_API_KEY_LOCAL ""
+#endif
+#ifndef MIMO_API_HOST
+#  define MIMO_API_HOST "token-plan-cn.xiaomimimo.com"
+#  define MIMO_API_PORT "443"
+#  define MIMO_API_PATH "/v1/chat/completions"
+#  define MIMO_LLM_MODEL "mimo-v2.6-flash"
+#endif
+
+/* config 里的后端全丢时使用的内置后端(与 2026-10 实测可用的配置一致;
+ * 2026-10-25 用 curl 在本机验证过: HTTP 200, 返回 OpenAI 兼容格式). */
+#define LLM_BUILTIN_HOST  MIMO_API_HOST
+#define LLM_BUILTIN_PATH  MIMO_API_PATH
+#define LLM_BUILTIN_PORT  MIMO_API_PORT
+#define LLM_BUILTIN_MODEL MIMO_LLM_MODEL
+
+static void llm_router_install_builtin_backend(void);
+
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +87,14 @@ static pthread_mutex_t s_router_lock = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_CONSECUTIVE_FAILURES 3
 
 /* Auto-recovery: disabled backends retry after this many seconds */
-#define RECOVERY_INTERVAL_SEC 300
+/* Transient phone-tethering flaps used to cost a full 5 minutes of silent
+ * local-model fallback, then one minute.  Measured bt-pan drops last ~40 s,
+ * so 60 s still meant "the next message is answered by the slow on-device
+ * model" almost every time the link hiccuped.  15 s is short enough that a
+ * recovered link is used again on the next message, while still stopping a
+ * hammering loop against a genuinely dead backend (and the agent now fails
+ * fast on its own when there is no uplink at all). */
+#define RECOVERY_INTERVAL_SEC 15
 
 /* Backoff: ignore rapid failures within this window (seconds) */
 #define BACKOFF_DEBOUNCE_SEC 5
@@ -157,12 +202,70 @@ int llm_router_init(void)
             TAG, i, b->host, b->model, b->cost_tier);
     }
 
+    /* ── config 全丢时的兜底后端 ──────────────────────────────────
+     *
+     * /data/ai_agent/config/config.json 有一个历史缺陷(docs_ble/24 号文
+     * §24.8 "云端 LLM 配置会被清空"): 它可能被写成只剩 net.dns_* 两项,
+     * 于是这里读出 0 个后端, 对话静默退到端侧本地模型 —— 现场表现就是
+     * "明明有网, 却答不出话", 而且只有一行 INFO 日志, 不查 router_status
+     * 根本发现不了。2026-10-25 现场复现了一次。
+     *
+     * 现在把 MiniMax 账号 key 编译进镜像, config 为空时用它注册一个
+     * 内置后端: config 里**有**配置时仍然优先用 config(这层只是兜底),
+     * config 再被写空也不会让云端对话消失。key 缺失(干净 checkout)时
+     * 保持原来的行为不变。 */
+    /* 2026-10-26: 账号已整体切到 Xiaomi MiMo Token Plan。config 里可能还留着
+     * 上一家(MiniMax)的后端配置, 直接以内置 MiMo 覆盖 —— 演示要的是确定性:
+     * 不依赖 /data 里那份可能被写坏/写旧的 config。MiniMax 配置不再使用。 */
+    if (MIMO_API_KEY_LOCAL[0] != '\0') {
+        s_backend_count = 0;
+        llm_router_install_builtin_backend();
+    } else if (s_backend_count == 0 && MINIMAX_TTS_KEY_LOCAL[0] != '\0') {
+        llm_router_install_builtin_backend();
+    }
+
     pthread_mutex_unlock(&s_router_lock);
 
-    syslog(LOG_INFO, "[%s] Router initialized: %d backends, profile=%d\n",
-        TAG, s_backend_count, s_profile);
+    if (s_backend_count == 0) {
+        syslog(LOG_ERR, "[%s] Router initialized: 0 backends (no config and "
+               "no built-in key) - cloud LLM unavailable, local fallback "
+               "only\n", TAG);
+    } else {
+        syslog(LOG_INFO, "[%s] Router initialized: %d backends, profile=%d\n",
+            TAG, s_backend_count, s_profile);
+    }
     return 0;
 }
+
+/* 用编译期凭据注册内置后端。Caller holds s_router_lock.
+ * 只在 config 里一个后端都没有时调用 —— 不覆盖用户/团队配置。 */
+static void llm_router_install_builtin_backend(void)
+{
+    llm_backend_t* b = &s_backends[0];
+
+    memset(b, 0, sizeof(*b));
+    strncpy(b->host, LLM_BUILTIN_HOST, sizeof(b->host) - 1);
+    strncpy(b->path, LLM_BUILTIN_PATH, sizeof(b->path) - 1);
+    strncpy(b->port, LLM_BUILTIN_PORT, sizeof(b->port) - 1);
+    strncpy(b->model, LLM_BUILTIN_MODEL, sizeof(b->model) - 1);
+    strncpy(b->api_key,
+            (MIMO_API_KEY_LOCAL[0] != '\0') ? MIMO_API_KEY_LOCAL
+                                            : MINIMAX_TTS_KEY_LOCAL,
+            sizeof(b->api_key) - 1);
+    b->priority = 0;
+    b->cost_tier = 1;
+    b->enabled = true;
+    b->fail_count = 0;
+
+    s_backend_count = 1;
+
+    /* 这条必须在启动日志里显眼 —— 配置被写空是一种"静默故障",
+     * 只有看到这一行才知道云端对话是靠内置凭据活着的。 */
+    syslog(LOG_WARNING, "[%s] config has no LLM backend; using built-in "
+           "%s backend (key from build-time constant)\n",
+           TAG, LLM_BUILTIN_MODEL);
+}
+
 
 /* ── Backend management ───────────────────────────────────── */
 

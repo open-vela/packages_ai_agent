@@ -33,6 +33,8 @@ extern "C" {
 #endif
 
 int llm_proxy_init(void);
+/* v114b10：语音通道 max_tokens 覆盖（0=恢复默认） */
+void llm_proxy_set_max_tokens(int v);
 int llm_set_backend(const char* host, const char* path);
 int llm_set_port(const char* port);
 
@@ -77,6 +79,40 @@ int llm_chat_tools(const char* system_prompt,
     cJSON* messages,
     const char* tools_json,
     llm_response_t* resp);
+
+/* ── Streaming (SSE) chat with tools ──────────────────────── */
+
+/** Incremental text callback: called for each non-empty
+ *  choices[0].delta.content fragment as it arrives. The string is a complete
+ *  UTF-8 sequence (decoded from one SSE JSON chunk) and is only valid for the
+ *  duration of the callback. Runs on the caller's thread (blocking TLS read
+ *  loop) — do not block inside. */
+typedef void (*llm_delta_cb_t)(const char* delta_utf8, void* arg);
+
+/**
+ * Streaming variant of llm_chat_tools(): request body gets "stream": true and
+ * the SSE body is parsed incrementally.
+ *
+ * - choices[0].delta.content is appended to resp->text and forwarded to cb;
+ * - tool_calls fragments are reassembled by index into resp->calls
+ *   (id / function.name / function.arguments):
+ *   resp->call_count and resp->tool_use are set as soon as they appear;
+ * - on HTTP != 200 / transport failure / unparseable stream / empty result it
+ *   automatically falls back to the non-streaming llm_chat_tools() and returns
+ *   that result (callers that already displayed deltas must replace the
+ *   partial text with the final text).
+ *
+ * SPEED-A 约定：cb 可能已经收到过增量后本函数才回退非流式 —— 回退时
+ * partial 文本会被丢弃，最终文本以 resp->text 为准。
+ *
+ * @return OK on success (resp filled), ERROR on failure.
+ */
+int llm_chat_tools_stream(const char* system_prompt,
+    cJSON* messages,
+    const char* tools_json,
+    llm_response_t* resp,
+    llm_delta_cb_t cb,
+    void* cb_arg);
 
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).

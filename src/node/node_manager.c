@@ -448,6 +448,8 @@ bool node_manager_handle_message(int ws_fd, const char* data, int len)
                     memset(&msg, 0, sizeof(msg));
                     strncpy(msg.channel, ch, sizeof(msg.channel) - 1);
                     strncpy(msg.chat_id, cid, sizeof(msg.chat_id) - 1);
+                    /* 转发的是别的节点产出的回答，按最终回答处理。 */
+                    msg.kind = AGENT_MSG_KIND_FINAL;
                     msg.content = strdup(ct);
                     if (msg.content) {
                         if (message_bus_push_outbound(&msg) != OK)

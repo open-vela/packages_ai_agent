@@ -132,7 +132,28 @@ static const char *TAG = "skills";
     "2. Parse user request into schedule_type and timing\n" \
     "3. Set channel/chat_id matching the message source (feishu/system)\n" \
     "4. cron_add to create the job\n" \
-    "5. Confirm with trigger time\n"
+    "5. Confirm with trigger time\n\n" \
+    "## Exception: reminders that must reach the user on the watch\n" \
+    "If the request came from the watch itself (nsh ask / key press / voice), use the\n" \
+    "关怀叫醒 (care-reminder) skill instead: it calls set_alarm, so the device\n" \
+    "previews one minute ahead, speaks up on time and escalates if nobody reacts.\n" \
+    "cron_add only drops a silent line into the chat history and will not wake anyone.\n"
+
+#define BUILTIN_CARE_ALARM \
+    "# 关怀叫醒\n\n" \
+    "手表上的提醒/叫醒一律用本技能（优先于 reminder/cron）：到点前先预告，到点主动开口叫醒，没人理会会再催一次。\n\n" \
+    "## 何时使用（优先于 reminder）\n" \
+    "用户说「X 分钟后提醒我 / 叫我 / 喊我起床」，或指定了某个钟点——**凡是希望用户在手表前被提醒到的，都用本技能**。\n" \
+    "不要用 cron_add / reminder 处理这类请求：cron 通知只在消息历史里静默出现，\n" \
+    "而 set_alarm 会让设备端主动开口（预告 + 叫醒 + 催促），这才是本产品的核心能力。\n\n" \
+    "## 怎么用\n" \
+    "1. 先算分钟数：用户给了时长（如 25 分钟）直接用；给了钟点先用 get_current_time 取当前时间再换算\n" \
+    "2. 调 set_alarm，参数 minutes，范围 1-1440\n" \
+    "3. 用用户的语言简短确认，并说明设备行为：到点前 1 分钟先预告、到点叫醒、没反应会再催\n" \
+    "4. 用户要取消时调 cancel_alarm\n" \
+    "5. 同一次请求只调一次 set_alarm，不要重复调用\n\n" \
+    "## 语气\n" \
+    "像同伴而不是闹钟：简短、带一点关心，不要长篇大论。\n"
 
 #define BUILTIN_NOTE_TAKER \
     "# Note Taker\n\n" \
@@ -208,6 +229,7 @@ static const builtin_skill_t s_builtins[] = {
     { "system-health",  BUILTIN_SYSTEM_HEALTH  },
     { "reminder",       BUILTIN_REMINDER       },
     { "note-taker",     BUILTIN_NOTE_TAKER     },
+    { "care-reminder",  BUILTIN_CARE_ALARM     },
     { "translate",      BUILTIN_TRANSLATE      },
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
@@ -223,12 +245,23 @@ static void install_builtin(const builtin_skill_t *skill)
     char path[128];
     snprintf(path, sizeof(path), "%s%s.md", AGENT_SKILLS_DIR, skill->filename);
 
-    /* Check if already exists */
+    /* Compare the installed copy with the built-in text: only installing
+     * when the file is missing meant wording fixes never reached a board
+     * whose /data already had the file from an earlier firmware. Skipping
+     * identical content keeps this cheap at every boot. */
     FILE *f = fopen(path, "r");
     if (f) {
+        static char cur[2048];
+        size_t n = fread(cur, 1, sizeof(cur) - 1, f);
+        cur[n] = '\0';
         fclose(f);
-        syslog(LOG_DEBUG, "[%s] Skill exists: %s\n", TAG, path);
-        return;
+
+        size_t want = strlen(skill->content);
+        if (n == want && memcmp(cur, skill->content, want) == 0) {
+            syslog(LOG_DEBUG, "[%s] Skill up to date: %s\n", TAG, path);
+            return;
+        }
+        syslog(LOG_INFO, "[%s] Updating built-in skill: %s\n", TAG, path);
     }
 
     /* Write built-in skill */

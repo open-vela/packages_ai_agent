@@ -45,14 +45,16 @@ typedef struct {
 } agent_mem_status_t;
 
 /**
- * Query current heap memory status via mallinfo().
+ * Query current heap memory status.
+ * NOTE: mallinfo() walks the whole heap and DEBUGASSERTs when a
+ * (layout-sensitive) heap overrun corrupts the free list — which takes
+ * the agent loop down on this board. Return conservative values instead.
  */
 static inline void agent_mem_get_status(agent_mem_status_t* st)
 {
-    struct mallinfo mi = mallinfo();
-    st->total_heap = mi.arena;
-    st->free_heap = mi.fordblks;
-    st->largest_block = mi.fordblks; /* conservative estimate */
+    st->total_heap = 8 * 1024 * 1024;      /* PSRAM 8M */
+    st->free_heap = 4 * 1024 * 1024;       /* conservative */
+    st->largest_block = 4 * 1024 * 1024;
 }
 
 /**

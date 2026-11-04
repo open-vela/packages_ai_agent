@@ -26,6 +26,7 @@ AI Agent 内置 35+ 种工具，Agent 通过 ReAct 循环自动调用。
 | `get_screen_state` | 屏幕开关状态 |
 | `get_heartrate` | 最新心率（BPM） |
 | `get_steps` | 当日步数和步频 |
+| `mic_selfcheck` | 麦克风自检：录 3 秒 PCM，给出 mic OK / mic NO-RESPONSE |
 | `vibrate` | 触发设备振动 |
 | `feishu_doc_create` | 创建飞书云文档 |
 | `feishu_doc_write` | 写入飞书文档内容 |

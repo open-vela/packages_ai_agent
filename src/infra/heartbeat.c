@@ -24,11 +24,13 @@
 #include "agent_config.h"
 #include "core/message_bus.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <time.h>
 
 static const char *TAG = "heartbeat";
 
@@ -37,6 +39,13 @@ static const char *TAG = "heartbeat";
     "If nothing needs attention, reply with just: HEARTBEAT_OK"
 
 static volatile bool s_heartbeat_running = false;
+
+/* Interruptible wait: heartbeat_stop() signals the cond so the thread
+ * exits naturally instead of being force-cancelled in a long sleep()
+ * (NuttX cancels remaining threads at process exit and the cancellation
+ * cleanup path can corrupt the heap). */
+static pthread_mutex_t s_hb_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_hb_cond = PTHREAD_COND_INITIALIZER;
 
 /* ── Content check ────────────────────────────────────────────── */
 
@@ -127,8 +136,18 @@ static void *heartbeat_thread(void *arg)
     (void)arg;
 
     while (s_heartbeat_running) {
-        /* Sleep for the heartbeat interval (use sleep() to avoid usleep overflow) */
-        sleep(AGENT_HEARTBEAT_INTERVAL_MS / 1000);
+        struct timespec ts;
+
+        /* Wait interruptibly for the heartbeat interval */
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += AGENT_HEARTBEAT_INTERVAL_MS / 1000;
+        pthread_mutex_lock(&s_hb_mutex);
+        pthread_cond_timedwait(&s_hb_cond, &s_hb_mutex, &ts);
+        pthread_mutex_unlock(&s_hb_mutex);
+
+        if (!s_heartbeat_running) {
+            break;
+        }
         heartbeat_send();
     }
 
@@ -174,7 +193,10 @@ void heartbeat_stop(void)
 {
     if (s_heartbeat_running) {
         s_heartbeat_running = false;
-        /* Thread will exit on next iteration */
+        pthread_mutex_lock(&s_hb_mutex);
+        pthread_cond_signal(&s_hb_cond);
+        pthread_mutex_unlock(&s_hb_mutex);
+        /* Thread exits naturally on next iteration */
         syslog(LOG_INFO, "[%s] Heartbeat stopped\n", TAG);
     }
 }

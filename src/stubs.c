@@ -128,108 +128,16 @@ __attribute__((weak)) int mqtt_publish(void* client, const char* topic,
 }
 #endif
 
-/* Media player stubs for sim build */
-#ifndef CONFIG_MEDIA
-__attribute__((weak)) void* media_player_open(const char* url)
-{
-    (void)url;
-    return NULL;
-}
-__attribute__((weak)) int media_player_close(void* player, int dummy)
-{
-    (void)player;
-    (void)dummy;
-    return -1;
-}
-__attribute__((weak)) int media_player_start(void* player)
-{
-    (void)player;
-    return -1;
-}
-__attribute__((weak)) int media_player_stop(void* player)
-{
-    (void)player;
-    return -1;
-}
-__attribute__((weak)) int media_player_pause(void* player)
-{
-    (void)player;
-    return -1;
-}
-__attribute__((weak)) int media_player_seek(void* player, unsigned int msec)
-{
-    (void)player;
-    (void)msec;
-    return -1;
-}
-__attribute__((weak)) int media_player_prepare(void* player, const char* url, const char* opts)
-{
-    (void)player;
-    (void)url;
-    (void)opts;
-    return -1;
-}
-__attribute__((weak)) int media_player_set_event_callback(void* player, void* cookie, void* cb)
-{
-    (void)player;
-    (void)cookie;
-    (void)cb;
-    return -1;
-}
-__attribute__((weak)) int media_player_get_position(void* player, unsigned int* msec)
-{
-    (void)player;
-    (void)msec;
-    return -1;
-}
-__attribute__((weak)) int media_player_get_duration(void* player, unsigned int* msec)
-{
-    (void)player;
-    (void)msec;
-    return -1;
-}
-__attribute__((weak)) int media_policy_set_stream_volume(const char* stream, int volume)
-{
-    (void)stream;
-    (void)volume;
-    return -1;
-}
-
-/* Media recorder stubs for sim build */
-__attribute__((weak)) void* media_recorder_open(const char* src)
-{
-    (void)src;
-    return NULL;
-}
-__attribute__((weak)) int media_recorder_close(void* rec)
-{
-    (void)rec;
-    return -1;
-}
-__attribute__((weak)) int media_recorder_prepare(void* rec, const char* url, const char* opts)
-{
-    (void)rec;
-    (void)url;
-    (void)opts;
-    return -1;
-}
-__attribute__((weak)) int media_recorder_start(void* rec)
-{
-    (void)rec;
-    return -1;
-}
-__attribute__((weak)) int media_recorder_stop(void* rec)
-{
-    (void)rec;
-    return -1;
-}
-__attribute__((weak)) ssize_t media_recorder_read_data(void* rec, void* buf, size_t len)
-{
-    (void)rec;
-    (void)buf;
-    (void)len;
-    return -1;
-}
+/* media_player_*  的实现在 src/voice/pcm_media_player.c（强符号）。
+ * media_recorder_* 的实现在 src/voice/pcm_media_recorder.c（强符号）。
+ *
+ * ★ 2026-10-14: 这里原本还有一组**永远失败**的 media_recorder_* 弱桩, 结果是
+ *   链接时弱符号先被拉进来、归档里那个强实现再也没机会被选中 —— 真机上
+ *   media_recorder_open() 恒返回 NULL, audio_capture_open() 的采集分支必然
+ *   失败("[audio_cap] media_recorder_open failed"), 也就是**实时语音采集从来
+ *   没工作过**。既然已经提供了真实现, 这组桩就必须删掉, 与 media_player 的
+ *   处理方式保持一致。 */
+#if 0
 #endif
 
 /* WeChat channel stubs for sim build */
@@ -271,16 +179,7 @@ __attribute__((weak)) bool agent_shutdown_requested(void)
     return _stub_shutdown;
 }
 
-/* ── Media player write_data stub ─────────────────────────── */
-
-__attribute__((weak)) int media_player_write_data(void* player,
-    const void* data, size_t len)
-{
-    (void)player;
-    (void)data;
-    (void)len;
-    return -1;
-}
+/* media_player_write_data() 由上面的 pcm0p 实现提供 (强符号)。 */
 
 /* ── QR code display stub ─────────────────────────────────── */
 
