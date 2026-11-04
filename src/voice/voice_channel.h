@@ -40,6 +40,19 @@ int voice_channel_stop_with_text(char *text_out, size_t text_cap);
 /* Synthesize text and play back (called from outbound dispatcher). */
 int voice_channel_speak(const char *text);
 
+/* Always-on listening: record, detect the end of speech locally, run ASR and
+ * hand the transcript to the agent, then wait for the answer to be spoken and
+ * listen again.  Returns 0 once the task is running. */
+int voice_channel_listen_start(void);
+
+/* Ask the listening loop to finish after the current session. */
+void voice_channel_listen_stop(void);
+
+/* [V712] Throw away the session that is currently recording: no ASR, no
+ * dispatch, no message.  The always-on listener uses it to hand the
+ * microphone back the instant the BOOT key is pressed. */
+int voice_channel_discard(void);
+
 /* Test TTS: synthesize text, save PCM to file. */
 int voice_channel_test_tts(const char *text, const char *out_path);
 

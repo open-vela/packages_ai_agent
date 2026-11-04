@@ -28,6 +28,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static const char *TAG = "memory";
 
@@ -128,15 +129,16 @@ int memory_store_init(void)
 
     ensure_file(AGENT_SOUL_FILE, default_soul);
     ensure_file(AGENT_USER_FILE, default_user);
-    ensure_file(AGENT_MEMORY_FILE, default_memory);
+    /* [FS-FIX4] v23 probe: ensure_file(MEMORY) hangs forever on the
+     * SMART FS.  The file is optional and recreated on demand. */
 
     char heartbeat_path[128];
     snprintf(heartbeat_path, sizeof(heartbeat_path), "%s/HEARTBEAT.md", AGENT_CONFIG_DIR);
-    ensure_file(heartbeat_path, default_heartbeat);
+    /* [FS-FIX4] same hang risk; skip. */
 
     char cron_path[128];
     snprintf(cron_path, sizeof(cron_path), "%s/cron.json", AGENT_CONFIG_DIR);
-    ensure_file(cron_path, default_cron);
+    /* [FS-FIX4] same hang risk; skip. */
 
     /* Daily notes directory (created on demand by tool_files) */
     ensure_dir(AGENT_MEMORY_DIR "/daily");

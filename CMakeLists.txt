@@ -16,6 +16,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   set(AGENT_SRCS
     src/agent_main.c
+    src/companion_face.c
     src/core/message_bus.c
     src/core/message_bus_tap.c
     src/core/agent_loop.c
@@ -43,6 +44,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_registry.c
     src/tools/tool_files.c
     src/tools/tool_get_time.c
+    src/tools/tool_weather.c
     src/tools/tool_web_search.c
     src/tools/tool_cron.c
     src/tools/tool_fetch_url.c
@@ -59,6 +61,10 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_guard.c
     src/tools/tool_amap.c
     src/voice/volc_tts.c
+    # [vox] ai_vox protocol: message parsing and the conversation state
+    # machine.  Kept free of transport and cJSON so it can be unit-tested
+    # on a host; see vox/tests/.
+    src/voice/vox/vox_ws_protocol.c
     src/voice/volc_tts_ws.c
     src/voice/volc_asr.c
     src/voice/voice_tts.c
@@ -66,9 +72,20 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/audio_capture.c
     src/voice/audio_playback.c
     src/voice/voice_channel.c
+    src/voice/mimo_tts.c
+    src/voice/mimo_asr.c
     src/stubs.c
     src/ui/qrcode_display.c
   )
+
+  # MiMo cloud backends are only reached through runtime function pointers
+  # (s_mimo_asr_ops / s_mimo_tts_ops), so the linker's --gc-sections would
+  # discard them.  Disable per-symbol sections for these two files so the
+  # whole translation unit is retained once its register() entry is referenced.
+  set_source_files_properties(
+    src/voice/mimo_tts.c
+    src/voice/mimo_asr.c
+    PROPERTIES COMPILE_FLAGS "-fno-function-sections -fno-data-sections")
 
   # Optional modules
   if(CONFIG_AI_AGENT_FEISHU)

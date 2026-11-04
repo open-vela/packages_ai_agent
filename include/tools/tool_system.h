@@ -20,3 +20,5 @@
 int tool_get_battery_execute(const char *input_json, char *output, size_t output_size);
 int tool_get_wear_state_execute(const char *input_json, char *output, size_t output_size);
 int tool_get_screen_state_execute(const char *input_json, char *output, size_t output_size);
+int tool_todo_execute(const char *input_json, char *output, size_t output_size);
+int tool_servo_execute(const char *input_json, char *output, size_t output_size);

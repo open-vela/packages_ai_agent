@@ -28,6 +28,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include "../sensor_chat.h"
 
 static const char *TAG = "bus";
 
@@ -157,7 +158,6 @@ void message_bus_msg_free(agent_msg_t *msg)
 
     if (msg->content != NULL) {
         free(msg->content);
-        msg->content = NULL;
     }
 
     if (msg->image_b64 != NULL) {
@@ -210,6 +210,18 @@ void message_bus_wakeup(void)
 
 int message_bus_push_inbound(const agent_msg_t *msg)
 {
+/* [SENSOR-CHAT] 语音对话控灯/传感器问答：硬件指令本地处理，不进 LLM */
+    {
+        if (msg && msg->content) {
+            char sreply[160];
+            if (sensor_chat_handle_text(msg->content, sreply, sizeof(sreply))) {
+                sensor_chat_reply_async(sreply);
+                free(msg->content);
+                return 0;
+            }
+        }
+    }
+
     if (msg == NULL) {
         return ERROR;
     }

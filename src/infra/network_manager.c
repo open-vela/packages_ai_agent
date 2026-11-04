@@ -20,11 +20,18 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
+#include <netutils/netlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+/* [V525] ensure_dns() 定义在公共区（三个平台分支都要用），所以这几个头
+ * 必须提前包含 —— 它们原本在下面的分支里才 include，公共区看不到。 */
+#include <errno.h>
+#include <stdio.h>
+#include "config/config_store.h"
 
 static const char* TAG = "netmgr";
 
@@ -63,10 +70,318 @@ bool network_is_connected(void)
     return false;
 }
 
+/* [V525] 确保 resolver 已被编程 —— 任何一次拿到 IP 之后都必须调。
+ *
+ * ★★★ 这是「无语音」的唯一阻塞点，根因查清了：
+ *
+ *   NuttX 的 DNS client 只认netlib_set_ipv4dnsaddr() 设置的地址
+ *   （缺省才用编译期的 CONFIG_NETDB_DNSSERVER_IPv4ADDR）。
+ *   **它从不读 /tmp/resolv.conf。**
+ *
+ *   而本项目的网络是 network_manager 自己管的，不走 netinit 工具那条路：
+ *     - netinit_set_ipv4addrs()（唯一会设 DNS 的地方）只在跑 netinit 时执行；
+ *     - network_set_dns() 只在 network_rpmsg_init()（BLE/RPMSG 分支）
+ *       和 nsh 命令 setdns 里被调用；
+ *     - **真实硬件分支 network_wifi_connect() / network_wifi_reconnect()
+ *       从头到尾没有调用过 network_set_dns()**。
+ *
+ *   于是 getaddrinfo("token-plan-cn.xiaomimimo.com") 永远拿不到名字服务器，
+ *   [vela_tls] 打印完 TCP connect 那一行就永久静默 —— 看着像网络不通，
+ *   其实是没配 DNS。IP 直连（42.48.185.89:2301）能通，正是这个原因。
+ *
+ *   DHCP 也失败过（[V113] second DHCP attempt also failed），不能指望 DHCP
+ *   下发的 DNS，必须显式写死。
+ *
+ * ★ 为什么不复用 network_set_dns()：它定义在下面的 RPMSG 分支里，而本函数
+ *   要放在公共区（QEMU / RPMSG / 真实硬件三个分支共用），否则链接期找不到符号
+ *   —— 这个坑踩过一次：ensure_dns 放在分支内，编译过但 LD 报
+ *   undefined reference。这里直接调 netlib_set_ipv4dnsaddr() 并顺手写
+ *   resolv.conf，两件事都在本地做完。
+ */
+/* [V1257] Does wlan0 already have a default route?  /proc/net/route has
+ * one line per route, "Iface Destination Gateway Flags ..."; the default
+ * route is the entry with Destination 00000000.  Returns true as soon as
+ * any such entry exists. */
+static bool route_has_default(void)
+{
+    FILE* fp = fopen("/proc/net/route", "r");
+    char line[256];
+    bool found = false;
+
+    if (!fp)
+      {
+        return false;
+      }
+
+    while (fgets(line, sizeof(line), fp))
+      {
+        char iface[32];
+        unsigned long dest;
+
+        /* "wlan0<TAB>00000000<TAB>..." -> a default route exists */
+        if (sscanf(line, "%31s %lx", iface, &dest) == 2 && dest == 0)
+          {
+            found = true;
+            break;
+          }
+      }
+
+    fclose(fp);
+    return found;
+}
+
+/* [V1257] On-site network switch: the subnet is no longer compiled in.
+ *
+ * config_store keys (written by the CLI "set_net <ip> <gw>"):
+ *   net.static_ip - force wlan0 to this IPv4 address (mask /24)
+ *   net.static_gw - gateway for the forced path
+ *
+ * Both keys empty (the default): DHCP's result is kept as-is - no
+ * set_ipv4netmask / set_ipv4addr / set_dripv4addr override at all.  The one
+ * rescue kept is the route fix-up: when /proc/net/route shows no default
+ * route, wlan0's current address is taken, its last octet is replaced with
+ * .1 and that is installed as the gateway (phone hotspots and ordinary
+ * routers answer on .1).
+ *
+ * net.static_ip configured: the former V1041 forced-static path runs
+ * (address + /24 mask); the gateway comes from net.static_gw or, when that
+ * key is empty, is derived as the .1 of the static IP's /24.
+ *
+ * Idempotent and quiet, so it can stay in ensure_dns() on every
+ * "connected" event. */
+static void ensure_static_ip(void)
+{
+    char cfg_ip[64] = { 0 };
+    char cfg_gw[64] = { 0 };
+    struct in_addr want;
+    struct in_addr gw;
+    struct in_addr cur;
+    struct in_addr mask;
+    char ip[INET_ADDRSTRLEN];
+    bool have_ip;
+    bool have_gw;
+    int rc;
+
+    have_ip = claw_config_get("net.static_ip", cfg_ip, sizeof(cfg_ip)) == OK
+              && cfg_ip[0] != '\0'
+              && inet_pton(AF_INET, cfg_ip, &want) == 1;
+    have_gw = claw_config_get("net.static_gw", cfg_gw, sizeof(cfg_gw)) == OK
+              && cfg_gw[0] != '\0'
+              && inet_pton(AF_INET, cfg_gw, &gw) == 1;
+
+    if (have_ip)
+      {
+        /* Forced static path (former V1041 behaviour). */
+        memset(&cur, 0, sizeof(cur));
+        if (netlib_get_ipv4addr("wlan0", &cur) != OK ||
+            cur.s_addr != want.s_addr)
+          {
+            /* Only d_ipaddr is rewritten by SIOCSIFADDR (netdev_ioctl.c:343),
+             * so the netmask and default route set around this call survive. */
+            rc = netlib_set_ipv4addr("wlan0", &want);
+            inet_ntop(AF_INET, &want, ip, sizeof(ip));
+            syslog(rc == OK ? LOG_INFO : LOG_ERR,
+                   "[V1257] static ip %s rc=%d\n", ip, rc);
+          }
+
+        if (!have_gw)
+          {
+            gw = want;
+            gw.s_addr = (want.s_addr & htonl(0xffffff00)) | htonl(1);
+          }
+
+        inet_pton(AF_INET, "255.255.255.0", &mask);
+        netlib_set_ipv4netmask("wlan0", &mask);
+        rc = netlib_set_dripv4addr("wlan0", &gw);
+        inet_ntop(AF_INET, &gw, ip, sizeof(ip));
+        syslog(LOG_INFO, "[V1257] static gw %s rc=%d\n", ip, rc);
+        return;
+      }
+
+    /* Default: keep DHCP's lease untouched; only rescue a missing default
+     * route (the old V526 symptom: empty route table, every connect times
+     * out). */
+    if (route_has_default())
+      {
+        return;
+      }
+
+    memset(&cur, 0, sizeof(cur));
+    if (netlib_get_ipv4addr("wlan0", &cur) != OK || cur.s_addr == 0)
+      {
+        return;                     /* no address yet, nothing to rescue */
+      }
+
+    if (!have_gw)
+      {
+        gw = cur;
+        gw.s_addr = (cur.s_addr & htonl(0xffffff00)) | htonl(1);
+      }
+
+    rc = netlib_set_dripv4addr("wlan0", &gw);
+    inet_ntop(AF_INET, &gw, ip, sizeof(ip));
+    syslog(LOG_INFO, "[V1257] no default route, rescue gw %s rc=%d\n",
+           ip, rc);
+}
+
+static void ensure_dns(void)
+{
+    static const char *const fallbacks[] = { "223.5.5.5", "119.29.29.29" };
+    char primary[64] = { 0 };
+    struct in_addr dns_addr;
+    unsigned int i;
+    FILE* fp;
+
+    /* ── [V526] 先修默认路由，再谈 DNS ──────────────────────────
+     *
+     * 板上的证据：`[V58] /proc/net/route open: 2` —— 路由表是**空的**。
+     * 没有默认路由意味着板子只能和同网段通信，出网的 TCP 和 UDP 都发不出去。
+     * 这一条解释了之前所有的现象：
+     *   - DNS 明明配成 223.5.5.5(rc=0) 却一个查询都发不出去；
+     *   - getaddrinfo() 卡在里面不返回（包根本出不去，只在本地等超时）；
+     *   - 改成 IP 直连 111.206.191.150:443 同样建不了连；
+     *   - 之前[V58] probe gw/srv/pub 全是 -110(ETIMEDOUT)，包括内网
+     *     42.48.185.89 —— 那些"能通"的印象其实也是超时。
+     *
+     * 为什么没有路由：编译期 CONFIG_NETINIT_DRIPADDR=0x0a000001 即 10.0.0.1，
+     * 那是另一个网络的网关，跟本机实际网段 192.168.31.0/24 毫无关系。
+     * DHCP 模式下这个静态值不参与路由表写入，而本项目**没有任何代码**
+     * 在 DHCP 之后补设默认路由（grep netlib_set_dripv4addr 在 packages/ 下
+     * 零命中）。
+     *
+     * [V1257] 现场换网后子网不再写死：默认保留 DHCP 结果，只在路由表
+     * 确实没有默认路由时补一条救急网关（详见 ensure_static_ip()）。
+     */
+    {
+        /* [V1257] Subnet lock removed - netmask/address/gateway are no
+         * longer forced here.  ensure_static_ip() keeps DHCP's result
+         * unless net.static_ip / net.static_gw are configured, and only
+         * rescues a missing default route (see its comment). */
+        ensure_static_ip();
+    }
+
+        /* [V1262] Resolver priority: default-route gateway first.
+     *
+     * On site the router / phone-hotspot DNS forwarder is what actually
+     * answers; public DNS (223.5.5.5) was measured unreachable on the
+     * venue-like network while the gateway answered.  Stored
+     * net.dns_primary is only used when no default route exists, and the
+     * public list is the last resort. */
+    {
+        char gwbuf[64] = { 0 };
+        FILE* gfp = fopen("/proc/net/route", "r");
+        char gline[256];
+
+        while (gfp && fgets(gline, sizeof(gline), gfp)) {
+            char giface[32];
+            unsigned long gdest;
+            unsigned long ggw;
+
+            if (sscanf(gline, "%31s %lx %lx", giface, &gdest, &ggw) == 3
+                && gdest == 0 && ggw != 0) {
+                struct in_addr ga;
+
+                ga.s_addr = (in_addr_t)ggw;
+                inet_ntop(AF_INET, &ga, gwbuf, sizeof(gwbuf));
+                break;
+            }
+        }
+        if (gfp) {
+            fclose(gfp);
+        }
+
+        if (gwbuf[0] != '\0') {
+            strncpy(primary, gwbuf, sizeof(primary) - 1);
+            primary[sizeof(primary) - 1] = '\0';
+            syslog(LOG_INFO, "[%s] [V1262] resolver <- default gw %s\n",
+                   TAG, gwbuf);
+        } else if (claw_config_get("net.dns_primary", primary,
+                                   sizeof(primary)) != OK
+                   || primary[0] == '\0') {
+            strncpy(primary, fallbacks[0], sizeof(primary) - 1);
+            primary[sizeof(primary) - 1] = '\0';
+            syslog(LOG_WARNING, "[%s] [V1262] no default route - "
+                   "resolver <- %s\n", TAG, fallbacks[0]);
+        }
+    }
+
+    if (inet_pton(AF_INET, primary, &dns_addr) != 1) {
+        syslog(LOG_ERR, "[%s] ensure_dns: bad stored DNS '%s', using %s\n",
+               TAG, primary, fallbacks[0]);
+        strncpy(primary, fallbacks[0], sizeof(primary) - 1);
+        primary[sizeof(primary) - 1] = '\0';
+        inet_pton(AF_INET, primary, &dns_addr);
+    }
+
+    /* 关键这一句：NuttX resolver 真正读的东西 */
+    for (i = 0; i < 2; i++) {
+        struct in_addr a;
+        int rc;
+
+        inet_pton(AF_INET, primary, &a);
+        rc = netlib_set_ipv4dnsaddr(&a);
+        syslog(LOG_INFO, "[%s] ensure_dns: resolver <- %s (rc=%d)\n",
+               TAG, primary, rc);
+        if (rc == OK) {
+            break;
+        }
+
+        /* 换用备用服务器再试 */
+        primary[0] = '\0';
+        strncpy(primary, fallbacks[i + 1 < 2 ? i + 1 : 1],
+                sizeof(primary) - 1);
+        primary[sizeof(primary) - 1] = '\0';
+    }
+
+    /* 同时写 resolv.conf（部分应用/工具会读它）。写不了不算失败。 */
+    fp = fopen("/tmp/resolv.conf", "w");
+    if (fp) {
+        fprintf(fp, "nameserver %s\n", primary);
+        fprintf(fp, "nameserver %s\n", fallbacks[1]);
+        fclose(fp);
+    } else {
+        syslog(LOG_WARNING, "[%s] ensure_dns: cannot write /tmp/resolv.conf "
+               "(non-fatal, netlib resolver already programmed)\n", TAG);
+    }
+}
+
+extern int nsh_commands_init(void);
+extern int nsh_commands_start(void);
+
+/* [V1258] Boot fallbacks anchored in network_manager.c.
+ *
+ * The agent_main object that actually reaches the link no longer calls
+ * nsh_commands_init()/start() or network_wifi_reconnect() - those calls
+ * sit in a newer agent_main.c than the object the archive serves (see
+ * the 2026-11-04 stale-object investigation).  Changes made in THIS
+ * file do reach the link reliably, so anchor the boot-time behaviour
+ * here:
+ *   1. Start the CLI (set_wifi / set_net / wifi_reconnect) on first
+ *      entry - the whole nsh_commands module would otherwise be
+ *      dead-stripped because nothing references it.
+ *   2. If netinit failed to associate, retry once with the credentials
+ *      saved by set_wifi in config_store (wifi_ssid/wifi_pass). */
 int network_wait_connected(uint32_t timeout_ms)
 {
+    static bool s_boot_cli_started;
+    static bool s_boot_retry_done;
+    int wait_polls = 0;
+
+    if (!s_boot_cli_started) {
+        s_boot_cli_started = true;
+        nsh_commands_init();
+        nsh_commands_start();
+        syslog(LOG_INFO,
+               "[%s] [V1258] CLI started (set_wifi/set_net available)\n",
+               TAG);
+    }
+
     if (timeout_ms == 0) {
-        return network_is_connected() ? OK : ERROR;
+        if (network_is_connected()) {
+            ensure_dns();
+            return OK;
+        }
+        return ERROR;
     }
 
     struct timespec deadline;
@@ -81,7 +396,21 @@ int network_wait_connected(uint32_t timeout_ms)
     while (1) {
         if (network_is_connected()) {
             syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, s_ip_str);
+            /* [V525] 一拿到 IP 就编程 resolver —— NuttX 不会从 DHCP 或
+             * resolv.conf 拿 DNS，不设就是永久解析失败。见 ensure_dns() 注释。 */
+            ensure_dns();
             return OK;
+        }
+
+        /* [V1258] netinit has had ~8 s and still no link: retry once
+         * with saved credentials before giving the deadline a chance. */
+        if (!s_boot_retry_done && ++wait_polls >= 16) {
+            s_boot_retry_done = true;
+            syslog(LOG_WARNING,
+                   "[%s] [V1258] no link after 8 s - retry with saved WiFi credentials\n",
+                   TAG);
+            network_wifi_reconnect();
+            continue;
         }
 
         struct timespec now;
@@ -319,7 +648,7 @@ static void load_net_config(void)
         && buf[0] != '\0') {
         g_net_config.read_timeout = atoi(buf);
     } else {
-        g_net_config.read_timeout = 30;
+        g_net_config.read_timeout = 200;
     }
 
     /* retry_max: default 3 */
@@ -577,17 +906,44 @@ int network_set_dns(const char* primary, const char* secondary)
 
     fp = fopen("/tmp/resolv.conf", "w");
     if (!fp) {
-        syslog(LOG_ERR, "[%s] Cannot open /tmp/resolv.conf: %d\n",
-            TAG, errno);
-        return -errno;
+        /* [V525] resolv.conf 写不了**不能**直接返回。
+         *
+         * 原来这里 `return -errno;`，把后面的 netlib_set_ipv4dnsaddr() 跳过了 ——
+         * 而那恰恰是 NuttX resolver 真正会读的东西。结果是：就算 /tmp 建不出来，
+         * DNS 也永远没被设置，gethostbyname() 全部超时。
+         * 这就是「有 resolv.conf 修复却依然解析失败」的原因之一。 */
+        
+    } else {
+        fprintf(fp, "nameserver %s\n", primary);
+        if (secondary && secondary[0] != '\0') {
+            fprintf(fp, "nameserver %s\n", secondary);
+        }
+        fclose(fp);
     }
 
-    fprintf(fp, "nameserver %s\n", primary);
-    if (secondary && secondary[0] != '\0') {
-        fprintf(fp, "nameserver %s\n", secondary);
-    }
+    /* [DNS-FIX] Program the NuttX resolver as well.
+     *
+     * NuttX's DNS client takes its nameserver from
+     * netlib_set_ipv4dnsaddr() -- or from the compile-time
+     * CONFIG_NETDB_DNSSERVER_IPv4ADDR default -- and never reads
+     * /tmp/resolv.conf.  Writing that file alone left the resolver
+     * pointing at the build-time default, so every hostname lookup
+     * failed instantly and connect() returned
+     * MBEDTLS_ERR_NET_CONNECT_FAILED (0x52) in about 5 ms.  That looks
+     * exactly like "the router is broken" on every AP, while
+     * IP-literal requests (42.48.185.89:2301) kept working. */
+    {
+        struct in_addr dns_addr;
 
-    fclose(fp);
+        if (inet_pton(AF_INET, primary, &dns_addr) == 1) {
+            int rc = netlib_set_ipv4dnsaddr(&dns_addr);
+            syslog(LOG_INFO, "[%s] resolver nameserver <- %s (rc=%d)\n",
+                TAG, primary, rc);
+        } else {
+            syslog(LOG_ERR, "[%s] invalid DNS address: %s\n",
+                TAG, primary);
+        }
+    }
 
     /* Persist to config_store */
     claw_config_set("net.dns_primary", primary);
@@ -832,6 +1188,13 @@ int network_wifi_connect(const char* iface, const char* ssid,
 
     snprintf(cmd, sizeof(cmd), "wapi mode %s 2", dev); /* MANAGED */
     system(cmd);
+    /* [WIFI-FIX] set country CN (channels 1-13) before associating.
+     * esp_wifi default country is "01"/world = channels 1-11; Chinese APs
+     * commonly use 12/13 which the default scan set cannot see -> NO_AP_FOUND.
+     * CN (1-13) is a superset and safe on any channel. */
+    snprintf(cmd, sizeof(cmd), "wapi country %s CN", dev);
+    system(cmd);
+
 
     if (pass && pass[0]) {
         snprintf(cmd, sizeof(cmd), "wapi psk %s %s 3", dev, q_pass);
@@ -890,6 +1253,23 @@ int network_wifi_connect(const char* iface, const char* ssid,
 
 int network_wifi_reconnect(void)
 {
+    /* The NuttX-native netinit (CONFIG_NETINIT_WAPI_SSID + CONFIG_NETINIT_
+     * DHCPC, both set for this board) associates wlan0 with the AP and
+     * obtains a DHCP lease during NSH bring-up.  If that already happened,
+     * re-running the low-level 'wapi' sequence below would tear a healthy
+     * association down and rebuild it (and, on the esp32s3 driver, may race
+     * with netinit).  So first give netinit a few seconds to finish; if a
+     * usable IPv4 address is present we are already online and must not
+     * touch the interface.  Only fall back to the manual wapi path when the
+     * link is still down (e.g. netinit failed, or the link dropped later). */
+
+    if (network_wait_connected(8000) == OK) {
+        syslog(LOG_INFO,
+            "[%s] Network already up: %s (netinit handled WiFi)\n",
+            TAG, network_get_ip());
+        return OK;
+    }
+
     char ssid[64] = { 0 };
     char pass[128] = { 0 };
     if (agent_config_get(AGENT_CFG_KEY_WIFI_SSID, ssid, sizeof(ssid)) != OK || !ssid[0]) {

@@ -57,6 +57,7 @@
 #include "core/arena_alloc.h"
 #endif
 
+#include <arpa/inet.h>    /* [V1257] inet_pton for set_net */
 #include <malloc.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -108,6 +109,7 @@ static void cmd_help(void)
         "  clear_proxy          - Remove proxy config\n"
         "  set_wifi <ssid> <pw> - Connect to WiFi (real hardware; saved for reboot)\n"
         "  wifi_reconnect       - Re-join WiFi using saved credentials\n"
+        "  set_net <ip> <gw>    - Force static IP (no args = back to DHCP)\n"
         "  set_search_key <key> - Set SerpAPI (Google) key\n"
         "  set_exa_key <key>    - Set Exa AI search key\n"
         "  set_tavily_key <key> - Set Tavily search key\n"
@@ -133,6 +135,7 @@ static void cmd_help(void)
         "  voice_start            - Start voice channel\n"
         "  voice_stop             - Stop voice channel\n"
         "  voice_test_tts <text> [out.pcm] - Test TTS synthesis\n"
+        "  voice_speak <text>            - Speak text via voice_channel_speak (real playback)"
         "  voice_test_asr <file>  - Test ASR recognition\n"
         "  set_voice_tts <name>   - Switch TTS backend\n"
         "  set_voice_asr <name>   - Switch ASR backend\n"
@@ -341,6 +344,32 @@ static void cmd_set_wifi(int argc, char** argv)
         printf("WiFi connected: %s\n", network_get_ip());
     else
         printf("WiFi failed. Check SSID/password or run net_status.\n");
+}
+
+static void cmd_set_net(int argc, char** argv)
+{
+    struct in_addr addr;
+
+    if (argc < 3) {
+        claw_config_set("net.static_ip", "");
+        claw_config_set("net.static_gw", "");
+        printf("Static IP cleared, DHCP will be used after reboot.\n"
+               "Usage: set_net <ip> <gateway>\n");
+        return;
+    }
+    if (inet_pton(AF_INET, argv[1], &addr) != 1 ||
+        inet_pton(AF_INET, argv[2], &addr) != 1) {
+        printf("Invalid IPv4 address.\n"
+               "Usage: set_net <ip> <gateway>\n");
+        return;
+    }
+    if (claw_config_set("net.static_ip", argv[1]) == OK &&
+        claw_config_set("net.static_gw", argv[2]) == OK) {
+        printf("Static IP %s (gw %s) saved. Reboot to apply.\n",
+               argv[1], argv[2]);
+    } else {
+        printf("Failed to save static IP config.\n");
+    }
 }
 
 static void cmd_wifi_reconnect(void)
@@ -874,6 +903,8 @@ static void cmd_skill_sync(void)
 }
 #endif
 
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA_SHELL_STDIN
+
 /* ── CLI thread ───────────────────────────────────────────────── */
 
 static void* cli_thread(void* arg)
@@ -949,6 +980,8 @@ static void* cli_thread(void* arg)
             cmd_set_wifi(argc, argv);
         else if (strcmp(cmd, "wifi_reconnect") == 0)
             cmd_wifi_reconnect();
+        else if (strcmp(cmd, "set_net") == 0)
+            cmd_set_net(argc, argv);
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
         else if (strcmp(cmd, "net_diag") == 0)
             cmd_net_diag(argc, argv);
@@ -1006,6 +1039,8 @@ static void* cli_thread(void* arg)
             cmd_voice_test_tts(argc, argv);
         else if (strcmp(cmd, "voice_test_asr") == 0)
             cmd_voice_test_asr(argc, argv);
+        else if (strcmp(cmd, "voice_speak") == 0)
+            cmd_voice_speak(argc, argv);
         else if (strcmp(cmd, "set_voice_tts") == 0)
             cmd_set_voice_tts(argc, argv);
         else if (strcmp(cmd, "set_voice_asr") == 0)
@@ -1073,6 +1108,8 @@ static void* cli_thread(void* arg)
     return NULL;
 }
 
+
+#endif /* CONFIG_EXAMPLES_AI_AGENT_VELA_SHELL_STDIN */
 /* ── Init / Start ─────────────────────────────────────────────── */
 
 int nsh_commands_init(void)
@@ -1086,5 +1123,16 @@ int nsh_commands_init(void)
 
 int nsh_commands_start(void)
 {
+#ifndef CONFIG_EXAMPLES_AI_AGENT_VELA_SHELL_STDIN
+    /* Reading stdin from an autostarted daemon steals console
+     * RX bytes away from NSH (both get fd 0 = /dev/console),
+     * which makes the NSH console stop responding shortly after
+     * boot.  The interactive "vela>" CLI is therefore opt-in;
+     * the voice pipeline is not affected. */
+    syslog(LOG_INFO, "[%s] stdin CLI disabled (enable "
+           "CONFIG_EXAMPLES_AI_AGENT_VELA_SHELL_STDIN to use it)\n", TAG);
+    return OK;
+#else
     return agent_task_create(cli_thread, "agent_cli", AGENT_CLI_STACK, NULL, AGENT_CLI_PRIO);
+#endif
 }

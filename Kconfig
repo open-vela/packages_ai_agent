@@ -63,6 +63,16 @@ config EXAMPLES_AI_AGENT_VELA_NODE_DISPLAY_NAME
 	---help---
 		Human-readable name shown on the Hub side for this Node.
 
+config EXAMPLES_AI_AGENT_VELA_SHELL_STDIN
+	bool "Enable interactive stdin CLI (vela> prompt)"
+	default n
+	---help---
+		When the agent is autostarted from board bringup, both NSH and
+		the agent CLI thread get /dev/console as fd 0 and compete for
+		console RX bytes - NSH stops responding shortly after boot.
+		Keep the stdin CLI disabled unless running the agent from an
+		interactive adb shell.
+
 choice
 	prompt "Shell security policy"
 	default EXAMPLES_AI_AGENT_VELA_SHELL_ALLOWLIST
@@ -161,6 +171,67 @@ config AI_AGENT_AUDIO_ALSA_DIRECT
 		boards; the agent then uses the media framework recorder,
 		which works everywhere. When enabled, the agent still falls
 		back to media_recorder at runtime if ALSA capture fails.
+
+config AI_AGENT_AUDIO_NATIVE
+	bool "Use native NuttX audio character device backend"
+	default y
+	---help---
+		Stream playback and capture through the standard NuttX audio
+		character device (AUDIOIOC_* ioctls on /dev/audio/pcmXp and
+		/dev/audio/pcmXc) instead of the media_player / media_recorder
+		framework.  This works on any board whose bring-up registers
+		raw audio devices (e.g. esp32s3-eye + ES8311).  If the device
+		cannot be opened the media backends are still tried as a
+		fallback.
+
+config AI_AGENT_VOICE_BOOT_TEST
+	bool "One-shot audio boot self-test (TTS + short PTT session)"
+	default n
+	---help---
+		Spawn a one-shot task ~10s after boot that (1) plays a TTS
+		greeting through /dev/audio/pcm0p and (2) runs a short
+		push-to-talk session so the native capture path
+		(/dev/audio/pcm0c -> audio_capture -> voice_asr) is exercised
+		and stays linked into the final ELF.  ASR transcripts are
+		logged to syslog.  Intended for audio bring-up verification;
+		disable once audio is verified on the target.
+
+config AI_AGENT_ASR_HTTP
+	bool "Enable HTTP ASR backend (self-hosted whisper, no API key)"
+	default y
+	---help---
+		Recognize speech through the self-hosted faster-whisper
+		webservice. PCM is wrapped into a WAV container and uploaded
+		as multipart/form-data; the transcription returns as text.
+
+config AI_AGENT_ASR_HTTP_URL
+	string "HTTP ASR endpoint base URL"
+	default "http://42.48.185.89:9009/asr"
+	depends on AI_AGENT_ASR_HTTP
+	---help---
+		Base URL of the self-hosted whisper ASR service. The agent
+		POSTs <url>?task=transcribe&language=zh&output=text with the
+		recording as multipart WAV (16kHz mono s16le).
+
+config AI_AGENT_TTS_HTTP
+	bool "Enable HTTP TTS backend (self-hosted, no API key)"
+	default y
+	---help---
+		Add an HTTP TTS channel that streams raw PCM (24kHz/mono/s16le)
+		from a user-operated service (e.g. an edge-tts + ffmpeg container)
+		so the device can speak without paid cloud TTS credentials.
+		Used as the primary TTS path; falls back to Volcengine when the
+		HTTP endpoint is unreachable.
+
+config AI_AGENT_TTS_HTTP_URL
+	string "HTTP TTS endpoint base URL"
+	default "http://192.168.31.239:2301/tts"
+	depends on AI_AGENT_TTS_HTTP
+	---help---
+		Base URL of the self-hosted HTTP TTS service. The agent issues
+		GET <url>?text=<percent-encoded>&rate=24000 and expects a raw
+		PCM body (audio/L16, 24kHz, mono, s16le). Overridable at runtime
+		via the config.json key "tts_http_url".
 
 config AI_AGENT_CAMERA
 	bool "Enable camera capture tool"
@@ -310,3 +381,17 @@ config AI_AGENT_REST_API
 		log retrieval from Android companion App.
 
 endif
+
+config AI_AGENT_WEATHER_LAT
+	string "Weather city latitude (Open-Meteo)"
+	default "39.9042"
+	---help---
+		Latitude of the city whose weather the info screen shows.
+		Used by the refresh_weather tool (Open-Meteo, no API key).
+
+config AI_AGENT_WEATHER_LON
+	string "Weather city longitude (Open-Meteo)"
+	default "116.4074"
+	---help---
+		Longitude of the city whose weather the info screen shows.
+

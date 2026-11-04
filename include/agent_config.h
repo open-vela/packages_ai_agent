@@ -116,7 +116,7 @@
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
  * acts as the hard backstop that actually unblocks the read. */
-#define AGENT_LLM_TIMEOUT_SEC 60
+#define AGENT_LLM_TIMEOUT_SEC 180
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
@@ -129,7 +129,13 @@
 
 /* ── LLM ────────────────────────────────────────────────────── */
 #define AGENT_LLM_DEFAULT_MODEL ""
-#define AGENT_LLM_MAX_TOKENS 4096
+/* [V737] Was 4096.  This is a *voice* assistant: the reply is read aloud, so
+ * 4096 tokens is 16+ seconds of generation the user sits through in silence,
+ * and a long reply also forces the TTS backend to split it into several
+ * HTTPS requests (each with its own TLS handshake).  512 tokens is ~340
+ * Chinese characters - far more than any spoken answer needs, and it puts a
+ * ceiling on the worst case. */
+#define AGENT_LLM_MAX_TOKENS 512
 #define AGENT_LLM_MAX_TOKENS_OPENAI 16384
 #define AGENT_LLM_API_HOST ""
 #define AGENT_LLM_API_PATH "/v1/chat/completions"
@@ -166,12 +172,12 @@
 #define AGENT_OUTBOUND_CORE 0
 
 /* ── Memory / Context ───────────────────────────────────────── */
-#define AGENT_CONTEXT_BUF_SIZE (8 * 1024)
+#define AGENT_CONTEXT_BUF_SIZE (16 * 1024)
 
 /* ── Cron / Heartbeat ──────────────────────────────────────── */
 #define AGENT_CRON_FILE AGENT_DATA_DIR "/cron.json"
 #define AGENT_CRON_FILE_MAX_SIZE (8 * 1024)
-#define AGENT_CRON_MAX_JOBS 16
+#define AGENT_CRON_MAX_JOBS 4  /* [V860e] 16->4: reclaim 8.5 KB DRAM bss */
 #define AGENT_CRON_CHECK_INTERVAL_MS (10 * 1000)
 #define AGENT_CRON_ID_LEN 9 /* 8 hex chars + NUL */
 #define AGENT_CRON_STACK (8 * 1024)
@@ -368,7 +374,11 @@
  * 128KB PCM ≈ 4s at 16kHz/16bit/mono; enough for typical TTS output.
  * Recording uses the same cap; 128KB ≈ 4s of audio which is fine for
  * short voice commands.  For longer recordings, increase as needed. */
-#define AGENT_VOICE_PCM_BUF_SIZE (128 * 1024)
+/* [V693] One PTT window is VOICE_PTT_MAX_SEC (8 s) of 16 kHz mono 16-bit
+ * PCM = 256 KB, and MIMO_ASR_MAX_PCM accepts exactly that.  At 128 KB
+ * accumulate_pcm_locked() dropped everything past the fourth second
+ * without saying so. */
+#define AGENT_VOICE_PCM_BUF_SIZE (256 * 1024)
 #define AGENT_VOICE_RESP_BUF_SIZE (128 * 1024)
 #define AGENT_VOICE_B64_BUF_SIZE (96 * 1024)
 
@@ -381,11 +391,17 @@
 #define AGENT_CFG_KEY_VOLC_ASR_CLUSTER "volc_asr_cluster"
 
 /* Default TTS speaker and cluster */
-#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
+#define AGENT_VOICE_DEFAULT_SPEAKER "zh_female_qingxinnvsheng_mars_bigtts"  /* [CALM-VOICE] 原来是 zh_male_beijingxiaoye_emo_v2_mars_bigtts（北京小爷，男声）——mimo 失败回退到 volc 时用户就听到男大叔音。 */
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
 
 /* WebSocket TTS output sample rate (big-model voices output 24kHz) */
-#define AGENT_TTS_WS_SAMPLE_RATE 24000
+/* TTS playback sample rate.  MUST stay 16000: the ESP32-S3 I2S0 is shared by
+ * the ES8311 mic (capture) and speaker (playback) and is locked to 16000 by
+ * CONFIG_ESP32S3_I2S0_SAMPLE_RATE (also required by the whisper ASR input).
+ * Requesting any other rate makes AUDIOIOC_CONFIGURE fail on the shared I2S
+ * and forces a silent media_player fallback.  The :2301 TTS bridge resamples
+ * edge-tts MP3 to this exact rate via ffmpeg, so the wire rate must match. */
+#define AGENT_TTS_WS_SAMPLE_RATE 16000
 
 /* ── Tool Guard (security) ──────────────────────────────────── */
 #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)

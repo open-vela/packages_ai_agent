@@ -565,6 +565,9 @@ int lvgl_ui_channel_send(const char* text)
         return -EINVAL;
     }
 
+    /* [V315] a reply is arriving: drop the BOOT-key "正在思考..." status */
+    lvgl_ui_channel_set_voice_status(0);
+
     /* Auto-show chat screen on first Agent reply */
     if (!s_state.screen_visible) {
         lvgl_ui_channel_show();
@@ -855,6 +858,48 @@ static void recording_indicator_show_processing(void)
     /* Switch indicator text to processing state */
     lv_label_set_text(s_state.rec_indicator, "识别中...");
     lv_obj_set_style_text_color(s_state.rec_indicator, lv_color_hex(0xf39c12), 0);
+}
+
+/* [V315] Physical BOOT button voice status.
+ * Runs in the LVGL thread via lv_async_call (see the public entry below). */
+static void voice_status_async_cb(void* data)
+{
+    int state = (int)(long)data;
+
+    if (!s_state.initialized || !s_state.running || !s_state.rec_indicator) {
+        return;
+    }
+
+    if (state != 0 && !s_state.screen_visible) {
+        /* Already in the LVGL thread: load the chat screen directly so the
+         * status text is actually visible over the idle info screen. */
+        show_screen_async_cb(NULL);
+    }
+
+    switch (state) {
+    case 1:  /* BOOT pressed: listening */
+        lv_label_set_text(s_state.rec_indicator, "开始聆听...");
+        lv_obj_set_style_text_color(s_state.rec_indicator, lv_color_hex(0xe74c3c), 0);
+        lv_obj_clear_flag(s_state.rec_indicator, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case 2:  /* BOOT released: thinking */
+        lv_label_set_text(s_state.rec_indicator, "正在思考...");
+        lv_obj_set_style_text_color(s_state.rec_indicator, lv_color_hex(0xf39c12), 0);
+        lv_obj_clear_flag(s_state.rec_indicator, LV_OBJ_FLAG_HIDDEN);
+        break;
+    default: /* clear */
+        lv_obj_add_flag(s_state.rec_indicator, LV_OBJ_FLAG_HIDDEN);
+        break;
+    }
+}
+
+/* [V315] Called from voice_channel's BOOT button task (any thread). */
+void lvgl_ui_channel_set_voice_status(int state)
+{
+    if (!s_state.initialized || !s_state.running) {
+        return;
+    }
+    lv_async_call(voice_status_async_cb, (void*)(long)state);
 }
 
 /* lvgl_ui_thread removed — we no longer run our own LVGL event loop.
