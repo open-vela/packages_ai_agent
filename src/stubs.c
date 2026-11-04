@@ -15,6 +15,7 @@
  */
 
 #include <nuttx/config.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -49,6 +50,41 @@ void ls_lvgl_set_actuator(const char* name, bool on)
 {
     (void)name;
     (void)on;
+}
+
+/* PWM breathing hook provided by examples/ls_lvgl (strong symbol there). */
+
+__attribute__((weak))
+void ls_lvgl_set_pwm_breath(bool on)
+{
+    (void)on;
+}
+
+/* Buzzer hook provided by examples/ls_lvgl (strong symbol there). */
+
+__attribute__((weak))
+void ls_lvgl_set_buzzer(bool on)
+{
+    (void)on;
+}
+
+/* Sensor read hooks provided by examples/ls_lvgl.  The panel owns the
+ * thermal device (exclusive open) and the I2C bus, so the agent reads the
+ * panel's cached samples while it is running.
+ */
+
+__attribute__((weak))
+int ls_lvgl_read_thermal(int32_t* milli_c)
+{
+    (void)milli_c;
+    return -ENOSYS;
+}
+
+__attribute__((weak))
+int ls_lvgl_read_light(unsigned int* lux_x100)
+{
+    (void)lux_x100;
+    return -ENOSYS;
 }
 
 __attribute__((weak)) void arm_netinitialize(void) { }

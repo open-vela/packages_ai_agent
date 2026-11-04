@@ -527,29 +527,27 @@ int tool_registry_init(void)
 
     REGISTER_TOOL(
         "board_pwm",
-        "Control hardware PWM2 driving the blue LED on the board. "
-        "Static mode: set duty (0-100, 0=stop), optional frequency "
-        "(default 1000 Hz). Breath mode: action=\"breath\" starts a "
-        "continuous breathing animation - the duty ramps 0->100->0 "
-        "repeatedly, period_ms per full cycle (default 3000). The "
-        "animation keeps running until it is stopped with duty=0.",
+        "Turn the on-board blue LED (hardware PWM2) on or off. "
+        "It ALWAYS breathes: turning it on - with no arguments, "
+        "action=\"breath\", or any duty above 0 - starts the LCD panel's "
+        "breathing animation, and the call returns at once. There is no "
+        "steady-on mode, so do not ask the user for a brightness. "
+        "Stop it with action=\"off\" or duty=0.",
         TOOL_SCHEMA_BEGIN()
-            TOOL_PARAM_NUM("duty", "Static mode: duty cycle percent 0-100 (0 = stop)") ","
-            TOOL_PARAM_STR("action", "Breath mode: set to \"breath\"") ","
-            TOOL_PARAM_NUM("period_ms",
-                "Breath mode: full breath cycle duration in ms, 200-60000 (default 3000)") ","
-            TOOL_PARAM_NUM("frequency", "PWM carrier frequency in Hz 10-100000 (default 1000)")
+            TOOL_PARAM_STR("action",
+                "\"breath\"/\"on\" starts the breathing animation, \"off\"/\"stop\" stops it") ","
+            TOOL_PARAM_NUM("duty", "0 = stop; any value above 0 also means breathing")
             TOOL_SCHEMA_END(),
         tool_board_pwm_execute);
 
     REGISTER_TOOL(
         "board_buzzer",
-        "Beep the on-board passive buzzer (1 kHz tone). "
-        "Use for alerts or notifications.",
+        "Sound the on-board buzzer as an alarm or alert. It beeps "
+        "continuously until stopped. action=\"on\" (or no arguments) "
+        "starts it, action=\"off\" stops it.",
         TOOL_SCHEMA_BEGIN()
-            TOOL_PARAM_NUM("duration_ms",
-                "Beep duration in ms 1-5000 (default 200)") ","
-            TOOL_PARAM_NUM("count", "Number of beeps 1-10 (default 1)")
+            TOOL_PARAM_STR("action",
+                "\"on\" (default) starts the alarm beeping, \"off\" stops it")
             TOOL_SCHEMA_END(),
         tool_board_buzzer_execute);
 

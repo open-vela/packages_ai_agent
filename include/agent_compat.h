@@ -167,3 +167,30 @@ void ls_lvgl_set_ai_text(const char* status, const char* text);
  *  Weak: resolved against the strong definition in ls_lvgl.c when that
  *  app is linked; otherwise the no-op stub in stubs.c takes over. */
 void ls_lvgl_set_actuator(const char* name, bool on);
+
+/** Ask the panel to start/stop the PWM BLUE breathing animation itself.
+ *  The panel owns PWM2 and already ramps the duty on its own UI tick, so
+ *  a tool that wants the LED to breathe only has to hand the request
+ *  over and return; running the ramp inside the agent blocks it for the
+ *  whole cycle.
+ *  Weak: resolved against the strong definition in ls_lvgl.c when that
+ *  app is linked; otherwise the no-op stub in stubs.c takes over. */
+void ls_lvgl_set_pwm_breath(bool on);
+
+/** Ask the panel to switch its BUZZER row on or off.  The panel beeps
+ *  the passive buzzer from its own UI tick, so an alert request returns
+ *  at once instead of blocking the agent for the beep duration.
+ *  Weak: resolved against the strong definition in ls_lvgl.c when that
+ *  app is linked; otherwise the no-op stub in stubs.c takes over. */
+void ls_lvgl_set_buzzer(bool on);
+
+/** Read the panel's cached on-die temperature, in milli-Celsius.
+ *  /dev/thermal0 only permits one open and the panel holds it, so the
+ *  agent asks the panel for its last sample instead of opening it.
+ *  Returns 0 on success, a negated errno otherwise.  Weak. */
+int ls_lvgl_read_thermal(int32_t* milli_c);
+
+/** Read the panel's cached BH1750 ambient light level, in lux * 100.
+ *  The panel owns the I2C bus used by the sensor.  Returns 0 on success,
+ *  a negated errno otherwise.  Weak. */
+int ls_lvgl_read_light(unsigned int* lux_x100);

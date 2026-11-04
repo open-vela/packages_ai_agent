@@ -915,138 +915,14 @@ int tool_board_led_execute(const char *input_json,
   return OK;
 }
 
-/* ── Breathing animation ──────────────────────────────────────
- *
- * The blue LED breathes by ramping the PWM duty up and down.  The ramp
- * runs in its own thread: the tool call has to return at once so the
- * agent can report back and take the next command, and the LED has to
- * keep breathing until it is told to stop.  Running the animation inline
- * blocked the agent for the whole cycle and left the LED off at the end.
- */
-
-static volatile bool s_pwm_breath_running;
-static volatile uint32_t s_pwm_breath_freq = PWM_FREQ_DEFAULT;
-static volatile int s_pwm_breath_period_ms = 3000;
-static pthread_t s_pwm_breath_thread;
-static bool s_pwm_breath_thread_valid;
-static pthread_mutex_t s_pwm_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void* pwm_breath_worker(void* arg)
-{
-  struct pwm_info_s info;
-  int fd;
-  int step_delay_us;
-  int step;
-
-  fd = open(PWM_DEVICE, O_RDONLY);
-  if (fd < 0)
-    {
-      syslog(LOG_ERR, "[%s] pwm breath: open %s failed: %d\n",
-             TAG, PWM_DEVICE, errno);
-      return NULL;
-    }
-
-  step_delay_us = s_pwm_breath_period_ms * 1000 / (PWM_BREATH_STEPS * 2);
-
-  memset(&info, 0, sizeof(info));
-  info.frequency = s_pwm_breath_freq;
-  info.duty = 0;
-  ioctl(fd, PWMIOC_SETCHARACTERISTICS, (unsigned long)(uintptr_t)&info);
-  ioctl(fd, PWMIOC_START, 0);
-
-  while (s_pwm_breath_running)
-    {
-      for (step = 1; step <= PWM_BREATH_STEPS; step++)
-        {
-          if (!s_pwm_breath_running)
-            {
-              break;
-            }
-
-          info.frequency = s_pwm_breath_freq;
-          info.duty = (uint32_t)((uint64_t)step * PWM_DUTY_MAX /
-                                 PWM_BREATH_STEPS);
-          ioctl(fd, PWMIOC_SETCHARACTERISTICS,
-                (unsigned long)(uintptr_t)&info);
-          up_udelay(step_delay_us);
-        }
-
-      for (step = PWM_BREATH_STEPS - 1; step >= 0; step--)
-        {
-          if (!s_pwm_breath_running)
-            {
-              break;
-            }
-
-          info.frequency = s_pwm_breath_freq;
-          info.duty = (uint32_t)((uint64_t)step * PWM_DUTY_MAX /
-                                 PWM_BREATH_STEPS);
-          ioctl(fd, PWMIOC_SETCHARACTERISTICS,
-                (unsigned long)(uintptr_t)&info);
-          up_udelay(step_delay_us);
-        }
-    }
-
-  /* Animation stopped: leave the PWM off. */
-  info.duty = 0;
-  ioctl(fd, PWMIOC_SETCHARACTERISTICS, (unsigned long)(uintptr_t)&info);
-  ioctl(fd, PWMIOC_STOP, 0);
-  close(fd);
-  return NULL;
-}
-
-/* Stop a running animation.  The worker checks the flag once per step,
- * so this returns within a step delay. */
-static void pwm_breath_stop(void)
-{
-  pthread_mutex_lock(&s_pwm_lock);
-  if (s_pwm_breath_thread_valid)
-    {
-      s_pwm_breath_running = false;
-      pthread_join(s_pwm_breath_thread, NULL);
-      s_pwm_breath_thread_valid = false;
-    }
-  pthread_mutex_unlock(&s_pwm_lock);
-}
-
-static int pwm_breath_start(uint32_t freq, int period_ms)
-{
-  int ret;
-
-  pwm_breath_stop();
-
-  pthread_mutex_lock(&s_pwm_lock);
-  s_pwm_breath_freq = freq;
-  s_pwm_breath_period_ms = period_ms;
-  s_pwm_breath_running = true;
-
-  ret = pthread_create(&s_pwm_breath_thread, NULL, pwm_breath_worker, NULL);
-  if (ret != 0)
-    {
-      s_pwm_breath_running = false;
-      pthread_mutex_unlock(&s_pwm_lock);
-      return -1;
-    }
-
-  s_pwm_breath_thread_valid = true;
-  pthread_mutex_unlock(&s_pwm_lock);
-  return 0;
-}
-
 /****************************************************************************
  * Tool: board_pwm
  *
- * Input (static mode):
- *   { "duty": 0-100, "frequency": Hz (default 1000) }
- *   duty=0 stops PWM. Controls blue LED on GPIO88.
- *
- * Input (breath mode):
- *   { "action": "breath", "period_ms": 3000, "frequency": Hz }
- *   Background animation: duty ramps 0->100->0 per cycle, stepping
- *   every period_ms/200 ms (100 steps up + 100 steps down), same as
- *   ls_driver_test/test_pwm.c.  The call returns immediately and the
- *   animation keeps running until it is stopped with a static duty=0.
- *   period_ms 200-60000 (default 3000).
+ * The blue LED on GPIO88 is always shown breathing; there is no steady-on
+ * mode.  Any request that turns it on -- action="breath"/"on", any
+ * duty > 0, or no argument at all -- is handed to the LCD panel's own
+ * 0->100->0 ramp through ls_lvgl_set_pwm_breath() and the call returns at
+ * once.  Only duty=0 or action="off"/"stop" stops the output.
  ****************************************************************************/
 
 int tool_board_pwm_execute(const char *input_json,
@@ -1061,10 +937,10 @@ int tool_board_pwm_execute(const char *input_json,
   cJSON *j_duty;
   cJSON *j_freq;
   cJSON *j_action;
-  cJSON *j_period;
   cJSON *resp;
   bool breath = false;
-  int period_ms = 3000;
+  bool action_off = false;
+  bool have_duty;
 
   if (!input_json || !output || output_size < 32)
     {
@@ -1080,15 +956,21 @@ int tool_board_pwm_execute(const char *input_json,
   j_action = cJSON_GetObjectItem(root, "action");
   if (cJSON_IsString(j_action))
     {
-      if (strcmp(j_action->valuestring, "breath") == 0)
+      if (strcmp(j_action->valuestring, "breath") == 0 ||
+          strcmp(j_action->valuestring, "on") == 0)
         {
           breath = true;
+        }
+      else if (strcmp(j_action->valuestring, "off") == 0 ||
+               strcmp(j_action->valuestring, "stop") == 0)
+        {
+          action_off = true;
         }
       else
         {
           cJSON_Delete(root);
           return json_fail(output, output_size,
-                           "{\"error\":\"unknown action '%s'. valid: breath\"}",
+                           "{\"error\":\"unknown action '%s'. valid: breath, off\"}",
                            j_action->valuestring);
         }
     }
@@ -1096,17 +978,18 @@ int tool_board_pwm_execute(const char *input_json,
   j_duty = cJSON_GetObjectItem(root, "duty");
   j_freq = cJSON_GetObjectItem(root, "frequency");
 
-  if (!breath && !cJSON_IsNumber(j_duty))
-    {
-      cJSON_Delete(root);
-      return json_fail(output, output_size,
-                       "{\"error\":\"missing required field: duty (0-100), or action=breath\"}", NULL);
-    }
+  have_duty = cJSON_IsNumber(j_duty) != 0;
 
-  duty = cJSON_IsNumber(j_duty) ? (uint32_t)j_duty->valuedouble : 0;
+  duty = have_duty ? (uint32_t)j_duty->valuedouble : 0;
   if (duty > 100)
     {
       duty = 100;
+    }
+
+  if (action_off)
+    {
+      duty = 0;
+      have_duty = true;
     }
 
   if (cJSON_IsNumber(j_freq) && j_freq->valuedouble >= 10 &&
@@ -1115,18 +998,31 @@ int tool_board_pwm_execute(const char *input_json,
       freq = (uint32_t)j_freq->valuedouble;
     }
 
-  if (breath)
-    {
-      j_period = cJSON_GetObjectItem(root, "period_ms");
-      if (cJSON_IsNumber(j_period) && j_period->valuedouble >= 200 &&
-          j_period->valuedouble <= 60000)
-        {
-          period_ms = (int)j_period->valuedouble;
-        }
-
-    }
-
   cJSON_Delete(root);
+
+  /* Every request that turns the blue LED on starts the panel's breathing
+   * animation: this board has no steady-on mode.  Only an explicit duty=0
+   * (or action=off) stops it. */
+
+  if (breath || !have_duty || duty > 0)
+    {
+      /* The panel owns PWM2 and already ramps the duty on its own UI
+       * tick, at its own fixed rate, so there is nothing to configure
+       * here.  Hand the request over and return at once: running the
+       * ramp inside the agent blocked it for the whole cycle, so the
+       * next command could not be taken until the animation was
+       * interrupted. */
+
+      ls_lvgl_set_pwm_breath(true);
+
+      resp = cJSON_CreateObject();
+      cJSON_AddBoolToObject(resp, "ok", true);
+      cJSON_AddStringToObject(resp, "mode", "breath");
+      cJSON_AddStringToObject(resp, "state", "breathing");
+      json_reply(resp, output, output_size);
+      syslog(LOG_INFO, "[%s] pwm breath (panel)\n", TAG);
+      return OK;
+    }
 
   /* Pinmux to PWM2 second function */
 
@@ -1146,38 +1042,13 @@ int tool_board_pwm_execute(const char *input_json,
       return ERROR;
     }
 
-  if (breath)
-    {
-      /* Start the animation in the background: the call returns at once
-       * and the LED keeps breathing until it is stopped. */
-      if (pwm_breath_start(freq, period_ms) != 0)
-        {
-          close(fd);
-          snprintf(output, output_size,
-                   "{\"error\":\"cannot start the breathing thread\"}");
-          return ERROR;
-        }
-
-      close(fd);
-
-      resp = cJSON_CreateObject();
-      cJSON_AddBoolToObject(resp, "ok", true);
-      cJSON_AddStringToObject(resp, "mode", "breath");
-      cJSON_AddNumberToObject(resp, "period_ms", period_ms);
-      cJSON_AddNumberToObject(resp, "frequency_hz", freq);
-      cJSON_AddStringToObject(resp, "state", "breathing");
-      json_reply(resp, output, output_size);
-      ls_lvgl_set_actuator("PWM BLUE", true);
-      syslog(LOG_INFO, "[%s] pwm breath %dms freq=%uHz\n",
-             TAG, period_ms, freq);
-      return OK;
-    }
-
-  /* A static duty takes over from the breathing animation. */
-  pwm_breath_stop();
-
   info.frequency = freq;
-  info.duty = (uint32_t)((uint64_t)duty * PWM_DUTY_MAX / 100);
+  info.duty = 0;
+
+  /* Only the stop path gets here.  Apply a zero duty but leave the timer
+   * running: the panel reuses the same open to resume its animation, and
+   * it only re-applies characteristics (never PWMIOC_START), so stopping
+   * the counter here would leave the LED dark for good. */
 
   ret = ioctl(fd, PWMIOC_SETCHARACTERISTICS, (unsigned long)(uintptr_t)&info);
   if (ret < 0)
@@ -1186,15 +1057,6 @@ int tool_board_pwm_execute(const char *input_json,
       snprintf(output, output_size,
                "{\"error\":\"PWMIOC_SETCHARACTERISTICS failed (errno %d)\"}", errno);
       return ERROR;
-    }
-
-  if (duty == 0)
-    {
-      ioctl(fd, PWMIOC_STOP, 0);
-    }
-  else
-    {
-      ioctl(fd, PWMIOC_START, 0);
     }
 
   close(fd);
@@ -1214,22 +1076,20 @@ int tool_board_pwm_execute(const char *input_json,
 /****************************************************************************
  * Tool: board_buzzer
  *
- * Input: { "duration_ms": 100 (1-5000), "count": 1 }
- * Passive buzzer on GPIO75, software 1 kHz square wave.
+ * The panel owns the buzzer: its BUZZER row beeps a 1 kHz tone from the
+ * UI tick (80 ms on, every 500 ms) for as long as the row is on.  An
+ * alarm request only has to switch that row, so the call returns at once
+ * instead of blocking the agent for the whole beep pattern.
+ *
+ * Input: {} (or action="on") starts the alarm; action="off"/"stop" ends it.
  ****************************************************************************/
 
 int tool_board_buzzer_execute(const char *input_json,
                               char *output, size_t output_size)
 {
-  int fd;
-  int duration_ms = 200;
-  int count = 1;
-  int n;
-  long cycles;
-  long c;
+  bool on = true;
   cJSON *root;
-  cJSON *j_dur;
-  cJSON *j_count;
+  cJSON *j_action;
   cJSON *resp;
 
   if (!input_json || !output || output_size < 32)
@@ -1243,65 +1103,24 @@ int tool_board_buzzer_execute(const char *input_json,
       return json_fail(output, output_size, "{\"error\":\"cannot parse input JSON\"}", NULL);
     }
 
-  j_dur = cJSON_GetObjectItem(root, "duration_ms");
-  j_count = cJSON_GetObjectItem(root, "count");
-
-  if (cJSON_IsNumber(j_dur) && j_dur->valuedouble >= 1 &&
-      j_dur->valuedouble <= 5000)
+  j_action = cJSON_GetObjectItem(root, "action");
+  if (cJSON_IsString(j_action) &&
+      (strcmp(j_action->valuestring, "off") == 0 ||
+       strcmp(j_action->valuestring, "stop") == 0))
     {
-      duration_ms = (int)j_dur->valuedouble;
-    }
-
-  if (cJSON_IsNumber(j_count) && j_count->valuedouble >= 1 &&
-      j_count->valuedouble <= 10)
-    {
-      count = (int)j_count->valuedouble;
+      on = false;
     }
 
   cJSON_Delete(root);
 
-  fd = gpio_open_output(BUZZER_PIN);
-  if (fd < 0)
-    {
-      snprintf(output, output_size,
-               "{\"error\":\"open buzzer GPIO%d failed (errno %d)\"}", BUZZER_PIN, errno);
-      return ERROR;
-    }
-
-  gpio_write_level(fd, 0);
-
-  cycles = (long)duration_ms * 1000 / (BUZZER_HALF_US * 2);
-
-  ls_lvgl_set_actuator("BUZZER", true);
-
-  for (n = 0; n < count; n++)
-    {
-      for (c = 0; c < cycles; c++)
-        {
-          gpio_write_level(fd, 1);
-          up_udelay(BUZZER_HALF_US);
-          gpio_write_level(fd, 0);
-          up_udelay(BUZZER_HALF_US);
-        }
-
-      if (n < count - 1)
-        {
-          up_mdelay(200);
-        }
-    }
-
-  close(fd);
-
-  ls_lvgl_set_actuator("BUZZER", false);
+  ls_lvgl_set_buzzer(on);
 
   resp = cJSON_CreateObject();
   cJSON_AddBoolToObject(resp, "ok", true);
-  cJSON_AddNumberToObject(resp, "duration_ms", duration_ms);
-  cJSON_AddNumberToObject(resp, "count", count);
-  cJSON_AddNumberToObject(resp, "frequency_hz", 1000);
+  cJSON_AddStringToObject(resp, "state", on ? "on" : "off");
   json_reply(resp, output, output_size);
 
-  syslog(LOG_INFO, "[%s] buzzer %dms x%d\n", TAG, duration_ms, count);
+  syslog(LOG_INFO, "[%s] buzzer %s (panel)\n", TAG, on ? "on" : "off");
   return OK;
 }
 
@@ -1366,6 +1185,22 @@ int tool_board_thermal_read_execute(const char *input_json,
   int fd;
   int32_t temp;
   cJSON *resp;
+
+  (void)input_json;
+
+  /* /dev/thermal0 admits one open at a time and the panel holds it for
+   * its own display, so prefer the value the panel already sampled. */
+
+  if (ls_lvgl_read_thermal(&temp) == 0)
+    {
+      resp = cJSON_CreateObject();
+      cJSON_AddBoolToObject(resp, "ok", true);
+      cJSON_AddNumberToObject(resp, "temperature_celsius", temp / 1000.0);
+      json_reply(resp, output, output_size);
+
+      syslog(LOG_INFO, "[%s] thermal %d mC (panel)\n", TAG, temp);
+      return OK;
+    }
 
   fd = open(THERMAL_PATH, O_RDONLY);
   if (fd < 0)
@@ -1472,6 +1307,23 @@ int tool_board_light_read_execute(const char *input_json,
   uint8_t addr;
   unsigned int lux_x100 = 0;
   cJSON *resp;
+
+  (void)input_json;
+
+  /* The panel owns the sensor bus, so use its cached sample when it is
+   * running; fall back to the bus only when the hook is not present. */
+
+  if (ls_lvgl_read_light(&lux_x100) == 0)
+    {
+      resp = cJSON_CreateObject();
+      cJSON_AddBoolToObject(resp, "ok", true);
+      cJSON_AddNumberToObject(resp, "lux", lux_x100 / 100.0);
+      json_reply(resp, output, output_size);
+
+      syslog(LOG_INFO, "[%s] light %u.%02u lux (panel)\n", TAG,
+             lux_x100 / 100, lux_x100 % 100);
+      return OK;
+    }
 
   i2c1_pinctrl_setup();
 
