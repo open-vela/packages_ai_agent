@@ -57,7 +57,7 @@ AI Agent 通过 NuttX NSH shell 提供以下命令。启动后输入 `help` 查�
 | 命令 | 说明 |
 |------|------|
 | `set_volc_key <api_key>` | 设置 TTS API Key |
-| `set_volc_asr <id> <tok> <cluster>` | 设置 ASR 凭证 |
+| `set_volc_asr <id> <tok> <resource_id_or_cluster>` | 设置 ASR 凭证（支持 V2 cluster 和 V3 resource ID） |
 | `set_volc_speaker <id>` | 设置 TTS 语音角色 |
 | `set_voice_tts <name>` | 切换 TTS 后端 |
 | `set_voice_asr <name>` | 切换 ASR 后端 |
@@ -86,6 +86,17 @@ AI Agent 通过 NuttX NSH shell 提供以下命令。启动后输入 `help` 查�
 | `node_start` | 连接到 Gateway |
 | `node_stop` | 断开 Node 连接 |
 | `node_list` | 列出已连接 Node |
+
+## Skills 与 MCP
+
+| 命令 | 说明 |
+|------|------|
+| `install_skill <name> <url>` | 从 HTTPS URL 下载并安装 Skill Markdown 文件 |
+| `mcp_add <name> <url> [token]` | 添加远程 MCP Server |
+| `mcp_remove <name>` | 移除远程 MCP Server |
+| `mcp_discover` | 从所有已添加的 MCP Server 发现远程工具 |
+| `mcp_status` | 查看 MCP Client 连接状态 |
+| `mcp_tools` | 列出已发现的远程 MCP 工具 |
 
 ## 会话与记忆
 

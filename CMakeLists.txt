@@ -33,6 +33,8 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/infra/vela_tls.c
     src/infra/config_store.c
     src/infra/network_manager.c
+    src/infra/url_parse.c
+    src/infra/a2a_handler.c
     src/infra/cron_service.c
     src/infra/heartbeat.c
     src/channels/nsh_commands.c
@@ -58,6 +60,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/skill_loader.c
     src/tools/tool_guard.c
     src/tools/tool_amap.c
+    src/tools/tool_2k0300.c
     src/voice/volc_tts.c
     src/voice/volc_tts_ws.c
     src/voice/volc_asr.c
@@ -124,20 +127,18 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   endif()
 
   if(CONFIG_AI_AGENT_BLE_GATT)
-    list(APPEND AGENT_SRCS
-      src/infra/ble_gatt.c
-      src/infra/ble_cmd_handler.c
-    )
+    list(APPEND AGENT_SRCS src/infra/ble_gatt.c)
   endif()
 
   if(CONFIG_AI_AGENT_BLE_NET)
     list(APPEND AGENT_SRCS src/infra/ble_net.c)
   endif()
 
-  if(CONFIG_AI_AGENT_REST_API)
+  if(CONFIG_AI_AGENT_XIAOZHI)
     list(APPEND AGENT_SRCS
-      src/infra/api_handler.c
-      src/infra/agent_logbuf.c
+      src/channels/xiaozhi_channel.c
+      src/channels/xiaozhi_opus.c
+      src/channels/xiaozhi_udp.c
     )
   endif()
 
@@ -162,15 +163,8 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
   # MQTT-C library
   set(MQTTC_INC ${NUTTX_APPS_DIR}/netutils/mqttc/MQTT-C/include)
 
-  # Direct ALSA capture backend (chip-specific, opt-in)
-  if(CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT)
-    set(ALSA_DIRECT_INC
-      ${NUTTX_APPS_DIR}/audioutils/alsa-lib/include
-      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/hal
-      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/include/osal
-      ${NUTTX_APPS_DIR}/vendor/allwinnertech/chips/r528/drivers/rtos-hal/hal/source
-    )
-  endif()
+  # zlib (V3 speech APIs gzip payloads)
+  set(ZLIB_INC ${NUTTX_APPS_DIR}/system/zlib/zlib)
 
   # BES AEC (audio preprocessing: NS + AGC)
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
@@ -189,6 +183,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     ${MEDIA_INC}
     ${BT_INC}
     ${MQTTC_INC}
+    ${ZLIB_INC}
   )
 
   if(CONFIG_AI_AGENT_AUDIO_PREPROCESS)
@@ -208,6 +203,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       ${AGENT_INCDIRS}
     DEPENDS
       mqttc
+      zlib
     STACKSIZE
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_STACKSIZE}
     PRIORITY

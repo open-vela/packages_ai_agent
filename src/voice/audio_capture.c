@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Xiaomi Corporation
+ * Copyright (c) 2026 Xiaomi Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,605 +14,723 @@
  * limitations under the License.
  */
 
-/* audio_capture.c - Audio capture via direct ALSA or media_recorder fallback.
+/* audio_capture.c — PCM capture straight off the NuttX audio device.
  *
- * The direct ALSA backend is gated behind CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
- * because it pulls in chip-specific ALSA headers (aw-alsa-lib) that are only
- * available on boards shipping that SDK. When the option is disabled (the
- * default), the agent uses the portable media_recorder backend that works on
- * any board with the Vela media framework. */
+ * This drives the ap_buffer queue of /dev/audio/pcm0c directly.  The
+ * media_recorder it replaces is built on audio_graph, which pulls in the
+ * whole of ffmpeg; the ES8388 lower half only implements the buffer queue
+ * anyway (audio_read is a stub), so this is the shortest path to working
+ * capture with no extra dependencies.
+ *
+ * The device always runs 2 channels of 16 bit samples - the codec rejects
+ * anything else - and the caller's channel count is produced by folding or
+ * copying frames here.  The sample rate is handed to the device unchanged;
+ * the I2S derives MCLK as 256*fs so any rate is programmable.
+ */
 
 #include "voice/audio_capture.h"
 #include "agent_config.h"
 
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-#include <aw-alsa-lib/pcm.h>
-#endif
 #include <errno.h>
-#include <media_recorder.h>
-#include <stdint.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <nuttx/audio/audio.h>
+#include <pthread.h>
+#include <sched.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <syslog.h>
 #include <unistd.h>
 
 static const char* TAG = "audio_cap";
 
-#define CAP_OPTIONS_LEN 128
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-#define CAP_ALSA_NAME_DEFAULT "default"
-#endif
+#define CAP_DEV_RATE     48000
+#define CAP_DEV_CHANNELS 2
+#define CAP_DEV_BITS     16
+#define CAP_DEV_FRAME    (CAP_DEV_CHANNELS * CAP_DEV_BITS / 8)
 
-#ifdef CONFIG_AI_AGENT_AUDIO_CAPTURE_GAIN
-#define AGENT_AUDIO_CAPTURE_GAIN CONFIG_AI_AGENT_AUDIO_CAPTURE_GAIN
-#else
-#define AGENT_AUDIO_CAPTURE_GAIN 6
-#endif
-
-enum audio_capture_backend {
-    AUDIO_CAPTURE_BACKEND_NONE = 0,
-    AUDIO_CAPTURE_BACKEND_ALSA,
-    AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER,
-};
+/* Where a filled buffer waits for the reader.  One slot per device buffer
+ * is enough: a buffer only becomes filled after it was enqueued. */
+#define CAP_QUEUE_MAX    16
 
 struct audio_capture {
-    enum audio_capture_backend backend;
-    union {
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-        snd_pcm_t* pcm;
-#endif
-        void* recorder;
-    } handle;
-    unsigned int bits_per_sample;
-    unsigned int requested_channels;
-    unsigned int hw_channels;
-    size_t out_frame_bytes;
-    size_t hw_frame_bytes;
-    unsigned char* scratch;
-    size_t scratch_size;
-    int started;
+    int fd;
+    mqd_t mq;
+    char mqname[32];
+    pthread_t thread;
+    volatile bool running;
+
+    unsigned int out_channels;
+    unsigned int out_rate;
+    unsigned int decim; /* device frames per output frame */
+    size_t out_frame;   /* bytes per frame the caller wants */
+
+    struct ap_buffer_s** bufs;
+    int nbufs;
+    int buf_size;
+
+    /* Filled buffers handed from the device thread to the reader. */
+    struct ap_buffer_s* filled[CAP_QUEUE_MAX];
+    int head;
+    int tail;
+    pthread_mutex_t lock;
+    sem_t avail;
+
+    /* Buffer currently being drained by audio_capture_read(). */
+    struct ap_buffer_s* cur;
+    size_t cur_off;
+
+    /* When set, the device thread writes each buffer here directly and
+     * recycles it, exactly like nxrecorder's record thread. */
+    int sink_fd;
+    unsigned sink_buffers;
+    unsigned sink_bytes;
 };
 
-static audio_capture_t* s_active_capture;
+static int capture_alloc_buffers(struct audio_capture* cap);
+static int capture_enqueue(struct audio_capture* cap,
+    struct ap_buffer_s* apb);
 
-static void apply_capture_gain(void* buf, size_t len)
+/* ── Filled-buffer ring ─────────────────────────────────────── */
+
+static void ring_push(struct audio_capture* cap, struct ap_buffer_s* apb)
 {
-#if AGENT_AUDIO_CAPTURE_GAIN > 1
-    int16_t* samples = (int16_t*)buf;
-    int count = (int)len / (int)sizeof(int16_t);
+    pthread_mutex_lock(&cap->lock);
+    if ((cap->head + 1) % CAP_QUEUE_MAX != cap->tail) {
+        cap->filled[cap->head] = apb;
+        cap->head = (cap->head + 1) % CAP_QUEUE_MAX;
+        sem_post(&cap->avail);
+    }
+    pthread_mutex_unlock(&cap->lock);
+}
 
-    for (int i = 0; i < count; i++) {
-        int32_t v = (int32_t)samples[i] * AGENT_AUDIO_CAPTURE_GAIN;
-        if (v > 32767) {
-            v = 32767;
-        } else if (v < -32768) {
-            v = -32768;
+static struct ap_buffer_s* ring_pop(struct audio_capture* cap)
+{
+    struct ap_buffer_s* apb = NULL;
+
+    pthread_mutex_lock(&cap->lock);
+    if (cap->tail != cap->head) {
+        apb = cap->filled[cap->tail];
+        cap->tail = (cap->tail + 1) % CAP_QUEUE_MAX;
+    }
+    pthread_mutex_unlock(&cap->lock);
+
+    return apb;
+}
+
+/* ── Device thread: collect filled buffers ──────────────────── */
+
+static void* capture_thread(void* arg)
+{
+    struct audio_capture* cap = arg;
+    struct audio_msg_s msg;
+    unsigned int prio;
+    int i;
+
+    /* nxrecorder's record thread owns the whole pipeline setup: query the
+     * buffer geometry, allocate, prime the queue and only then start the
+     * device.  Doing any of it from the caller's context is a difference
+     * worth not having. */
+
+    if (capture_alloc_buffers(cap) != 0) {
+        syslog(LOG_ERR, "[%s] buffer allocation failed\n", TAG);
+        return NULL;
+    }
+
+    for (i = 0; i < cap->nbufs; i++) {
+        if (capture_enqueue(cap, cap->bufs[i]) != 0) {
+            syslog(LOG_ERR, "[%s] enqueue %d failed: %d\n",
+                TAG, i, errno);
+            return NULL;
         }
-        samples[i] = (int16_t)v;
     }
-#else
-    (void)buf;
-    (void)len;
-#endif
+
+    if (ioctl(cap->fd, AUDIOIOC_START, 0) < 0) {
+        syslog(LOG_ERR, "[%s] START failed: %d\n", TAG, errno);
+        return NULL;
+    }
+
+    while (cap->running) {
+        struct timespec ts;
+        ssize_t n;
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 1;
+        n = mq_timedreceive(cap->mq, (char*)&msg, sizeof(msg), &prio, &ts);
+
+        if (n < 0 && (errno == ETIMEDOUT || errno == EAGAIN)) {
+            continue;
+        }
+
+        if (n != sizeof(msg)) {
+            if (!cap->running) {
+                break;
+            }
+            continue;
+        }
+
+        switch (msg.msg_id) {
+        case AUDIO_MSG_DEQUEUE:
+            if (!msg.u.ptr) {
+                break;
+            }
+
+            if (cap->sink_fd >= 0) {
+                struct ap_buffer_s* apb = (struct ap_buffer_s*)msg.u.ptr;
+
+                if (write(cap->sink_fd, apb->samp, apb->nbytes)
+                        != (ssize_t)apb->nbytes) {
+                    syslog(LOG_ERR, "[%s] sink write failed: %d\n",
+                        TAG, errno);
+                }
+
+                if (cap->sink_buffers < 4) {
+                    syslog(LOG_INFO,
+                        "[%s] sink buf#%u: %u bytes from %p\n",
+                        TAG, cap->sink_buffers, apb->nbytes,
+                        (void*)apb->samp);
+                }
+
+                /* Dump words straight out of the buffer, before they go
+                 * to the file: if these are clean and the file is not, the
+                 * damage happens on the way to the card.  One buffer from
+                 * the start and one from the middle - the middle is where
+                 * the audio actually is, the first buffer is still the
+                 * codec's all-ones idle pattern. */
+                if (cap->sink_buffers == 0 || cap->sink_buffers == 6) {
+                    unsigned char* w = apb->samp;
+                    unsigned k;
+                    size_t base = (cap->sink_buffers == 6) ? 16384 : 0;
+
+                    syslog(LOG_INFO, "[%s] apb buf#%u words at %zu:",
+                        TAG, cap->sink_buffers, base);
+                    for (k = 0; k < 16 &&
+                         base + (k + 1) * 4 <= apb->nbytes; k++) {
+                        syslog(LOG_INFO, " %02x%02x%02x%02x",
+                            w[base + k * 4 + 3], w[base + k * 4 + 2],
+                            w[base + k * 4 + 1], w[base + k * 4]);
+                    }
+                }
+
+                cap->sink_buffers++;
+                cap->sink_bytes += apb->nbytes;
+                capture_enqueue(cap, apb);
+            } else {
+                ring_push(cap, (struct ap_buffer_s*)msg.u.ptr);
+            }
+            break;
+
+        case AUDIO_MSG_STOP:
+            cap->running = false;
+            break;
+
+        case AUDIO_MSG_COMPLETE:
+            /* es8388 emits COMPLETE after every buffer, not just at the
+             * end of the stream - it is not a terminator here. */
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    return NULL;
 }
 
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-static const char* resolve_alsa_name(const char* dev_path)
+/* ── Frame conversion ───────────────────────────────────────── */
+
+/* The device always runs at 48kHz stereo - the parameters the nxrecorder
+ * "record" command uses, which is the one combination known to produce
+ * clean audio on this board.  Capturing at 16kHz instead comes out as
+ * loud noise, so a slower caller is box-filtered down here instead.  The
+ * channel count is folded at the same time, and a mono caller gets the
+ * left slot: that is where the microphone ends up, and averaging the
+ * grounded right slot in would only add its noise. */
+static size_t frames_to_out(struct audio_capture* cap,
+    const unsigned char* src, size_t src_len,
+    unsigned char* dst, size_t dst_cap)
 {
-    if (!dev_path || dev_path[0] == '\0') {
-        return CAP_ALSA_NAME_DEFAULT;
+    size_t n_in = src_len / CAP_DEV_FRAME;
+    size_t n_out = n_in / cap->decim;
+    size_t i;
+
+    if (n_out * cap->out_frame > dst_cap) {
+        n_out = dst_cap / cap->out_frame;
     }
 
-    if (strncmp(dev_path, "/dev/audio/", strlen("/dev/audio/")) == 0) {
-        return CAP_ALSA_NAME_DEFAULT;
-    }
-
-    return dev_path;
-}
-
-static snd_pcm_format_t capture_format_from_bits(unsigned int bits_per_sample)
-{
-    switch (bits_per_sample) {
-    case 16:
-        return SND_PCM_FORMAT_S16_LE;
-    case 24:
-        return SND_PCM_FORMAT_S24_LE;
-    default:
-        return (snd_pcm_format_t)-1;
-    }
-}
-
-static int configure_alsa_capture(snd_pcm_t* pcm, snd_pcm_format_t format,
-    unsigned int sample_rate, unsigned int channels)
-{
-    snd_pcm_hw_params_t* hw;
-    snd_pcm_sw_params_t* sw;
-    snd_pcm_uframes_t period_frames = sample_rate / 10;
-    snd_pcm_uframes_t buffer_frames;
-    int ret;
-
-    if (period_frames == 0) {
-        period_frames = 256;
-    }
-
-    buffer_frames = period_frames * 4;
-
-    snd_pcm_hw_params_alloca(&hw);
-    ret = snd_vela_pcm_hw_params_any(pcm, hw);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_hw_params_set_access(pcm, hw,
-        SND_PCM_ACCESS_RW_INTERLEAVED);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_hw_params_set_format(pcm, hw, format);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_hw_params_set_channels(pcm, hw, channels);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_hw_params_set_rate(pcm, hw, sample_rate, 0);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_hw_params_set_period_size(pcm, hw,
-        period_frames, 0);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_hw_params_set_buffer_size(pcm, hw,
-        buffer_frames);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_hw_params(pcm, hw);
-    if (ret < 0) {
-        return ret;
-    }
-
-    snd_pcm_sw_params_alloca(&sw);
-    ret = snd_vela_pcm_sw_params_current(pcm, sw);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_sw_params_set_start_threshold(pcm, sw, 1);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_sw_params_set_stop_threshold(pcm, sw, buffer_frames);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = snd_vela_pcm_sw_params_set_avail_min(pcm, sw, period_frames);
-    if (ret < 0) {
-        return ret;
-    }
-
-    return snd_vela_pcm_sw_params(pcm, sw);
-}
-
-static int ensure_scratch_capacity(audio_capture_t* cap, size_t need)
-{
-    if (cap->scratch_size >= need) {
+    if (n_out == 0) {
         return 0;
     }
 
-    unsigned char* scratch = realloc(cap->scratch, need);
-    if (!scratch) {
+    if (cap->decim == 1 && cap->out_channels == CAP_DEV_CHANNELS) {
+        memcpy(dst, src, n_out * CAP_DEV_FRAME);
+        return n_out * CAP_DEV_FRAME;
+    }
+
+    for (i = 0; i < n_out; i++) {
+        size_t f0 = i * cap->decim;
+        int32_t left = 0;
+        int32_t right = 0;
+        size_t f;
+
+        for (f = 0; f < cap->decim; f++) {
+            const unsigned char* p = src + (f0 + f) * CAP_DEV_FRAME;
+
+            left += (int16_t)(p[0] | (p[1] << 8));
+            right += (int16_t)(p[2] | (p[3] << 8));
+        }
+
+        left /= (int32_t)cap->decim;
+        right /= (int32_t)cap->decim;
+
+        if (cap->out_channels == 2) {
+            dst[i * 4] = (unsigned char)(left & 0xff);
+            dst[i * 4 + 1] = (unsigned char)((left >> 8) & 0xff);
+            dst[i * 4 + 2] = (unsigned char)(right & 0xff);
+            dst[i * 4 + 3] = (unsigned char)((right >> 8) & 0xff);
+        } else {
+            dst[i * 2] = (unsigned char)(left & 0xff);
+            dst[i * 2 + 1] = (unsigned char)((left >> 8) & 0xff);
+        }
+    }
+
+    return n_out * cap->out_frame;
+}
+
+/* ── Device setup ───────────────────────────────────────────── */
+
+static int capture_alloc_buffers(struct audio_capture* cap)
+{
+    struct audio_buf_desc_s desc;
+    struct ap_buffer_info_s info;
+    int i;
+
+    if (ioctl(cap->fd, AUDIOIOC_GETBUFFERINFO, (uintptr_t)&info) != OK) {
+        syslog(LOG_ERR, "[%s] GETBUFFERINFO failed: %d\n", TAG, errno);
+        return -EIO;
+    }
+
+    if (info.nbuffers > CAP_QUEUE_MAX) {
+        info.nbuffers = CAP_QUEUE_MAX;
+    }
+
+    if (info.nbuffers > 0 && info.buffer_size > 0) {
+        cap->nbufs = info.nbuffers;
+        cap->buf_size = info.buffer_size;
+    }
+
+    syslog(LOG_INFO, "[%s] allocating %d x %d byte buffers\n",
+        TAG, cap->nbufs, cap->buf_size);
+    cap->bufs = calloc(cap->nbufs, sizeof(struct ap_buffer_s*));
+
+    if (!cap->bufs) {
         return -ENOMEM;
     }
 
-    cap->scratch = scratch;
-    cap->scratch_size = need;
+    for (i = 0; i < cap->nbufs; i++) {
+        memset(&desc, 0, sizeof(desc));
+        desc.numbytes = cap->buf_size;
+        desc.u.pbuffer = &cap->bufs[i];
+
+        if (ioctl(cap->fd, AUDIOIOC_ALLOCBUFFER, (uintptr_t)&desc)
+                != sizeof(desc)) {
+            syslog(LOG_ERR, "[%s] ALLOCBUFFER %d failed\n", TAG, i);
+            return -ENOMEM;
+        }
+    }
+
     return 0;
 }
 
-static int alsa_read_frames(audio_capture_t* cap, void* buf,
-    snd_pcm_uframes_t frames)
+static void capture_free_buffers(struct audio_capture* cap)
 {
-    snd_pcm_uframes_t done = 0;
-    unsigned char* dst = buf;
+    struct audio_buf_desc_s desc;
+    int i;
 
-    while (done < frames) {
-        snd_pcm_sframes_t ret = snd_vela_pcm_readi(cap->handle.pcm,
-            dst + done * cap->hw_frame_bytes, frames - done);
-
-        if (ret == -EAGAIN) {
-            usleep(10 * 1000);
-            continue;
-        }
-
-        if (ret == -EPIPE) {
-            syslog(LOG_WARNING, "[%s] ALSA overrun, preparing capture\n",
-                TAG);
-            snd_vela_pcm_prepare(cap->handle.pcm);
-            continue;
-        }
-
-        if (ret == -ESTRPIPE) {
-            continue;
-        }
-
-        if (ret < 0) {
-            return done > 0 ? (int)done : (int)ret;
-        }
-
-        done += (snd_pcm_uframes_t)ret;
+    if (!cap->bufs) {
+        return;
     }
 
-    return (int)done;
+    for (i = 0; i < cap->nbufs; i++) {
+        if (cap->bufs[i]) {
+            memset(&desc, 0, sizeof(desc));
+            desc.u.buffer = cap->bufs[i];
+            ioctl(cap->fd, AUDIOIOC_FREEBUFFER, (uintptr_t)&desc);
+        }
+    }
+
+    free(cap->bufs);
+    cap->bufs = NULL;
 }
 
-static void downmix_interleaved_s16_to_mono(audio_capture_t* cap,
-    void* out_buf, const void* in_buf, size_t frames)
+static int capture_enqueue(struct audio_capture* cap,
+    struct ap_buffer_s* apb)
 {
-    int16_t* out = out_buf;
-    const int16_t* in = in_buf;
+    struct audio_buf_desc_s desc;
 
-    for (size_t i = 0; i < frames; i++) {
-        int32_t mixed = 0;
+    apb->nbytes = apb->nmaxbytes;
+    apb->curbyte = 0;
+    apb->flags = 0;
 
-        for (unsigned int ch = 0; ch < cap->hw_channels; ch++) {
-            mixed += in[i * cap->hw_channels + ch];
-        }
+    memset(&desc, 0, sizeof(desc));
+    desc.numbytes = apb->nbytes;
+    desc.u.buffer = apb;
 
-        out[i] = (int16_t)(mixed / (int32_t)cap->hw_channels);
-    }
-}
-
-static int open_alsa_capture(audio_capture_t* cap, const char* dev_path,
-    unsigned int sample_rate, unsigned int channels,
-    unsigned int bits_per_sample)
-{
-    const char* alsa_name = resolve_alsa_name(dev_path);
-    snd_pcm_format_t format = capture_format_from_bits(bits_per_sample);
-    unsigned int attempts[2];
-    int attempt_count = 0;
-    int last_ret = -ENODEV;
-
-    if ((int)format < 0) {
-        return -ENOTSUP;
-    }
-
-    attempts[attempt_count++] = channels;
-    if (channels == 1) {
-        attempts[attempt_count++] = 3;
-    }
-
-    for (int i = 0; i < attempt_count; i++) {
-        snd_pcm_t* pcm = NULL;
-        unsigned int hw_channels = attempts[i];
-        int ret = snd_vela_pcm_open(&pcm, alsa_name,
-            SND_VELA_PCM_STREAM_CAPTURE, 0);
-
-        if (ret < 0) {
-            last_ret = ret;
-            continue;
-        }
-
-        ret = configure_alsa_capture(pcm, format, sample_rate, hw_channels);
-        if (ret < 0) {
-            snd_vela_pcm_close(pcm);
-            last_ret = ret;
-            continue;
-        }
-
-        cap->backend = AUDIO_CAPTURE_BACKEND_ALSA;
-        cap->handle.pcm = pcm;
-        cap->bits_per_sample = bits_per_sample;
-        cap->requested_channels = channels;
-        cap->hw_channels = hw_channels;
-        cap->out_frame_bytes = (bits_per_sample / 8) * channels;
-        cap->hw_frame_bytes = snd_vela_pcm_frames_to_bytes(pcm, 1);
-
-        syslog(LOG_INFO,
-            "[%s] opened direct ALSA capture (%s, %uHz, req=%uch, hw=%uch, %ubit)\n",
-            TAG, alsa_name, sample_rate, channels, hw_channels,
-            bits_per_sample);
-        return 0;
-    }
-
-    return last_ret;
-}
-
-#endif /* CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT */
-
-static int open_media_recorder_capture(audio_capture_t* cap,
-    unsigned int sample_rate, unsigned int channels,
-    unsigned int bits_per_sample)
-{
-    char opts[CAP_OPTIONS_LEN];
-    int ret;
-
-    cap->handle.recorder = media_recorder_open(MEDIA_SOURCE_MIC);
-    if (!cap->handle.recorder) {
-        syslog(LOG_ERR, "[%s] media_recorder_open failed, errno=%d\n",
-            TAG, errno);
-        return -errno;
-    }
-
-    snprintf(opts, sizeof(opts),
-        "format=s%ule:sample_rate=%u:ch_layout=%s",
-        bits_per_sample, sample_rate,
-        (channels == 1) ? "mono" : "stereo");
-
-    ret = media_recorder_prepare(cap->handle.recorder, NULL, opts);
-    if (ret < 0) {
-        syslog(LOG_ERR, "[%s] prepare failed: %d\n", TAG, ret);
-        media_recorder_close(cap->handle.recorder);
-        cap->handle.recorder = NULL;
-        return ret;
-    }
-
-    cap->backend = AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER;
-    cap->bits_per_sample = bits_per_sample;
-    cap->requested_channels = channels;
-    cap->hw_channels = channels;
-    cap->out_frame_bytes = (bits_per_sample / 8) * channels;
-    cap->hw_frame_bytes = cap->out_frame_bytes;
-
-    syslog(LOG_INFO, "[%s] opened media recorder (%uHz %uch %ubit)\n",
-        TAG, sample_rate, channels, bits_per_sample);
-    return 0;
+    return ioctl(cap->fd, AUDIOIOC_ENQUEUEBUFFER, (uintptr_t)&desc) < 0
+        ? -errno
+        : 0;
 }
 
 audio_capture_t* audio_capture_open(const char* dev_path,
     unsigned int sample_rate, unsigned int channels,
     unsigned int bits_per_sample)
 {
-    if (s_active_capture) {
-        syslog(LOG_WARNING, "[%s] force closing stale capture\n", TAG);
-        audio_capture_close(s_active_capture);
-        usleep(100000);
+    struct audio_caps_desc_s cap_desc;
+    struct mq_attr attr;
+    audio_capture_t* cap;
+
+    if (!dev_path || !sample_rate) {
+        return NULL;
     }
 
-    audio_capture_t* cap = calloc(1, sizeof(*cap));
+    if (CAP_DEV_RATE % sample_rate != 0) {
+        syslog(LOG_ERR,
+            "[%s] sample rate %u must divide the device rate %d\n",
+            TAG, sample_rate, CAP_DEV_RATE);
+        return NULL;
+    }
+
+    if (bits_per_sample != 0 && bits_per_sample != CAP_DEV_BITS) {
+        syslog(LOG_ERR, "[%s] only %d bit samples supported, got %u\n",
+            TAG, CAP_DEV_BITS, bits_per_sample);
+        return NULL;
+    }
+
+    if (channels != 1 && channels != 2) {
+        syslog(LOG_ERR, "[%s] bad channel count %u\n", TAG, channels);
+        return NULL;
+    }
+
+    cap = calloc(1, sizeof(*cap));
     if (!cap) {
         return NULL;
     }
 
-    int ret = -ENOTSUP;
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-    ret = open_alsa_capture(cap, dev_path, sample_rate, channels,
-        bits_per_sample);
-    if (ret < 0) {
-        syslog(LOG_WARNING,
-            "[%s] direct ALSA capture unavailable (%d), falling back to media recorder\n",
-            TAG, ret);
-    }
-#else
-    (void)dev_path;
-#endif
+    cap->fd = -1;
+    cap->mq = (mqd_t)-1;
+    cap->sink_fd = -1;
+    cap->out_channels = channels;
+    cap->out_rate = sample_rate;
+    cap->decim = CAP_DEV_RATE / sample_rate;
+    cap->out_frame = channels * (CAP_DEV_BITS / 8);
+    pthread_mutex_init(&cap->lock, NULL);
+    sem_init(&cap->avail, 0, 0);
 
-    if (ret < 0) {
-        ret = open_media_recorder_capture(cap, sample_rate, channels,
-            bits_per_sample);
-        if (ret < 0) {
-            free(cap);
-            return NULL;
+    cap->fd = open(dev_path, O_RDWR | O_CLOEXEC);
+    if (cap->fd < 0) {
+        syslog(LOG_ERR, "[%s] open %s failed: %d\n", TAG, dev_path, errno);
+        goto err_out;
+    }
+
+    /* The codec only takes stereo, so the device is configured for two
+     * channels whatever the caller asked for. */
+
+    /* The order below is nxrecorder's, byte for byte: RESERVE before
+     * CONFIGURE, and the buffers are not allocated until start().  Doing
+     * CONFIGURE first produced a stream whose upper half words were
+     * corrupted every fourth frame, for reasons that only the driver's
+     * reserve path explains. */
+
+    if (ioctl(cap->fd, AUDIOIOC_RESERVE, 0) < 0) {
+        syslog(LOG_ERR, "[%s] RESERVE failed: %d\n", TAG, errno);
+        goto err_out;
+    }
+
+    {
+        struct audio_caps_s q;
+
+        memset(&q, 0, sizeof(q));
+        q.ac_len = sizeof(q);
+        q.ac_type = AUDIO_TYPE_INPUT;
+        q.ac_subtype = AUDIO_TYPE_QUERY;
+        ioctl(cap->fd, AUDIOIOC_GETCAPS, (uintptr_t)&q);
+    }
+
+    memset(&cap_desc, 0, sizeof(cap_desc));
+    cap_desc.caps.ac_len = sizeof(struct audio_caps_s);
+    cap_desc.caps.ac_type = AUDIO_TYPE_INPUT;
+    cap_desc.caps.ac_channels = CAP_DEV_CHANNELS;
+    cap_desc.caps.ac_chmap = 0;
+    cap_desc.caps.ac_controls.hw[0] = CAP_DEV_RATE;
+    cap_desc.caps.ac_controls.b[3] = CAP_DEV_RATE >> 16;
+    cap_desc.caps.ac_controls.b[2] = CAP_DEV_BITS;
+    cap_desc.caps.ac_subtype = AUDIO_FMT_UNDEF;
+
+    if (ioctl(cap->fd, AUDIOIOC_CONFIGURE, (uintptr_t)&cap_desc) < 0) {
+        syslog(LOG_ERR, "[%s] CONFIGURE %dHz failed: %d\n",
+            TAG, CAP_DEV_RATE, errno);
+        goto err_out;
+    }
+
+    /* The queue has to be big enough for every buffer the driver can hand
+     * back while it is shutting down, so the buffer geometry is queried
+     * here - before the queue exists - and not only in the device thread. */
+    {
+        struct ap_buffer_info_s info;
+
+        if (ioctl(cap->fd, AUDIOIOC_GETBUFFERINFO, (uintptr_t)&info) == OK) {
+            cap->nbufs = info.nbuffers;
+            cap->buf_size = info.buffer_size;
+        } else {
+            cap->nbufs = 8;
+            cap->buf_size = 32768;
         }
     }
 
-    s_active_capture = cap;
+    attr.mq_maxmsg = cap->nbufs + 8;
+    attr.mq_msgsize = sizeof(struct audio_msg_s);
+    attr.mq_curmsgs = 0;
+    attr.mq_flags = 0;
+
+    snprintf(cap->mqname, sizeof(cap->mqname), "/tmp/cap%0lx",
+        (unsigned long)((uintptr_t)cap));
+    mq_unlink(cap->mqname);
+
+    cap->mq = mq_open(cap->mqname, O_RDWR | O_CREAT, 0644, &attr);
+    if (cap->mq == (mqd_t)-1) {
+        syslog(LOG_ERR, "[%s] mq_open failed: %d\n", TAG, errno);
+        goto err_out;
+    }
+
+    ioctl(cap->fd, AUDIOIOC_REGISTERMQ, (uintptr_t)cap->mq);
+
+    syslog(LOG_INFO,
+        "[%s] open %s: %uHz %uch <- device %dHz %dch, %d x %d byte buffers\n",
+        TAG, dev_path, sample_rate, channels,
+        CAP_DEV_RATE, CAP_DEV_CHANNELS, cap->nbufs, cap->buf_size);
+
     return cap;
+
+err_out:
+    audio_capture_close(cap);
+    return NULL;
 }
 
 int audio_capture_start(audio_capture_t* cap)
 {
+    pthread_attr_t attr;
+    struct sched_param sparam;
+    int ret;
+
     if (!cap) {
         return -EINVAL;
     }
 
-    switch (cap->backend) {
-    case AUDIO_CAPTURE_BACKEND_ALSA:
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-        if (!cap->handle.pcm) {
-            return -EINVAL;
-        }
+    cap->running = true;
 
-        if (cap->started) {
-            return 0;
-        }
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8192);
 
-        if (snd_vela_pcm_prepare(cap->handle.pcm) < 0) {
-            syslog(LOG_ERR, "[%s] ALSA prepare failed\n", TAG);
-            return -EIO;
-        }
+    /* This thread is the audio consumer: it receives AUDIO_MSG_DEQUEUE,
+     * writes the buffer to the sink and hands it back to the device.  A
+     * default attr inherits the caller's priority (the PTT worker, itself
+     * inherited from LVGL) at 100, the same priority as the render thread,
+     * so it has to wait its turn while LVGL draws.  The pipeline then
+     * drains and the 8-byte I2S RX FIFO overruns: the stuttering in the
+     * recording.  Mark it explicit FIFO above the UI, below the ES8388
+     * worker (252).
+     */
 
-        cap->started = 1;
-        syslog(LOG_INFO, "[%s] ALSA capture prepared\n", TAG);
-        return 0;
-#else
-        return -ENOTSUP;
-#endif
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    sparam.sched_priority = AGENT_VOICE_CAPTURE_PRIO;
+    pthread_attr_setschedparam(&attr, &sparam);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
-    case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER: {
-        int ret;
+    ret = pthread_create(&cap->thread, &attr, capture_thread, cap);
+    pthread_attr_destroy(&attr);
 
-        if (!cap->handle.recorder) {
-            return -EINVAL;
-        }
-
-        ret = media_recorder_start(cap->handle.recorder);
-        if (ret < 0) {
-            syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
-            return ret;
-        }
-
-        syslog(LOG_INFO, "[%s] media recorder capture started\n", TAG);
-        return 0;
+    if (ret != 0) {
+        cap->running = false;
+        return -EIO;
     }
 
-    default:
+    return 0;
+}
+
+/* Consume one device buffer exactly the way nxrecorder does: hand the raw
+ * buffer to the caller to write, then give it back.  Used by the record
+ * to file path, where the buffered reader's bookkeeping is pure overhead
+ * and a source of bugs - nxrecorder writes apb->samp/apb->nbytes straight
+ * out and that path is known good. */
+unsigned audio_capture_sink_bytes(audio_capture_t* cap)
+{
+    return cap ? cap->sink_bytes : 0;
+}
+
+void audio_capture_set_sink(audio_capture_t* cap, int fd)
+{
+    if (cap) {
+        cap->sink_fd = fd;
+    }
+}
+
+int audio_capture_take_raw(audio_capture_t* cap,
+    const unsigned char** data, size_t* len)
+{
+    if (!cap || !data || !len) {
         return -EINVAL;
+    }
+
+    while (sem_wait(&cap->avail) != 0) {
+        if (errno != EINTR) {
+            return -errno;
+        }
+    }
+
+    cap->cur = ring_pop(cap);
+    if (!cap->cur) {
+        return -EIO;
+    }
+
+    *data = cap->cur->samp;
+    *len = cap->cur->nbytes;
+    return 0;
+}
+
+void audio_capture_release_raw(audio_capture_t* cap)
+{
+    if (cap && cap->cur) {
+        capture_enqueue(cap, cap->cur);
+        cap->cur = NULL;
     }
 }
 
 int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
 {
+    unsigned char* out = buf;
+    size_t done = 0;
+
     if (!cap || !buf || len == 0) {
         return -EINVAL;
     }
 
-    switch (cap->backend) {
-    case AUDIO_CAPTURE_BACKEND_ALSA: {
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-        snd_pcm_uframes_t frames;
-        int nframes;
-        size_t out_len;
+    while (done < len) {
+        size_t produced;
 
-        if (!cap->handle.pcm || cap->out_frame_bytes == 0) {
-            return -EINVAL;
-        }
-
-        frames = len / cap->out_frame_bytes;
-        if (frames == 0) {
-            return -EINVAL;
-        }
-
-        if (cap->hw_channels == cap->requested_channels) {
-            nframes = alsa_read_frames(cap, buf, frames);
-            if (nframes <= 0) {
-                return nframes;
+        if (!cap->cur) {
+            while (sem_wait(&cap->avail) != 0) {
+                if (errno != EINTR) {
+                    return done > 0 ? (int)done : -errno;
+                }
             }
 
-            out_len = (size_t)nframes * cap->out_frame_bytes;
-            if (cap->bits_per_sample == 16) {
-                apply_capture_gain(buf, out_len);
+            cap->cur = ring_pop(cap);
+            cap->cur_off = 0;
+
+            if (!cap->cur) {
+                continue;
             }
-            return (int)out_len;
         }
 
-        if (cap->bits_per_sample != 16 || cap->requested_channels != 1) {
-            return -ENOTSUP;
+        produced = frames_to_out(cap,
+            &cap->cur->samp[cap->cur_off],
+            cap->cur->nbytes - cap->cur_off,
+            out + done, len - done);
+
+        if (produced == 0) {
+            /* Either the tail of the buffer holds no whole frame, or the
+             * caller's tail is a partial frame.  Recycle in the first
+             * case, return early in the second; both avoid spinning. */
+
+            if (cap->cur->nbytes - cap->cur_off
+                    < cap->decim * CAP_DEV_FRAME) {
+                capture_enqueue(cap, cap->cur);
+                cap->cur = NULL;
+                continue;
+            }
+
+            break;
         }
 
-        if (ensure_scratch_capacity(cap, frames * cap->hw_frame_bytes) < 0) {
-            return -ENOMEM;
-        }
+        cap->cur_off += produced / cap->out_frame
+            * cap->decim * CAP_DEV_FRAME;
+        done += produced;
 
-        nframes = alsa_read_frames(cap, cap->scratch, frames);
-        if (nframes <= 0) {
-            return nframes;
+        if (cap->cur_off >= cap->cur->nbytes) {
+            capture_enqueue(cap, cap->cur);
+            cap->cur = NULL;
         }
-
-        downmix_interleaved_s16_to_mono(cap, buf, cap->scratch,
-            (size_t)nframes);
-        out_len = (size_t)nframes * cap->out_frame_bytes;
-        apply_capture_gain(buf, out_len);
-        return (int)out_len;
-#else
-        return -ENOTSUP;
-#endif
     }
 
-    case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER: {
-        ssize_t n;
-
-        if (!cap->handle.recorder) {
-            return -EINVAL;
-        }
-
-        n = media_recorder_read_data(cap->handle.recorder, buf, len);
-        if (n > 0 && cap->bits_per_sample == 16) {
-            apply_capture_gain(buf, (size_t)n);
-        }
-
-        return (int)n;
-    }
-
-    default:
-        return -EINVAL;
-    }
-}
-
-int audio_capture_abort(audio_capture_t* cap)
-{
-    if (!cap) {
-        return -EINVAL;
-    }
-
-    switch (cap->backend) {
-    case AUDIO_CAPTURE_BACKEND_ALSA:
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-        if (cap->handle.pcm && cap->started) {
-            int ret = snd_vela_pcm_drop(cap->handle.pcm);
-            cap->started = 0;
-            return ret;
-        }
-        return 0;
-#else
-        return -ENOTSUP;
-#endif
-
-    case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER:
-        if (cap->handle.recorder) {
-#ifdef CONFIG_MEDIA_GRAPH
-            media_recorder_close_socket(cap->handle.recorder);
-#endif
-            return media_recorder_stop(cap->handle.recorder);
-        }
-        return 0;
-
-    default:
-        return -EINVAL;
-    }
+    return (int)done;
 }
 
 void audio_capture_close(audio_capture_t* cap)
 {
+    struct audio_msg_s msg;
+
     if (!cap) {
         return;
     }
 
-    switch (cap->backend) {
-    case AUDIO_CAPTURE_BACKEND_ALSA:
-#ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
-        if (cap->handle.pcm) {
-            if (cap->started) {
-                snd_vela_pcm_drop(cap->handle.pcm);
-            }
-            snd_vela_pcm_close(cap->handle.pcm);
-            cap->handle.pcm = NULL;
-        }
-        free(cap->scratch);
-        cap->scratch = NULL;
-        cap->scratch_size = 0;
-#endif
-        break;
+    /* Stop the device BEFORE this thread stops reading.  The stop ioctl
+     * makes the driver hand back the buffers it still holds and the
+     * driver's own worker posts one message per buffer; if this thread
+     * had already stopped consuming, that queue would fill, the driver
+     * worker would block in mq_send, and the stop ioctl - which waits for
+     * that worker - would never return.  nxrecorder's record thread drains
+     * until COMPLETE for the same reason. */
+    syslog(LOG_INFO, "[%s] close: stopping device\n", TAG);
 
-    case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER:
-        if (cap->handle.recorder) {
-            media_recorder_stop(cap->handle.recorder);
-            usleep(50 * 1000);
-            media_recorder_close(cap->handle.recorder);
-            cap->handle.recorder = NULL;
-        }
-        break;
-
-    default:
-        break;
+    if (cap->fd >= 0) {
+        ioctl(cap->fd, AUDIOIOC_STOP, 0);
     }
 
-    if (s_active_capture == cap) {
-        s_active_capture = NULL;
+    cap->running = false;
+
+    if (cap->mq != (mqd_t)-1) {
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_id = AUDIO_MSG_STOP;
+        if (mq_send(cap->mq, (const char*)&msg, sizeof(msg), 0) < 0) {
+            syslog(LOG_ERR, "[%s] close: mq_send failed: %d\n",
+                TAG, errno);
+        }
     }
 
+    syslog(LOG_INFO, "[%s] close: joining device thread\n", TAG);
+
+    if (cap->thread) {
+        pthread_join(cap->thread, NULL);
+    }
+
+    syslog(LOG_INFO, "[%s] close: device thread joined\n", TAG);
+
+    /* The half-consumed buffer is dropped rather than re-enqueued: the
+     * device is already stopped and its worker is gone, so handing it
+     * back would leave the driver holding a pointer to memory that
+     * capture_free_buffers() frees right below. */
+
+    cap->cur = NULL;
+
+    capture_free_buffers(cap);
+
+    if (cap->mq != (mqd_t)-1) {
+        if (cap->fd >= 0) {
+            ioctl(cap->fd, AUDIOIOC_UNREGISTERMQ, (uintptr_t)cap->mq);
+        }
+        mq_close(cap->mq);
+        mq_unlink(cap->mqname);
+    }
+
+    if (cap->fd >= 0) {
+        ioctl(cap->fd, AUDIOIOC_RELEASE, 0);
+        close(cap->fd);
+    }
+
+    sem_destroy(&cap->avail);
+    pthread_mutex_destroy(&cap->lock);
     free(cap);
-    syslog(LOG_INFO, "[%s] closed\n", TAG);
 }

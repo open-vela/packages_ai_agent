@@ -361,6 +361,151 @@ void parse_ns_xml_tool_calls(llm_response_t* resp)
     }
 }
 
+/* Parse Format 3: DeepSeek DSML.
+ *
+ *   <｜｜DSML｜｜ calls>
+ *   <｜｜DSML｜｜ invoke name="NAME">
+ *   <｜｜DSML｜｜ parameter name="KEY">VALUE</｜｜DSML｜｜ parameter>
+ *   </｜｜DSML｜｜ invoke>
+ *   <｜｜DSML｜｜ calls>
+ *
+ * DeepSeek puts the tool call in the message content instead of the
+ * OpenAI tool_calls field, and the two existing XML parsers do not match
+ * it: they look for "tool_call" and ":tool_call>", while DSML writes
+ * "calls" and "invoke".  The namespace prefix is matched loosely here -
+ * only "invoke name=", "parameter name=" and the closing tags matter - so
+ * it does not matter whether the model spells the prefix with the
+ * fullwidth pipes or with plain angle brackets. */
+void parse_dsml_tool_calls(llm_response_t* resp)
+{
+    static const char INVOKE[] = "invoke name=\"";
+    static const char PARAM[] = "parameter name=\"";
+    static const char INVOKE_END[] = "invoke>";
+    const char* p;
+
+    if (resp->call_count > 0 || !resp->text) {
+        return;
+    }
+
+    if (!strstr(resp->text, INVOKE)) {
+        return;
+    }
+
+    p = resp->text;
+
+    while (resp->call_count < AGENT_MAX_TOOL_CALLS) {
+        const char* inv = strstr(p, INVOKE);
+        const char* name_end;
+        const char* inv_end;
+        const char* scan;
+        llm_tool_call_t* call;
+        cJSON* args;
+
+        if (!inv) {
+            break;
+        }
+
+        name_end = strchr(inv + strlen(INVOKE), '"');
+        if (!name_end) {
+            break;
+        }
+
+        /* Parameters belong to this invoke, so stop at its closing tag. */
+        inv_end = strstr(name_end, INVOKE_END);
+        if (!inv_end) {
+            break;
+        }
+
+        call = &resp->calls[resp->call_count];
+
+        {
+            size_t name_len = (size_t)(name_end - (inv + strlen(INVOKE)));
+
+            if (name_len >= sizeof(call->name)) {
+                name_len = sizeof(call->name) - 1;
+            }
+            memcpy(call->name, inv + strlen(INVOKE), name_len);
+            call->name[name_len] = '\0';
+        }
+
+        snprintf(call->id, sizeof(call->id), "dsml_%d", resp->call_count);
+
+        args = cJSON_CreateObject();
+        scan = name_end;
+
+        while (scan < inv_end) {
+            const char* ps = strstr(scan, PARAM);
+            const char* key_end;
+            const char* val;
+            const char* val_end;
+
+            if (!ps || ps >= inv_end) {
+                break;
+            }
+
+            key_end = strchr(ps + strlen(PARAM), '"');
+            if (!key_end || key_end > inv_end) {
+                break;
+            }
+
+            val = key_end + 1;
+            if (*val == '>') {
+                val++;
+            }
+
+            val_end = strchr(val, '<');
+            if (!val_end || val_end > inv_end) {
+                break;
+            }
+
+            {
+                char key[64];
+                size_t klen = (size_t)(key_end - (ps + strlen(PARAM)));
+                char* value;
+
+                if (klen >= sizeof(key)) {
+                    klen = sizeof(key) - 1;
+                }
+                memcpy(key, ps + strlen(PARAM), klen);
+                key[klen] = '\0';
+
+                value = calloc(1, (size_t)(val_end - val) + 1);
+                if (value) {
+                    memcpy(value, val, (size_t)(val_end - val));
+                    cJSON_AddStringToObject(args, key, value);
+                    free(value);
+                }
+            }
+
+            scan = val_end;
+        }
+
+        {
+            char* args_str = cJSON_PrintUnformatted(args);
+
+            cJSON_Delete(args);
+            if (args_str) {
+                call->input = args_str;
+                call->input_len = strlen(args_str);
+            }
+        }
+
+        resp->call_count++;
+        p = name_end + 1;
+    }
+
+    if (resp->call_count > 0) {
+        resp->tool_use = true;
+        free(resp->text);
+        resp->text = NULL;
+        resp->text_len = 0;
+        syslog(LOG_WARNING,
+            "[%s] Parsed %d tool call(s) from DSML\n",
+            TAG, resp->call_count);
+    }
+}
+
+
 /* ── Extract OpenAI tool_calls from response message ──────── */
 
 void extract_openai_tool_calls(cJSON* message, llm_response_t* resp)

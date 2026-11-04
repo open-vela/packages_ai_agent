@@ -41,6 +41,7 @@
 #include "tools/tool_vision.h"
 #include "tools/tool_camera.h"
 #include "tools/tool_web_search.h"
+#include "tools/tool_2k0300.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -50,7 +51,7 @@
 
 static const char* TAG = "tools";
 
-#define MAX_TOOLS 48
+#define MAX_TOOLS 56
 #define MAX_PROVIDERS 4
 
 /* ── External tool provider registry ───────────────────────── */
@@ -271,14 +272,16 @@ int tool_registry_init(void)
         tool_cron_remove_execute);
 
     /* Fetch URL tool */
+    /* fetch_url — disabled: unused on this board (no web browsing use case).
     REGISTER_TOOL(
         "fetch_url",
         "Fetch content from an HTTPS URL.",
         TOOL_SCHEMA_BEGIN() TOOL_PARAM_STR("url", "The HTTPS URL to fetch")
             TOOL_SCHEMA_END_REQUIRED("\"url\""),
         tool_fetch_url_execute);
+    */
 
-    /* Vision tool */
+    /* Vision tool — disabled: no camera/screen on LS2K0300 board.
     REGISTER_TOOL(
         "analyze_image",
         "Analyze a screen screenshot or image file with vision LLM. "
@@ -288,6 +291,7 @@ int tool_registry_init(void)
                                          "file. Omit to auto-capture screen.") "," TOOL_PARAM_STR("prompt", "Question or instruction about the image")
                 TOOL_SCHEMA_END(),
         tool_analyze_image_execute);
+    */
 
     /* Camera capture tool */
 #ifdef CONFIG_AI_AGENT_CAMERA
@@ -331,7 +335,7 @@ int tool_registry_init(void)
         tool_run_shell_execute);
 #endif
 
-    /* System state tools */
+    /* System state tools — disabled: watch-only sensors, not on LS2K0300.
     REGISTER_TOOL_NO_PARAMS(
         "get_battery",
         "Get battery level, charging status, voltage, temperature.",
@@ -347,7 +351,6 @@ int tool_registry_init(void)
         "Check if screen is on or off.",
         tool_get_screen_state_execute);
 
-    /* Health / fitness tools */
     REGISTER_TOOL_NO_PARAMS(
         "get_heartrate",
         "Get latest heart rate in BPM.",
@@ -356,8 +359,9 @@ int tool_registry_init(void)
     REGISTER_TOOL_NO_PARAMS("get_steps",
         "Get step count and step frequency.",
         tool_get_steps_execute);
+    */
 
-    /* Device control tools */
+    /* Device control tools — disabled: no vibration motor on LS2K0300.
     REGISTER_TOOL(
         "vibrate",
         "Trigger vibration. duration_ms: 1-5000 (default 200), amplitude: 1-255.",
@@ -367,8 +371,9 @@ int tool_registry_init(void)
             "Strength 1-255")
             TOOL_SCHEMA_END(),
         tool_vibrate_execute);
+    */
 
-    /* Feishu document tools */
+    /* Feishu tools — disabled: no Feishu credentials on this board.
     REGISTER_TOOL(
         "feishu_doc_create",
         "Create a new Feishu cloud document. Returns document_id and URL.",
@@ -403,7 +408,7 @@ int tool_registry_init(void)
                 TOOL_SCHEMA_END(),
         tool_feishu_doc_list_execute);
 
-    /* Feishu group chat tools */
+    -- Feishu group chat tools --
     REGISTER_TOOL(
         "feishu_chat_members",
         "List members of a Feishu group chat with name and open_id.",
@@ -425,8 +430,12 @@ int tool_registry_init(void)
             "Message text after the @mention")
             TOOL_SCHEMA_END_REQUIRED("\"chat_id\",\"open_id\",\"text\""),
         tool_feishu_send_mention_execute);
+    */
 
-    /* Music search */
+    /*
+     * Music tools — disabled: no media framework on LS2K0300.
+     * (music_search/play/pause/resume/stop/seek/set_volume/status)
+     *
     REGISTER_TOOL("music_search",
         "Search songs by keyword. Returns name, artist, URL. "
         "Does NOT play — call music_play with URL after.",
@@ -435,7 +444,6 @@ int tool_registry_init(void)
             TOOL_SCHEMA_END_REQUIRED("\"keyword\""),
         tool_music_search_execute);
 
-    /* Music playback tools (URL mode) */
     REGISTER_TOOL("music_play",
         "Play music from URL or local file. Stops current track first.",
         TOOL_SCHEMA_BEGIN()
@@ -483,8 +491,9 @@ int tool_registry_init(void)
         "Get current music playback status including state, "
         "position, duration, volume, and track URL.",
         tool_music_status_execute);
+    */
 
-    /* QuickApp launch tool */
+    /* QuickApp tools — disabled: no QuickApp engine on LS2K0300.
     REGISTER_TOOL("launch_quickapp",
         "Launch a QuickApp by package name.",
         TOOL_SCHEMA_BEGIN()
@@ -492,10 +501,91 @@ int tool_registry_init(void)
                 TOOL_SCHEMA_END_REQUIRED("\"package_name\""),
         tool_launch_quickapp_execute);
 
-    /* QuickApp exit tool */
     REGISTER_TOOL_NO_PARAMS("exit_quickapp",
         "Exit current QuickApp, return to home.",
         tool_exit_quickapp_execute);
+    */
+
+    /* ── LS2K0300 Board Peripheral Tools ────────────────────── */
+
+    REGISTER_TOOL(
+        "board_led",
+        "Control the on-board LEDs of the LS2K0300 board: the red LED "
+        "and the green LED.  Actions: on, off, toggle, blink.  The blue "
+        "LED is not here - it is driven by PWM, use board_pwm for it.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_ENUM("led", "Which LED(s) to control",
+                "\"red\",\"green\",\"both\"") ","
+            TOOL_PARAM_ENUM("action", "Action to perform",
+                "\"on\",\"off\",\"toggle\",\"blink\"") ","
+            TOOL_PARAM_NUM("times",
+                "Blink count 1-10 (only for blink, default 3)") ","
+            TOOL_PARAM_NUM("interval_ms",
+                "Blink interval in ms 50-5000 (only for blink, default 500)")
+            TOOL_SCHEMA_END_REQUIRED("\"led\",\"action\""),
+        tool_board_led_execute);
+
+    REGISTER_TOOL(
+        "board_pwm",
+        "Turn the on-board blue LED (hardware PWM2) on or off. "
+        "It ALWAYS breathes: turning it on - with no arguments, "
+        "action=\"breath\", or any duty above 0 - starts the LCD panel's "
+        "breathing animation, and the call returns at once. There is no "
+        "steady-on mode, so do not ask the user for a brightness. "
+        "Stop it with action=\"off\" or duty=0.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("action",
+                "\"breath\"/\"on\" starts the breathing animation, \"off\"/\"stop\" stops it") ","
+            TOOL_PARAM_NUM("duty", "0 = stop; any value above 0 also means breathing")
+            TOOL_SCHEMA_END(),
+        tool_board_pwm_execute);
+
+    REGISTER_TOOL(
+        "board_buzzer",
+        "Sound the on-board buzzer as an alarm or alert. It beeps "
+        "continuously until stopped. action=\"on\" (or no arguments) "
+        "starts it, action=\"off\" stops it.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("action",
+                "\"on\" (default) starts the alarm beeping, \"off\" stops it")
+            TOOL_SCHEMA_END(),
+        tool_board_buzzer_execute);
+
+    REGISTER_TOOL_NO_PARAMS(
+        "board_key_read",
+        "Read the current state of the two on-board push buttons "
+        "(key1 and key2). Returns pressed/released for each.",
+        tool_board_key_read_execute);
+
+    REGISTER_TOOL_NO_PARAMS(
+        "board_thermal_read",
+        "Read the on-die CPU temperature sensor of the LS2K0300 "
+        "in celsius.",
+        tool_board_thermal_read_execute);
+
+    REGISTER_TOOL(
+        "board_adc_read",
+        "Read the MCP3204 SPI ADC voltage on the board. "
+        "Returns 12-bit raw value and voltage (Vref 3.3V).",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_NUM("channel", "ADC channel 0-3 (default 0)")
+            TOOL_SCHEMA_END(),
+        tool_board_adc_read_execute);
+
+    REGISTER_TOOL_NO_PARAMS(
+        "board_light_read",
+        "Read ambient light level in lux from the BH1750 I2C light "
+        "sensor on the board.",
+        tool_board_light_read_execute);
+
+    REGISTER_TOOL(
+        "board_oled_show",
+        "Display ASCII text on the 128x64 SSD1306 OLED screen. "
+        "Supports multiple lines with \\n. Max 256 chars.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("text", "Text to display (ASCII, up to 256 chars)")
+            TOOL_SCHEMA_END_REQUIRED("\"text\""),
+        tool_board_oled_show_execute);
 
     build_tools_json_locked();
     syslog(LOG_INFO, "[%s] Tool registry initialized\n", TAG);

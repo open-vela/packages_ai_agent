@@ -23,6 +23,7 @@
 #include "tools/tool_fetch_url.h"
 #include "agent_config.h"
 #include "agent_compat.h"
+#include "infra/url_parse.h"
 #include "infra/vela_tls.h"
 #include "infra/http_proxy.h"
 
@@ -109,39 +110,24 @@ int tool_fetch_url_execute(const char *input_json, char *output, size_t output_s
         return ERROR;
     }
 
-    /* Parse URL: https://host[:port]/path */
-    if (strncmp(url, "https://", 8) != 0) {
+    /* Parse URL */
+    parsed_url_t pu;
+    if (url_parse(url, &pu) != 0 || !pu.use_tls
+        || strncmp(url, "https://", 8) != 0) {
         snprintf(output, output_size, "Error: only https:// URLs supported");
         cJSON_Delete(root);
         return ERROR;
     }
 
-    const char *hoststart = url + 8;
-    const char *slash = strchr(hoststart, '/');
-    const char *pathstart = slash ? slash : "/";
-
-    /* Extract host and port */
-    char host[256] = {0};
-    char port[8] = "443";
-    size_t hostlen = slash ? (size_t)(slash - hoststart) : strlen(hoststart);
-    if (hostlen >= sizeof(host)) hostlen = sizeof(host) - 1;
-    memcpy(host, hoststart, hostlen);
-
-    char *colon = strchr(host, ':');
-    if (colon) {
-        *colon = '\0';
-        strncpy(port, colon + 1, sizeof(port) - 1);
-    }
-
     /* SSRF protection: block private/loopback addresses */
-    if (is_private_host(host)) {
-        syslog(LOG_WARNING, "[%s] Blocked SSRF attempt to private host: %s\n", TAG, host);
+    if (is_private_host(pu.host)) {
+        syslog(LOG_WARNING, "[%s] Blocked SSRF attempt to private host: %s\n", TAG, pu.host);
         snprintf(output, output_size, "Error: access to private/internal addresses is not allowed");
         cJSON_Delete(root);
         return ERROR;
     }
 
-    syslog(LOG_INFO, "[%s] Fetching: %s (host=%s port=%s)\n", TAG, url, host, port);
+    syslog(LOG_INFO, "[%s] Fetching: %s (host=%s port=%s)\n", TAG, url, pu.host, pu.port);
 
     char *resp = malloc(FETCH_RESP_SIZE);
     if (!resp) {
@@ -150,10 +136,10 @@ int tool_fetch_url_execute(const char *input_json, char *output, size_t output_s
         return ERROR;
     }
 
-    int status = vela_https_get(host, port, pathstart, resp, FETCH_RESP_SIZE);
+    int status = vela_https_get(pu.host, pu.port, pu.path, resp, FETCH_RESP_SIZE);
 
     if (status != 200) {
-        snprintf(output, output_size, "Error: HTTP %d from %s", status, host);
+        snprintf(output, output_size, "Error: HTTP %d from %s", status, pu.host);
         free(resp);
         cJSON_Delete(root);
         return ERROR;
@@ -169,7 +155,7 @@ int tool_fetch_url_execute(const char *input_json, char *output, size_t output_s
                "returning placeholder\n", TAG, (int)resp_len);
         snprintf(output, output_size,
                  "[binary data: %d bytes from %s, "
-                 "not displayable as text]", (int)resp_len, host);
+                 "not displayable as text]", (int)resp_len, pu.host);
         free(resp);
         cJSON_Delete(root);
         return OK;
@@ -182,7 +168,7 @@ int tool_fetch_url_execute(const char *input_json, char *output, size_t output_s
     memcpy(output, resp, resp_len);
     output[resp_len] = '\0';
 
-    syslog(LOG_INFO, "[%s] Fetched %d bytes from %s\n", TAG, (int)resp_len, host);
+    syslog(LOG_INFO, "[%s] Fetched %d bytes from %s\n", TAG, (int)resp_len, pu.host);
     free(resp);
     cJSON_Delete(root);
     return OK;

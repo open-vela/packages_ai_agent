@@ -35,7 +35,6 @@ static const char *TAG = "skills";
 
 #define BUILTIN_WEATHER \
     "# Weather\n" \
-    "\n" \
     "Get current weather and forecasts using web_search.\n" \
     "\n" \
     "## When to use\n" \
@@ -55,7 +54,6 @@ static const char *TAG = "skills";
 
 #define BUILTIN_DAILY_BRIEFING \
     "# Daily Briefing\n" \
-    "\n" \
     "Compile a personalized daily briefing for the user.\n" \
     "\n" \
     "## When to use\n" \
@@ -79,7 +77,6 @@ static const char *TAG = "skills";
 
 #define BUILTIN_SKILL_CREATOR \
     "# Skill Creator\n" \
-    "\n" \
     "Create new skills for AI Agent.\n" \
     "\n" \
     "## When to use\n" \
@@ -195,6 +192,48 @@ static const char *TAG = "skills";
     "- Add: get_current_time, then edit_file/write_file to append: - [ ] [YYYY-MM-DD] desc\n" \
     "- Complete: edit_file to change - [ ] to - [x]\n"
 
+#define BUILTIN_BOARD_CONTROL \
+    "# Board Peripheral Control\n" \
+    "Control LS2K0300 board peripherals with natural language: " \
+    "lights (红/绿/蓝灯/开灯/关灯/灯闪), buzzer (蜂鸣器/响/报警), " \
+    "buttons (按键), CPU temperature (CPU温度), ADC voltage (电压), " \
+    "light level (光照), OLED text display (屏幕显示). " \
+    "ALWAYS call the board_* tools for these requests — never claim " \
+    "an action was done without calling the tool first.\n\n" \
+    "## When to use\n" \
+    "When user mentions lights (红/绿/蓝灯), LED, buzzer (蜂鸣器/响一声), " \
+    "buttons (按键), temperature (CPU温度/板卡温度), ADC voltage (电压/电位器), " \
+    "light level (光照/亮度传感), or showing text on the OLED screen (屏幕显示).\n\n" \
+    "## Tools\n" \
+    "- board_led: LEDs. led: red|green|both, action: on|off|toggle|blink. " \
+    "blink supports times (1-10) and interval_ms (50-5000).\n" \
+    "- board_pwm: blue LED via PWM. Static: duty 0-100 (0=off). " \
+    "Breathing animation: action=breath, period_ms per full breath " \
+    "cycle (default 3000), cycles count (default 1). " \
+    "Example: breath 3s x5 -> action=breath, period_ms=3000, cycles=5. " \
+    "Animation blocks until finished, then LED is off.\n" \
+    "- board_buzzer: beep. duration_ms (1-5000, default 200), count (1-10). " \
+    "Alert pattern example: count:3, duration_ms:100.\n" \
+    "- board_key_read: read key1/key2 state (pressed/released).\n" \
+    "- board_thermal_read: CPU temperature in celsius.\n" \
+    "- board_adc_read: MCP3204 ADC. channel 0-3, returns raw + voltage " \
+    "(0-3.3V). Connect a potentiometer to CH0.\n" \
+    "- board_light_read: BH1750 ambient light in lux.\n" \
+    "- board_oled_show: display ASCII text on OLED (128x64). Use \\n for " \
+    "new lines, max 4 lines x 16 chars.\n\n" \
+    "## Examples\n" \
+    "- 打开红灯 → board_led(led:\"red\", action:\"on\")\n" \
+    "- 关闭所有灯 → board_led(led:\"both\", action:\"off\")\n" \
+    "- 让蓝灯呼吸 → board_pwm(duty:50)\n" \
+    "- 报警 → board_buzzer(duration_ms:500, count:3)\n" \
+    "- CPU多热 → board_thermal_read()\n" \
+    "- 屏幕显示Hello → board_oled_show(text:\"Hello\")\n" \
+    "- 现在光照多少 → board_light_read()\n\n" \
+    "## Notes\n" \
+    "LEDs light on high level (active-high); the tool handles polarity internally. " \
+    "All tools return JSON with ok/error. If a sensor is missing, " \
+    "the error says which device was not detected.\n"
+
 /* Built-in skill registry */
 typedef struct {
     const char *filename;   /* e.g. "weather" */
@@ -212,6 +251,7 @@ static const builtin_skill_t s_builtins[] = {
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
     { "task-manager",   BUILTIN_TASK_MANAGER   },
+    { "board-control",  BUILTIN_BOARD_CONTROL  },
 };
 
 #define NUM_BUILTINS (sizeof(s_builtins) / sizeof(s_builtins[0]))
@@ -313,6 +353,32 @@ static void extract_description(FILE *f, char *out, size_t out_size)
         off += copy;
     }
 
+    /* Drop trailing partial UTF-8 sequence: the size clamp above can
+     * cut a multi-byte code point in half, producing invalid bytes
+     * that make the LLM API reject the whole request (HTTP 400
+     * "invalid unicode code point"). */
+    while (off > 0 && (unsigned char)out[off - 1] >= 0x80) {
+        size_t lead = off - 1;
+        while (lead > 0 && (unsigned char)out[lead] >= 0x80 &&
+               (unsigned char)out[lead] < 0xC0) {
+            lead--;
+        }
+
+        if ((unsigned char)out[lead] >= 0xC0) {
+            unsigned char c = (unsigned char)out[lead];
+            size_t seq = (c & 0xE0) == 0xC0 ? 2 :
+                         (c & 0xF0) == 0xE0 ? 3 :
+                         (c & 0xF8) == 0xF0 ? 4 : 1;
+            if (off - lead < seq) {
+                off = lead;   /* incomplete sequence: drop it */
+                break;
+            }
+            break;            /* sequence complete: keep it */
+        }
+
+        off = lead;           /* stray continuation byte: drop */
+    }
+
     /* Trim trailing space */
     while (off > 0 && out[off - 1] == ' ') off--;
     out[off] = '\0';
@@ -363,8 +429,12 @@ size_t skill_loader_build_summary(char *buf, size_t size)
         char title[64];
         extract_title(first_line, strlen(first_line), title, sizeof(title));
 
-        /* Read description (until blank line) */
-        char desc[256];
+        /* Read description (until blank line). 512 bytes: long
+         * descriptions get clamped to the buffer, and the clamp
+         * must respect UTF-8 boundaries (see extract_description)
+         * or the prompt ends up with a split code point that the
+         * LLM API rejects as invalid unicode. */
+        char desc[512];
         extract_description(f, desc, sizeof(desc));
         fclose(f);
 
@@ -376,9 +446,10 @@ size_t skill_loader_build_summary(char *buf, size_t size)
 
     closedir(dir);
 
-    buf[off] = '\0';
-    syslog(LOG_INFO, "[%s] Skills summary: %d bytes\n", TAG, (int)off);
-    return off;
+    buf[utf8_sanitize(buf, size)] = '\0';
+    syslog(LOG_INFO, "[%s] Skills summary: %d bytes\n", TAG,
+           (int)strlen(buf));
+    return strlen(buf);
 }
 
 /* ── Hot-reload support ──────────────────────────────────────── */
@@ -447,4 +518,61 @@ void skill_loader_refresh(void)
     tool_registry_invalidate();
     syslog(LOG_INFO, "[%s] Skills refreshed (hash=%08x)\n",
         TAG, s_last_skill_hash);
+}
+
+/* ── UTF-8 sanitation for prompt fragments ───────────────────── */
+
+/**
+ * Truncate a UTF-8 string at a code point boundary. Any trailing
+ * incomplete multi-byte sequence is dropped. Guard against buffers
+ * built by clamped snprintf chains (skill summary, tool names, ...)
+ * reaching the LLM API, which rejects JSON containing invalid
+ * unicode sequences with HTTP 400.
+ */
+size_t utf8_sanitize(char *s, size_t len)
+{
+    size_t i = 0;
+    size_t last_complete = 0;
+
+    while (i < len && s[i] != '\0') {
+        unsigned char c = (unsigned char)s[i];
+        size_t seq;
+
+        if (c < 0x80) {
+            seq = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            seq = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            seq = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            seq = 4;
+        } else {
+            /* stray continuation byte: cut everything from here */
+            s[i] = '\0';
+            return i;
+        }
+
+        /* verify continuation bytes exist */
+        if (i + seq > len || s[i + seq - 1] == '\0') {
+            break;   /* incomplete at end */
+        }
+
+        {
+            size_t k;
+            for (k = 1; k < seq; k++) {
+                if (((unsigned char)s[i + k] & 0xC0) != 0x80) {
+                    s[i] = '\0';
+                    return i;
+                }
+            }
+        }
+
+        i += seq;
+        last_complete = i;
+    }
+
+    if (i != last_complete) {
+        s[last_complete] = '\0';
+    }
+    return last_complete;
 }

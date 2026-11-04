@@ -13,7 +13,7 @@
 - 📡 **多渠道接入** — CLI / 飞书 Bot / 微信 Bot / WebSocket / MQTT / 语音（ASR+TTS），统一消息总线，均可通过 Kconfig 独立开关
 - 🌐 **多节点协作** — Hub 模式接受设备连接，Node 模式连接 OpenClaw Gateway，跨设备工具调用
 - 🔌 **MCP 协议** — 设备端 MCP Client 通过 Streamable HTTP 直连远程 MCP Server（已验证高德地图 15 工具、滴滴出行 13 工具），动态发现和调用远程工具
-- 📝 **Skills 系统** — Markdown 格式可扩展技能，10 个内置 Skill，对话即可创建新技能
+- 📝 **Skills 系统** — Markdown 格式可扩展技能，内置多个 Skill，对话即可创建新技能
 - 🔒 **安全加固** — 工具白名单、敏感工具限流、Shell 三级策略、日志脱敏
 - 💾 **低内存优化** — 堆检测、内存池、流式输出，模块化 Kconfig 裁剪，适配手表级设备（~256KB RAM）
 - 🔀 **智能路由** — 多后端 LLM Router，复杂度感知路由、自动故障转移、成本优化
@@ -58,7 +58,7 @@ vela> mcp_discover                       # 发现远程工具
 | `qwen` | qwen-turbo | 通义千问 |
 | `deepseek` | deepseek-chat | DeepSeek |
 | `glm` | glm-4-flash | 智谱 AI |
-| `mimo` | MiMo-v2-Flash | 小米大模型（Flash/Pro/Omni） |
+| `mimo` | `mimo-v2-flash` | 小米大模型（Flash/Pro/Omni） |
 | `openai` | gpt-4o | OpenAI |
 | `claude` | claude-sonnet-4-20250514 | Anthropic Claude |
 | `openrouter` | openrouter/hunter-alpha | OpenRouter 聚合 |
@@ -114,7 +114,7 @@ vela> router_status                      # 查看路由状态
 
 ## Skills 系统
 
-10 个内置 Skill，Markdown 格式，对话即可创建新技能：
+内置多个 Skill，Markdown 格式，对话即可创建新技能：
 
 | Skill | 说明 |
 |-------|------|
