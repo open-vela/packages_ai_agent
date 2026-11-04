@@ -18,6 +18,7 @@
 #include "voice/volc_asr.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
@@ -29,6 +30,16 @@ static const char* TAG = "voice_asr";
 static const voice_asr_ops_t* s_backends[VOICE_ASR_MAX_BACKENDS];
 static int s_backend_count;
 static const voice_asr_ops_t* s_active;
+
+/* The recognition backend opens one WebSocket/TLS session per call, and
+ * the Volcengine endpoint only serves one session per API key at a time.
+ * volc_asr also reloads its credentials into a shared static on entry.
+ * A second PTT released while the previous recognition is still
+ * streaming therefore collides with the first: the new session is
+ * refused, stalls, or comes back with an empty result.  Serialize the
+ * calls; a pending one simply waits its turn. */
+
+static pthread_mutex_t s_recognize_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int voice_asr_register(const voice_asr_ops_t* ops)
 {
@@ -97,7 +108,17 @@ int voice_asr_recognize(const unsigned char* pcm_data,
         return -ENODEV;
     }
 
-    return s_active->recognize(pcm_data, pcm_len, text_out, text_cap);
+    if (pthread_mutex_trylock(&s_recognize_lock) != 0)
+    {
+        syslog(LOG_INFO,
+            "[%s] recognize: previous session still running, waiting\n",
+            TAG);
+        pthread_mutex_lock(&s_recognize_lock);
+    }
+
+    int ret = s_active->recognize(pcm_data, pcm_len, text_out, text_cap);
+    pthread_mutex_unlock(&s_recognize_lock);
+    return ret;
 }
 
 /* ── Streaming ASR (delegates to volc_asr streaming API) ─────── */

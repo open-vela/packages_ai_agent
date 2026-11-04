@@ -36,6 +36,7 @@
 #include <mqueue.h>
 #include <nuttx/audio/audio.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -521,6 +522,7 @@ err_out:
 int audio_capture_start(audio_capture_t* cap)
 {
     pthread_attr_t attr;
+    struct sched_param sparam;
     int ret;
 
     if (!cap) {
@@ -531,6 +533,22 @@ int audio_capture_start(audio_capture_t* cap)
 
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8192);
+
+    /* This thread is the audio consumer: it receives AUDIO_MSG_DEQUEUE,
+     * writes the buffer to the sink and hands it back to the device.  A
+     * default attr inherits the caller's priority (the PTT worker, itself
+     * inherited from LVGL) at 100, the same priority as the render thread,
+     * so it has to wait its turn while LVGL draws.  The pipeline then
+     * drains and the 8-byte I2S RX FIFO overruns: the stuttering in the
+     * recording.  Mark it explicit FIFO above the UI, below the ES8388
+     * worker (252).
+     */
+
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    sparam.sched_priority = AGENT_VOICE_CAPTURE_PRIO;
+    pthread_attr_setschedparam(&attr, &sparam);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+
     ret = pthread_create(&cap->thread, &attr, capture_thread, cap);
     pthread_attr_destroy(&attr);
 

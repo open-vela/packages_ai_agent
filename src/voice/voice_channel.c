@@ -40,11 +40,15 @@
 #include <math.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <nuttx/timers/pwm.h>
 
 static const char* TAG = "voice";
 static int s_backends_registered;
@@ -1004,6 +1008,11 @@ static void* asr_and_dispatch(void* arg)
         syslog(LOG_INFO, "[%s] ASR result: %s\n", TAG, text);
         printf("ASR: %s\n", text);
 
+        /* Recognized text goes to the console only; the panel shows the
+         * state and then the agent's reply. */
+
+        ls_lvgl_set_ai_text("thinking...", NULL);
+
         agent_msg_t msg;
 
         memset(&msg, 0, sizeof(msg));
@@ -1697,7 +1706,12 @@ static void ptt_post(unsigned char ev)
  * is known to produce clean audio, and the one the audio_capture.c driver
  * could not be made to match byte for byte. */
 
-#define PTT_CAPTURE_PATH "/mnt/ptt.wav"
+/* The capture goes to the RAM-backed /tmp (mounted by the board bringup),
+ * not to the SD card.  The file only has to survive until ASR has read
+ * it a few seconds later, and keeping the SDIO DMA off the bus while the
+ * I2S DMA runs removes one source of the short capture dropouts. */
+
+#define PTT_CAPTURE_PATH "/tmp/ptt.wav"
 
 static FAR struct nxrecorder_s *s_recorder;
 
@@ -1705,7 +1719,62 @@ static void ptt_handle_down(void)
 {
     int ret;
 
+    /* Stop any TTS playback BEFORE opening the capture device.  The
+     * playback and capture nodes share one ES8388, and closing the
+     * playback node resets every codec register, which wipes the ADC
+     * configuration in the middle of a recording.  Recording while the
+     * reply is still audible also captures the reply itself.  This is
+     * the same workaround voice_channel_start() does; the PTT path grew
+     * up separately and never picked it up. */
+
+    pthread_mutex_lock(&s_voice.lock);
+    if (s_voice.tts_pb) {
+        syslog(LOG_INFO,
+            "[%s] PTT: stopping active TTS to prevent echo\n", TAG);
+        s_voice.tts_abort = 1;
+        audio_playback_stop(s_voice.tts_pb);
+        pthread_mutex_unlock(&s_voice.lock);
+
+        /* Wait for the speak thread to finish closing the playback
+         * device: speak_lock is held for the whole speak call. */
+
+        pthread_mutex_lock(&s_voice.speak_lock);
+        pthread_mutex_unlock(&s_voice.speak_lock);
+
+        syslog(LOG_INFO, "[%s] PTT: TTS playback fully closed\n", TAG);
+    } else {
+        pthread_mutex_unlock(&s_voice.lock);
+    }
+
     ls_lvgl_set_ai_text("listening...", "speak now");
+
+    /* Silence the blue LED's PWM while the microphone is open.  Its
+     * 1 kHz carrier couples into the 24 dB mic preamp and saturates the
+     * capture: every take recorded while the LED was lit came back as
+     * clipped noise and the recognizer answered "no text".  The panel
+     * skips its own ramp while the key is held, so this zero duty holds
+     * for the whole take; when the key is released the panel resumes
+     * the animation on its own. */
+
+    {
+        int pwm_fd = open("/dev/pwm2", O_RDONLY);
+
+        if (pwm_fd >= 0)
+          {
+            struct pwm_info_s pwm;
+
+            memset(&pwm, 0, sizeof(pwm));
+            pwm.frequency = 1000;
+            pwm.duty = 0;
+
+            /* START, not SETCHARACTERISTICS: the latter only reaches the
+             * hardware when this file already owns a started session, and
+             * the whole point here is to force the output low. */
+
+            ioctl(pwm_fd, PWMIOC_START, (unsigned long)(uintptr_t)&pwm);
+            close(pwm_fd);
+          }
+    }
 
     if (s_recorder != NULL) {
         nxrecorder_release(s_recorder);
@@ -1740,6 +1809,11 @@ static void ptt_handle_up(void)
         nxrecorder_release(s_recorder);
         s_recorder = NULL;
     }
+
+    /* Give the recorder a moment to finish flushing before the recognizer
+     * opens the file. */
+
+    usleep(500000);
 
     /* Feed the recording to the recognizer.  The file is raw PCM, so the
      * format is given explicitly. */
@@ -1886,12 +1960,80 @@ static void report_channel_levels(const unsigned char* src, size_t len,
     }
 }
 
+/* The microphone reaches only one ADC channel, but which one can change
+ * during a take: the codec is clocked as an I2S slave, and every DMA
+ * restart can slip the left/right alignment by one 16-bit slot, so the
+ * voice wanders between the channels while the take is being recorded.
+ * The channel not driving the microphone sits at near-Nyquist noise with
+ * a very high zero-crossing rate, while voice crosses far less often.
+ * Pick the calmer channel for each short window so a take whose channels
+ * alternate still comes through as continuous voice. */
+
+#define ASR_CHANNEL_WINDOW_MS 30
+
+static unsigned char* build_channel_map(const unsigned char* src,
+    size_t nframes, unsigned int channels, size_t win, size_t* nwin_out)
+{
+    size_t nwin = (nframes + win - 1) / win;
+    unsigned int nc = channels > 4 ? 4 : channels;
+    unsigned char* sel;
+    size_t w;
+
+    if (nwin == 0) {
+        nwin = 1;
+    }
+
+    *nwin_out = nwin;
+
+    sel = malloc(nwin);
+    if (!sel) {
+        return NULL;
+    }
+
+    for (w = 0; w < nwin; w++) {
+        size_t f0 = w * win;
+        size_t f1 = f0 + win;
+        size_t zc[4] = { 0, 0, 0, 0 };
+        int prev[4] = { 0, 0, 0, 0 };
+        unsigned int best = 0;
+        unsigned int c;
+        size_t f;
+
+        if (f1 > nframes) {
+            f1 = nframes;
+        }
+
+        for (f = f0; f < f1; f++) {
+            for (c = 0; c < nc; c++) {
+                const unsigned char* p = src + (f * channels + c) * 2;
+                int s = (int16_t)(p[0] | (p[1] << 8));
+                int sign = (s > 0) - (s < 0);
+
+                if (sign && prev[c] && sign != prev[c]) {
+                    zc[c]++;
+                }
+                if (sign) {
+                    prev[c] = sign;
+                }
+            }
+        }
+
+        for (c = 1; c < nc; c++) {
+            if (zc[c] < zc[best]) {
+                best = c;
+            }
+        }
+
+        sel[w] = (unsigned char)best;
+    }
+
+    return sel;
+}
+
 /* Fold a captured stream down to the 16kHz mono that volc_asr declares to
- * the server.  The microphone only reaches the left channel of the codec
- * (the right input is tied to AGND on this board), so the right channel
- * is dropped instead of being mixed in — mixing would add its noise for
- * no gain.  Anything above 16kHz is box-filtered down, which is crude but
- * is what the recognizer needs to see. */
+ * the server, following the per-window channel choice (see above).
+ * Anything above 16kHz is box-filtered down, which is crude but is what
+ * the recognizer needs to see. */
 static size_t pcm_to_asr_format(const unsigned char* src, size_t src_len,
     unsigned int channels, unsigned int rate,
     unsigned char* dst, size_t dst_cap)
@@ -1899,6 +2041,9 @@ static size_t pcm_to_asr_format(const unsigned char* src, size_t src_len,
     size_t nframes;
     size_t out_n;
     size_t i;
+    size_t win;
+    size_t nwin = 0;
+    unsigned char* sel = NULL;
 
     if (channels < 1) {
         channels = 1;
@@ -1914,10 +2059,21 @@ static size_t pcm_to_asr_format(const unsigned char* src, size_t src_len,
         out_n = dst_cap / 2;
     }
 
+    win = (size_t)rate * ASR_CHANNEL_WINDOW_MS / 1000;
+    if (win < 1) {
+        win = 1;
+    }
+
+    if (channels > 1 && nframes > 0) {
+        sel = build_channel_map(src, nframes, channels, win, &nwin);
+    }
+
     for (i = 0; i < out_n; i++) {
         size_t f0 = (size_t)((uint64_t)i * rate / AGENT_VOICE_SAMPLE_RATE);
         size_t f1 =
             (size_t)((uint64_t)(i + 1) * rate / AGENT_VOICE_SAMPLE_RATE);
+        size_t start = f0;
+        unsigned int c = 0;
         int32_t sum = 0;
         int16_t sample;
 
@@ -1928,16 +2084,26 @@ static size_t pcm_to_asr_format(const unsigned char* src, size_t src_len,
             f1 = nframes;
         }
 
+        if (sel && win) {
+            size_t w = start / win;
+
+            c = (w < nwin) ? sel[w] : sel[nwin - 1];
+        }
+
         for (; f0 < f1; f0++) {
-            const unsigned char* p = src + (f0 * channels) * 2;
+            const unsigned char* p = src + (f0 * channels + c) * 2;
 
             sum += (int16_t)(p[0] | (p[1] << 8));
         }
 
-        sample = (int16_t)(sum / (int32_t)(f1 - f0 > 0 ? f1 - f0 : 1));
+        sample = (int16_t)(sum / (int32_t)(f1 - start > 0
+                                               ? f1 - start
+                                               : 1));
         dst[i * 2] = (unsigned char)(sample & 0xff);
         dst[i * 2 + 1] = (unsigned char)((sample >> 8) & 0xff);
     }
+
+    free(sel);
 
     return out_n * 2;
 }
@@ -1996,7 +2162,11 @@ static void* asr_file_worker(void* arg)
 
     if (ret == 0) {
         printf("ASR result: %s\n", text);
-        ls_lvgl_set_ai_text("thinking...", text);
+
+        /* The recognized text stays on the console; the panel only shows
+         * the state and then the agent's own reply. */
+
+        ls_lvgl_set_ai_text("thinking...", NULL);
 
         agent_msg_t msg;
 

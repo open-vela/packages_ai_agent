@@ -93,7 +93,11 @@ typedef struct {
     mbedtls_ssl_config cfg;
     mbedtls_net_context net;
     mbedtls_ctr_drbg_context ctr_drbg;
+    int ws_ready; /* WebSocket upgrade completed */
 } asr_tls_ctx_t;
+
+static int ws_send_frame(asr_tls_ctx_t* ctx, unsigned char opcode,
+                         const unsigned char* payload, size_t plen);
 
 /* Session auth, filled from the config store by volc_asr_init() */
 typedef struct {
@@ -234,6 +238,7 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
     mbedtls_ssl_config_init(&ctx->cfg);
     mbedtls_net_init(&ctx->net);
     mbedtls_ctr_drbg_init(&ctx->ctr_drbg);
+    ctx->ws_ready = 0;
 
     const char* pers = "volc_asr";
 
@@ -273,6 +278,12 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
         struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
 
         setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO,
+            &tv, sizeof(tv));
+
+        /* A stalled peer would otherwise block the close frame and the
+         * last audio chunks forever. */
+
+        setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO,
             &tv, sizeof(tv));
     }
 
@@ -327,6 +338,19 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
 
 static void asr_tls_free(asr_tls_ctx_t* ctx)
 {
+    /* Close the WebSocket properly before the transport goes away.  The
+     * server keeps the streaming session (and this API key's single
+     * concurrency slot) until it sees a Close frame; a bare TCP/TLS
+     * teardown left the next recognition waiting for that slot, which is
+     * what made every second recognition hang. */
+
+    if (ctx->ws_ready) {
+        static const unsigned char normal_close[2] = { 0x03, 0xe8 };
+        ws_send_frame(ctx, WS_OPCODE_CLOSE, normal_close,
+            sizeof(normal_close));
+        ctx->ws_ready = 0;
+    }
+
     mbedtls_ssl_close_notify(&ctx->ssl);
     mbedtls_net_free(&ctx->net);
     mbedtls_ssl_free(&ctx->ssl);
@@ -1135,6 +1159,9 @@ int volc_asr_recognize(const unsigned char* pcm_data,
         return -ENOENT;
     }
 
+    syslog(LOG_INFO, "[%s] recognize: %zu bytes, opening session\n",
+        TAG, pcm_len);
+
     struct timespec e2e_t0;
     clock_gettime(CLOCK_MONOTONIC, &e2e_t0);
 
@@ -1156,6 +1183,8 @@ int volc_asr_recognize(const unsigned char* pcm_data,
         asr_tls_free(&ctx);
         return ret;
     }
+
+    ctx.ws_ready = 1;
 
     /* 3. Send full_client_request (seq starts at 1) */
     int32_t seq = 1;
@@ -1281,6 +1310,8 @@ volc_asr_stream_t* volc_asr_stream_open(void)
         free(s);
         return NULL;
     }
+
+    s->tls.ws_ready = 1;
 
     s->seq = 1;
     ret = send_full_client_request(&s->tls, s->seq);
