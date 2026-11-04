@@ -74,6 +74,9 @@
 #ifdef CONFIG_AI_AGENT_WEIXIN
 #include "channels/weixin_channel.h"
 #endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+#include "channels/xiaozhi_channel.h"
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #include "ui/lvgl_ui_channel.h"
 #endif
@@ -130,6 +133,9 @@ static void net_state_change_cb(net_state_t state, void* arg)
 #ifdef CONFIG_AI_AGENT_WEIXIN
         weixin_channel_start();
 #endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        xiaozhi_channel_start();
+#endif
         g_net_services_started = true;
     } else if (state == NET_STATE_DISCONNECTED) {
         syslog(LOG_WARNING,
@@ -181,6 +187,10 @@ static void* network_watch_task(void* arg)
 #ifdef CONFIG_AI_AGENT_WEIXIN
         if (weixin_channel_start() != OK)
             syslog(LOG_WARNING, "[%s] weixin_channel_start failed\n", TAG);
+#endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        if (xiaozhi_channel_start() != OK)
+            syslog(LOG_WARNING, "[%s] xiaozhi_channel_start failed\n", TAG);
 #endif
 
         syslog(LOG_INFO, "[%s] All network services started!\n", TAG);
@@ -324,12 +334,14 @@ static void quickapp_mq_dispatch(const char *chat_id, const char *content)
 
 /* ── Voice failure cooldown — prevent error-message cascade ──── */
 
+#ifdef CONFIG_AI_AGENT_VOICE_TTS
 static volatile bool s_voice_cooldown;
 static time_t s_voice_cooldown_until;
+#endif
 
 /**
  * Reads messages from the outbound queue and dispatches them to the
- * appropriate channel (FeiShu, WebSocket, CLI, etc.).
+ * appropriate channel (Feishu, WebSocket, CLI, etc.).
  */
 static void* outbound_dispatch_task(void* arg)
 {
@@ -384,6 +396,18 @@ static void* outbound_dispatch_task(void* arg)
             mqtt_channel_send(msg.chat_id, msg.content);
 #endif
         } else if (strcmp(msg.channel, AGENT_CHAN_VOICE) == 0) {
+            /* The reply is shown as a subtitle on the panel and printed
+             * to the terminal.  Speaking it is optional: the TTS round
+             * trip is slow and costs a service call, and a demo driven
+             * from the LCD only needs the text.
+             */
+            ls_lvgl_set_ai_text("reply", msg.content);
+            pthread_mutex_lock(&g_stdout_lock);
+            printf("\n[Agent]: %s\nvela> ", msg.content);
+            fflush(stdout);
+            pthread_mutex_unlock(&g_stdout_lock);
+
+#ifdef CONFIG_AI_AGENT_VOICE_TTS
             /* Check voice cooldown — skip voice dispatch if a recent
              * speak call failed, to prevent error-message cascade. */
             if (s_voice_cooldown && time(NULL) < s_voice_cooldown_until) {
@@ -398,6 +422,11 @@ static void* outbound_dispatch_task(void* arg)
                     s_voice_cooldown_until = time(NULL) + 5;
                 }
             }
+#else
+            syslog(LOG_INFO,
+                "[%s] reply shown as subtitle and terminal only "
+                "(CONFIG_AI_AGENT_VOICE_TTS is off)\n", TAG);
+#endif
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         } else if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) == 0) {
             int uret = lvgl_ui_channel_send(msg.content);
@@ -435,6 +464,10 @@ static void* outbound_dispatch_task(void* arg)
             fflush(stdout);
             pthread_mutex_unlock(&g_stdout_lock);
             syslog(LOG_INFO, "[agent] [Agent]: %s\n", msg.content);
+
+            /* Mirror the reply on the LCD panel subtitle */
+
+            ls_lvgl_set_ai_text("reply", msg.content);
         } else {
             syslog(LOG_WARNING, "[%s] Unknown channel: %s\n", TAG, msg.channel);
         }
@@ -593,6 +626,11 @@ int ai_agent_main(int argc, char* argv[])
         BOOT_LOG_RC(&t0, "P3", "weixin_channel_init", rc);
 #endif
 
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+        rc = xiaozhi_channel_init();
+        BOOT_LOG_RC(&t0, "P3", "xiaozhi_channel_init", rc);
+#endif
+
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         rc = lvgl_ui_channel_init();
         BOOT_LOG_RC(&t0, "P3", "lvgl_ui_channel_init", rc);
@@ -715,6 +753,9 @@ int ai_agent_main(int argc, char* argv[])
     /* Phase 5 services (network-dependent) */
 #ifdef CONFIG_AI_AGENT_WEIXIN
     weixin_channel_stop();
+#endif
+#ifdef CONFIG_AI_AGENT_XIAOZHI
+    xiaozhi_channel_stop();
 #endif
 #ifdef CONFIG_AI_AGENT_NODE
     node_client_stop();

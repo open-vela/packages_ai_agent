@@ -34,6 +34,7 @@
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
 #include "tools/tool_registry.h"
+#include "channels/nsh_commands.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -203,6 +204,11 @@ static void add_tool_result_messages(cJSON* messages,
 
         syslog(LOG_INFO, "[%s] Tool call: %s args=%.500s\n", TAG,
             call->name, call->input ? call->input : "(null)");
+        pthread_mutex_lock(&g_stdout_lock);
+        printf("\n[tool] %s(%s)\n", call->name,
+            call->input ? call->input : "");
+        fflush(stdout);
+        pthread_mutex_unlock(&g_stdout_lock);
         tool_output[0] = '\0';
         char* patched = inject_cron_context(
             call->name, call->input, msg_channel, msg_chat_id);
@@ -210,8 +216,22 @@ static void add_tool_result_messages(cJSON* messages,
             patched ? patched : call->input,
             tool_output, tool_output_size);
         free(patched);
+        /* Tool output (run_shell especially) can contain invalid
+         * UTF-8 (binary garbage, split multibyte chars). Any such
+         * byte sequence entering the conversation makes the LLM API
+         * reject the whole request with HTTP 400 "invalid unicode
+         * code point". Sanitize before adding to messages. */
+        {
+            size_t out_len = strlen(tool_output);
+            utf8_sanitize(tool_output, out_len + 1 > out_len ?
+                out_len : out_len + 1);
+        }
         syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n", TAG,
             call->name, (int)strlen(tool_output));
+        pthread_mutex_lock(&g_stdout_lock);
+        printf("[tool] -> %.160s\n", tool_output);
+        fflush(stdout);
+        pthread_mutex_unlock(&g_stdout_lock);
 
         cJSON* result_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(result_msg, "role", "tool");
@@ -289,6 +309,12 @@ static void add_tool_result_messages(cJSON* messages,
         } else {
             strncpy(seen_ids[seen_count++], resp->calls[i].id,
                 sizeof(seen_ids[0]) - 1);
+
+            /* Same UTF-8 guard as the single-tool path: tool output
+             * goes into the conversation verbatim and invalid bytes
+             * would make the LLM API reject the request. */
+            utf8_sanitize(tasks[i].output,
+                strlen(tasks[i].output) + 1);
 
             cJSON* result_msg = cJSON_CreateObject();
             cJSON_AddStringToObject(result_msg, "role", "tool");
@@ -662,7 +688,7 @@ static char* handle_slash_remind(const agent_msg_t* msg)
     char* reply = calloc(1, 512);
     if (reply) {
         tool_registry_execute("cron_add", input, reply, 512);
-        snprintf(reply, 512, "好的，%d 秒后提醒你：%s",
+        snprintf(reply, 512, "好的，%d 秒后提醒你：%.400s",
             secs, remind_msg);
     }
     return reply;

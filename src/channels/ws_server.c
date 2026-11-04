@@ -22,6 +22,8 @@
 
 #include "channels/ws_server.h"
 #include "core/message_bus.h"
+#include "infra/a2a_handler.h"
+#include "tools/mcp_server.h"
 #ifdef CONFIG_AI_AGENT_NODE
 #include "node/node_manager.h"
 #endif
@@ -149,18 +151,39 @@ static int make_accept_key(const char* key, char* out, size_t out_size)
  * Read full HTTP upgrade request, extract Sec-WebSocket-Key.
  * Returns 0 on success; sends 101 response.
  */
-static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
-    char* chat_id_out, size_t chat_id_size)
+/**
+ * WebSocket handshake. If pre_buf is non-NULL, use it as already-read
+ * HTTP headers; otherwise read from fd.
+ */
+static int do_ws_handshake_ex(int fd, const char *pre_buf, int pre_len,
+                               char *chat_id_out, size_t chat_id_size)
 {
+    char local_buf[1024];
+    const char *buf;
+
+    if (pre_buf) {
+        buf = pre_buf;
+    } else {
+        int total = 0;
+        while (total < (int)sizeof(local_buf) - 1) {
+            int n = recv(fd, local_buf + total,
+                         sizeof(local_buf) - 1 - total, 0);
+            if (n <= 0) return -1;
+            total += n;
+            local_buf[total] = '\0';
+            if (strstr(local_buf, "\r\n\r\n")) break;
+        }
+        buf = local_buf;
+    }
 
     /* Extract Sec-WebSocket-Key */
-    char* key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
+    const char *key_hdr = strcasestr(buf, "\r\nSec-WebSocket-Key: ");
     if (!key_hdr) {
         syslog(LOG_WARNING, "[%s] No Sec-WebSocket-Key\n", TAG);
         return -1;
     }
     key_hdr += 21;
-    char* eol = strstr(key_hdr, "\r\n");
+    const char *eol = strstr(key_hdr, "\r\n");
     if (!eol)
         return -1;
 
@@ -187,7 +210,6 @@ static int do_ws_handshake_ex(int fd, const char* buf, int buf_len,
     if (send(fd, resp, rlen, 0) != rlen)
         return -1;
 
-    /* Default chat_id from fd (may be overridden by first message) */
     snprintf(chat_id_out, chat_id_size, "ws_%d", fd);
     return 0;
 }
@@ -348,31 +370,27 @@ static void* client_thread(void* arg)
     free(arg);
     int fd = ca.fd;
 
-    /* Peek HTTP headers to decide: REST API or WebSocket */
-    char* peek_buf = malloc(2048);
-    if (!peek_buf) {
-        close(fd);
-        return NULL;
-    }
+    /* Peek HTTP headers to decide: A2A/REST/MCP or WebSocket upgrade */
+    char peek_buf[2048];
     int peek_total = 0;
-    while (peek_total < 2048 - 1) {
+    while (peek_total < (int)sizeof(peek_buf) - 1) {
         int n = recv(fd, peek_buf + peek_total,
-            2048 - 1 - peek_total, 0);
-        if (n <= 0) {
-            free(peek_buf);
-            close(fd);
-            return NULL;
-        }
+                     sizeof(peek_buf) - 1 - peek_total, 0);
+        if (n <= 0) { close(fd); return NULL; }
         peek_total += n;
         peek_buf[peek_total] = '\0';
-        if (strstr(peek_buf, "\r\n\r\n"))
-            break;
+        if (strstr(peek_buf, "\r\n\r\n")) break;
+    }
+
+    /* Try A2A HTTP routes first */
+    if (a2a_try_handle(fd, peek_buf, peek_total)) {
+        close(fd);
+        return NULL;
     }
 
     /* Try REST API (config/skills/logs) */
 #ifdef CONFIG_AI_AGENT_REST_API
     if (api_try_handle(fd, peek_buf, peek_total)) {
-        free(peek_buf);
         struct linger lg = { .l_onoff = 1, .l_linger = 0 };
         setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         close(fd);
@@ -380,17 +398,20 @@ static void* client_thread(void* arg)
     }
 #endif
 
-    /* Not REST API - proceed with WebSocket handshake using pre-read buffer */
-    char chat_id[32];
-    if (do_ws_handshake_ex(fd, peek_buf, peek_total,
-            chat_id, sizeof(chat_id))
-        != 0) {
-        syslog(LOG_WARNING, "[%s] Handshake failed for fd=%d\n", TAG, fd);
-        free(peek_buf);
+    /* Try MCP Server (for remote MCP client integration) */
+    if (mcp_server_try_handle_http(fd, peek_buf, peek_total)) {
         close(fd);
         return NULL;
     }
-    free(peek_buf);
+
+    /* Not an HTTP API - proceed with the WebSocket handshake */
+    char chat_id[32];
+    if (do_ws_handshake_ex(fd, peek_buf, peek_total,
+                            chat_id, sizeof(chat_id)) != 0) {
+        syslog(LOG_WARNING, "[%s] Handshake failed for fd=%d\n", TAG, fd);
+        close(fd);
+        return NULL;
+    }
 
     /* Register client */
     pthread_mutex_lock(&s_clients_mtx);

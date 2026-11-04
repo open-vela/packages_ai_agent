@@ -40,6 +40,7 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/vendor/allwinnertech/chips/r528/drivers/rtos-hal/hal/source
 endif
 CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/mqttc/MQTT-C/include
+CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/system/zlib/zlib
 
 # Source files
 
@@ -84,6 +85,7 @@ CSRCS += src/tools/mcp_client.c
 endif
 CSRCS += src/tools/skill_loader.c
 CSRCS += src/tools/tool_guard.c
+CSRCS += src/tools/tool_2k0300.c
 
 ifeq ($(CONFIG_AI_AGENT_SKILL_SYNC),y)
 CSRCS += src/tools/skill_sync.c

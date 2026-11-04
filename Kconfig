@@ -149,18 +149,15 @@ config AI_AGENT_AUDIO_CAPTURE_GAIN
 		- 6 = Compensate for 6-channel DMIC with 1 active mic
 		- Higher values for more amplification (may clip)
 
-config AI_AGENT_AUDIO_ALSA_DIRECT
-	bool "Use direct ALSA capture backend"
+config AI_AGENT_VOICE_TTS
+	bool "Speak the agent reply aloud"
 	default n
 	---help---
-		Capture audio directly through the ALSA (aw-alsa-lib) PCM
-		interface instead of the portable media_recorder backend.
-		This requires chip-specific ALSA headers and the Allwinner
-		R528 rtos-hal include tree, so it only builds on boards that
-		ship that SDK. Leave disabled (the default) on all other
-		boards; the agent then uses the media framework recorder,
-		which works everywhere. When enabled, the agent still falls
-		back to media_recorder at runtime if ALSA capture fails.
+		Synthesize the agent's reply with the TTS backend and play it
+		out of the speaker.  With this off the reply is only shown as
+		a subtitle on the panel and printed to the terminal, which is
+		what a demo driven from the LCD wants - and it saves the
+		round trip to the TTS service.
 
 config AI_AGENT_CAMERA
 	bool "Enable camera capture tool"
@@ -204,6 +201,36 @@ config AI_AGENT_TEST_IMAGE_DIR
 		Directory for test images used by the vision integration tests.
 		Images can be pre-pushed via adb or generated at runtime.
 		Must be on a writable filesystem.
+
+config AI_AGENT_BLE_GATT
+	bool "Enable BLE GATT data channel"
+	default n
+	depends on BLUETOOTH
+	---help---
+		Enable the BLE GATT data channel using Nordic UART Service
+		(NUS) pattern. Provides bidirectional data exchange over BLE
+		without classic Bluetooth. Suitable for iOS devices and
+		low-power BLE-only chips. Costs ~8KB code + ~2KB RAM.
+
+config AI_AGENT_BLE_NET
+	bool "Enable BLE network channel (SPP + TUN)"
+	default n
+	depends on BLUETOOTH
+	---help---
+		Enable the BLE network channel using SPP + TUN for IP
+		traffic proxy through a companion phone app. Costs ~12KB
+		code + ~4KB RAM (TUN buffer + SPP state). Requires a
+		companion app on the phone to proxy network traffic.
+
+config AI_AGENT_XIAOZHI
+	bool "Enable XiaoZhi channel"
+	default n
+	---help---
+		Enable the XiaoZhi WebSocket protocol channel. Connects
+		to XiaoZhi Server via WSS for JSON control messages and
+		binary Opus audio frames. Includes OTA config fetch,
+		auto-reconnect with exponential backoff, and MCP support.
+		Costs ~16KB code + ~12KB RAM (WS buffers + Opus codec).
 
 config AI_AGENT_NET_RPMSG
 	bool "Use RPMSG/TUN network (no Wi-Fi)"

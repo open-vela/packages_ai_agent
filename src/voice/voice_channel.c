@@ -24,6 +24,9 @@
 #include "infra/config_store.h"
 #include "agent_compat.h"
 #include "agent_config.h"
+#include <nuttx/audio/audio.h>
+
+#include "system/nxrecorder.h"
 #include "voice/audio_capture.h"
 #include "voice/audio_playback.h"
 #include "voice/voice_asr.h"
@@ -34,13 +37,18 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <nuttx/timers/pwm.h>
 
 static const char* TAG = "voice";
 static int s_backends_registered;
@@ -225,7 +233,76 @@ static struct {
 
 /* ── File-based helpers (kept for QEMU test commands) ──── */
 
-static int read_pcm_file(const char* path,
+/* What a PCM file claims to be.  nxrecorder writes headerless PCM, so a
+ * file may or may not describe itself. */
+typedef struct {
+    unsigned int channels;
+    unsigned int rate;
+    unsigned int bits;
+} pcm_format_t;
+
+/* nxrecorder's own defaults ("record" with no arguments), used when a file
+ * carries no header and the caller did not say either. */
+#define PCM_DEFAULT_CHANNELS 2
+#define PCM_DEFAULT_RATE     48000
+#define PCM_DEFAULT_BITS     16
+
+static unsigned int rd_u16(const unsigned char* p)
+{
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+}
+static unsigned int rd_u32(const unsigned char* p)
+{
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+           ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+/* Scan a RIFF/WAVE container for its "fmt " chunk.  Returns the offset of
+ * the sample data and fills in fmt, or -1 if this is not a WAV file. */
+static long wav_probe(const unsigned char* buf, size_t len, pcm_format_t* fmt)
+{
+    size_t pos = 12;
+    long data_off = -1;
+
+    if (len < 44 || memcmp(buf, "RIFF", 4) != 0 ||
+        memcmp(buf + 8, "WAVE", 4) != 0) {
+        return -1;
+    }
+
+    while (pos + 8 <= len) {
+        unsigned int csize = rd_u32(buf + pos + 4);
+        size_t next;
+
+        /* A chunk longer than the file is a corrupt size, not a big
+         * chunk: bail rather than wrap around on the arithmetic below.
+         */
+
+        if (csize > len - pos - 8) {
+            break;
+        }
+
+        next = pos + 8 + csize + (csize & 1);
+
+        if (memcmp(buf + pos, "fmt ", 4) == 0 && csize >= 16) {
+            fmt->channels = rd_u16(buf + pos + 10);
+            fmt->rate = rd_u32(buf + pos + 12);
+            fmt->bits = rd_u16(buf + pos + 22);
+        } else if (memcmp(buf + pos, "data", 4) == 0 &&
+                   data_off < 0) {
+            data_off = (long)(pos + 8);
+        }
+
+        if (data_off >= 0 && fmt->rate && fmt->channels && fmt->bits) {
+            return data_off;
+        }
+
+        pos = next;
+    }
+
+    return -1;
+}
+
+static int read_pcm_file(const char* path, pcm_format_t* fmt,
     unsigned char** out, size_t* out_len)
 {
     int fd = open(path, O_RDONLY);
@@ -238,9 +315,9 @@ static int read_pcm_file(const char* path,
 
     off_t fsize = lseek(fd, 0, SEEK_END);
 
-    if (fsize <= 0 || (size_t)fsize > AGENT_VOICE_PCM_BUF_SIZE) {
-        syslog(LOG_ERR, "[%s] File too large or empty: %ld\n",
-            TAG, (long)fsize);
+    if (fsize <= 0 || (size_t)fsize > AGENT_VOICE_PCM_FILE_MAX) {
+        syslog(LOG_ERR, "[%s] File too large or empty: %ld (max %d)\n",
+            TAG, (long)fsize, AGENT_VOICE_PCM_FILE_MAX);
         close(fd);
         return -EFBIG;
     }
@@ -263,8 +340,46 @@ static int read_pcm_file(const char* path,
         return -EIO;
     }
 
+    /* A WAV container describes itself, which beats anything the caller
+     * guessed.  Otherwise fall back to the caller's idea of the format,
+     * and failing that to what nxrecorder produces by default.
+     */
+
+    pcm_format_t parsed = { 0, 0, 0 };
+    long data_off = wav_probe(buf, (size_t)fsize, &parsed);
+
+    if (data_off >= 0) {
+        *fmt = parsed;
+    } else {
+        data_off = 0;
+    }
+
+    if (!fmt->channels) {
+        fmt->channels = PCM_DEFAULT_CHANNELS;
+    }
+    if (!fmt->rate) {
+        fmt->rate = PCM_DEFAULT_RATE;
+    }
+    if (!fmt->bits) {
+        fmt->bits = PCM_DEFAULT_BITS;
+    }
+
+    if (fmt->bits != 16) {
+        syslog(LOG_ERR, "[%s] Only 16 bit samples are supported, got %u\n",
+            TAG, fmt->bits);
+        free(buf);
+        return -ENOTSUP;
+    }
+
+    /* Slide the samples down over the container so the caller gets one
+     * buffer of PCM and frees the pointer it was given. */
+
+    if (data_off > 0) {
+        memmove(buf, buf + data_off, (size_t)fsize - (size_t)data_off);
+    }
+
     *out = buf;
-    *out_len = (size_t)fsize;
+    *out_len = (size_t)fsize - (size_t)data_off;
     return 0;
 }
 
@@ -370,16 +485,318 @@ static int process_audio_chunk(voice_asr_stream_t** stream_ptr,
 
 /* ── Recording thread (PTT mode — streaming ASR) ─────────── */
 
+/* ── Capture-to-file diagnostic ─────────────────────────────────
+ *
+ * While PTT_RECORD_ONLY_PATH is defined, the push-to-talk key records the
+ * raw microphone stream to that file and skips the ASR and the agent
+ * entirely, so the capture path can be listened to on a PC.  Comment the
+ * define out to go back to live recognition.
+ */
+
+#define PTT_RECORD_ONLY_PATH "/mnt/ptt.wav"
+
+/* Capture format while recording to a file: the same one the nxrecorder
+ * "record" command uses, which is the combination known to give clean
+ * audio on this board.  Capturing at 16kHz instead comes out as loud
+ * noise.  Live recognition asks the driver for 16kHz mono instead, and
+ * audio_capture folds the 48kHz stereo device stream down to it. */
+
+#ifdef PTT_RECORD_ONLY_PATH
+#  define PTT_CAPTURE_RATE     48000
+#  define PTT_CAPTURE_CHANNELS 2
+/* Device native, so bytes track wall clock at 192KB/s: a 3200 byte read
+ * would be 17ms of audio and the buffer could never get back to the
+ * device in time. */
+#  define CHUNK_SIZE           32768
+#else
+#  define PTT_CAPTURE_RATE     AGENT_VOICE_SAMPLE_RATE
+#  define PTT_CAPTURE_CHANNELS AGENT_VOICE_CHANNELS
+#  define CHUNK_SIZE           AGENT_ASR_CHUNK_SIZE
+#endif
+
+#ifdef PTT_RECORD_ONLY_PATH
+static int s_dump_fd = -1;
+
+/* The capture is written as a real RIFF/WAVE file so it drops straight
+ * onto a PC without any format guessing.  The sizes are filled in on
+ * close, when the length is known. */
+
+static void wav_put16(unsigned char* p, unsigned v)
+{
+    p[0] = (unsigned char)(v & 0xff);
+    p[1] = (unsigned char)((v >> 8) & 0xff);
+}
+
+static void wav_put32(unsigned char* p, unsigned v)
+{
+    p[0] = (unsigned char)(v & 0xff);
+    p[1] = (unsigned char)((v >> 8) & 0xff);
+    p[2] = (unsigned char)((v >> 16) & 0xff);
+    p[3] = (unsigned char)((v >> 24) & 0xff);
+}
+
+static int wav_write_header(int fd, unsigned rate,
+    unsigned channels, unsigned bits)
+{
+    unsigned char h[44];
+
+    memset(h, 0, sizeof(h));
+    memcpy(h, "RIFF", 4);
+    wav_put32(h + 4, 36);
+    memcpy(h + 8, "WAVE", 4);
+    memcpy(h + 12, "fmt ", 4);
+    wav_put32(h + 16, 16);
+    wav_put16(h + 20, 1); /* PCM */
+    wav_put16(h + 22, channels);
+    wav_put32(h + 24, rate);
+    wav_put32(h + 28, rate * channels * (bits / 8));
+    wav_put16(h + 32, channels * (bits / 8));
+    wav_put16(h + 34, bits);
+    memcpy(h + 36, "data", 4);
+    wav_put32(h + 40, 0);
+
+    return write(fd, h, sizeof(h)) == sizeof(h) ? 0 : -EIO;
+}
+
+static void wav_finish(int fd)
+{
+    unsigned char b[4];
+    off_t total = lseek(fd, 0, SEEK_END);
+
+    if (total < 44) {
+        return;
+    }
+
+    wav_put32(b, (unsigned)(total - 8));
+    if (lseek(fd, 4, SEEK_SET) < 0 || write(fd, b, 4) != 4) {
+        return;
+    }
+
+    wav_put32(b, (unsigned)(total - 44));
+    if (lseek(fd, 40, SEEK_SET) < 0 || write(fd, b, 4) != 4) {
+        return;
+    }
+
+    lseek(fd, 0, SEEK_END);
+}
+
+/* Per-channel statistics.  The device always captures stereo and one of
+ * the two slots is the microphone while the other is a grounded input on
+ * this board, so the two must be looked at separately: scanning only one
+ * hides which one carries the speech.  The zero crossing rate is what
+ * separates a voice recording from a noise floor - speech sits around
+ * 500-2500 Hz while noise on a 48kHz stream runs up near 16000 Hz. */
+static void wav_analyze(int fd, unsigned rate, unsigned channels)
+{
+    static unsigned char buf[4096];
+    off_t off = 44;
+    off_t total = lseek(fd, 0, SEEK_END);
+    long frames = 0;
+    unsigned c;
+
+    long peak[2] = {0, 0};
+    long sum[2] = {0, 0};
+    long dmax[2] = {0, 0};
+    long dsum[2] = {0, 0};
+    long zc[2] = {0, 0};
+    long big[2] = {0, 0};
+    long sumbuf[64];
+    long cntbuf[64];
+    int16_t prev[2] = {0, 0};
+    int have_prev = 0;
+
+    if (channels == 0 || rate == 0) {
+        return;
+    }
+
+    memset(sumbuf, 0, sizeof(sumbuf));
+    memset(cntbuf, 0, sizeof(cntbuf));
+
+    if (lseek(fd, off, SEEK_SET) < 0) {
+        return;
+    }
+
+    while (off < total) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        size_t i;
+
+        if (n < 0) {
+            printf("analyze: read failed at %ld: %d\n", (long)off, errno);
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+
+        for (i = 0; i + channels * 2 <= (size_t)n; i += channels * 2) {
+            for (c = 0; c < channels && c < 2; c++) {
+                int16_t s = (int16_t)(buf[i + c * 2] |
+                                      (buf[i + c * 2 + 1] << 8));
+                long v = s < 0 ? -s : s;
+
+                if (v > peak[c]) {
+                    peak[c] = v;
+                }
+                sum[c] += v;
+
+                /* Level per buffer: a dropped or starved buffer shows up
+                 * here as a collapse, which a threshold on the sample
+                 * size cannot show. */
+                {
+                    size_t b = (size_t)(frames / 8192);
+
+                    if (b < sizeof(sumbuf) / sizeof(sumbuf[0])) {
+                        sumbuf[b] += v;
+                        cntbuf[b]++;
+                    }
+                }
+
+                if (have_prev) {
+                    long d = (long)s - (long)prev[c];
+
+                    if (d < 0) {
+                        d = -d;
+                    }
+                    dsum[c] += d;
+                    if (d > dmax[c]) {
+                        dmax[c] = d;
+                    }
+                    if (d > 4000) {
+                        big[c]++;
+                    }
+                    if ((s < 0) != (prev[c] < 0)) {
+                        zc[c]++;
+                    }
+                }
+
+                prev[c] = s;
+            }
+
+            have_prev = 1;
+            frames++;
+        }
+
+        off += n;
+    }
+
+    if (frames == 0) {
+        printf("analyze: no samples\n");
+        return;
+    }
+
+    printf("analyze: %ld frames @%uHz x%uch\n", frames, rate, channels);
+
+    /* First frames as raw 32-bit words.  A stereo frame is one word with
+     * one half word per channel, so the pattern here says outright
+     * whether the layout is what the analyzer assumes. */
+    printf("  first frames:");
+    {
+        unsigned char raw[64];
+        size_t i;
+
+        if (lseek(fd, 44, SEEK_SET) >= 0) {
+            ssize_t nr = read(fd, raw, sizeof(raw));
+
+            for (i = 0; i + 4 <= (size_t)nr; i += 4) {
+                printf(" %02x%02x%02x%02x",
+                    raw[i + 3], raw[i + 2], raw[i + 1], raw[i]);
+            }
+        }
+    }
+    printf("\n");
+
+    if (lseek(fd, 44 + 4 * 4096, SEEK_SET) >= 0) {
+        unsigned char raw[64];
+        ssize_t nr = read(fd, raw, sizeof(raw));
+        size_t i;
+
+        printf("  mid frames:  ");
+        for (i = 0; i + 4 <= (size_t)nr; i += 4) {
+            printf(" %02x%02x%02x%02x",
+                raw[i + 3], raw[i + 2], raw[i + 1], raw[i]);
+        }
+        printf("\n");
+    }
+
+    for (c = 0; c < channels && c < 2; c++) {
+        printf("  ch%u: peak=%ld mean_abs=%ld step_max=%ld step_mean=%ld\n",
+            c, peak[c], sum[c] / frames, dmax[c], dsum[c] / frames);
+        printf("       mean/peak x1000=%ld  steps>4000=%ld  zcr=%ldHz\n",
+            peak[c] ? (dsum[c] / frames) * 1000 / peak[c] : 0,
+            big[c], zc[c] * (long)rate / (long)frames);
+    }
+
+    /* Mean level per buffer.  A gap or a starved buffer shows up as a
+     * collapse here. */
+    printf("  mean level per buffer:");
+    {
+        size_t nb = (size_t)(frames / 8192) + 1;
+        size_t b;
+
+        if (nb > sizeof(sumbuf) / sizeof(sumbuf[0])) {
+            nb = sizeof(sumbuf) / sizeof(sumbuf[0]);
+        }
+        for (b = 0; b < nb; b++) {
+            printf(" %ld", cntbuf[b] ? sumbuf[b] / cntbuf[b] : 0);
+        }
+    }
+    printf("\n");
+}
+/* Analyze any recording on the card, not just the one the push-to-talk
+ * path just made.  Lets a capture from nxrecorder be compared against one
+ * from audio_capture without re-recording either. */
+int voice_channel_analyze_file(const char* path)
+{
+    int fd;
+
+    if (!path) {
+        return -EINVAL;
+    }
+
+    fd = open(path, O_RDWR);
+    if (fd < 0) {
+        printf("cannot open %s: %d\n", path, errno);
+        return -errno;
+    }
+
+    wav_analyze(fd, PTT_CAPTURE_RATE, PTT_CAPTURE_CHANNELS);
+    close(fd);
+    return 0;
+}
+
+#endif
+
 static void* recording_thread(void* arg)
 {
     (void)arg;
-    unsigned char chunk[AGENT_ASR_CHUNK_SIZE];
+    unsigned char* chunk;
     int need_fallback = 0;
-    // int dump_fd = -1;
     size_t total_bytes_read = 0;
     size_t total_bytes_sent = 0;
     int chunk_count = 0;
     int abnormal_exit = 0;
+#ifdef PTT_RECORD_ONLY_PATH
+    long max_write_us = 0;
+    struct timespec t_start;
+#endif
+
+    /* Sized so one read drains a whole device buffer.  Walking a buffer
+     * in ten small reads starved the DMA queue: a buffer cannot go back
+     * to the device until it has been fully consumed, so tiny reads mean
+     * tiny effective buffering, and the 8 byte I2S FIFO then overruns and
+     * drops samples - the same stuttering that a slow write target caused
+     * before.  32KB is the ES8388 buffer size. */
+
+    chunk = malloc(CHUNK_SIZE);
+    if (!chunk) {
+        syslog(LOG_ERR, "[%s] chunk alloc failed\n", TAG);
+        sem_post(&s_voice.rec_ready);
+        return NULL;
+    }
+
+#ifdef PTT_RECORD_ONLY_PATH
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+#endif
 
     syslog(LOG_INFO, "[%s] recording thread started (streaming)\n", TAG);
 
@@ -392,6 +809,11 @@ static void* recording_thread(void* arg)
     pthread_mutex_unlock(&s_voice.lock);
 
     if (!stream) {
+#ifdef PTT_RECORD_ONLY_PATH
+        /* Nothing to recognise: the audio is going to a file. */
+        syslog(LOG_INFO, "[%s] capture-to-file, no ASR session\n", TAG);
+        (void)need_fallback;
+#else
         /* No pre-connected stream — open now (may lose first 300-800ms) */
         stream = voice_asr_stream_open();
         syslog(LOG_WARNING,
@@ -403,9 +825,11 @@ static void* recording_thread(void* arg)
             s_voice.state = VOICE_IDLE;
             pthread_mutex_unlock(&s_voice.lock);
             sem_post(&s_voice.rec_ready);
+            free(chunk);
             return NULL;
         }
         pthread_mutex_unlock(&s_voice.lock);
+#endif
     } else {
         syslog(LOG_INFO, "[%s] using pre-connected ASR stream\n", TAG);
     }
@@ -429,8 +853,17 @@ static void* recording_thread(void* arg)
             break;
         }
 
-        int n = audio_capture_read(s_voice.cap,
-            chunk, sizeof(chunk));
+#ifdef PTT_RECORD_ONLY_PATH
+        if (s_dump_fd >= 0) {
+            /* The sink writes the buffers from the device thread, so
+             * there is nothing to pull here - just wait for the state to
+             * change so the session can be closed. */
+            usleep(20000);
+            continue;
+        }
+#endif
+
+        int n = audio_capture_read(s_voice.cap, chunk, CHUNK_SIZE);
 
         if (n == -EAGAIN || n == -EWOULDBLOCK) {
             /* Non-blocking capture socket has no data yet (common right
@@ -450,28 +883,56 @@ static void* recording_thread(void* arg)
         total_bytes_read += (size_t)n;
         chunk_count++;
 
-        /* Dump raw PCM to file */
-        // if (dump_fd >= 0) {
-        //     write(dump_fd, chunk, (size_t)n);
-        // }
-
         /* Log audio level for first few chunks and periodically
-         * to diagnose silence vs actual speech from QEMU mic. */
-        if (chunk_count <= 3 || chunk_count % 50 == 0) {
+         * to diagnose silence vs actual speech from QEMU mic.  The clip
+         * count is what tells gain problems apart from dropouts: a hot
+         * preamp squares the waveform off and that is what a "sparking"
+         * crackle sounds like. */
+        if (1) { /* every chunk: a take is only ~18 of them */
             int16_t* samples = (int16_t*)chunk;
             int sample_count = n / 2;
             int32_t peak = 0;
+            int32_t clipped = 0;
 
             for (int i = 0; i < sample_count; i++) {
                 int32_t v = samples[i] < 0 ? -samples[i] : samples[i];
                 if (v > peak) {
                     peak = v;
                 }
+                if (v >= 30000) {
+                    clipped++;
+                }
             }
             syslog(LOG_INFO,
-                "[%s] chunk#%d: %d bytes, peak=%ld\n",
-                TAG, chunk_count, n, (long)peak);
+                "[%s] chunk#%d: %d bytes, peak=%ld clipped=%ld/%d%s\n",
+                TAG, chunk_count, n, (long)peak, (long)clipped,
+                sample_count, clipped ? "  <-- CLIPPING" : "");
         }
+
+#ifdef PTT_RECORD_ONLY_PATH
+        /* Raw capture to file, no ASR. */
+
+        if (s_dump_fd >= 0) {
+            struct timespec tw0;
+            struct timespec tw1;
+            long usec;
+
+            clock_gettime(CLOCK_MONOTONIC, &tw0);
+
+            if (write(s_dump_fd, chunk, (size_t)n) != n) {
+                syslog(LOG_ERR, "[%s] dump write failed: %d\n",
+                    TAG, errno);
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &tw1);
+            usec = (tw1.tv_sec - tw0.tv_sec) * 1000000
+                + (tw1.tv_nsec - tw0.tv_nsec) / 1000;
+            if (usec > max_write_us) {
+                max_write_us = usec;
+            }
+            continue;
+        }
+#endif
 
 #ifdef CONFIG_AI_AGENT_AUDIO_PREPROCESS
         preproc_chunk(pp, chunk, n);
@@ -504,6 +965,30 @@ static void* recording_thread(void* arg)
         "[%s] recording thread exit: %d chunks, %zu read, %zu sent%s\n",
         TAG, chunk_count, total_bytes_read, total_bytes_sent,
         abnormal_exit ? " (abnormal)" : "");
+
+#ifdef PTT_RECORD_ONLY_PATH
+    {
+        struct timespec t1;
+        long wall_ms;
+        long audio_ms;
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        wall_ms = (t1.tv_sec - t_start.tv_sec) * 1000
+            + (t1.tv_nsec - t_start.tv_nsec) / 1000000;
+
+        /* 48kHz stereo 16 bit is 192000 bytes of audio per second. */
+        audio_ms = (long)(total_bytes_read * 1000 / 192000);
+
+        total_bytes_read = audio_capture_sink_bytes(s_voice.cap);
+        syslog(LOG_INFO,
+            "[%s] capture: wall=%ldms audio=%ldms sink=%zu bytes "
+            "worst_write=%ldus %s\n",
+            TAG, wall_ms, audio_ms, total_bytes_read, max_write_us,
+            audio_ms + 200 < wall_ms ? "STARVED" : "ok");
+    }
+#endif
+
+    free(chunk);
     return NULL;
 }
 
@@ -530,6 +1015,11 @@ static void* asr_and_dispatch(void* arg)
     if (ret == 0 && text[0] != '\0') {
         syslog(LOG_INFO, "[%s] ASR result: %s\n", TAG, text);
         printf("ASR: %s\n", text);
+
+        /* Recognized text goes to the console only; the panel shows the
+         * state and then the agent's reply. */
+
+        ls_lvgl_set_ai_text("thinking...", NULL);
 
         agent_msg_t msg;
 
@@ -671,6 +1161,32 @@ int voice_channel_start(void)
      * the first 300-800ms of speech to be lost.
      *
      * If the pre-open fails we fall back to batch mode as before. */
+#ifdef PTT_RECORD_ONLY_PATH
+    /* Diagnostic mode: the audio goes to a file, so no ASR session is
+     * needed and the network is not touched at all. */
+    voice_asr_stream_t* pre_stream = NULL;
+
+    /* O_RDWR: wav_analyze() reads the file back once it is written, and
+     * wav_finish() seeks around in it to patch the RIFF sizes. */
+    s_dump_fd = open(PTT_RECORD_ONLY_PATH,
+        O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (s_dump_fd < 0) {
+        syslog(LOG_ERR, "[%s] cannot create %s: %d\n",
+            TAG, PTT_RECORD_ONLY_PATH, errno);
+    } else {
+        if (wav_write_header(s_dump_fd, PTT_CAPTURE_RATE,
+                PTT_CAPTURE_CHANNELS, AGENT_VOICE_BITS) != 0) {
+            syslog(LOG_ERR, "[%s] WAV header write failed\n", TAG);
+            close(s_dump_fd);
+            s_dump_fd = -1;
+        } else {
+            syslog(LOG_INFO,
+                "[%s] recording %dHz %dch WAV to %s (ASR disabled)\n",
+                TAG, PTT_CAPTURE_RATE, PTT_CAPTURE_CHANNELS,
+                PTT_RECORD_ONLY_PATH);
+        }
+    }
+#else
     voice_asr_stream_t* pre_stream = voice_asr_stream_open();
     if (!pre_stream) {
         syslog(LOG_WARNING,
@@ -679,6 +1195,7 @@ int voice_channel_start(void)
         syslog(LOG_INFO, "[%s] ASR pre-connected\n", TAG);
         s_voice.asr_stream = pre_stream;
     }
+#endif
 
     /* Open capture device (but do NOT start yet — start after the
      * recording thread is spawned so the consumer is ready before
@@ -686,9 +1203,7 @@ int voice_channel_start(void)
      * overflow "data queue is more than max count(4)"). */
     s_voice.cap = audio_capture_open(
         AGENT_AUDIO_CAPTURE_DEV,
-        AGENT_VOICE_SAMPLE_RATE,
-        AGENT_VOICE_CHANNELS,
-        AGENT_VOICE_BITS);
+        PTT_CAPTURE_RATE, PTT_CAPTURE_CHANNELS, AGENT_VOICE_BITS);
 
     if (!s_voice.cap) {
         if (pre_stream) {
@@ -700,14 +1215,35 @@ int voice_channel_start(void)
         return -EIO;
     }
 
+#ifdef PTT_RECORD_ONLY_PATH
+    /* Record straight to the file from the device thread, the way
+     * nxrecorder's record thread does it. */
+    if (s_dump_fd >= 0) {
+        audio_capture_set_sink(s_voice.cap, s_dump_fd);
+    }
+#endif
+
     s_voice.state = VOICE_RECORDING;
     pthread_mutex_unlock(&s_voice.lock);
 
-    /* Spawn recording thread BEFORE starting capture */
+    /* Spawn recording thread BEFORE starting capture.
+     *
+     * The priority matters: without it the thread inherits from the
+     * push-to-talk worker, which in turn inherited from the panel, so it
+     * ends up at the same priority as LVGL's own render thread and gets
+     * time-sliced against it.  LVGL drawing plus the SSD1306 mirror over
+     * I2C is enough to stall the reader long enough for the audio buffers
+     * to run dry, which is the stuttering in the recording.  FIFO above
+     * the UI so the reader always runs as soon as a buffer is ready. */
     pthread_attr_t attr;
+    struct sched_param sparam;
 
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, AGENT_VOICE_STACK);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    sparam.sched_priority = AGENT_VOICE_CAPTURE_PRIO;
+    pthread_attr_setschedparam(&attr, &sparam);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
     int ret = pthread_create(&s_voice.rec_thread, &attr,
         recording_thread, NULL);
@@ -740,7 +1276,6 @@ int voice_channel_start(void)
             s_voice.asr_stream = NULL;
         }
         pthread_mutex_unlock(&s_voice.lock);
-        audio_capture_abort(s_voice.cap);
         pthread_join(s_voice.rec_thread, NULL);
         audio_capture_close(s_voice.cap);
         s_voice.cap = NULL;
@@ -762,7 +1297,6 @@ int voice_channel_stop(void)
     s_voice.state = VOICE_STOPPING;
     pthread_mutex_unlock(&s_voice.lock);
 
-    audio_capture_abort(s_voice.cap);
 
     /* Wait for recording thread to finish */
     pthread_join(s_voice.rec_thread, NULL);
@@ -780,6 +1314,21 @@ int voice_channel_stop(void)
 
     syslog(LOG_INFO, "[%s] recorded %zu bytes (stream=%p)\n",
         TAG, pcm_len, (void*)stream);
+
+#ifdef PTT_RECORD_ONLY_PATH
+    if (s_dump_fd >= 0) {
+        off_t written;
+
+        wav_finish(s_dump_fd);
+        wav_analyze(s_dump_fd, PTT_CAPTURE_RATE, PTT_CAPTURE_CHANNELS);
+        written = lseek(s_dump_fd, 0, SEEK_END);
+        close(s_dump_fd);
+        s_dump_fd = -1;
+        printf("Recorded %ld bytes to %s\n",
+            (long)written, PTT_RECORD_ONLY_PATH);
+        return 0;
+    }
+#endif
 
     /* If streaming ASR was active, finish it to get result.
      * Note: in streaming mode pcm_len is always 0 because audio
@@ -874,7 +1423,6 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     s_voice.state = VOICE_STOPPING;
     pthread_mutex_unlock(&s_voice.lock);
 
-    audio_capture_abort(s_voice.cap);
 
     /* Wait for recording thread to finish */
     pthread_join(s_voice.rec_thread, NULL);
@@ -892,6 +1440,27 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
 
     syslog(LOG_INFO, "[%s] recorded %zu bytes (with_text, stream=%p)\n",
         TAG, pcm_len, (void*)stream);
+
+#ifdef PTT_RECORD_ONLY_PATH
+    /* Diagnostic mode: the capture went to a file, so there is nothing to
+     * recognise and no agent to tell. */
+    if (s_dump_fd >= 0) {
+        off_t written;
+
+        wav_finish(s_dump_fd);
+        wav_analyze(s_dump_fd, PTT_CAPTURE_RATE, PTT_CAPTURE_CHANNELS);
+        written = lseek(s_dump_fd, 0, SEEK_END);
+        close(s_dump_fd);
+        s_dump_fd = -1;
+        printf("Recorded %ld bytes to %s\n",
+            (long)written, PTT_RECORD_ONLY_PATH);
+        syslog(LOG_INFO, "[%s] capture saved to %s (%ld bytes)\n",
+            TAG, PTT_RECORD_ONLY_PATH, (long)written);
+        snprintf(text_out, text_cap, "(recording saved to %s)",
+            PTT_RECORD_ONLY_PATH);
+        return 0;
+    }
+#endif
 
     /* Streaming ASR path: finish and copy text to caller.
      * In streaming mode audio goes directly to server, so
@@ -1106,6 +1675,221 @@ int voice_channel_speak(const char* text)
     return 0;
 }
 
+/* ── Push-to-talk, driven by the panel's KEY1 ─────────────── */
+
+/* The panel reports key edges from its own UI tick, so everything that
+ * blocks has to happen elsewhere: voice_channel_start() spends 300-800ms
+ * on the TLS pre-connect, and stop_with_text() waits out the ASR.  One
+ * worker drains a FIFO of edges so a quick release cannot overtake a
+ * slow start and end up stopping a session that never opened. */
+
+#define PTT_EVENT_QUEUE 4
+
+static pthread_mutex_t s_ptt_lock = PTHREAD_MUTEX_INITIALIZER;
+static sem_t s_ptt_sem;
+static unsigned char s_ptt_events[PTT_EVENT_QUEUE];
+static int s_ptt_head;
+static int s_ptt_tail;
+static pthread_t s_ptt_thread;
+static bool s_ptt_running;
+
+static void ptt_post(unsigned char ev)
+{
+    int next;
+
+    pthread_mutex_lock(&s_ptt_lock);
+    next = (s_ptt_head + 1) % PTT_EVENT_QUEUE;
+
+    if (next != s_ptt_tail) {
+        s_ptt_events[s_ptt_head] = ev;
+        s_ptt_head = next;
+        sem_post(&s_ptt_sem);
+    } else {
+        syslog(LOG_WARNING, "[%s] PTT queue full, dropping edge\n", TAG);
+    }
+
+    pthread_mutex_unlock(&s_ptt_lock);
+}
+
+/* The push-to-talk path records through nxrecorder - the same code the
+ * "record" command uses.  It is the only capture path on this board that
+ * is known to produce clean audio, and the one the audio_capture.c driver
+ * could not be made to match byte for byte. */
+
+/* The capture goes to the RAM-backed /tmp (mounted by the board bringup),
+ * not to the SD card.  The file only has to survive until ASR has read
+ * it a few seconds later, and keeping the SDIO DMA off the bus while the
+ * I2S DMA runs removes one source of the short capture dropouts. */
+
+#define PTT_CAPTURE_PATH "/tmp/ptt.wav"
+
+static FAR struct nxrecorder_s *s_recorder;
+
+static void ptt_handle_down(void)
+{
+    int ret;
+
+    /* Stop any TTS playback BEFORE opening the capture device.  The
+     * playback and capture nodes share one ES8388, and closing the
+     * playback node resets every codec register, which wipes the ADC
+     * configuration in the middle of a recording.  Recording while the
+     * reply is still audible also captures the reply itself.  This is
+     * the same workaround voice_channel_start() does; the PTT path grew
+     * up separately and never picked it up. */
+
+    pthread_mutex_lock(&s_voice.lock);
+    if (s_voice.tts_pb) {
+        syslog(LOG_INFO,
+            "[%s] PTT: stopping active TTS to prevent echo\n", TAG);
+        s_voice.tts_abort = 1;
+        audio_playback_stop(s_voice.tts_pb);
+        pthread_mutex_unlock(&s_voice.lock);
+
+        /* Wait for the speak thread to finish closing the playback
+         * device: speak_lock is held for the whole speak call. */
+
+        pthread_mutex_lock(&s_voice.speak_lock);
+        pthread_mutex_unlock(&s_voice.speak_lock);
+
+        syslog(LOG_INFO, "[%s] PTT: TTS playback fully closed\n", TAG);
+    } else {
+        pthread_mutex_unlock(&s_voice.lock);
+    }
+
+    ls_lvgl_set_ai_text("listening...", "speak now");
+
+    /* Silence the blue LED's PWM while the microphone is open.  Its
+     * 1 kHz carrier couples into the 24 dB mic preamp and saturates the
+     * capture: every take recorded while the LED was lit came back as
+     * clipped noise and the recognizer answered "no text".  The panel
+     * skips its own ramp while the key is held, so this zero duty holds
+     * for the whole take; when the key is released the panel resumes
+     * the animation on its own. */
+
+    {
+        int pwm_fd = open("/dev/pwm2", O_RDONLY);
+
+        if (pwm_fd >= 0)
+          {
+            struct pwm_info_s pwm;
+
+            memset(&pwm, 0, sizeof(pwm));
+            pwm.frequency = 1000;
+            pwm.duty = 0;
+
+            /* START, not SETCHARACTERISTICS: the latter only reaches the
+             * hardware when this file already owns a started session, and
+             * the whole point here is to force the output low. */
+
+            ioctl(pwm_fd, PWMIOC_START, (unsigned long)(uintptr_t)&pwm);
+            close(pwm_fd);
+          }
+    }
+
+    if (s_recorder != NULL) {
+        nxrecorder_release(s_recorder);
+        s_recorder = NULL;
+    }
+
+    s_recorder = nxrecorder_create();
+    if (s_recorder == NULL) {
+        ls_lvgl_set_ai_text("idle", "recorder unavailable");
+        return;
+    }
+
+    nxrecorder_setdevice(s_recorder, AGENT_AUDIO_CAPTURE_DEV);
+
+    ret = nxrecorder_recordinternal(s_recorder, PTT_CAPTURE_PATH,
+                                    AUDIO_FMT_UNDEF, 2, 16, 48000, 0);
+    if (ret != 0) {
+        syslog(LOG_ERR, "[%s] PTT record failed: %d\n", TAG, ret);
+        ls_lvgl_set_ai_text("idle", "cannot open microphone");
+        nxrecorder_release(s_recorder);
+        s_recorder = NULL;
+    }
+}
+
+static void ptt_handle_up(void)
+{
+    ls_lvgl_set_ai_text("recognizing...", NULL);
+
+    if (s_recorder != NULL) {
+        /* Stops the record thread, which closes the file. */
+        nxrecorder_stop(s_recorder);
+        nxrecorder_release(s_recorder);
+        s_recorder = NULL;
+    }
+
+    /* Give the recorder a moment to finish flushing before the recognizer
+     * opens the file. */
+
+    usleep(500000);
+
+    /* Feed the recording to the recognizer.  The file is raw PCM, so the
+     * format is given explicitly. */
+    voice_channel_test_asr(PTT_CAPTURE_PATH, 2, 48000);
+}
+
+static void* ptt_worker(void* arg)
+{
+    (void)arg;
+
+    for (;;) {
+        unsigned char ev;
+
+        while (sem_wait(&s_ptt_sem) != 0) {
+            if (errno != EINTR) {
+                return NULL;
+            }
+        }
+
+        pthread_mutex_lock(&s_ptt_lock);
+        if (s_ptt_tail == s_ptt_head) {
+            pthread_mutex_unlock(&s_ptt_lock);
+            continue;
+        }
+
+        ev = s_ptt_events[s_ptt_tail];
+        s_ptt_tail = (s_ptt_tail + 1) % PTT_EVENT_QUEUE;
+        pthread_mutex_unlock(&s_ptt_lock);
+
+        if (ev) {
+            ptt_handle_down();
+        } else {
+            ptt_handle_up();
+        }
+    }
+
+    return NULL;
+}
+
+void ai_agent_voice_ptt(bool down)
+{
+    pthread_attr_t attr;
+
+    if (!s_ptt_running) {
+        pthread_mutex_lock(&s_ptt_lock);
+
+        if (!s_ptt_running) {
+            sem_init(&s_ptt_sem, 0, 0);
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, ASR_THREAD_STACK);
+
+            if (pthread_create(&s_ptt_thread, &attr, ptt_worker, NULL) == 0) {
+                s_ptt_running = true;
+            } else {
+                syslog(LOG_ERR, "[%s] PTT worker start failed\n", TAG);
+            }
+
+            pthread_attr_destroy(&attr);
+        }
+
+        pthread_mutex_unlock(&s_ptt_lock);
+    }
+
+    ptt_post(down ? 1 : 0);
+}
+
 /* ── Test commands (file-based, for QEMU) ───────────────── */
 
 int voice_channel_test_tts(const char* text, const char* out_path)
@@ -1148,15 +1932,205 @@ int voice_channel_test_tts(const char* text, const char* out_path)
 
 typedef struct {
     char pcm_path[256];
+    unsigned int channels; /* channels in the file */
+    unsigned int rate;     /* sample rate of the file */
 } asr_task_args_t;
+
+/* Report how much signal each channel actually carries.  On this board the
+ * microphone reaches LIN only and RIN is tied to AGND, so one channel is
+ * expected to be loud and the other near-silent - and the channel order in
+ * a frame is not something to take on faith. */
+static void report_channel_levels(const unsigned char* src, size_t len,
+    unsigned int channels)
+{
+    size_t nframes = len / (2 * channels);
+    unsigned int c;
+
+    for (c = 0; c < channels && c < 4; c++) {
+        long peak = 0;
+        double sq = 0;
+        size_t f;
+
+        for (f = 0; f < nframes; f++) {
+            const unsigned char* p = src + (f * channels + c) * 2;
+            long s = (long)(int16_t)(p[0] | (p[1] << 8));
+
+            if (s < 0) {
+                s = -s;
+            }
+            if (s > peak) {
+                peak = s;
+            }
+            sq += (double)s * (double)s;
+        }
+
+        printf("ASR:   ch%u peak=%ld rms=%ld\n",
+            c, peak,
+            nframes ? (long)sqrt(sq / (double)nframes) : 0L);
+    }
+}
+
+/* The microphone reaches only one ADC channel, but which one can change
+ * during a take: the codec is clocked as an I2S slave, and every DMA
+ * restart can slip the left/right alignment by one 16-bit slot, so the
+ * voice wanders between the channels while the take is being recorded.
+ * The channel not driving the microphone sits at near-Nyquist noise with
+ * a very high zero-crossing rate, while voice crosses far less often.
+ * Pick the calmer channel for each short window so a take whose channels
+ * alternate still comes through as continuous voice. */
+
+#define ASR_CHANNEL_WINDOW_MS 30
+
+static unsigned char* build_channel_map(const unsigned char* src,
+    size_t nframes, unsigned int channels, size_t win, size_t* nwin_out)
+{
+    size_t nwin = (nframes + win - 1) / win;
+    unsigned int nc = channels > 4 ? 4 : channels;
+    unsigned char* sel;
+    size_t w;
+
+    if (nwin == 0) {
+        nwin = 1;
+    }
+
+    *nwin_out = nwin;
+
+    sel = malloc(nwin);
+    if (!sel) {
+        return NULL;
+    }
+
+    for (w = 0; w < nwin; w++) {
+        size_t f0 = w * win;
+        size_t f1 = f0 + win;
+        size_t zc[4] = { 0, 0, 0, 0 };
+        int prev[4] = { 0, 0, 0, 0 };
+        unsigned int best = 0;
+        unsigned int c;
+        size_t f;
+
+        if (f1 > nframes) {
+            f1 = nframes;
+        }
+
+        for (f = f0; f < f1; f++) {
+            for (c = 0; c < nc; c++) {
+                const unsigned char* p = src + (f * channels + c) * 2;
+                int s = (int16_t)(p[0] | (p[1] << 8));
+                int sign = (s > 0) - (s < 0);
+
+                if (sign && prev[c] && sign != prev[c]) {
+                    zc[c]++;
+                }
+                if (sign) {
+                    prev[c] = sign;
+                }
+            }
+        }
+
+        for (c = 1; c < nc; c++) {
+            if (zc[c] < zc[best]) {
+                best = c;
+            }
+        }
+
+        sel[w] = (unsigned char)best;
+    }
+
+    return sel;
+}
+
+/* Fold a captured stream down to the 16kHz mono that volc_asr declares to
+ * the server, following the per-window channel choice (see above).
+ * Anything above 16kHz is box-filtered down, which is crude but is what
+ * the recognizer needs to see. */
+static size_t pcm_to_asr_format(const unsigned char* src, size_t src_len,
+    unsigned int channels, unsigned int rate,
+    unsigned char* dst, size_t dst_cap)
+{
+    size_t nframes;
+    size_t out_n;
+    size_t i;
+    size_t win;
+    size_t nwin = 0;
+    unsigned char* sel = NULL;
+
+    if (channels < 1) {
+        channels = 1;
+    }
+    if (rate < 1) {
+        rate = AGENT_VOICE_SAMPLE_RATE;
+    }
+
+    nframes = src_len / (2 * channels);
+    out_n = (size_t)((uint64_t)nframes * AGENT_VOICE_SAMPLE_RATE / rate);
+
+    if (out_n * 2 > dst_cap) {
+        out_n = dst_cap / 2;
+    }
+
+    win = (size_t)rate * ASR_CHANNEL_WINDOW_MS / 1000;
+    if (win < 1) {
+        win = 1;
+    }
+
+    if (channels > 1 && nframes > 0) {
+        sel = build_channel_map(src, nframes, channels, win, &nwin);
+    }
+
+    for (i = 0; i < out_n; i++) {
+        size_t f0 = (size_t)((uint64_t)i * rate / AGENT_VOICE_SAMPLE_RATE);
+        size_t f1 =
+            (size_t)((uint64_t)(i + 1) * rate / AGENT_VOICE_SAMPLE_RATE);
+        size_t start = f0;
+        unsigned int c = 0;
+        int32_t sum = 0;
+        int16_t sample;
+
+        if (f1 <= f0) {
+            f1 = f0 + 1;
+        }
+        if (f1 > nframes) {
+            f1 = nframes;
+        }
+
+        if (sel && win) {
+            size_t w = start / win;
+
+            c = (w < nwin) ? sel[w] : sel[nwin - 1];
+        }
+
+        for (; f0 < f1; f0++) {
+            const unsigned char* p = src + (f0 * channels + c) * 2;
+
+            sum += (int16_t)(p[0] | (p[1] << 8));
+        }
+
+        sample = (int16_t)(sum / (int32_t)(f1 - start > 0
+                                               ? f1 - start
+                                               : 1));
+        dst[i * 2] = (unsigned char)(sample & 0xff);
+        dst[i * 2 + 1] = (unsigned char)((sample >> 8) & 0xff);
+    }
+
+    free(sel);
+
+    return out_n * 2;
+}
 
 static void* asr_file_worker(void* arg)
 {
     asr_task_args_t* a = (asr_task_args_t*)arg;
     unsigned char* pcm = NULL;
     size_t pcm_len = 0;
+    pcm_format_t fmt = { a->channels, a->rate, AGENT_VOICE_BITS };
 
-    int ret = read_pcm_file(a->pcm_path, &pcm, &pcm_len);
+    /* A WAV header in the file overrides whatever was passed on the
+     * command line; otherwise the arguments do, and failing both, what
+     * nxrecorder writes by default.
+     */
+
+    int ret = read_pcm_file(a->pcm_path, &fmt, &pcm, &pcm_len);
 
     if (ret != 0) {
         printf("Failed to read %s: %d\n", a->pcm_path, ret);
@@ -1164,16 +2138,45 @@ static void* asr_file_worker(void* arg)
         return NULL;
     }
 
-    printf("ASR: recognizing %zu bytes from %s ...\n",
-        pcm_len, a->pcm_path);
+    printf("ASR: recognizing %zu bytes from %s (%uHz %uch %ubit) ...\n",
+        pcm_len, a->pcm_path, fmt.rate, fmt.channels, fmt.bits);
+
+    report_channel_levels(pcm, pcm_len, fmt.channels);
+
+    /* volc_asr declares 16kHz mono to the server; anything else has to be
+     * folded down first or the recognition comes back empty. */
+
+    unsigned char* mono = malloc(pcm_len);
+
+    if (!mono) {
+        printf("Error: out of memory\n");
+        free(pcm);
+        free(a);
+        return NULL;
+    }
+
+    size_t mono_len = pcm_to_asr_format(pcm, pcm_len,
+        fmt.channels, fmt.rate, mono, pcm_len);
+
+    free(pcm);
+
+    if (fmt.channels != 1 || fmt.rate != AGENT_VOICE_SAMPLE_RATE) {
+        printf("ASR: %uHz %uch -> 16kHz mono, %zu bytes\n",
+            fmt.rate, fmt.channels, mono_len);
+    }
 
     char text[512];
 
-    ret = voice_asr_recognize(pcm, pcm_len, text, sizeof(text));
-    free(pcm);
+    ret = voice_asr_recognize(mono, mono_len, text, sizeof(text));
+    free(mono);
 
     if (ret == 0) {
         printf("ASR result: %s\n", text);
+
+        /* The recognized text stays on the console; the panel only shows
+         * the state and then the agent's own reply. */
+
+        ls_lvgl_set_ai_text("thinking...", NULL);
 
         agent_msg_t msg;
 
@@ -1195,10 +2198,11 @@ static void* asr_file_worker(void* arg)
     return NULL;
 }
 
-int voice_channel_test_asr(const char* pcm_path)
+int voice_channel_test_asr(const char* pcm_path,
+    unsigned int channels, unsigned int rate)
 {
     if (!pcm_path) {
-        printf("Usage: voice_test_asr <pcm_file>\n");
+        printf("Usage: voice_test_asr <audio_file> [channels] [rate]\n");
         return -EINVAL;
     }
 
@@ -1211,6 +2215,12 @@ int voice_channel_test_asr(const char* pcm_path)
 
     strncpy(args->pcm_path, pcm_path, sizeof(args->pcm_path) - 1);
     args->pcm_path[sizeof(args->pcm_path) - 1] = '\0';
+
+    /* 0 means "not stated": a WAV header in the file wins, then these,
+     * then the nxrecorder defaults. */
+
+    args->channels = channels;
+    args->rate = rate;
 
     int ret = agent_task_create(asr_file_worker, "asr_test",
         ASR_THREAD_STACK, args, AGENT_VOICE_PRIO);

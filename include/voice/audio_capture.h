@@ -40,8 +40,13 @@ int audio_capture_start(audio_capture_t *cap);
 int audio_capture_read(audio_capture_t *cap,
     void *buf, size_t len);
 
-/* Interrupt any in-flight blocking read without freeing the handle. */
-int audio_capture_abort(audio_capture_t* cap);
+/* Consume one device buffer raw, exactly as nxrecorder writes it: the
+ * caller gets apb->samp / apb->nbytes and must call release_raw() after. */
+void audio_capture_set_sink(audio_capture_t* cap, int fd);
+unsigned audio_capture_sink_bytes(audio_capture_t* cap);
+int audio_capture_take_raw(audio_capture_t* cap,
+    const unsigned char** data, size_t* len);
+void audio_capture_release_raw(audio_capture_t* cap);
 
 /* Stop recording and release all resources. */
 void audio_capture_close(audio_capture_t *cap);

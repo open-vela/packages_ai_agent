@@ -277,6 +277,8 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         clock_settime(CLOCK_REALTIME, &ts);
     }
 
+    /* ── Phase timing (DNS+TCP / handshake) to locate slowness ── */
+
     /* TCP connect — use HTTP CONNECT proxy if configured */
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
     {
@@ -409,8 +411,9 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         }
     }
 
-    syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
-        mbedtls_ssl_get_ciphersuite(&ctx->ssl));
+    syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG,
+           mbedtls_ssl_get_version(&ctx->ssl),
+           mbedtls_ssl_get_ciphersuite(&ctx->ssl));
 
     return 0;
 }
@@ -627,13 +630,24 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
     memcpy(resp_buf, body_start, copy);
     resp_pos = copy;
 
-    /* Keep reading body */
+    /* Keep reading body.  For chunked responses, stop as soon as the
+     * terminating chunk ("0\r\n\r\n") is seen: relying on the server
+     * to close the connection breaks on keep-alive servers — the
+     * response is complete but the read loop blocks until the
+     * server's keep-alive timeout fires (observed: ~60s stall with
+     * openresty/DeepSeek). */
     if (!eof) {
         while (resp_pos < resp_cap - 1) {
             if (content_length >= 0 && (long)resp_pos >= content_length)
                 break;
-            if (chunked && chunked_end_seen(resp_buf, resp_pos))
-                break;
+            /* Chunked: stop once the final-chunk marker is in the
+             * raw stream (decoded later). The marker is the
+             * sequence "0\r\n\r\n"; scanning the tail is cheap. */
+            if (chunked && resp_pos >= 5) {
+                size_t tail = resp_pos < 16 ? resp_pos : 16;
+                if (memmem(resp_buf + resp_pos - tail, tail, "0\r\n\r\n", 5))
+                    break;
+            }
             ret = mbedtls_ssl_read(&ctx->ssl,
                 (unsigned char*)(resp_buf + resp_pos),
                 resp_cap - 1 - resp_pos);

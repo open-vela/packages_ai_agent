@@ -15,6 +15,7 @@
  */
 
 #include <nuttx/config.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -30,6 +31,61 @@ void leave_critical_section(void) { }
 #ifdef CONFIG_GRAPHICS_LVGL
 __attribute__((weak)) pid_t gettid(void) { return 0; }
 #endif
+
+/* LCD subtitle hook provided by examples/ls_lvgl (strong symbol there).
+ * When the panel app is not linked or not running, this no-op takes over.
+ */
+
+__attribute__((weak))
+void ls_lvgl_set_ai_text(const char* status, const char* text)
+{
+    (void)status;
+    (void)text;
+}
+
+/* Actuator hook provided by examples/ls_lvgl (strong symbol there). */
+
+__attribute__((weak))
+void ls_lvgl_set_actuator(const char* name, bool on)
+{
+    (void)name;
+    (void)on;
+}
+
+/* PWM breathing hook provided by examples/ls_lvgl (strong symbol there). */
+
+__attribute__((weak))
+void ls_lvgl_set_pwm_breath(bool on)
+{
+    (void)on;
+}
+
+/* Buzzer hook provided by examples/ls_lvgl (strong symbol there). */
+
+__attribute__((weak))
+void ls_lvgl_set_buzzer(bool on)
+{
+    (void)on;
+}
+
+/* Sensor read hooks provided by examples/ls_lvgl.  The panel owns the
+ * thermal device (exclusive open) and the I2C bus, so the agent reads the
+ * panel's cached samples while it is running.
+ */
+
+__attribute__((weak))
+int ls_lvgl_read_thermal(int32_t* milli_c)
+{
+    (void)milli_c;
+    return -ENOSYS;
+}
+
+__attribute__((weak))
+int ls_lvgl_read_light(unsigned int* lux_x100)
+{
+    (void)lux_x100;
+    return -ENOSYS;
+}
 
 __attribute__((weak)) void arm_netinitialize(void) { }
 

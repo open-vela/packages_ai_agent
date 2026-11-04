@@ -116,7 +116,7 @@
  * a timeout and replies with a user-friendly error message.
  * The socket-level SO_RCVTIMEO (AGENT_LLM_SOCKET_TIMEOUT_SEC)
  * acts as the hard backstop that actually unblocks the read. */
-#define AGENT_LLM_TIMEOUT_SEC 60
+#define AGENT_LLM_TIMEOUT_SEC 150
 
 /* Socket-level read timeout applied via SO_RCVTIMEO in vela_tls.
  * Must be >= AGENT_LLM_TIMEOUT_SEC to allow the agent-level
@@ -225,7 +225,7 @@
 #define AGENT_WS_MAX_CLIENTS 8
 
 /* ── WS client thread stack ──────────────────────────────────── */
-#define AGENT_WS_CLIENT_STACK (12 * 1024)
+#define AGENT_WS_CLIENT_STACK (16 * 1024)
 
 /* ── Serial CLI ─────────────────────────────────────────────── */
 #define AGENT_CLI_STACK (16 * 1024)
@@ -255,6 +255,9 @@
 #define AGENT_CFG_KEY_GATEWAY_HOST "gateway_host"
 #define AGENT_CFG_KEY_GATEWAY_PORT "gateway_port"
 #define AGENT_CFG_KEY_GATEWAY_TOKEN "gateway_token"
+#define AGENT_CFG_KEY_XIAOZHI_ENDPOINT "xiaozhi_endpoint"
+#define AGENT_CFG_KEY_XIAOZHI_CLIENT_ID "xiaozhi_client_id"
+#define AGENT_CFG_KEY_XIAOZHI_DEVICE_ID "xiaozhi_device_id"
 
 /* ── Vision / Multimodal ─────────────────────────────────────── */
 #define AGENT_VISION_MAX_IMAGE_SIZE \
@@ -333,19 +336,26 @@
 #define AGENT_VOICE_STACK (16 * 1024)
 #define AGENT_VOICE_PRIO 50
 
+/* Priority of the capture reader.  It has to outrank the panel's render
+ * thread (which runs at 100): sharing that priority means time-slicing
+ * against LVGL drawing and the SSD1306 mirror, and the audio buffers run
+ * dry while the reader waits its turn.  Below the audio driver's own
+ * worker so the two never invert. */
+#define AGENT_VOICE_CAPTURE_PRIO 200
+
 /* Doubao TTS V3 API endpoint (HTTP Chunked, x-api-key auth) */
 #define AGENT_DOUBAO_TTS_HOST "openspeech.bytedance.com"
 #define AGENT_DOUBAO_TTS_PORT "443"
 #define AGENT_DOUBAO_TTS_V3_PATH "/api/v3/tts/unidirectional"
 #define AGENT_DOUBAO_TTS_RESOURCE "volc.service_type.10029"
 
-/* Doubao streaming ASR WebSocket API (V2) */
+/* Doubao streaming ASR WebSocket API (V3, bigmodel) */
 #define AGENT_DOUBAO_ASR_HOST "openspeech.bytedance.com"
 #define AGENT_DOUBAO_ASR_PORT "443"
-#define AGENT_DOUBAO_ASR_WS_PATH "/api/v2/asr"
+#define AGENT_DOUBAO_ASR_WS_PATH "/api/v3/sauc/bigmodel_async"
 
-/* Default ASR cluster (streaming, common Chinese) */
-#define AGENT_DOUBAO_ASR_CLUSTER "volcengine_streaming_common"
+/* Default ASR resource (model version), 2.0 hourly-billing variant */
+#define AGENT_DOUBAO_ASR_RESOURCE "volc.seedasr.sauc.duration"
 
 /* Audio device paths (platform-specific) */
 #ifndef AGENT_AUDIO_CAPTURE_DEV
@@ -365,12 +375,20 @@
 #define AGENT_VOICE_FRAME_MS 20
 
 /* Buffer sizes — keep small to avoid OOM during concurrent agent+voice.
- * 128KB PCM ≈ 4s at 16kHz/16bit/mono; enough for typical TTS output.
- * Recording uses the same cap; 128KB ≈ 4s of audio which is fine for
+ * 256KB PCM ≈ 8s at 16kHz/16bit/mono; enough for typical TTS output.
+ * Recording uses the same cap; 256KB ≈ 8s of audio which is fine for
  * short voice commands.  For longer recordings, increase as needed. */
-#define AGENT_VOICE_PCM_BUF_SIZE (128 * 1024)
+#define AGENT_VOICE_PCM_BUF_SIZE (256 * 1024)
 #define AGENT_VOICE_RESP_BUF_SIZE (128 * 1024)
 #define AGENT_VOICE_B64_BUF_SIZE (96 * 1024)
+
+/* Ceiling for audio files read from storage.  This bounds what the file
+ * based test commands accept; the reader allocates the file size, not
+ * the ceiling, so a generous limit costs no memory.  Captures made by
+ * nxrecorder come in at whatever the device produces (48kHz stereo is
+ * 192KB/s), which is 6x the 32KB/s the ASR is asked for — hence the
+ * headroom over AGENT_VOICE_PCM_BUF_SIZE. */
+#define AGENT_VOICE_PCM_FILE_MAX (2 * 1024 * 1024)
 
 /* Config store keys */
 #define AGENT_CFG_KEY_VOLC_APPKEY "volc_appkey"
@@ -379,6 +397,7 @@
 #define AGENT_CFG_KEY_VOLC_SPEAKER "volc_speaker"
 #define AGENT_CFG_KEY_VOLC_CLUSTER "volc_cluster"
 #define AGENT_CFG_KEY_VOLC_ASR_CLUSTER "volc_asr_cluster"
+#define AGENT_CFG_KEY_VOLC_ASR_RESOURCE "volc_asr_resource"
 
 /* Default TTS speaker and cluster */
 #define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
