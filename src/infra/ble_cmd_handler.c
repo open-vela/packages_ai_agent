@@ -32,6 +32,18 @@
  *                                                   -> evt=expression
  *   {"cmd":"settings_get"} / {"cmd":"settings_set","brightness":N|"dnd":1}
  *                                                   -> evt=settings
+ *   {"cmd":"care_list","limit":8}                    -> evt=care_list（RAM care_log）
+ *   {"cmd":"care_ack","seq":N,"feedback":"ACCEPTED|IGNORED|REJECTED"}
+ *                                                   -> evt=care_ack
+ *   {"cmd":"care_settings_get"} / {"cmd":"care_settings_set",
+ *     "dnd":0,"voice":1,"quiet_start":22,"quiet_end":7,"daily_budget":8,
+ *     "types":{"hr":1,"idle":1,"sedentary":1}}      -> evt=care_settings
+ *     （P2B-1A：voice=关怀本地语音开关，RAM only，默认 1；0=voice_off）
+ *   {"cmd":"care_event","type":"eye_rest|water|sleep|weather"}
+ *     -> {"evt":"care_event","ok":1,"type":"...","suppressed":0}
+ *     （P2B-2A/docs114：未知 type ok=0；suppressed=1 表示被 DND/夜间/预算/
+ *       冷却/最小间隔静默；eye_rest 只角标/历史不出声，water/sleep/weather
+ *       走本地缓存语音，仍受 voice/PTT/音乐门禁）
  *   {"cmd":"demo","action":"hr_alert|greet|water|sleep|weather|sedentary|
  *                           milestone|alarm","seconds":N}
  *                                                   -> evt=demo（DEMO-FW/PHONE 演示用）
@@ -64,6 +76,8 @@
 #include "ui/lvgl_ui_channel.h"
 #include "ui/pet_care.h"
 #include "ui/settings_page.h"
+#include "core/care_log.h"     /* P1b care_list / care_ack */
+#include "core/care_router.h"  /* P1b care_settings 运行时设置 */
 #endif
 
 /* 2026-11-02 health：把设备侧已有的健康数据打包成一条 JSON 回传手机。
@@ -112,6 +126,12 @@ static long long watch_from_app_time(long long t)
 
 /* 回包里 items 数组的额度：留出外层对象的几十字节，整帧仍在 1600 以内 */
 #define BLE_ITEMS_MAX 1400
+
+/* P1b：care_list 回包可到 ~1.5KB。复用 BLE RX 缓冲做输出（BLE RX 线程
+ * 串行，dispatch 返回前不会再收新包），避免为回包新增静态大缓冲。
+ * 定义提前到 handlers 之前，recv 侧仍用同一块。 */
+#define BLE_RX_BUF_SIZE 1600
+static char     s_rx_buf[BLE_RX_BUF_SIZE];
 
 /* chat 单条提问上限。RX 侧整包只收 512 字节，扣掉 JSON 外壳后单条文本最多
  * 也就 460 上下；取 384，既能装下长句，也不至于让 BT 栈线程的栈帧变胖。 */
@@ -1110,6 +1130,366 @@ static void handle_settings_set(const char* json)
 #endif
 }
 
+/* ── care_*（PROACTIVE-P1B，docs_ble/110 §1）────────────────────
+ * 协议：
+ *   care_list   {"cmd":"care_list","limit":8}
+ *     -> {"evt":"care_list","count":N,"items":[{"seq","ts","type","state",
+ *         "decision","reason","action","feedback","score","hr","dev",
+ *         "still_min","idle_s","hour","dnd","quiet"},...]}（按 seq 倒序）
+ *   care_ack    {"cmd":"care_ack","seq":N,"feedback":"ACCEPTED|IGNORED|REJECTED"}
+ *     -> {"evt":"care_ack","ok":1,"seq":N,"feedback":"..."}（不存在 ok=0）
+ *   care_settings_get / care_settings_set（见下面 send/handle）
+ *
+ * 线程：BLE RX 回调线程，命令串行；care_log/care_router 内部只有短临界区/
+ * 内存锁，不阻塞、不写盘。care_list 回包复用 s_rx_buf（1600B），单帧上限
+ * 与 ble_gatt TX_SLOT 对齐；字段一样不少，超出时由 care_log 按字节预算截断
+ * items（count 如实反映实际条数）。 */
+#if defined(CONFIG_AI_AGENT_LVGL_UI)
+static void handle_care_list(const char* json)
+{
+    int64_t v = 0;
+    int limit = 6;
+    int written;
+
+    if (json_get_int64(json, "limit", &v) == 0) {
+        if (v < 1) {
+            v = 1;
+        }
+        /* P1c：docs110/112 验收按 6 条，且 BLE 单帧 1600B 典型只放得下
+         * ~6 条；即使 App 仍传 8 也压到 6，保证 count≤6。 */
+        if (v > 6) {
+            v = 6;
+        }
+        limit = (int)v;
+    }
+
+    /* 复用 RX 缓冲作为回包输出：dispatch 期间不会再有 RX 写入。 */
+    written = care_log_export_json(s_rx_buf, sizeof(s_rx_buf), limit,
+        -(int32_t)AGENT_UTC_OFFSET_SEC);
+    if (written > 0 && (size_t)written < sizeof(s_rx_buf)) {
+        send_response(s_rx_buf);
+    } else {
+        syslog(LOG_WARNING, "[%s] care_list: export failed (%d)\n",
+            TAG, written);
+        send_response("{\"evt\":\"care_list\",\"ok\":0,"
+                      "\"msg\":\"export failed\"}");
+    }
+}
+
+static void handle_care_ack(const char* json)
+{
+    char resp[224];
+    char feedback[16];
+    int64_t seq = 0;
+    int written;
+
+    if (json_get_int64(json, "seq", &seq) != 0 || seq < 1
+        || seq > 0xFFFFFFFFLL) {
+        send_response("{\"evt\":\"care_ack\",\"ok\":0,"
+                      "\"msg\":\"invalid seq\"}");
+        return;
+    }
+    if (json_get_string(json, "feedback", feedback, sizeof(feedback)) != 0) {
+        send_response("{\"evt\":\"care_ack\",\"ok\":0,"
+                      "\"msg\":\"missing feedback\"}");
+        return;
+    }
+
+    if (care_log_ack((uint32_t)seq, feedback)) {
+        written = snprintf(resp, sizeof(resp),
+            "{\"evt\":\"care_ack\",\"ok\":1,\"seq\":%lld,"
+            "\"feedback\":\"%s\"}",
+            (long long)seq, feedback);
+    } else {
+        written = snprintf(resp, sizeof(resp),
+            "{\"evt\":\"care_ack\",\"ok\":0,\"seq\":%lld,"
+            "\"msg\":\"seq not found or invalid feedback\"}",
+            (long long)seq);
+    }
+    if (written > 0 && (size_t)written < sizeof(resp)) {
+        send_response(resp);
+    }
+}
+
+/* 回包一律以固件真实状态为准（不回声请求值）。 */
+static void send_care_settings_event(void)
+{
+    char resp[224];
+    int written;
+    care_router_settings_t st;
+    int dnd;
+
+    care_router_get_settings(&st);
+    dnd = pet_care_get_dnd() ? 1 : 0;
+
+    written = snprintf(resp, sizeof(resp),
+        "{\"evt\":\"care_settings\",\"ok\":1,\"dnd\":%d,\"voice\":%d,"
+        "\"quiet_start\":%u,\"quiet_end\":%u,\"daily_budget\":%u,"
+        "\"types\":{\"hr\":%d,\"idle\":%d,\"sedentary\":%d}}",
+        dnd, st.voice ? 1 : 0,
+        (unsigned)st.quiet_start, (unsigned)st.quiet_end,
+        (unsigned)st.daily_budget,
+        (st.types & CARE_ROUTER_TYPES_HR) ? 1 : 0,
+        (st.types & CARE_ROUTER_TYPES_IDLE) ? 1 : 0,
+        (st.types & CARE_ROUTER_TYPES_SEDENTARY) ? 1 : 0);
+
+    if (written > 0 && (size_t)written < sizeof(resp)) {
+        send_response(resp);
+    }
+}
+
+static void handle_care_settings_set(const char* json)
+{
+    int64_t v = 0;
+    int64_t tv = 0;
+    bool b = false;
+    bool dirty = false;
+    bool router_dirty = false;
+    bool dnd_dirty = false;
+    bool dnd_val = false;
+    care_router_settings_t cur;
+    care_router_settings_t st;
+    const char* pv;
+    const char* types;
+
+    care_router_get_settings(&cur);
+    st = cur;
+
+    /* ── 1) 解析 + 校验全部字段（此阶段**不产生任何副作用**）──
+     * P1c：任一字段非法 -> ok=0 且不改任何值（含 DND）；
+     * 全部合法后才在下面一次性应用（原子）。 */
+
+    pv = json_find_value(json, "dnd");
+    if (pv != NULL) {
+        if (json_get_bool(json, "dnd", &b) != 0) {
+            send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                          "\"msg\":\"dnd must be 0/1 or true/false\"}");
+            return;
+        }
+        dnd_dirty = true;
+        dnd_val = b;
+        dirty = true;
+    }
+
+    /* P2B-1A（task-65）：voice 开关，与其它字段一起"先校验后原子应用"；
+     * 只接受 0/1 或 true/false，非法 -> 整包 ok=0 且不改任何值。 */
+    pv = json_find_value(json, "voice");
+    if (pv != NULL) {
+        if (json_get_bool(json, "voice", &b) != 0) {
+            send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                          "\"msg\":\"voice must be 0/1 or true/false\"}");
+            return;
+        }
+        st.voice = b;
+        router_dirty = true;
+        dirty = true;
+    }
+
+    pv = json_find_value(json, "quiet_start");
+    if (pv != NULL) {
+        if (json_get_int64(json, "quiet_start", &v) != 0
+            || v < 0 || v > 23) {
+            send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                          "\"msg\":\"quiet_start out of range (0-23)\"}");
+            return;
+        }
+        st.quiet_start = (uint8_t)v;
+        router_dirty = true;
+        dirty = true;
+    }
+
+    pv = json_find_value(json, "quiet_end");
+    if (pv != NULL) {
+        if (json_get_int64(json, "quiet_end", &v) != 0
+            || v < 0 || v > 23) {
+            send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                          "\"msg\":\"quiet_end out of range (0-23)\"}");
+            return;
+        }
+        st.quiet_end = (uint8_t)v;
+        router_dirty = true;
+        dirty = true;
+    }
+
+    pv = json_find_value(json, "daily_budget");
+    if (pv != NULL) {
+        if (json_get_int64(json, "daily_budget", &v) != 0
+            || v < 1 || v > 12) {
+            send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                          "\"msg\":\"daily_budget out of range (1-12)\"}");
+            return;
+        }
+        st.daily_budget = (uint8_t)v;
+        router_dirty = true;
+        dirty = true;
+    }
+
+    /* types 是嵌套对象：只接受 0/1；任一非法 -> 整包 ok=0（不改任何值） */
+    types = json_find_value(json, "types");
+    if (types != NULL) {
+        uint8_t mask = st.types;
+        bool any = false;
+
+        if (*types != '{') {
+            send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                          "\"msg\":\"types must be an object\"}");
+            return;
+        }
+
+        pv = json_find_value(types, "hr");
+        if (pv != NULL) {
+            if (json_get_int64(types, "hr", &tv) != 0
+                || (tv != 0 && tv != 1)) {
+                send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                              "\"msg\":\"types.hr must be 0/1\"}");
+                return;
+            }
+            if (tv != 0) {
+                mask |= CARE_ROUTER_TYPES_HR;
+            } else {
+                mask &= (uint8_t)~CARE_ROUTER_TYPES_HR;
+            }
+            any = true;
+        }
+
+        pv = json_find_value(types, "idle");
+        if (pv != NULL) {
+            if (json_get_int64(types, "idle", &tv) != 0
+                || (tv != 0 && tv != 1)) {
+                send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                              "\"msg\":\"types.idle must be 0/1\"}");
+                return;
+            }
+            if (tv != 0) {
+                mask |= CARE_ROUTER_TYPES_IDLE;
+            } else {
+                mask &= (uint8_t)~CARE_ROUTER_TYPES_IDLE;
+            }
+            any = true;
+        }
+
+        pv = json_find_value(types, "sedentary");
+        if (pv != NULL) {
+            if (json_get_int64(types, "sedentary", &tv) != 0
+                || (tv != 0 && tv != 1)) {
+                send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                              "\"msg\":\"types.sedentary must be 0/1\"}");
+                return;
+            }
+            if (tv != 0) {
+                mask |= CARE_ROUTER_TYPES_SEDENTARY;
+            } else {
+                mask &= (uint8_t)~CARE_ROUTER_TYPES_SEDENTARY;
+            }
+            any = true;
+        }
+
+        if (any) {
+            st.types = mask;
+            router_dirty = true;
+            dirty = true;
+        }
+    }
+
+    if (!dirty) {
+        send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                      "\"msg\":\"missing care settings fields\"}");
+        return;
+    }
+
+    /* ── 2) 全部字段合法：一次性原子应用（先 settings，再 DND）── */
+    if (router_dirty && !care_router_set_settings(&st)) {
+        send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                      "\"msg\":\"settings rejected\"}");
+        return;
+    }
+
+    if (dnd_dirty) {
+        pet_care_set_dnd(dnd_val);   /* 与 settings_set 同一入口，双向同步 */
+    }
+
+    syslog(LOG_INFO, "[%s] care_settings_set atomic: dnd=%d voice=%d "
+        "quiet=%u-%u budget=%u types=0x%x\n", TAG, (int)pet_care_get_dnd(),
+        (int)st.voice, (unsigned)st.quiet_start, (unsigned)st.quiet_end,
+        (unsigned)st.daily_budget, (unsigned)st.types);
+    send_care_settings_event();
+}
+
+/* ── P2B-2A（task-68，docs_ble/114）：App care_event 场景 ────────────
+ * 白名单：eye_rest/water/sleep/weather；未知 type -> ok=0。
+ * BLE RX 线程只做门禁/记账/投递（pet_care_care_event 内部），UI/语音在
+ * LVGL render 线程执行；suppressed=1 表示被 Router 门禁静默（无角标/历史/声）。 */
+extern int pet_care_care_event(const char *type);
+
+static void handle_care_event(const char* json)
+{
+    char type[16];
+    char resp[128];
+    int written;
+    int rc;
+
+    if (json_get_string(json, "type", type, sizeof(type)) != 0) {
+        send_response("{\"evt\":\"care_event\",\"ok\":0,"
+                      "\"msg\":\"missing type\"}");
+        return;
+    }
+
+    if (strcmp(type, "eye_rest") != 0 && strcmp(type, "water") != 0
+        && strcmp(type, "sleep") != 0 && strcmp(type, "weather") != 0) {
+        send_response("{\"evt\":\"care_event\",\"ok\":0,"
+                      "\"msg\":\"unknown type\"}");
+        return;
+    }
+
+    rc = pet_care_care_event(type);
+    if (rc < 0) {
+        send_response("{\"evt\":\"care_event\",\"ok\":0,"
+                      "\"msg\":\"internal error\"}");
+        return;
+    }
+
+    written = snprintf(resp, sizeof(resp),
+        "{\"evt\":\"care_event\",\"ok\":1,\"type\":\"%s\","
+        "\"suppressed\":%d}", type, (rc == 1) ? 1 : 0);
+    if (written > 0 && (size_t)written < sizeof(resp)) {
+        send_response(resp);
+    }
+}
+#else  /* !CONFIG_AI_AGENT_LVGL_UI */
+static void handle_care_list(const char* json)
+{
+    (void)json;
+    send_response("{\"evt\":\"care_list\",\"ok\":0,"
+                  "\"msg\":\"ui unavailable\"}");
+}
+
+static void handle_care_ack(const char* json)
+{
+    (void)json;
+    send_response("{\"evt\":\"care_ack\",\"ok\":0,"
+                  "\"msg\":\"ui unavailable\"}");
+}
+
+static void send_care_settings_event(void)
+{
+    send_response("{\"evt\":\"care_settings\",\"ok\":0,"
+                  "\"msg\":\"ui unavailable\"}");
+}
+
+static void handle_care_settings_set(const char* json)
+{
+    (void)json;
+    send_care_settings_event();
+}
+
+static void handle_care_event(const char* json)
+{
+    (void)json;
+    send_response("{\"evt\":\"care_event\",\"ok\":0,"
+                  "\"msg\":\"ui unavailable\"}");
+}
+#endif /* CONFIG_AI_AGENT_LVGL_UI */
+
 /* ── demo（DEMO-FW / DEMO-PHONE 2026-11-03）：手机 App 触发演示动作 ──
  * 演示视频里所有主动关怀都由手机点按触发，手表只负责响应：
  *   切到小云页（lvgl_ui_channel_navigate_pet）→ 气泡/历史 → 本地预合成音频。
@@ -1220,6 +1600,16 @@ static void dispatch_json(char *buf)
         handle_settings_get();
     } else if (strcmp(cmd, "settings_set") == 0) {
         handle_settings_set(buf);
+    } else if (strcmp(cmd, "care_list") == 0) {
+        handle_care_list(buf);              /* PROACTIVE-P1B */
+    } else if (strcmp(cmd, "care_ack") == 0) {
+        handle_care_ack(buf);               /* PROACTIVE-P1B */
+    } else if (strcmp(cmd, "care_settings_get") == 0) {
+        send_care_settings_event();         /* PROACTIVE-P1B */
+    } else if (strcmp(cmd, "care_settings_set") == 0) {
+        handle_care_settings_set(buf);      /* PROACTIVE-P1B */
+    } else if (strcmp(cmd, "care_event") == 0) {
+        handle_care_event(buf);             /* P2B-2A docs114 场景事件 */
     } else if (strcmp(cmd, "demo") == 0) {
         handle_demo(buf);   /* DEMO-FW：演示触发（hr_alert/greet/alarm） */
     } else {
@@ -1240,9 +1630,6 @@ static void dispatch_json(char *buf)
  * JSON 再 dispatch，同时兼容旧的"整条一次写"。
  ****************************************************************************/
 
-#define BLE_RX_BUF_SIZE 1600
-
-static char     s_rx_buf[BLE_RX_BUF_SIZE];
 static uint16_t s_rx_len;
 static int      s_rx_depth;
 static bool     s_rx_in_str;

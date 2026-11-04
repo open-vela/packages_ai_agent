@@ -35,6 +35,9 @@ extern "C" {
  *     阈值跟着底噪走, 不需要重新标定。
  *   · 起说需要**连续 2 帧**超阈值, 抗单帧脉冲噪声(敲击、爆音)。 */
 
+/* 放行一帧时的回调。frame 是 16bit 小端 PCM, samples 通常为 320。 */
+typedef void (*vad_emit_fn)(void* user, const short* frame, size_t samples);
+
 typedef struct
 {
   short          preroll[15 * 320];   /* 300ms @16kHz 的预滚环形缓冲 */
@@ -55,12 +58,17 @@ typedef struct
   int            silence_run;         /* 距最后一个"响"帧的连续静音帧数 */
   int            done;                /* 1 = 一句话已说完(粘滞, 见下) */
 
+  /* ── VOICE-F3（task-61）：冷启动/短录音诊断 + 抢救 ──────────────────
+   * emit_cb/emit_user 在 feed 时缓存，vad_trim_finish() 抢救短录音时要
+   * 主动补发预滚帧（原 finish 只有 v, 拿不到回调）。fed_frames 记录总共
+   * 喂进来的 20ms 帧数（含标定期），用于日志和"短录音"判定。 */
+  vad_emit_fn    emit_cb;             /* 首次 feed 时记住的放行回调 */
+  void*          emit_user;
+  unsigned long  fed_frames;          /* 总输入帧数(含标定期, 20ms/帧) */
+
   short          pend[320];           /* 不足一帧的残余 */
   size_t         pend_len;            /* 采样数 */
 } vad_trim_t;
-
-/* 放行一帧时的回调。frame 是 16bit 小端 PCM, samples 通常为 320。 */
-typedef void (*vad_emit_fn)(void* user, const short* frame, size_t samples);
 
 void vad_trim_init(vad_trim_t* v);
 
@@ -69,7 +77,11 @@ void vad_trim_feed(vad_trim_t* v, const short* pcm, size_t samples,
                    vad_emit_fn emit, void* user);
 
 /* 收尾: 处理残余(不足一帧的按静音处理, 不强行放行)。
- * 返回 1 表示整段里**一帧都没放行**(全静音), 调用方据此告警。 */
+ * 返回 1 表示整段里**一帧都没放行**(全静音), 调用方据此告警。
+ *
+ * VOICE-F3: 如果录音在冷启动窗口(200ms 标定期)内就结束了(用户短按 PTT),
+ * 会把预滚里已采到的帧补发出去并返回 0 —— 避免整段录音被标定段吃掉后
+ * 直接变成 -ENODATA(-61)。长录音全静音仍返回 1(不上传噪声)。 */
 int vad_trim_finish(vad_trim_t* v);
 
 /* 「一句话说完了」—— 用于**自动断句**(不用手动停录)。

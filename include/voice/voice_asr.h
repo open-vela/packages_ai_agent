@@ -73,6 +73,16 @@ int voice_asr_set_backend(const char *name);
 /* Get the name of the current active backend, or NULL. */
 const char *voice_asr_get_backend(void);
 
+/* ── VOICE-F3（task-61）：连续"没检测到语音"(-ENODATA / -61) 统计 ──────
+ * 流式/批量 ASR 返回 -ENODATA 时在公共分发层累计；成功一次清零。
+ * 供 UI/voice_channel 做操作引导与限流：>=3 时建议提示"按住说话、说完
+ * 再松手"，不要在失败后自动重试（每次重试都会重新采集+走一次 ASR）。
+ * 计数上限饱和在 255，日志本身已在 voice_asr.c 内限流。 */
+unsigned voice_asr_consecutive_nospeech(void);
+
+/* 手动清零（例如 PTT 按下、开始新一轮录音时由调用方重置）。 */
+void voice_asr_reset_nospeech(void);
+
 /* Recognize speech using the active backend. */
 int voice_asr_recognize(const unsigned char *pcm_data,
                         size_t pcm_len,

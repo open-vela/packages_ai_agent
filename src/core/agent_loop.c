@@ -38,6 +38,7 @@
 #include "health/pedometer.h"
 #endif
 #include "infra/network_manager.h"
+#include "infra/vela_tls.h"   /* P0-NET：[lat] 连接/握手分段 + 保守预连接 */
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
@@ -52,6 +53,7 @@
 #include "agent_compat.h"
 #include "agent_config.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -63,6 +65,91 @@
 #include "cJSON.h"
 
 static const char* TAG = "agent";
+
+/* RCA-FIX-A F8：local_lm 开始/结束耗时（只读日志，线程安全；单调时钟）。 */
+static int64_t agent_lat_mono_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ── LOCAL-FAST B（2026-11-04，docs_ble/108 §2.B/§2.C；B-FIX 按 perf-fw 复核收敛）
+ * 只在**离线**（network_get_state()!=CONNECTED）时先让端侧模型抢答，
+ * 以及启动时预热端侧模型解释器。
+ * 依赖 LOCAL-FAST A（task-24/25）在 local_lm.h 提供的：
+ *   void local_lm_warmup_start(void);
+ *   int  local_lm_reply(const char *text, char **out);  // 内部先走模板快路径
+ * 这些声明已经在本文件 :44 的 #include "llm/local_lm.h" 里，不再重复 extern
+ *（v142c 复核 P2 的重复声明已删）。
+ * 链接期需要 A 的符号；若构建报 undefined reference，说明 A 未合入。
+ *
+ * 回滚开关（编译期）：
+ *   -DLOCAL_FIRST_WARMUP=0  不调 warmup（不影响其它逻辑）
+ *   -DLOCAL_FIRST_ENABLE=0  关闭离线本地优先，恢复 v142c 行为 */
+#ifndef LOCAL_FIRST_ENABLE
+#define LOCAL_FIRST_ENABLE 1
+#endif
+#ifndef LOCAL_FIRST_WARMUP
+#define LOCAL_FIRST_WARMUP 1
+#endif
+
+/* LOCAL-FAST C（2026-11-04）：简单消息本地模板快路径优先。
+ * 实测问题：离线时 network 状态未及时翻转，`ask 你好` 仍先等云端失败
+ * ~16s 才走端侧快路径。修法：第 0 轮云 LLM 之前先无条件试 A 的模板/规则
+ * 快路径（毫秒级、不跑模型、不联网）；命中即本地回答并跳过云端。
+ * 回滚开关：-DLOCAL_FAST_PREEMPT=0（不影响 B 的离线本地优先/预热）。 */
+#ifndef LOCAL_FAST_PREEMPT
+#define LOCAL_FAST_PREEMPT 1
+#endif
+
+/* VOICE-A-FIX（task-41，perf-fw A2/P0）：LLM 流式首 token 超时（-ETIMEDOUT）
+ * 不参与 router failover / 非流式重试，直接走 local fallback。
+ * VOICE-F2（task-60）：语音回合进一步短路成 <=30 字短模板（跳过 ~7s TFLM），
+ * 只有真正离线才保留 local_lm。
+ * 回滚开关：-DVOICE_A_ETIMEDOUT_SHORTCIRCUIT=0（恢复 failover 行为）。 */
+#ifndef VOICE_A_ETIMEDOUT_SHORTCIRCUIT
+#define VOICE_A_ETIMEDOUT_SHORTCIRCUIT 1
+#endif
+
+/* VOICE-F2（task-60，perf-fw F2）：语音回合"首 token 超时/看门狗超时/联网下
+ * 云端失败"兜底不再跑端侧模型（local_lm/TFLM 实测 ~7s），直接给 <=30 字短
+ * 模板走既有 outbound dispatch（落屏 + 语音播报）；**真正离线**（uplink_down
+ * 或 network 非 CONNECTED）仍保留 local_lm 兜底（离线是它唯一正确的场景）。
+ * 回滚开关：-DVOICE_F2_TIMEOUT_SKIP_TFLM=0（恢复原 7s 端侧模型兜底）。 */
+#ifndef VOICE_F2_TIMEOUT_SKIP_TFLM
+#define VOICE_F2_TIMEOUT_SKIP_TFLM 1
+#endif
+
+/* <=30 字、语音友好；不承诺执行设备动作（超时回合工具链可能未完成）。 */
+#define VOICE_F2_TIMEOUT_SHORT_MSG "网络有点慢，请再说一次好吗"
+
+/* ── P0-NET（task-48，2026-11-04）：网络/LLM 低延迟收口 ──
+ *  P0_NET_PRECONNECT：网络就绪时在 agent 线程里做一次保守 TLS 预连接
+ *    （只 TCP+TLS 握手放回池，不发请求；不新增线程）。回滚 -DP0_NET_PRECONNECT=0。
+ *  P0_NET_LAT：每轮 [lat] 聚合日志（conn/handshake/ttft/gen/tts_first）。
+ *    回滚 -DP0_NET_LAT=0（vela_tls/llm_proxy 的 [lat] 打点保留）。
+ *  VOICE_BREVITY_PROMPT：语音 prompt 约束 1–3 句、≤80 字。
+ *    回滚 -DVOICE_BREVITY_PROMPT=0（恢复 v114b5 的 90 字文案）。 */
+#ifndef P0_NET_PRECONNECT
+#define P0_NET_PRECONNECT 1
+#endif
+#ifndef P0_NET_LAT
+#define P0_NET_LAT 1
+#endif
+#ifndef VOICE_BREVITY_PROMPT
+#define VOICE_BREVITY_PROMPT 1
+#endif
+
+/* 由 llm_proxy.c 实现：保守预连接当前 LLM 主机（失败静默）。 */
+extern int llm_proxy_preconnect(void);
+
+/* 设备控制意图判定 local_lm_is_control_intent() 已由 A-FIX 写进
+ * llm/local_lm.h（本文件 :44 已 include），这里不再重复 extern
+ * （perf-fw 复核 P2；v142c 的 warmup 重复 extern 也已删）。
+ * 用途：开灯/空调/闹钟/播放/测量这类控制消息**绝不能**交给端侧模型的
+ * ai_lm 虚拟设备执行器（它会回“好的，已为您打开…”但实际什么都没控制）。 */
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
@@ -91,6 +178,30 @@ static bool llm_call_timed_out(uint32_t latency_ms);
     "请求超时，LLM 响应时间过长。请稍后重试，或尝试简化你的问题。"
 #define LLM_TIMEOUT_TASK_COMPLETE_MSG \
     "任务已完成，但生成确认消息超时。"
+
+/* VOICE-F2：语音回合超时兜底 -> 短模板（跳过端侧模型）。
+ * 返回 malloc 文本；NULL 表示非 voice 通道或开关关闭 -> 调用方走原逻辑。 */
+static char* voice_f2_timeout_short_text(const agent_msg_t* msg,
+    const char* why)
+{
+#if VOICE_F2_TIMEOUT_SKIP_TFLM
+    size_t n;
+
+    if (msg == NULL
+        || strcmp(msg->channel, AGENT_CHAN_VOICE) != 0) {
+        return NULL;
+    }
+    n = strlen(VOICE_F2_TIMEOUT_SHORT_MSG);
+    syslog(LOG_WARNING,
+        "[%s] voice-f2: %s -> skip local_lm (TFLM ~7s), short template "
+        "(%zu chars <=30, dispatch + TTS)\n", TAG, why, n);
+    return strdup(VOICE_F2_TIMEOUT_SHORT_MSG);
+#else
+    (void)msg;
+    (void)why;
+    return NULL;
+#endif
+}
 
 /* ── Clock-safe elapsed time calculation ───────────────────── */
 
@@ -1739,11 +1850,16 @@ static long s_turn_stream_first_ms = -1;
  * 因此在 LLM 返回后立刻 abort 掉流式占位，避免与最终消息重复。 */
 typedef struct {
     const char* user_text;
+    const char* channel;
     bool  started;
     bool  first;
     int   deltas;
     long  first_ms;
     struct timeval t0;
+    /* VOICE-B（docs_ble/112 §2B）：voice 通道的流式首句 TTS。
+     * 首个 delta 前 begin，后续 delta feed，最终回答处 end（takeover 防重复）。 */
+    bool  voice;
+    bool  voice_started;
 } agent_stream_ctx_t;
 
 static void agent_llm_stream_delta(const char* delta, void* arg)
@@ -1770,9 +1886,30 @@ static void agent_llm_stream_delta(const char* delta, void* arg)
     if (c->started) {
         (void)lvgl_ui_channel_stream_delta(delta);
     }
+
+    /* VOICE-B：voice 通道边生成边播首句。begin/feed 只做短内存操作 +
+     * speak 队列入队（首句凑齐即异步入队），不在网络回调里做 TTS/播放。 */
+    if (c->voice) {
+        if (!c->voice_started) {
+            voice_channel_stream_begin();
+            c->voice_started = true;
+        }
+        voice_channel_stream_feed(delta);
+    }
     c->deltas++;
 }
 #endif
+
+/* LOCAL-FAST C：允许"本地快路径优先"的用户对话通道白名单。
+ * 只抢 voice/ble/cli 的真实用户对话；care/system/heartbeat 等主动关怀、
+ * 系统 meta-prompt 通道一律不抢（它们内容长，本地模板本来也不命中）。 */
+static bool agent_channel_is_user_dialog(const char* channel)
+{
+    return channel != NULL
+        && (strcmp(channel, AGENT_CHAN_VOICE) == 0
+            || strcmp(channel, "ble") == 0
+            || strcmp(channel, AGENT_CHAN_CLI) == 0);
+}
 
 /* Run the ReAct tool-calling loop. Returns final_text (caller owns). */
 static char* run_react_loop(const char* sys_prompt, cJSON* messages,
@@ -1795,6 +1932,15 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     bool watchdog_fired = false;
     persona_id_t cache_persona;
 
+    /* LOCAL-FAST B-FIX（perf-fw 复核 P0）：
+     *   control_intent —— 设备控制类消息禁止交给端侧模型（ai_lm 的虚拟设备
+     *     执行器会编造“已为您打开/已上锁”，而真实硬件无动作）。
+     *   local_attempted —— 离线本地优先是否已经试过一次；断网时原兜底分支
+     *     不要对同一条消息再跑一次端侧推理（复核 P0：离线最坏等待翻倍）。 */
+    bool control_intent = (msg->content != NULL)
+        && local_lm_is_control_intent(msg->content);
+    bool local_attempted = false;
+
     s_turn_stream_deltas = 0;
     s_turn_stream_first_ms = -1;
 
@@ -1804,6 +1950,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
     memset(&stream_ctx, 0, sizeof(stream_ctx));
     stream_ctx.user_text = msg->content;
+    stream_ctx.channel = msg->channel;
+    stream_ctx.voice = (strcmp(msg->channel, AGENT_CHAN_VOICE) == 0);
     stream_enabled = (msg->channel[0] != '\0')
         && (strcmp(msg->channel, "voice") == 0
             || strcmp(msg->channel, "ble") == 0
@@ -1888,6 +2036,134 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         bool uplink_down = false;
         int err;
 
+        /* ── LOCAL-FAST C（2026-11-04）：简单消息本地快路径优先 ──
+         * 实测问题：离线时 network 状态没及时翻转，`ask 你好` 仍先等云端
+         * 失败 ~16s 才走端侧快路径。这里在**第 0 轮、云 LLM 之前**先试 A 的
+         * 模板/规则快路径（毫秒级、不跑模型、不联网），命中即本地回答并
+         * break，完全跳过云端（无论在线/离线）。
+         * 未命中 / 控制意图 / 非用户对话通道（care/system/heartbeat）→ 继续
+         * 原路径：联网走云端，离线走下面的"离线本地优先/断网直落端侧"。
+         * 本地回答不写 LLM cache（send_reply 已按 s_answer_from_local 跳过）。 */
+#if LOCAL_FAST_PREEMPT
+        if (iteration == 0 && !control_intent
+            && msg->content != NULL
+            && agent_channel_is_user_dialog(msg->channel)) {
+            char* fast_text = NULL;
+            int64_t lm_t0 = agent_lat_mono_ms();
+            int lm_ret = local_lm_fast_reply(msg->content, &fast_text);
+            long lm_ms = (long)(agent_lat_mono_ms() - lm_t0);
+
+            /* RCA-FIX-A F8：local_lm 快路径耗时（模板命中/未命中都记） */
+            syslog(LOG_INFO,
+                "[%s] [lat] local_lm fast ms=%ld ret=%d hit=%d\n",
+                TAG, lm_ms, lm_ret,
+                (lm_ret == 0 && fast_text != NULL && fast_text[0] != '\0'));
+
+            if (lm_ret == 0
+                && fast_text != NULL && fast_text[0] != '\0') {
+                final_text = fast_text;
+                s_answer_from_local = true;
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+                /* 回合开始已放"小云思考中…"占位：本地快路径不走流式，
+                 * 收回占位，最终回答由 dispatch 镜像落屏。 */
+                if (stream_enabled && stream_ctx.started) {
+                    lvgl_ui_channel_stream_abort();
+                    stream_ctx.started = false;
+                }
+#endif
+                syslog(LOG_INFO,
+                    "[%s] local-fast preempt: chan=%s -> %zu B template reply, "
+                    "cloud skipped (no network wait)\n",
+                    TAG, msg->channel, strlen(final_text));
+                agent_trace_step(&trace, iteration, NULL, 0, 1);
+                break;
+            }
+            free(fast_text);   /* 未命中/控制类：交回原路径 */
+        }
+#endif /* LOCAL_FAST_PREEMPT */
+
+        /* ── LOCAL-FAST B-FIX（perf-fw 复核）：只在**离线**时本地优先 ──
+         * 判据只有 network_get_state()!=NET_STATE_CONNECTED。
+         * 已删除 IOB>=75% 触发：IOB 是全局网络缓冲池，TTS 下载/ASR 上传/PAN
+         * 风暴都会瞬时抬高，connected+IOB 高 ≠ 云不可用；按 IOB 触发会把
+         * 正常云回答降级成端侧模型（质量差、且可能编造设备动作）。
+         * 控制类消息（control_intent）绝不进入 ai_lm 虚拟设备执行器：离线时
+         * 给诚实的固定提示（明确不做动作）；联网时的控制请求本来就不会走到
+         * 这里（本块只在离线生效），仍由云端工具链正常处理。
+         * 失败：不改原路径（断网继续走下面既有“no uplink 直落端侧”分支，
+         * 但 local_attempted 会阻止它对同一条消息再推理一次）。 */
+#if LOCAL_FIRST_ENABLE
+        if (iteration == 0
+            && network_get_state() != NET_STATE_CONNECTED) {
+            char* local_first_text = NULL;
+            int local_first_ret = -1;
+            bool local_avail = local_lm_available();
+
+            if (control_intent) {
+                /* 离线 + 设备控制：明确“需要联网”，绝不编造已执行动作。 */
+                final_text = strdup(
+                    "这个需要联网才能执行设备操作，等我连上手机再试～");
+                local_attempted = true;   /* 原兜底也不要再跑端侧模型 */
+                if (final_text != NULL) {
+                    s_answer_from_local = true;
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+                    if (stream_enabled && stream_ctx.started) {
+                        lvgl_ui_channel_stream_abort();
+                        stream_ctx.started = false;
+                    }
+#endif
+                    syslog(LOG_WARNING,
+                        "[%s] local-first: offline + control intent -> honest "
+                        "refusal (no device action, no ai_lm takeover)\n", TAG);
+                    agent_trace_step(&trace, iteration, NULL, 0, 1);
+                    break;
+                }
+                syslog(LOG_WARNING,
+                    "[%s] local-first: offline + control intent, refusal "
+                    "alloc failed, falling through\n", TAG);
+            } else if (local_avail && msg->content != NULL) {
+                int64_t lm_t0 = agent_lat_mono_ms();
+
+                local_attempted = true;   /* 复核 P0：防断网时二次推理 */
+                local_first_ret = local_lm_reply(msg->content,
+                    &local_first_text);
+                /* RCA-FIX-A F8：离线本地优先的端侧耗时 */
+                syslog(LOG_INFO,
+                    "[%s] [lat] local_lm reply_offline ms=%ld ret=%d\n",
+                    TAG, (long)(agent_lat_mono_ms() - lm_t0),
+                    local_first_ret);
+            }
+
+            if (local_first_ret == 0 && local_first_text != NULL
+                && local_first_text[0] != '\0') {
+                final_text = local_first_text;
+                s_answer_from_local = true;
+#ifdef CONFIG_AI_AGENT_LVGL_UI
+                /* 回合开始时已经放了“小云思考中…”占位：本地优先不走流式，
+                 * 必须收回占位，最终回答由 dispatch 镜像落屏。 */
+                if (stream_enabled && stream_ctx.started) {
+                    lvgl_ui_channel_stream_abort();
+                    stream_ctx.started = false;
+                }
+#endif
+                syslog(LOG_INFO,
+                    "[%s] local-first: offline (chan=%s) -> local reply %zu B, "
+                    "cloud skipped\n",
+                    TAG, msg->channel, strlen(final_text));
+                agent_trace_step(&trace, iteration, NULL, 0, 1);
+                break;
+            }
+
+            if (!control_intent) {
+                free(local_first_text);   /* 失败/空结果：本地不接管 */
+                syslog(LOG_INFO,
+                    "[%s] local-first: offline (chan=%s) but local reply failed "
+                    "(avail=%d ret=%d), continuing original path\n",
+                    TAG, msg->channel, (int)local_avail, local_first_ret);
+            }
+        }
+#endif /* LOCAL_FIRST_ENABLE */
+
         gettimeofday(&tv_start, NULL);
         if (network_get_state() != NET_STATE_CONNECTED) {
             /* No uplink: a cloud call could only hang until the socket
@@ -1929,6 +2205,14 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     lvgl_ui_channel_stream_abort();
                     stream_ctx.started = false;
                 }
+                /* VOICE-B：调用失败/工具轮/空文本 -> 放弃流式首句，
+                 * 让 outbound dispatch 回退原整段 TTS（与旧行为一致）。 */
+                if (stream_ctx.voice_started
+                    && (err != OK || resp.tool_use || resp.text == NULL
+                        || resp.text[0] == '\0')) {
+                    voice_channel_stream_abort();
+                    stream_ctx.voice_started = false;
+                }
                 /* 本轮累计（[turn] llm_done 行会汇总打印，验收直接 grep） */
                 s_turn_stream_deltas += stream_ctx.deltas;
                 if (s_turn_stream_first_ms < 0 && stream_ctx.first)
@@ -1953,6 +2237,19 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
+        /* VOICE-A-FIX（perf-fw A2/P0）：-ETIMEDOUT 是首 token 降级信号，不是
+         * "后端故障"——不要 failover 到下一个后端（那里会再走一次非流式
+         * llm_chat_tools，最长 AGENT_LLM_TIMEOUT_SEC，离群又变回几十秒），
+         * 直接落到下面的 local fallback 路径。
+         * llm_proxy 已保证 -ETIMEDOUT 只可能来自语音回合的首 token 超时。 */
+#if VOICE_A_ETIMEDOUT_SHORTCIRCUIT
+        if (err == -ETIMEDOUT) {
+            syslog(LOG_WARNING,
+                "[%s] first-token timeout -> skip router failover/non-stream, "
+                "go local fallback\n", TAG);
+        }
+        else
+#endif
         /* Router failover: on LLM call failure, try next backend */
         if (err != OK && router_idx >= 0 && !uplink_down) {
             syslog(LOG_WARNING,
@@ -1985,6 +2282,12 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             char *local_text = NULL;
             bool timed_out = llm_call_timed_out(latency_ms);
 
+            if (err == -ETIMEDOUT && !timed_out) {
+                syslog(LOG_WARNING,
+                    "[%s] first-token timeout (%" PRIu32 "ms) -> local fallback "
+                    "(no cloud retry)\n", TAG, latency_ms);
+            }
+
             if (timed_out) {
                 syslog(LOG_WARNING,
                     "[%s] LLM watchdog: call failed after %" PRIu32 " ms "
@@ -1998,11 +2301,65 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
             llm_response_free(&resp);
 
-            if (local_lm_available() &&
-                local_lm_reply(msg->content, &local_text) == 0) {
-                final_text = local_text;
-                s_answer_from_local = true;   /* label the reply 本地 */
-                break;
+            /* VOICE-F2（task-60）：语音回合在"联网但云端失败/首 token 超时/
+             * 看门狗超时"时跳过 ~7s 端侧模型，直接 <=30 字短模板走 dispatch；
+             * 真正离线（uplink_down / 非 CONNECTED）保留下面的 local_lm。 */
+            {
+                bool voice_chan =
+                    (strcmp(msg->channel, AGENT_CHAN_VOICE) == 0);
+                bool offline = uplink_down
+                    || (network_get_state() != NET_STATE_CONNECTED);
+
+                if (voice_chan && !offline) {
+                    char* short_text = voice_f2_timeout_short_text(msg,
+                        (err == -ETIMEDOUT) ? "first-token timeout"
+                        : (timed_out ? "watchdog timeout"
+                                     : "cloud failure while online"));
+                    if (short_text != NULL) {
+                        final_text = short_text;
+                        s_answer_from_local = true;
+                        watchdog_fired = timed_out;
+                        break;
+                    }
+                }
+            }
+
+            /* LOCAL-FAST B-FIX（perf-fw 复核 P0）：
+             *   - control_intent：控制类消息即使云端失败也不交给端侧模型
+             *     （ai_lm 虚拟设备执行器会编造“已为您打开/已上锁”，真实硬件
+             *     无动作）；不生成动作确认，交给下面超时/错误兜底输出诚实提示。
+             *   - local_attempted：离线时上面的本地优先已经试过一次，这里
+             *     不再重复推理（复核 P0：离线最坏等待翻倍）。 */
+            if (control_intent) {
+                syslog(LOG_WARNING,
+                    "[%s] local-first: control intent -> skip on-device model "
+                    "in fallback (no virtual device action)\n", TAG);
+            }
+
+            if (!local_attempted && !control_intent && local_lm_available()) {
+#if VOICE_F2_TIMEOUT_SKIP_TFLM
+                /* VOICE-F2：只有"真正离线"的语音回合才保留端侧模型兜底
+                 * （联网超时已在上面短路成短模板）。 */
+                if (strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
+                    && (uplink_down
+                        || network_get_state() != NET_STATE_CONNECTED)) {
+                    syslog(LOG_INFO,
+                        "[%s] voice-f2: real offline (chan=%s) -> keep "
+                        "local_lm fallback\n", TAG, msg->channel);
+                }
+#endif
+                int64_t lm_t0 = agent_lat_mono_ms();
+                int lm_ret = local_lm_reply(msg->content, &local_text);
+
+                /* RCA-FIX-A F8：云端失败后回落端侧的耗时（本次 18:10 为 ~7s） */
+                syslog(LOG_INFO,
+                    "[%s] [lat] local_lm reply_fallback ms=%ld ret=%d\n",
+                    TAG, (long)(agent_lat_mono_ms() - lm_t0), lm_ret);
+                if (lm_ret == 0) {
+                    final_text = local_text;
+                    s_answer_from_local = true;   /* label the reply 本地 */
+                    break;
+                }
             }
 
             if (timed_out) {
@@ -2029,8 +2386,19 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 lvgl_ui_channel_stream_abort();
                 stream_ctx.started = false;
             }
+            /* VOICE-B：超时降级 -> 放弃流式首句，dispatch 播降级文案 */
+            if (stream_ctx.voice_started) {
+                voice_channel_stream_abort();
+                stream_ctx.voice_started = false;
+            }
 #endif
-            final_text = strdup(LLM_TIMEOUT_MSG);
+            /* VOICE-F2：语音回合看门狗超时不跑端侧模型 -> 短模板。 */
+            {
+                char* short_text = voice_f2_timeout_short_text(msg,
+                    "post-call watchdog");
+                final_text = (short_text != NULL) ? short_text
+                                                  : strdup(LLM_TIMEOUT_MSG);
+            }
             watchdog_fired = true;
             break;
         }
@@ -2076,6 +2444,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     lvgl_ui_channel_stream_abort();
                     stream_ctx.started = false;
                 }
+                /* VOICE-B：重试会换文本 -> 放弃流式首句，最终整段 TTS 兜底 */
+                if (stream_ctx.voice_started) {
+                    voice_channel_stream_abort();
+                    stream_ctx.voice_started = false;
+                }
 #endif
                 syslog(LOG_INFO,
                     "[%s] Cascade: cheap response inadequate, "
@@ -2112,7 +2485,12 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                             TAG, latency_ms);
                         free(fallback_text);
                         fallback_text = NULL;
-                        final_text = strdup(LLM_TIMEOUT_MSG);
+                        {
+                            char* short_text = voice_f2_timeout_short_text(msg,
+                                "cascade watchdog");
+                            final_text = (short_text != NULL)
+                                ? short_text : strdup(LLM_TIMEOUT_MSG);
+                        }
                         watchdog_fired = true;
                         agent_trace_step(&trace, iteration, NULL,
                             latency_ms, 0);
@@ -2151,6 +2529,13 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             if (stream_ctx.started) {
                 lvgl_ui_channel_stream_end(resp.text ? resp.text : "", false);
                 stream_ctx.started = false;
+            }
+            /* VOICE-B：最终回答收尾 —— flush 尾句并登记 takeover，随后
+             * outbound dispatch 的整段 speak_async 会被哈希匹配跳过，
+             * 因此不会重复播报已流式说过的句子。 */
+            if (stream_ctx.voice_started) {
+                voice_channel_stream_end(resp.text ? resp.text : "");
+                stream_ctx.voice_started = false;
             }
 #endif
             agent_trace_step(&trace, iteration, NULL, latency_ms, 1);
@@ -2278,8 +2663,17 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
 send_reply:
     /* Cache store: save simple query responses for future reuse.
-     * 键的构造与上面的 cache check 一致，必须带上人格。 */
-    if (final_text && msg->content
+     * 键的构造与上面的 cache check 一致，必须带上人格。
+     * LOCAL-FAST B-FIX（perf-fw 复核 P1）：本地回答（离线本地优先 / 断网
+     * 端侧兜底，s_answer_from_local=true）不写 LLM cache —— 否则网络恢复后
+     * 5 分钟内相同问题仍会命中低质量本地回答；时间类问题还会拿到陈旧时间。 */
+    if (final_text && s_answer_from_local
+        && complexity == LLM_COMPLEXITY_SIMPLE) {
+        /* 验收打点：本地回答不写 cache（网络恢复后不会命中低质量本地答案） */
+        syslog(LOG_INFO,
+            "[%s] local-first: skip LLM cache store (local answer)\n", TAG);
+    }
+    if (final_text && msg->content && !s_answer_from_local
         && complexity == LLM_COMPLEXITY_SIMPLE) {
         char cache_key[LLM_CACHE_KEY_LEN + 8];
 
@@ -2338,14 +2732,24 @@ static void inject_session_context(char* sys_prompt, size_t size,
         "block in your reply text.\n",
         channel, chat_id);
 
-    /* v114b5：语音通道强制短答（屏幕可显示全文，但只念前 60 字）。 */
+    /* v114b5 / P0-NET：语音通道强制短答。P0-NET 起收紧为 1–3 句、≤80 字
+     * （与 llm_proxy 语音 max_tokens 80 对齐；这段是固定串，利于前缀缓存命中）。 */
     if (strcmp(channel, AGENT_CHAN_VOICE) == 0) {
         size_t l2 = strlen(sys_prompt);
+#if VOICE_BREVITY_PROMPT
+        snprintf(sys_prompt + l2, size - l2,
+            "\nIMPORTANT: This reply is spoken aloud on a watch. "
+            "Answer in ONE TO THREE short sentences, at most 80 Chinese "
+            "characters in total. Give the conclusion first; no lists, no "
+            "markdown, no long explanations. If the full answer would be "
+            "longer, summarize it to fit.\n");
+#else
         snprintf(sys_prompt + l2, size - l2,
             "\nIMPORTANT: This reply is spoken aloud on a watch. "
             "Answer in ONE short paragraph of at most 90 Chinese characters. "
             "Be complete but concise; no lists, no markdown. If the full answer "
             "would be longer, summarize it to fit.\n");
+#endif
     }
 }
 
@@ -2401,11 +2805,65 @@ static void* agent_loop_task(void* arg)
     syslog(LOG_INFO, "[%s] Tools JSON loaded: %d bytes\n",
         TAG, tools_json ? (int)strlen(tools_json) : 0);
 
+    /* P0-NET：网络就绪时做一次保守预连接（只 TCP+TLS 握手，不发请求）。
+     * 不新增线程：复用本 agent 线程，在"还没有消息"的等待窗口里做；
+     * 成功后恢复无限等待；失败最多重试约 30s 后放弃（静默，不影响回合）。 */
+#if P0_NET_PRECONNECT
+    bool preconnect_done = false;
+    int preconnect_tries = 0;
+    int offline_polls = 0;   /* 无网时最多轮询 ~3 分钟，之后恢复无限等待 */
+#endif
+
     while (!agent_shutdown_requested()) {
         agent_msg_t msg;
-        int err = message_bus_pop_inbound(&msg, UINT32_MAX);
+        uint32_t pop_wait = UINT32_MAX;
+
+#if P0_NET_PRECONNECT
+        /* P0-NET（perf-fw 复核 #2）：断链/池失效后重置 preconnect_done，
+         * 下一次网络恢复时重建暖连接（vela_tls_pool_invalidate 也由网络
+         * 断链触发，池中连接会在下一次请求 acquire 时丢弃）。 */
+        if (network_get_state() != NET_STATE_CONNECTED && preconnect_done) {
+            preconnect_done = false;
+            preconnect_tries = 0;
+            offline_polls = 0;
+            syslog(LOG_INFO,
+                "[%s] [lat] preconnect reset (link down)\n", TAG);
+        }
+        if (!preconnect_done)
+            pop_wait = 1500;   /* 网络就绪前用短超时轮询，顺便做预连接 */
+#endif
+        int err = message_bus_pop_inbound(&msg, pop_wait);
 
         if (err != OK) {
+#if P0_NET_PRECONNECT
+            if (pop_wait != UINT32_MAX) {
+                if (network_get_state() != NET_STATE_CONNECTED) {
+                    /* 还没网：最多轮询 ~3 分钟（120×1.5s），之后不再为预连接
+                     * 唤醒；真到有网时首个请求走原有"连接+握手"路径。 */
+                    if (++offline_polls >= 120) {
+                        preconnect_done = true;
+                        syslog(LOG_INFO,
+                            "[%s] [lat] preconnect: still offline after %ds, "
+                            "give up\n", TAG, offline_polls * 1500 / 1000);
+                    }
+                } else {
+                    preconnect_tries++;
+                    int pr = llm_proxy_preconnect();
+
+                    syslog(LOG_INFO,
+                        "[%s] [lat] preconnect attempt=%d result=%d\n",
+                        TAG, preconnect_tries, pr);
+                    if (pr == OK || preconnect_tries >= 20) {
+                        if (pr != OK) {
+                            syslog(LOG_WARNING,
+                                "[%s] [lat] preconnect give up after %d tries\n",
+                                TAG, preconnect_tries);
+                        }
+                        preconnect_done = true;
+                    }
+                }
+            }
+#endif
             continue;
         }
 
@@ -2476,6 +2934,11 @@ static void* agent_loop_task(void* arg)
         struct timeval turn_t0;
         gettimeofday(&turn_t0, NULL);
         long gate_ms = (long)calc_elapsed_ms(&turn_gate_t0, &turn_t0);
+#if P0_NET_LAT
+        /* P0-NET：本轮起点记录建连序号；结束时若序号变化才算“本轮新建连接”，
+         * 否则一律标记 cache（conn/hs 记 0），避免把上一轮/预连接的耗时算进来。 */
+        uint64_t lat_conn_seq0 = vela_tls_conn_seq();
+#endif
         syslog(LOG_INFO, "[%s] [turn] chan=%s begin gate_ms=%ld\n",
             TAG, msg.channel, gate_ms);
 
@@ -2629,17 +3092,77 @@ static void* agent_loop_task(void* arg)
             TAG, msg.channel, llm_ms, s_turn_stream_first_ms,
             s_turn_stream_deltas);
 
+        /* P0-NET：LLM 阶段结束——按建连序号判断本轮是否真的新建了连接：
+         * 序号变化且 pool_hit=false → conn/hs 取本轮值；否则本轮回合是 cache
+         * （复用池连接/预连接），conn/hs 记 0。后面的 TTS 网络会覆盖 vela_tls
+         * 的 last timing，所以必须此时取。 */
+#if P0_NET_LAT
+        int64_t lat_conn_ms = 0;
+        int64_t lat_hs_ms = 0;
+        bool lat_new_conn = false;
+        if (vela_tls_conn_seq() != lat_conn_seq0) {
+            bool hit = true;
+
+            vela_tls_get_last_timing(&lat_conn_ms, &lat_hs_ms, &hit);
+            if (hit) {
+                lat_conn_ms = 0;
+                lat_hs_ms = 0;
+            } else {
+                lat_new_conn = true;
+            }
+        }
+        /* TTS 首块序号：dispatch 前抓一次，dispatch 后变化才算本轮 tts_first。 */
+        unsigned lat_tts_seq0 = 0;
+        voice_channel_get_last_tts_first_ms(NULL, &lat_tts_seq0);
+#endif
+
         syslog(LOG_INFO, "[%s] probe: dispatch_begin\n", TAG);
         dispatch_response(&msg, final_text);
         syslog(LOG_INFO, "[%s] probe: dispatch_end\n", TAG);
 
+#if P0_NET_LAT
+        /* P0-NET：本轮 TTS 首块延迟（voice_channel 的时间轴，单位 ms，-1=本轮
+         * 没走 TTS/没收到首块）。序号变化才取，避免拿到上一轮的旧值。 */
+        long lat_tts_first_ms = -1;
+        unsigned lat_tts_seq1 = 0;
+
+        voice_channel_get_last_tts_first_ms(&lat_tts_first_ms, &lat_tts_seq1);
+        if (lat_tts_seq1 == lat_tts_seq0)
+            lat_tts_first_ms = -1;
+        else if (lat_tts_first_ms < 0)
+            lat_tts_first_ms = -1;
+#endif
+
         struct timeval turn_end_t;
         gettimeofday(&turn_end_t, NULL);
         long dispatch_ms = (long)calc_elapsed_ms(&llm_done_t, &turn_end_t);
+        long total_ms = gate_ms + llm_ms + dispatch_ms;
+
         syslog(LOG_INFO,
             "[%s] [turn] chan=%s done llm_ms=%ld dispatch_ms=%ld total_ms=%ld\n",
-            TAG, msg.channel, llm_ms, dispatch_ms,
-            gate_ms + llm_ms + dispatch_ms);
+            TAG, msg.channel, llm_ms, dispatch_ms, total_ms);
+
+#if P0_NET_LAT
+        /* P0-NET：单轮 [lat] 聚合（分段口径，全部为**本轮局部值**）。
+         * conn/new|cache：conn_new 表示本轮真的建连（conn/hs 有效）；cache 表示
+         * 复用池连接/预连接（conn/hs 记 0）。
+         * tts_first_ms：来自 voice_channel 的 TTS 首块时间轴（相对 TTS 开始），
+         * 本轮序号变化才取，否则 -1（本轮没走 TTS/没收到首块）。 */
+        {
+            long gen_ms = (s_turn_stream_first_ms > 0
+                    && llm_ms >= s_turn_stream_first_ms)
+                ? llm_ms - s_turn_stream_first_ms : -1;
+
+            syslog(LOG_INFO,
+                "[%s] [lat] turn chan=%s conn=%s conn_ms=%lld "
+                "handshake_ms=%lld pool=%d ttft_ms=%ld gen_ms=%ld "
+                "tts_first_ms=%ld llm_ms=%ld dispatch_ms=%ld total_ms=%ld\n",
+                TAG, msg.channel, lat_new_conn ? "new" : "cache",
+                (long long)lat_conn_ms, (long long)lat_hs_ms,
+                lat_new_conn ? 0 : 1, s_turn_stream_first_ms, gen_ms,
+                lat_tts_first_ms, llm_ms, dispatch_ms, total_ms);
+        }
+#endif
 
         /* Free image_b64 if not already freed by vision path */
         free(msg.image_b64);
@@ -2664,6 +3187,17 @@ static void* agent_loop_task(void* arg)
 int agent_loop_init(void)
 {
     syslog(LOG_INFO, "[%s] Agent loop initialized\n", TAG);
+
+#if LOCAL_FIRST_WARMUP
+    /* LOCAL-FAST B（docs/108 §2.B）：在 ai_agent 主进程上下文预热端侧模型，
+     * 让"首次 fallback/弱网本地回答"不再付 ai_lm_init()+AllocateTensors 的
+     * 一次性时间。A 内部是一次性 detached 8KB 线程，失败自动忽略；这里
+     * 不等待、不新增常驻线程。必须在主进程上下文调用（不要挪到 NSH 短任务组，
+     * 否则线程会被任务组清理掉 —— demo_voice 踩过同类坑）。 */
+    local_lm_warmup_start();
+    syslog(LOG_INFO, "[%s] local-first: warmup requested\n", TAG);
+#endif
+
     return OK;
 }
 

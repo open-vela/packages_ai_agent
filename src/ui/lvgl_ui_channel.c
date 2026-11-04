@@ -1423,6 +1423,12 @@ static void wait_for_device(const char *path)
     syslog(LOG_WARNING, "[%s] %s never appeared\n", UI_TAG, path);
 }
 
+/* task-64：care 角标状态与 init/stop 清理前置声明（角标实现见 P2A 段落）。 */
+static lv_obj_t *s_care_badge;
+static lv_obj_t *s_care_badge_label;
+static lv_timer_t *s_care_badge_timer;
+static void care_badge_cleanup(void);
+
 int lvgl_ui_channel_init(void)
 {
     lv_nuttx_result_t result;
@@ -1430,6 +1436,17 @@ int lvgl_ui_channel_init(void)
 
     if (s_ui.initialized) {
         return 0;
+    }
+
+    /* task-64：badge 状态在 init 时兜底重置（正常 stop 已清理；这里防
+     * 异常路径留下悬挂指针，LVGL 重新 lv_init 后旧对象一律不可再用）。 */
+    if (s_care_badge != NULL || s_care_badge_label != NULL
+        || s_care_badge_timer != NULL) {
+        syslog(LOG_WARNING, "[%s] init: stale care badge state, reset\n",
+            UI_TAG);
+        s_care_badge = NULL;
+        s_care_badge_label = NULL;
+        s_care_badge_timer = NULL;
     }
 
     syslog(LOG_INFO, "[%s] init\n", UI_TAG);
@@ -1498,6 +1515,11 @@ void lvgl_ui_channel_stop(void)
     if (s_hist_store.dirty) {
         history_store_flush();
     }
+    /* task-64：清掉顶层 care 角标与 5s timer，避免 stop/restart 后悬挂对象
+     * 或 timer 回调访问已销毁的 LVGL 树。render 线程已 join，此处安全。 */
+    if (s_ui.initialized) {
+        care_badge_cleanup();
+    }
     s_ui.initialized = false;
 }
 
@@ -1553,6 +1575,142 @@ int lvgl_ui_channel_navigate_pet(void)
     }
 
     return (lvgl_ui_post(navigate_pet_async_cb, NULL) == 0) ? 0 : -ENOMEM;
+}
+
+/* ── P2A-感知增强（task-62）：主动关怀跨页角标 ──────────────────────
+ * 顶层(lv_layer_top)小角标：任何页面可见、**不切页**；5s 自动消失；
+ * 连续触发刷新文本并重新计时。线程安全：任意线程调用，经 lvgl_ui_post
+ * 在 render 线程创建/更新 LVGL 对象（LVGL 以 LV_OS_NONE 构建）。 */
+typedef struct {
+    char text[MSG_MAX_LEN];
+} care_badge_msg_t;
+
+/* task-64：init/stop 清理（调用时须保证 LVGL 渲染线程未在跑，例如 stop 的
+ * join 之后；正常自动消失走 care_badge_hide_cb）。 */
+static void care_badge_cleanup(void)
+{
+    if (s_care_badge_timer != NULL) {
+        lv_timer_delete(s_care_badge_timer);
+        s_care_badge_timer = NULL;
+    }
+    if (s_care_badge != NULL) {
+        lv_obj_delete(s_care_badge);
+        s_care_badge = NULL;
+        s_care_badge_label = NULL;
+    }
+    syslog(LOG_INFO, "[%s] care badge cleanup (init/stop)\n", UI_TAG);
+}
+
+static void care_badge_hide_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    s_care_badge_timer = NULL;   /* 回收由 lv_timer auto-delete 负责 */
+    if (s_care_badge != NULL) {
+        lv_obj_delete(s_care_badge);
+        s_care_badge = NULL;
+        s_care_badge_label = NULL;
+    }
+    syslog(LOG_INFO, "[%s] care badge auto-hide (30s)\n", UI_TAG);
+}
+
+static void care_badge_post_cb(void *data)
+{
+    care_badge_msg_t *m = (care_badge_msg_t *)data;
+    int W;
+    int bw;
+
+    if (m == NULL) {
+        return;
+    }
+    if (!s_ui.initialized) {
+        free(m);
+        return;
+    }
+
+    W = lv_display_get_horizontal_resolution(NULL);
+    bw = (W - 80 < 330) ? W - 80 : 330;
+    if (bw < 120) {
+        bw = 120;
+    }
+
+    if (s_care_badge == NULL) {
+        lv_obj_t *badge = lv_obj_create(lv_layer_top());
+        lv_obj_t *lbl;
+
+        lv_obj_set_size(badge, bw, LV_SIZE_CONTENT);
+        lv_obj_align(badge, LV_ALIGN_TOP_MID, 0, 34);
+        lv_obj_set_style_radius(badge, 12, 0);
+        lv_obj_set_style_bg_color(badge, lv_color_hex(CLR_PANEL), 0);
+        lv_obj_set_style_bg_opa(badge, LV_OPA_90, 0);
+        lv_obj_set_style_border_width(badge, 0, 0);
+        lv_obj_set_style_pad_all(badge, 8, 0);
+        lv_obj_set_style_shadow_width(badge, 8, 0);
+        lv_obj_set_style_shadow_opa(badge, LV_OPA_40, 0);
+        lv_obj_remove_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(badge, LV_OBJ_FLAG_CLICKABLE);
+
+        lbl = lv_label_create(badge);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lbl, bw - 16);
+        lv_obj_set_style_text_font(lbl, s_ui.font, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(CLR_TEXT), 0);
+
+        s_care_badge = badge;
+        s_care_badge_label = lbl;
+    }
+
+    lv_label_set_text(s_care_badge_label, m->text);
+
+    /* 刷新即重新计时：先删旧 timer（render 线程内安全）再建 5s 一次性 timer */
+    if (s_care_badge_timer != NULL) {
+        lv_timer_delete(s_care_badge_timer);
+        s_care_badge_timer = NULL;
+    }
+    s_care_badge_timer = lv_timer_create(care_badge_hide_cb, 30000, NULL);
+    if (s_care_badge_timer != NULL) {
+        /* LVGL timer 默认无限重复；必须显式 1 次，否则每 5s 重复 auto-hide。 */
+        lv_timer_set_repeat_count(s_care_badge_timer, 1);
+        lv_timer_set_auto_delete(s_care_badge_timer, true);
+    } else {
+        /* timer 创建失败不能留下永久角标：立即隐藏，保证"5s 消失"语义 */
+        syslog(LOG_WARNING,
+            "[%s] care badge: timer create failed, hide immediately\n", UI_TAG);
+        lv_obj_delete(s_care_badge);
+        s_care_badge = NULL;
+        s_care_badge_label = NULL;
+    }
+
+    syslog(LOG_INFO, "[%s] care badge: %s (top layer, auto-hide 30s)\n",
+        UI_TAG, m->text);
+    free(m);
+}
+
+int lvgl_ui_care_badge(const char *text)
+{
+    care_badge_msg_t *m;
+    int ret;
+
+    if (!text || text[0] == '\0') {
+        return -EINVAL;
+    }
+    if (!s_ui.initialized || !s_ui.running) {
+        syslog(LOG_WARNING, "[%s] care badge: channel not ready\n", UI_TAG);
+        return -EINVAL;
+    }
+
+    m = malloc(sizeof(*m));
+    if (!m) {
+        return -ENOMEM;
+    }
+    memset(m, 0, sizeof(*m));
+    strncpy(m->text, text, MSG_MAX_LEN - 1);
+
+    ret = lvgl_ui_post(care_badge_post_cb, m);
+    if (ret != 0) {
+        free(m);
+        return ret;
+    }
+    return 0;
 }
 
 /* Common first half of normal/silent sends.  One call queues one bubble and
@@ -1707,6 +1865,45 @@ int lvgl_ui_channel_log(const char *text, bool is_user)
     strncpy(payload->text, text, MSG_MAX_LEN - 1);
     payload->is_user = is_user;
     lvgl_ui_post(history_log_async_cb, payload);
+    return 0;
+}
+
+/* task-64：主动关怀历史（no-nav）。history_log_async_cb 会在表盘时
+ * ui_nav_goto(AI 页)，而关怀必须在表盘/任意页面保持当前页不变；这里只
+ * 写历史环 + 刷新历史浮层，不碰气泡/桌宠页/导航。 */
+static void care_history_log_async_cb(void *data)
+{
+    ui_msg_t *m = (ui_msg_t *)data;
+
+    if (s_ui.initialized) {
+        /* SPEED-B：流式 end 已落过的同一条最终回答不重复落历史 */
+        if (!stream_dedup_should_skip(m->text, false)) {
+            history_add(m->text, false);
+        }
+        if (s_ui.history_visible) {
+            history_rebuild_list();
+        }
+        syslog(LOG_INFO, "[%s] care history (no-nav): %s\n", UI_TAG, m->text);
+    }
+    free(m);
+}
+
+int lvgl_ui_care_history_log(const char *text)
+{
+    ui_msg_t *payload;
+
+    if (!text || text[0] == '\0' || !s_ui.initialized) {
+        return -EINVAL;
+    }
+
+    payload = malloc(sizeof(ui_msg_t));
+    if (!payload) {
+        return -ENOMEM;
+    }
+    memset(payload, 0, sizeof(*payload));
+    strncpy(payload->text, text, MSG_MAX_LEN - 1);
+    payload->is_user = false;
+    lvgl_ui_post(care_history_log_async_cb, payload);
     return 0;
 }
 

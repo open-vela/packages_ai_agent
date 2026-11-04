@@ -189,6 +189,31 @@ static pthread_mutex_t s_pool_lock = PTHREAD_MUTEX_INITIALIZER;
  * 小栈线程里跑 mbedtls_ssl_close_notify()/free()。 */
 static volatile bool s_pool_stale;
 
+/* ── P0-NET（2026-11-04）：连接/握手分段计时 + 保守预连接 ──
+ * 目标：让"连接暖"(TCP+TLS 已完成)在空闲时预先发生，弱网首包少付 1–3s；
+ * 只做 TCP+TLS 握手并放回连接池，**不发送任何 HTTP 请求**，因此不改变
+ * keep=false/截断/重试语义。失败静默；不新增线程（由既有线程空闲时调用）。
+ * 回滚：-DVELA_TLS_PRECONNECT=0（预连接失效，其余计时日志保留）。 */
+#ifndef VELA_TLS_PRECONNECT
+#define VELA_TLS_PRECONNECT 1
+#endif
+/* 预连接硬超时（毫秒）：握手在**不持 s_post_lock** 的情况下进行，socket 读/
+ * 写超时被压到剩余预算，mbedtls_ssl_handshake 循环里再查一次 deadline，
+ * 保证一次预连接最多阻塞约该时长，不会让首轮用户消息卡很久。 */
+#ifndef VELA_TLS_PRECONNECT_TIMEOUT_MS
+#define VELA_TLS_PRECONNECT_TIMEOUT_MS 2000
+#endif
+
+/* 最近一次“新建连接”的耗时（毫秒）与是否复用池连接；供 [lat] 聚合日志读取。 */
+static volatile int64_t s_last_conn_ms;
+static volatile int64_t s_last_handshake_ms;
+static volatile bool s_last_pool_hit;
+/* P0-NET：新建连接序号（每成功新建一条 +1）。agent_loop/llm_proxy 用它判断
+ * "本轮是否真的新建了连接"：序号不变 => 复用池连接，[lat] 里 conn/hs 记 0/cache。 */
+static volatile uint64_t s_conn_seq;
+/* 预连接专用硬截止（0=非预连接）；只在 tls_ctx_connect 里读取。 */
+static volatile int64_t s_preconnect_deadline_ms;
+
 /* 2026-11-01 v102b：串行化 HTTPS POST。
  * 真机复现：TTS 拉流（mimo POST）与 LLM 请求（同一 host、两个 TLS 连接）
  * 同时进行时，zblue 反复报 "Unable to allocate buffer within timeout"，
@@ -255,6 +280,7 @@ static conn_slot_t* pool_acquire(const char* host, const char* port)
                 return s;
             }
             s->in_use = true;
+            s_last_pool_hit = true;   /* P0-NET：本次请求复用池连接（无握手） */
             pthread_mutex_unlock(&s_pool_lock);
             return s;
         }
@@ -330,9 +356,32 @@ void vela_tls_pool_cleanup(void)
     pthread_mutex_unlock(&s_pool_lock);
 }
 
+/* P0-NET：读取最近一次连接分段耗时；pool_hit=true 表示该次复用了池连接
+ * （此时 conn_ms/handshake_ms 是更早一次新建连接的值，仅作参考）。 */
+void vela_tls_get_last_timing(int64_t* conn_ms, int64_t* handshake_ms,
+    bool* pool_hit)
+{
+    if (conn_ms != NULL)
+        *conn_ms = s_last_conn_ms;
+    if (handshake_ms != NULL)
+        *handshake_ms = s_last_handshake_ms;
+    if (pool_hit != NULL)
+        *pool_hit = s_last_pool_hit;
+}
+
+/* P0-NET：新建连接序号。调用方在动作前后各取一次，序号变化表示本轮真的
+ * 新建了连接（否则为复用池连接 cache）。 */
+uint64_t vela_tls_conn_seq(void)
+{
+    return s_conn_seq;
+}
+
 static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
 {
     int ret;
+    /* P0-NET：分段计时（TCP connect / TLS handshake），日志与 [lat] 聚合使用。 */
+    int64_t t_conn0 = tls_mono_ms();
+    int64_t t_hs0 = 0;
 
     mbedtls_ssl_init(&ctx->ssl);
     mbedtls_ssl_config_init(&ctx->cfg);
@@ -390,6 +439,8 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         }
     }
 
+    s_last_conn_ms = tls_mono_ms() - t_conn0;
+
     /* Force blocking mode and set socket-level read timeout.
      * This avoids using select()/poll() inside mbedtls_net_recv_timeout
      * which returns MBEDTLS_ERR_NET_POLL_FAILED (-0x0047) on NuttX/QEMU.
@@ -398,22 +449,40 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
      * can take over 60s for long responses. */
     mbedtls_net_set_block(&ctx->net);
     if (ctx->net.fd >= 0) {
+        if (s_preconnect_deadline_ms > 0) {
+            /* P0-NET 预连接：握手阶段的读写超时压到“剩余预算”，保证
+             * mbedtls_ssl_handshake 的一次阻塞 read 不会超过硬截止。 */
+            int64_t remain = s_preconnect_deadline_ms - tls_mono_ms();
+            struct timeval pv;
+
+            if (remain <= 0) {
+                syslog(LOG_INFO,
+                    "[%s] preconnect deadline hit before handshake\n", TAG);
+                return VELA_TLS_ERR_CONNECT;
+            }
+            pv.tv_sec = (time_t)(remain / 1000);
+            pv.tv_usec = (suseconds_t)((remain % 1000) * 1000);
+            setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &pv, sizeof(pv));
+            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &pv, sizeof(pv));
+        } else {
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
-        int read_timeout_sec = network_get_read_timeout();
-        struct timeval tv = { .tv_sec = read_timeout_sec, .tv_usec = 0 };
+            int read_timeout_sec = network_get_read_timeout();
+            struct timeval tv = { .tv_sec = read_timeout_sec, .tv_usec = 0 };
 #else
-        struct timeval tv = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
-            .tv_usec = 0 };
+            struct timeval tv = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
+                .tv_usec = 0 };
 #endif
-        setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
-        {
-            int timeout_sec = network_get_connect_timeout();
-            struct timeval ctv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-            setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
-        }
+            {
+                int timeout_sec = network_get_connect_timeout();
+                struct timeval ctv = { .tv_sec = timeout_sec, .tv_usec = 0 };
+                setsockopt(ctx->net.fd, SOL_SOCKET, SO_SNDTIMEO, &ctv,
+                    sizeof(ctv));
+            }
 #endif
+        }
     }
 
     /* SSL config: client, TLS, default ciphersuites */
@@ -474,7 +543,16 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         mbedtls_net_send, mbedtls_net_recv, NULL);
 
     /* Handshake */
+    t_hs0 = tls_mono_ms();
     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
+        if (s_preconnect_deadline_ms > 0
+            && tls_mono_ms() > s_preconnect_deadline_ms) {
+            /* P0-NET：预连接硬超时（握手被 socket 超时打断或本身太慢）。 */
+            syslog(LOG_INFO,
+                "[%s] preconnect handshake timeout (>%dms), giving up\n",
+                TAG, VELA_TLS_PRECONNECT_TIMEOUT_MS);
+            return VELA_TLS_ERR_HANDSHAKE;
+        }
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
 #if defined(MBEDTLS_ERROR_C)
             char err_buf[128];
@@ -491,10 +569,97 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         }
     }
 
+    s_last_handshake_ms = tls_mono_ms() - t_hs0;
+    s_last_pool_hit = false;
+    s_conn_seq++;   /* P0-NET：新建连接序号（[lat] 判断本轮是否真的建连） */
+    syslog(LOG_INFO,
+        "[lat] tls new_conn host=%s conn_ms=%ld handshake_ms=%ld ver=%s\n",
+        host, (long)s_last_conn_ms, (long)s_last_handshake_ms,
+        mbedtls_ssl_get_version(&ctx->ssl));
+
     syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
         mbedtls_ssl_get_ciphersuite(&ctx->ssl));
 
     return 0;
+}
+
+/* P0-NET：保守预连接（见文件上方开关说明）。
+ * 只做 TCP+TLS 握手并放回池，不发送 HTTP 请求；不新增线程，失败静默。
+ *
+ * ★ perf-fw 复核修正（构建前必改）：**握手期间不得持 s_post_lock**（否则会
+ *   阻塞 LLM/TTS POST）。流程改为：
+ *     1) trylock(s_post_lock) 探测 busy；忙 → 直接跳过（宁可不预连接）；
+ *     2) 在锁内 pool_acquire() 登记 in_use 槽（防止被其它请求复用/淘汰）；
+ *     3) **释放 s_post_lock**；
+ *     4) 做 TCP+TLS 握手，socket 读写超时压到剩余预算 + 握手循环查 deadline，
+ *        硬上限 VELA_TLS_PRECONNECT_TIMEOUT_MS（默认 2s）；
+ *     5) pool_release(keep=true) 放回（预置 reuses=-1，不消耗复用配额）。
+ *   TCP connect 本身仍在现有网络连接超时内（PAN 已连接时通常 <1s），
+ *   若仍超时由上层（agent_loop 只做一次/受限次数）兜底。 */
+int vela_tls_preconnect(const char* host, const char* port)
+{
+#if VELA_TLS_PRECONNECT
+    if (host == NULL || port == NULL || host[0] == '\0' || port[0] == '\0')
+        return -1;
+
+#ifdef CONFIG_AI_AGENT_NET_RPMSG
+    if (network_get_state() != NET_STATE_CONNECTED) {
+        syslog(LOG_DEBUG, "[%s] preconnect skipped: no uplink\n", TAG);
+        return -1;
+    }
+#endif
+
+    /* 1) 只短暂持 POST 锁：探测 busy + 登记 in_use 槽。 */
+    if (pthread_mutex_trylock(&s_post_lock) != 0) {
+        syslog(LOG_DEBUG, "[%s] preconnect skipped: POST busy\n", TAG);
+        return -1;
+    }
+
+    conn_slot_t* slot = pool_acquire(host, port);
+
+    if (slot == NULL) {
+        pthread_mutex_unlock(&s_post_lock);
+        return -1;
+    }
+
+    if (slot->valid && strcmp(slot->host, host) == 0
+        && strcmp(slot->port, port) == 0) {
+        /* 池里已有同一 host:port 的暖连接：直接放回。 */
+        pool_release(slot, host, port, true);
+        syslog(LOG_DEBUG, "[%s] preconnect: pool already warm %s:%s\n",
+            TAG, host, port);
+        pthread_mutex_unlock(&s_post_lock);
+        return 0;
+    }
+
+    /* 2) 槽已登记为 in_use：立即释放 POST 锁，握手期间不阻塞任何 POST。 */
+    pthread_mutex_unlock(&s_post_lock);
+
+    /* 3) 硬截止握手（socket 超时 + 握手循环 deadline 双重约束）。 */
+    s_preconnect_deadline_ms = tls_mono_ms() + VELA_TLS_PRECONNECT_TIMEOUT_MS;
+    int ret = tls_ctx_connect(&slot->ctx, host, port);
+    s_preconnect_deadline_ms = 0;
+
+    if (ret != 0) {
+        syslog(LOG_INFO, "[%s] preconnect %s:%s failed (silent, ret=%d)\n",
+            TAG, host, port, ret);
+        pool_release(slot, host, port, false);
+        return -1;
+    }
+
+    /* 4) 放回池：pool_release(keep=true) 写 host/port/valid 并 ++reuses；
+     *    预置 -1 使预连接本身不消耗"复用次数"配额。 */
+    slot->reuses = -1;
+    pool_release(slot, host, port, true);
+
+    syslog(LOG_INFO, "[lat] preconnect ok %s:%s conn_ms=%ld handshake_ms=%ld\n",
+        host, port, (long)s_last_conn_ms, (long)s_last_handshake_ms);
+    return 0;
+#else
+    (void)host;
+    (void)port;
+    return -1;
+#endif
 }
 
 /* ── HTTP/1.1 framing ────────────────────────────────────────── */
@@ -724,7 +889,15 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
         eof = 1;
     }
 
-    /* Keep reading body */
+    /* Keep reading body.
+     * v142 Fix1：旧代码对 0/PEER_CLOSE/任意 mbedtls 错误一律静默 break，
+     * 把"读到一半失败"伪装成正常结束（HTTP 200 + 半截 body）。现在区分：
+     *   peer_closed —— 对端关闭（body 收完整才算正常，否则 truncated）
+     *   read_err    —— 真正的读错误，记录错误码供取证
+     * 完整性在循环后用 Content-Length / chunked 终结符校验。 */
+    int read_err = 0;
+    int peer_closed = 0;
+
     if (!eof) {
         while (resp_pos < resp_cap - 1) {
             if (content_length >= 0 && (long)resp_pos >= content_length)
@@ -741,12 +914,76 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
                 if (chunked && chunked_end_seen(resp_buf, resp_pos))
                     break;
             } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                peer_closed = 1;
                 break;
             } else if (ret != MBEDTLS_ERR_SSL_WANT_READ) {
+                read_err = ret;
                 break;
             }
         }
     }
+
+    /* v142 Fix1：body 完整性校验。任何 framing 没读完都算 truncated：
+     *   - Content-Length：resp_pos < cl
+     *   - chunked：没看到 "0\r\n\r\n" 终结块
+     *   - 无 framing（HTTP/1.0 close-delimited）：EOF 之前出现读错误
+     * 返回 VELA_TLS_ERR_TRUNCATED 并 keep=false（不把带残留 body 的连接
+     * 放回池）；**不在这里重发 POST**（见 vela_tls.h 错误码注释）。 */
+    {
+        int truncated = 0;
+        /* 调用方缓冲（resp_cap）已满导致的截断不算网络截断：保持旧语义
+         *（有些调用方故意传小缓冲，只关心前 N 字节；若在这里报错会改变它们
+         * 的行为）。只记录一行便于发现"明明有更多数据却没读"的配置问题。 */
+        int capped = (resp_pos >= resp_cap - 1);
+
+        if (!capped) {
+            if (content_length >= 0 && (long)resp_pos < content_length)
+                truncated = 1;
+            else if (chunked && !chunked_end_seen(resp_buf, resp_pos))
+                truncated = 1;
+            else if (content_length < 0 && !chunked && read_err != 0)
+                truncated = 1;
+        } else if ((content_length >= 0 && (long)resp_pos < content_length)
+                   || (chunked && !chunked_end_seen(resp_buf, resp_pos))) {
+            syslog(LOG_INFO,
+                   "[%s] body capped by caller buffer (%u/%ld), keep old truncate semantics\n",
+                   TAG, (unsigned)resp_pos, content_length);
+        }
+
+        if (truncated) {
+            struct timespec t_end;
+            long ms;
+
+            clock_gettime(CLOCK_MONOTONIC, &t_end);
+            ms = (long)(t_end.tv_sec - t_start.tv_sec) * 1000L
+               + (t_end.tv_nsec - t_start.tv_nsec) / 1000000L;
+
+            if (read_err != 0) {
+                /* 单独一行 -0x%04x：真机排障直接 grep，可对上 mbedtls 手册 */
+                syslog(LOG_WARNING,
+                       "[%s] body read error -0x%04x at %u/%ld chunked=%d %ldms\n",
+                       TAG, -read_err, (unsigned)resp_pos, content_length,
+                       chunked, ms);
+            }
+            syslog(LOG_WARNING,
+                   "[%s] body TRUNCATED %s%u/%ld chunked=%d peer_closed=%d reads=%d %ldms status=%d\n",
+                   TAG, read_err != 0 ? "after-error " : "",
+                   (unsigned)resp_pos, content_length, chunked, peer_closed,
+                   read_calls, ms, http_status);
+
+            if (out_body_len)
+                *out_body_len = resp_pos;
+            if (out_keep_alive)
+                *out_keep_alive = false;   /* 连接不可复用，不放回池 */
+
+            tls_raw_release(raw);
+            return VELA_TLS_ERR_TRUNCATED;
+        }
+    }
+
+    /* 对端已关闭：即使 body 完整，也不能再放回连接池复用。 */
+    if (peer_closed && out_keep_alive)
+        *out_keep_alive = false;
 
     resp_buf[resp_pos] = '\0';
     tls_raw_release(raw);
@@ -913,7 +1150,72 @@ static bool tls_stream_link_down(void)
 #endif
 }
 
-/* 流式期间把单次读超时压短（死链更快失败），结束后恢复原值。 */
+/* ── VOICE-A（2026-11-04）：流式读超时按"距整体 deadline 的剩余时间"收紧 ──
+ * 旧实现只在两次 read 之间检查 deadline，body 阶段的 SO_RCVTIMEO 固定 20s
+ * （响应头阶段用 connect 时设的 60s）——服务端一个字节都不发时，一次阻塞
+ * read 就能越过 deadline（语音 8s 首 token 超时会被拖到 ~20/60s）。
+ *
+ * 新实现（默认开启，可编译开关回滚）：
+ *   - 响应头阶段：单次读超时 = min(连接时超时, 剩余 deadline)
+ *     （非语音 LLM 90s > 60s、TTS 30s：行为与原一致或更早失败，不超过整体 deadline）
+ *   - body 阶段：单次读超时 = min(TLS_STREAM_IDLE_TIMEOUT_SEC(20s), 剩余 deadline)
+ *     （90s/30s 总预算的既有调用方仍是原来的 20s 空闲超时，行为不变；
+ *       语音 8s 总预算 => 每次读最多 8s，第一次 read 就能在 deadline 内失败）
+ *   - 函数返回前恢复连接原超时值，避免影响池化复用的后续请求。
+ * 回滚：-DVELA_TLS_STREAM_DEADLINE_READ_TIMEOUT=0（恢复旧的固定超时行为）。 */
+#ifndef VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+#define VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT 1
+#endif
+
+#if VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+/* 读取连接当前 SO_RCVTIMEO（毫秒）；0 表示无限/读失败。 */
+static int64_t tls_stream_sock_timeout_ms(tls_ctx_t* ctx, struct timeval* old)
+{
+    socklen_t olen = sizeof(*old);
+
+    memset(old, 0, sizeof(*old));
+    if (ctx->net.fd < 0)
+        return 0;
+    if (getsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, old, &olen) != 0)
+        return 0;
+    if (old->tv_sec <= 0 && old->tv_usec <= 0)
+        return 0;
+    return (int64_t)old->tv_sec * 1000 + old->tv_usec / 1000;
+}
+
+static void tls_stream_restore_sock_timeout(tls_ctx_t* ctx,
+    const struct timeval* old)
+{
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
+
+    if (ctx->net.fd < 0)
+        return;
+    if (old->tv_sec > 0 || old->tv_usec > 0)
+        tv = *old;
+    /* old 为 0 = 原值是无限等待；显式写回 0，别让收紧后的值泄漏到池化连接。 */
+    setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+/* 设置下一次 read 的超时：min(cap_ms, 距整体 deadline 的剩余)。
+ * 返回 0 成功；-1 表示 deadline 已到（调用方按 -ETIMEDOUT 处理）。 */
+static int tls_stream_arm_read_timeout(tls_ctx_t* ctx, int64_t deadline_ms,
+    int64_t cap_ms)
+{
+    int64_t remain = deadline_ms - tls_mono_ms();
+    struct timeval tv;
+
+    if (remain <= 0)
+        return -1;
+    if (cap_ms > 0 && remain > cap_ms)
+        remain = cap_ms;
+
+    tv.tv_sec = (time_t)(remain / 1000);
+    tv.tv_usec = (suseconds_t)((remain % 1000) * 1000);
+    if (ctx->net.fd >= 0)
+        setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return 0;
+}
+#else /* 旧行为：body 阶段固定 20s 读超时 */
 static void tls_stream_timeout_push(tls_ctx_t* ctx, struct timeval* old)
 {
     struct timeval tv = { .tv_sec = TLS_STREAM_IDLE_TIMEOUT_SEC,
@@ -933,15 +1235,67 @@ static void tls_stream_timeout_pop(tls_ctx_t* ctx, const struct timeval* old)
         return;
     setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO, old, sizeof(*old));
 }
+#endif /* VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT */
 
 /**
  * 流式读 HTTP/1.1 响应：只收头 + 增量转发 body。
  * 返回：成功时 HTTP 状态码（>0）；失败返回负 VELA_TLS_ERR_* / -EIO / -ETIMEDOUT。
  * out_keep_alive：连接是否可放回池（body 完整读完才 true）。
  */
+/* RCA-FIX-A（audio_rca2 F1）：首字节前把有效 deadline 收紧到
+ * first_body_deadline_ms（绝对单调时刻，0=不启用）。首个 body 字节到达后恢复
+ * 只看整体 deadline。 */
+static int64_t tls_stream_effective_deadline(int64_t deadline_ms,
+    int64_t first_body_deadline_ms, bool first_body_seen)
+{
+    if (!first_body_seen && first_body_deadline_ms > 0
+        && first_body_deadline_ms < deadline_ms)
+        return first_body_deadline_ms;
+    return deadline_ms;
+}
+
+/* RCA-FIX-A F8：记录首个 body 字节到达时刻（只有第一次有效）。 */
+static void tls_log_first_byte(bool* seen, int64_t t_start_ms, size_t bytes)
+{
+    if (*seen)
+        return;
+    *seen = true;
+    syslog(LOG_INFO, "[%s] [lat] http first_byte_ms=%ld bytes=%zu\n",
+        TAG, (long)(tls_mono_ms() - t_start_ms), bytes);
+}
+
+/* RCA-FIX-A：流式读失败归类。
+ *   首个 body 字节前到达 first_body deadline → -ETIMEDOUT（主动首 token 超时）；
+ *   否则按原整体 deadline/READ 错误语义。 */
+static int tls_stream_read_error(int mbedtls_ret, int64_t t_start_ms,
+    int64_t deadline_ms, int64_t first_body_deadline_ms, bool first_body_seen)
+{
+    int64_t now = tls_mono_ms();
+
+    if (!first_body_seen && first_body_deadline_ms > 0
+        && now >= first_body_deadline_ms) {
+        syslog(LOG_WARNING,
+            "[%s] [lat] stream first_body deadline hit after %ldms "
+            "(read err -0x%04x)\n",
+            TAG, (long)(now - t_start_ms), -mbedtls_ret);
+        return -ETIMEDOUT;
+    }
+    if (now >= deadline_ms) {
+        syslog(LOG_WARNING,
+            "[%s] stream read deadline hit after %ldms (-0x%04x)\n",
+            TAG, (long)(now - t_start_ms), -mbedtls_ret);
+        return -ETIMEDOUT;
+    }
+    syslog(LOG_WARNING,
+        "[%s] stream body read error -0x%04x after %ldms\n",
+        TAG, -mbedtls_ret, (long)(now - t_start_ms));
+    return VELA_TLS_ERR_READ;
+}
+
 static int tls_read_response_stream(tls_ctx_t* ctx,
     vela_http_stream_cb_t cb, void* arg,
-    size_t* out_body_len, bool* out_keep_alive, int64_t deadline_ms)
+    size_t* out_body_len, bool* out_keep_alive, int64_t deadline_ms,
+    int64_t first_body_deadline_ms)
 {
     char* raw = tls_raw_acquire();
     size_t raw_len = 0;
@@ -951,21 +1305,51 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
     int stop = 0;
     bool ok = false;
     bool keep = false;
+    bool first_body_seen = false;
     long content_length = -1;
     int chunked = 0;
+    int64_t t_start_ms = tls_mono_ms();
     char buf[TLS_STREAM_CHUNK_BUF];
+#if !VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
     struct timeval old_tv;
     bool timeout_pushed = false;
+#endif
+#if VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+    struct timeval orig_tv;
+    int64_t orig_timeout_ms = 0;
+
+    /* VOICE-A：保存连接原 SO_RCVTIMEO，函数返回前恢复（池化连接不能被改短）。 */
+    orig_timeout_ms = tls_stream_sock_timeout_ms(ctx, &orig_tv);
+    if (orig_timeout_ms <= 0)
+        orig_timeout_ms = (int64_t)AGENT_LLM_SOCKET_TIMEOUT_SEC * 1000;
+#endif
     chunk_stream_t cs;
 
     /* ── 1. 读响应头（到 \r\n\r\n）── */
     for (;;) {
         int r;
+        int64_t eff_deadline = tls_stream_effective_deadline(deadline_ms,
+            first_body_deadline_ms, first_body_seen);
 
-        if (tls_mono_ms() > deadline_ms) {
+        if (tls_mono_ms() > eff_deadline) {
+            if (eff_deadline != deadline_ms) {
+                syslog(LOG_WARNING,
+                    "[%s] [lat] stream first_body deadline hit after %ldms "
+                    "(headers not complete)\n",
+                    TAG, (long)(tls_mono_ms() - t_start_ms));
+            }
             err = -ETIMEDOUT;
             goto out;
         }
+#if VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+        /* 响应头阶段也要被整体/首字节 deadline 约束（否则一次 60s 阻塞
+         * read 会把语音 8s 首 token 超时拖过 deadline）。 */
+        if (tls_stream_arm_read_timeout(ctx, eff_deadline,
+                orig_timeout_ms) != 0) {
+            err = -ETIMEDOUT;
+            goto out;
+        }
+#endif
         if (tls_stream_link_down()) {
             err = VELA_TLS_ERR_READ;
             goto out;
@@ -1037,14 +1421,19 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
     }
 
     /* ── 2. body：先处理响应头里已经带出来的首段，再续读 ── */
+#if !VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
     tls_stream_timeout_push(ctx, &old_tv);
     timeout_pushed = true;
+#endif
 
     memset(&cs, 0, sizeof(cs));
     cs.state = CHUNK_ST_SIZE;
 
     {
         size_t init = (size_t)(raw + raw_len - body_start);
+
+        if (init > 0)
+            tls_log_first_byte(&first_body_seen, t_start_ms, init);
 
         if (chunked) {
             int fret = chunk_stream_feed(&cs, cb, arg, body_start, init,
@@ -1061,7 +1450,16 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
             for (;;) {
                 int r;
 
-                if (tls_mono_ms() > deadline_ms) {
+                int64_t eff_deadline = tls_stream_effective_deadline(
+                    deadline_ms, first_body_deadline_ms, first_body_seen);
+
+                if (tls_mono_ms() > eff_deadline) {
+                    if (eff_deadline != deadline_ms) {
+                        syslog(LOG_WARNING,
+                            "[%s] [lat] stream first_body deadline hit after "
+                            "%ldms\n", TAG,
+                            (long)(tls_mono_ms() - t_start_ms));
+                    }
                     err = -ETIMEDOUT;
                     goto out;
                 }
@@ -1069,6 +1467,13 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
                     err = VELA_TLS_ERR_READ;
                     goto out;
                 }
+#if VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+                if (tls_stream_arm_read_timeout(ctx, eff_deadline,
+                        (int64_t)TLS_STREAM_IDLE_TIMEOUT_SEC * 1000) != 0) {
+                    err = -ETIMEDOUT;
+                    goto out;
+                }
+#endif
                 if (stop) {
                     /* 调用方已拿到想要的（如 [DONE]）：提前结束。
                      * 剩余帧没读，连接不能复用。 */
@@ -1079,6 +1484,7 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
                 r = mbedtls_ssl_read(&ctx->ssl, (unsigned char*)buf,
                     sizeof(buf));
                 if (r > 0) {
+                    tls_log_first_byte(&first_body_seen, t_start_ms, (size_t)r);
                     fret = chunk_stream_feed(&cs, cb, arg, buf, (size_t)r,
                         &payload, &stop);
                     if (fret < 0) {
@@ -1089,12 +1495,16 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
                         ok = true;
                         goto out;
                     }
-                } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                } else if (r == 0
+                           || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
                     /* 末尾 chunk 之前就 EOF = 响应被截断 */
                     err = VELA_TLS_ERR_READ;
                     goto out;
                 } else if (r != MBEDTLS_ERR_SSL_WANT_READ) {
-                    err = VELA_TLS_ERR_READ;
+                    /* RCA-FIX-A：首字节 deadline 到点 -> -ETIMEDOUT；
+                     * 否则沿用原整体 deadline / READ 错误语义。 */
+                    err = tls_stream_read_error(r, t_start_ms, deadline_ms,
+                        first_body_deadline_ms, first_body_seen);
                     goto out;
                 }
             }
@@ -1116,7 +1526,16 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
             while (!stop && need > 0) {
                 int r;
 
-                if (tls_mono_ms() > deadline_ms) {
+                int64_t eff_deadline = tls_stream_effective_deadline(
+                    deadline_ms, first_body_deadline_ms, first_body_seen);
+
+                if (tls_mono_ms() > eff_deadline) {
+                    if (eff_deadline != deadline_ms) {
+                        syslog(LOG_WARNING,
+                            "[%s] [lat] stream first_body deadline hit after "
+                            "%ldms\n", TAG,
+                            (long)(tls_mono_ms() - t_start_ms));
+                    }
                     err = -ETIMEDOUT;
                     goto out;
                 }
@@ -1124,10 +1543,19 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
                     err = VELA_TLS_ERR_READ;
                     goto out;
                 }
+#if VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+                if (tls_stream_arm_read_timeout(ctx, eff_deadline,
+                        (int64_t)TLS_STREAM_IDLE_TIMEOUT_SEC * 1000) != 0) {
+                    err = -ETIMEDOUT;
+                    goto out;
+                }
+#endif
                 r = mbedtls_ssl_read(&ctx->ssl, (unsigned char*)buf,
                     sizeof(buf));
                 if (r > 0) {
                     size_t n = (size_t)r;
+
+                    tls_log_first_byte(&first_body_seen, t_start_ms, n);
                     int cbr;
 
                     if (n > need)
@@ -1141,10 +1569,14 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
                         stop = 1;
                     payload += n;
                     need -= n;
-                } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                } else if (r == 0
+                           || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
                     break;
                 } else if (r != MBEDTLS_ERR_SSL_WANT_READ) {
-                    err = VELA_TLS_ERR_READ;
+                    /* RCA-FIX-A：首字节 deadline 到点 -> -ETIMEDOUT；
+                     * 否则沿用原整体 deadline / READ 错误语义。 */
+                    err = tls_stream_read_error(r, t_start_ms, deadline_ms,
+                        first_body_deadline_ms, first_body_seen);
                     goto out;
                 }
             }
@@ -1172,7 +1604,16 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
             while (!stop) {
                 int r;
 
-                if (tls_mono_ms() > deadline_ms) {
+                int64_t eff_deadline = tls_stream_effective_deadline(
+                    deadline_ms, first_body_deadline_ms, first_body_seen);
+
+                if (tls_mono_ms() > eff_deadline) {
+                    if (eff_deadline != deadline_ms) {
+                        syslog(LOG_WARNING,
+                            "[%s] [lat] stream first_body deadline hit after "
+                            "%ldms\n", TAG,
+                            (long)(tls_mono_ms() - t_start_ms));
+                    }
                     err = -ETIMEDOUT;
                     goto out;
                 }
@@ -1180,10 +1621,19 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
                     err = VELA_TLS_ERR_READ;
                     goto out;
                 }
+#if VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+                if (tls_stream_arm_read_timeout(ctx, eff_deadline,
+                        (int64_t)TLS_STREAM_IDLE_TIMEOUT_SEC * 1000) != 0) {
+                    err = -ETIMEDOUT;
+                    goto out;
+                }
+#endif
                 r = mbedtls_ssl_read(&ctx->ssl, (unsigned char*)buf,
                     sizeof(buf));
                 if (r > 0) {
                     int cbr = cb(buf, (size_t)r, arg);
+
+                    tls_log_first_byte(&first_body_seen, t_start_ms, (size_t)r);
                     if (cbr < 0) {
                         err = cbr;
                         goto out;
@@ -1191,10 +1641,14 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
                     payload += (size_t)r;
                     if (cbr > 0)
                         stop = 1;
-                } else if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                } else if (r == 0
+                           || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
                     break;
                 } else if (r != MBEDTLS_ERR_SSL_WANT_READ) {
-                    err = VELA_TLS_ERR_READ;
+                    /* RCA-FIX-A：首字节 deadline 到点 -> -ETIMEDOUT；
+                     * 否则沿用原整体 deadline / READ 错误语义。 */
+                    err = tls_stream_read_error(r, t_start_ms, deadline_ms,
+                        first_body_deadline_ms, first_body_seen);
                     goto out;
                 }
             }
@@ -1205,8 +1659,13 @@ static int tls_read_response_stream(tls_ctx_t* ctx,
     }
 
 out:
+#if VELA_TLS_STREAM_DEADLINE_READ_TIMEOUT
+    /* VOICE-A：恢复连接原始读超时，避免收紧后的值泄漏到池化复用的下一请求。 */
+    tls_stream_restore_sock_timeout(ctx, &orig_tv);
+#else
     if (timeout_pushed)
         tls_stream_timeout_pop(ctx, &old_tv);
+#endif
     tls_raw_release(raw);
     if (out_body_len)
         *out_body_len = payload;
@@ -1215,6 +1674,17 @@ out:
     if (err != 0)
         return err;
     return ok ? http_status : VELA_TLS_ERR_READ;
+}
+
+/* RCA-FIX-A F8：请求 body 全部写完的时刻（相对本次流式请求开始）。
+ * 在 BT PAN 上 TLS 写完成时间可反推 HCI ACL TX 背压（zblue 的
+ * "Unable to allocate buffer within timeout" 无法在本层计数，见报告说明）。 */
+static void tls_log_request_sent(const char* host, const char* path,
+    size_t body_len, int64_t t_start_ms)
+{
+    syslog(LOG_INFO,
+        "[%s] [lat] http request_sent host=%s path=%s body=%zu sent_ms=%ld\n",
+        TAG, host, path, body_len, (long)(tls_mono_ms() - t_start_ms));
 }
 
 /* 一次完整的"流式 HTTPS 请求"（连接/握手失败时由公开 wrapper 重试一次，
@@ -1229,9 +1699,11 @@ static int vela_https_request_stream_once(
     vela_http_stream_cb_t cb,
     void* cb_arg,
     int64_t deadline_ms,
+    int64_t first_body_deadline_ms,
     size_t* out_body_len)
 {
     int ret;
+    int64_t t_start_ms = tls_mono_ms();
     conn_slot_t* slot = pool_acquire(host, port);
 
     if (slot && slot->valid) {
@@ -1261,8 +1733,9 @@ static int vela_https_request_stream_once(
         if (ret == 0) {
             bool keep = false;
 
+            tls_log_request_sent(host, path, body_len, t_start_ms);
             ret = tls_read_response_stream(&slot->ctx, cb, cb_arg,
-                out_body_len, &keep, deadline_ms);
+                out_body_len, &keep, deadline_ms, first_body_deadline_ms);
             pool_release(slot, host, port, ret > 0 && keep);
             return ret;
         }
@@ -1289,8 +1762,9 @@ static int vela_https_request_stream_once(
             tls_ctx_free(&tmp_ctx);
             return ret;
         }
+        tls_log_request_sent(host, path, body_len, t_start_ms);
         ret = tls_read_response_stream(&tmp_ctx, cb, cb_arg, out_body_len,
-            NULL, deadline_ms);
+            NULL, deadline_ms, first_body_deadline_ms);
         tls_ctx_free(&tmp_ctx);
         return ret;
     }
@@ -1308,9 +1782,11 @@ static int vela_https_request_stream_once(
         return ret;
     }
 
+    tls_log_request_sent(host, path, body_len, t_start_ms);
+
     bool keep = false;
     ret = tls_read_response_stream(&slot->ctx, cb, cb_arg, out_body_len,
-        &keep, deadline_ms);
+        &keep, deadline_ms, first_body_deadline_ms);
     pool_release(slot, host, port, ret > 0 && keep);
     return ret;
 }
@@ -1370,6 +1846,17 @@ static int vela_https_request_once(
             ret = tls_read_response(&slot->ctx, resp_buf, resp_cap, out_body_len, &keep);
             if (ret > 0) {
                 pool_release(slot, host, port, keep);
+                return ret;
+            }
+            if (ret == VELA_TLS_ERR_TRUNCATED) {
+                /* v142 Fix1：请求**已经发出**、body 半截 —— 不能再走下面
+                 * 的 "reconnect + 重发" 分支（POST 有副作用：LLM 会重复
+                 * 计费、TTS 会重复生成）。丢弃连接，是否重试交给调用方
+                 * （MiMo TTS 在 mimo_tts.c 里显式重试一次）。 */
+                syslog(LOG_WARNING,
+                    "[%s] %s %s truncated body: drop conn, no auto retry\n",
+                    TAG, method, host);
+                pool_release(slot, host, port, false);
                 return ret;
             }
         }
@@ -1515,10 +2002,13 @@ int vela_https_post_json(const char* host, const char* port, const char* path,
 }
 
 
-int vela_https_post_json_stream(const char* host, const char* port,
+/* RCA-FIX-A：流式 POST 实现；old API 传 first_body_timeout_ms=0 完全等价旧行为。
+ * first_body_timeout_ms>0 时，在**首个 body 字节前**把读超时压到该预算，
+ * 服务端完全静默也会在 ~8-9s 返回 -ETIMEDOUT（主动首 token deadline）。 */
+static int vela_https_post_json_stream_impl(const char* host, const char* port,
     const char* path, const vela_header_t* extra_headers,
     const char* json_body, vela_http_stream_cb_t cb, void* cb_arg,
-    uint32_t timeout_ms)
+    uint32_t timeout_ms, uint32_t first_body_timeout_ms)
 {
     /* Build a merged header list: Content-Type first, then caller extras
      * (与 vela_https_post_json 完全一致的请求头构造)。 */
@@ -1528,6 +2018,7 @@ int vela_https_post_json_stream(const char* host, const char* port,
     size_t body_len;
     int64_t t_start;
     int64_t deadline_ms;
+    int64_t first_body_deadline_ms = 0;
     int ret;
 
     if (!cb)
@@ -1549,6 +2040,8 @@ int vela_https_post_json_stream(const char* host, const char* port,
                                           ? timeout_ms
                                           : (uint32_t)AGENT_LLM_TIMEOUT_SEC
                                               * 1000U);
+    if (first_body_timeout_ms > 0)
+        first_body_deadline_ms = t_start + (int64_t)first_body_timeout_ms;
 
     /* 2026-11-01 v102b：与 TTS/其它 POST 串行化。整个流期间持锁
      * （见 s_post_lock 定义处注释）。 */
@@ -1559,7 +2052,8 @@ int vela_https_post_json_stream(const char* host, const char* port,
     }
 
     ret = vela_https_request_stream_once(host, port, path, merged,
-        json_body, body_len, cb, cb_arg, deadline_ms, NULL);
+        json_body, body_len, cb, cb_arg, deadline_ms,
+        first_body_deadline_ms, NULL);
 
     /* 连接/握手快速失败重试 1 次（请求还没写出去，POST 重发无副作用；
      * 与 vela_https_request() 的策略/门槛完全一致）。 */
@@ -1569,17 +2063,40 @@ int vela_https_post_json_stream(const char* host, const char* port,
             "[%s] (stream) POST %s connect/handshake failed (%d) after %ldms, retry once\n",
             TAG, host, ret, (long)(tls_mono_ms() - t_start));
         usleep(300 * 1000);
+        /* 重试是新的发送尝试：deadline/首字节预算都从重试时刻重新计。 */
         deadline_ms = tls_mono_ms()
             + (int64_t)(timeout_ms > 0 ? timeout_ms
                                        : (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000U);
+        if (first_body_timeout_ms > 0)
+            first_body_deadline_ms = tls_mono_ms()
+                + (int64_t)first_body_timeout_ms;
         ret = vela_https_request_stream_once(host, port, path, merged,
-            json_body, body_len, cb, cb_arg, deadline_ms, NULL);
+            json_body, body_len, cb, cb_arg, deadline_ms,
+            first_body_deadline_ms, NULL);
         syslog(LOG_INFO, "[%s] (stream) retry %s (ret=%d)\n", TAG,
             ret > 0 ? "OK" : "failed", ret);
     }
 
     pthread_mutex_unlock(&s_post_lock);
     return ret;
+}
+
+int vela_https_post_json_stream(const char* host, const char* port,
+    const char* path, const vela_header_t* extra_headers,
+    const char* json_body, vela_http_stream_cb_t cb, void* cb_arg,
+    uint32_t timeout_ms)
+{
+    return vela_https_post_json_stream_impl(host, port, path, extra_headers,
+        json_body, cb, cb_arg, timeout_ms, 0);
+}
+
+int vela_https_post_json_stream_ex(const char* host, const char* port,
+    const char* path, const vela_header_t* extra_headers,
+    const char* json_body, vela_http_stream_cb_t cb, void* cb_arg,
+    uint32_t timeout_ms, uint32_t first_body_timeout_ms)
+{
+    return vela_https_post_json_stream_impl(host, port, path, extra_headers,
+        json_body, cb, cb_arg, timeout_ms, first_body_timeout_ms);
 }
 
 int vela_https_head_date(const char* host, const char* port, const char* path,

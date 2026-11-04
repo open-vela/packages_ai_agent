@@ -77,6 +77,22 @@ static void pcm_delay_ms(unsigned ms)
     nanosleep(&ts, NULL);
 }
 
+/* AUDIO-FIX：pthread_cond_timedwait 统一用 CLOCK_MONOTONIC 算 abstime。
+ * 旧代码用 CLOCK_REALTIME：BLE/RTC 对时跳变时，一次 20ms 的条件等待会被
+ * 放大成分钟/小时级 —— worker 看起来"卡死"（stop 超时报 worker still
+ * running，随后泄漏/后续 TTS reap=0 的触发条件之一）。
+ * 条件变量在 media_player_open() 里用 condattr_setclock(MONOTONIC) 初始化。 */
+static void pcm_cond_deadline(struct timespec* ts, unsigned ms)
+{
+    clock_gettime(CLOCK_MONOTONIC, ts);
+    ts->tv_nsec += (long)ms * 1000000L;
+    while (ts->tv_nsec >= 1000000000L)
+    {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
 #  define PCM_DEV_DEFAULT "/dev/audio/pcm0p"
 #  define PCM_OUT_RATE    16000
 /* v114b13：TTS 语速提升 10%（用户反馈"说话速度太慢"）。
@@ -129,7 +145,36 @@ struct pcm_media_s
     unsigned long wait_ms_total;  /* write_data 背压总等待毫秒 */
     unsigned long reap_empty;     /* 没有可回收 DEQUEUE 的次数 */
     char     dev[64];
+
+    /* 2026-11-04 v142k AUDIO-FIX（TTS 欠载/APB 不回收）：
+     * worker join 超时后**禁止 free**（UAF 会污染后续播放的 fd/mq/audio 状态）：
+     *   leaked=1        -> player 已登记到 g_leaked，close 只 defer，不释放；
+     *   mq_msgs         -> mq 收到消息总数（诊断 deq=0：是否根本没收到 DEQUEUE）；
+     *   stop_timeouts   -> stop 等 worker 超时次数（软重启后异常的可观测判据）。 */
+    int      leaked;
+    volatile int stop_done;       /* P2：本 player 已完成一次 stop（重复调用直接返回） */
+    volatile int worker_done;     /* worker 真正退出（置位后才可 join+free） */
+    unsigned long mq_msgs;
+    unsigned long stop_timeouts;
+    /* AUDIO-FIX F4（perf-fw RCA §4）：stop 串行化。
+     * PTT 打断（audio_playback_stop）与 speak 线程 close 会对同一 player
+     * 并发调 media_player_stop → 双等待/双 join（UB）/标志撕裂。 */
+    pthread_mutex_t stop_lock;
 };
+
+/* ── AUDIO-FIX：泄漏 player 回收表（纯 RAM，无新线程）─────────────────
+ * stop 超时后 worker 可能仍活着，直接 free p/fd/mq → UAF（后续 TTS reap=0）。
+ * 这里只挂指针、保留全部资源；等 worker 自己退出（running==0）后，由下一次
+ * media_player_open() 在既有调用线程里 join+free（上限 2，O(2) 无阻塞）。
+ * 若 worker 永不退出，保持泄漏到重启（远好于 UAF/死机）。 */
+#define PCM_MAX_LEAKED 2
+static struct pcm_media_s* g_leaked[PCM_MAX_LEAKED];
+static int g_nleaked;
+static pthread_mutex_t g_leak_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void pcm_free_player(struct pcm_media_s* p);
+static void pcm_leak_register(struct pcm_media_s* p);
+static void pcm_reclaim_leaked(void);
 
 static void pcm_ring_push(struct pcm_media_s* p, const unsigned char* src,
     size_t len)
@@ -220,6 +265,7 @@ static void pcm_reap(struct pcm_media_s* p)
         clock_gettime(CLOCK_REALTIME, &ts);
         if (mq_timedreceive(p->mq, (char*)&msg, sizeof(msg), NULL, &ts) <= 0)
             return;
+        p->mq_msgs++;
         if (msg.msg_id == AUDIO_MSG_DEQUEUE && msg.u.ptr != NULL)
         {
             /* 2026-11-01: upper 的 DEQUEUE 是"广播"给所有注册客户端，
@@ -257,9 +303,8 @@ static void* pcm_worker(void* arg)
         while (p->running && p->rbytes < 4096 && !p->draining)
         {
             struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 20 * 1000 * 1000;
-            if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+
+            pcm_cond_deadline(&ts, 20);
             pthread_cond_timedwait(&p->cv, &p->lock, &ts);
         }
         have = p->rbytes;
@@ -271,6 +316,13 @@ static void* pcm_worker(void* arg)
         {
             if (p->draining) break;              /* 排空完毕 */
             continue;
+        }
+
+        /* AUDIO-FIX：stop 超时后 stop/close 会置 failed，worker 别再把
+         * 新 APB 投给已 STOP 的设备（否则残留到下一句 TTS 里）。 */
+        if (p->failed)
+        {
+            break;
         }
 
         struct ap_buffer_s* apb = pcm_take_free(p);
@@ -319,12 +371,13 @@ static void* pcm_worker(void* arg)
               {
                 dbg_last = now;
                 syslog(LOG_INFO,
-                       "[pcm_media] dbg rbytes=%u nfree=%d enq=%lu reap=%lu "
-                       "written=%lu dropped=%lu ring_max=%lu wait_ms=%lu "
-                       "rate=%d/%d\n",
-                       (unsigned)p->rbytes, p->nfree, p->enq_apbs,
-                       p->reap_deqs, p->written, p->dropped,
-                       p->ring_max, p->wait_ms_total,
+                       "[pcm_media] dbg rbytes=%u nfree=%d held=%d enq=%lu "
+                       "reap=%lu mq=%lu written=%lu dropped=%lu ring_max=%lu "
+                       "wait_ms=%lu leaked=%d rate=%d/%d\n",
+                       (unsigned)p->rbytes, p->nfree,
+                       (int)(p->napbs - p->nfree), p->enq_apbs,
+                       p->reap_deqs, p->mq_msgs, p->written, p->dropped,
+                       p->ring_max, p->wait_ms_total, p->leaked,
                        p->rate_in, p->rate_out);
                 (void)dbg_ticks;
               }
@@ -341,15 +394,164 @@ static void* pcm_worker(void* arg)
      * 这 5 秒里它仍持有设备 fd、8 个 APB 和已注册的 mqueue，
      * 是"连点几次歌就有几个播放器重叠"的直接原因。
      *
-     * 在这里清掉之后，stop 的等待会在 worker 真正退出时立刻结束。 */
+     * 在这里清掉之后，stop 的等待会在 worker 真正退出时立刻结束。
+     * AUDIO-FIX：worker_done 单独标记"线程真的走到返回点"——stop 超时路径
+     * 也会把 running 置 0，reclaim 只能用 worker_done 判断能否安全 join。 */
+    p->worker_done = 1;
     p->running = 0;
     return NULL;
 }
 
+/* AUDIO-FIX：真正释放 player（只在 worker 已退出/join 且设备已 STOP 后调用）。 */
+static void pcm_free_player(struct pcm_media_s* p)
+{
+    for (int i = 0; i < p->napbs; i++)
+    {
+        if (p->apbs[i])
+        {
+            struct audio_buf_desc_s d;
+            d.u.buffer = p->apbs[i];
+            ioctl(p->fd, AUDIOIOC_FREEBUFFER, (unsigned long)&d);
+            p->apbs[i] = NULL;
+        }
+    }
+    if (p->mq != (mqd_t)-1)
+    {
+        if (p->fd >= 0) ioctl(p->fd, AUDIOIOC_UNREGISTERMQ, 0);
+        mq_close(p->mq);
+        if (p->mq_name[0]) mq_unlink(p->mq_name);
+        p->mq = (mqd_t)-1;
+    }
+    if (p->fd >= 0)
+    {
+        close(p->fd);
+        p->fd = -1;
+    }
+    pthread_mutex_destroy(&p->stop_lock);
+    pthread_mutex_destroy(&p->lock);
+    pthread_cond_destroy(&p->cv);
+    free(p);
+}
+
+/* AUDIO-FIX：登记泄漏 player（去重；表满则保持泄漏到重启）。 */
+static void pcm_leak_register(struct pcm_media_s* p)
+{
+    int i;
+
+    if (p == NULL)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&g_leak_lock);
+    for (i = 0; i < g_nleaked; i++)
+    {
+        if (g_leaked[i] == p)
+        {
+            pthread_mutex_unlock(&g_leak_lock);
+            return;
+        }
+    }
+    if (g_nleaked < PCM_MAX_LEAKED)
+    {
+        g_leaked[g_nleaked++] = p;
+        pthread_mutex_unlock(&g_leak_lock);
+        syslog(LOG_WARNING,
+            "[pcm_media] leak registered (%d/%d): worker kept alive, "
+            "fd/mq/APBs retained\n", g_nleaked, PCM_MAX_LEAKED);
+        return;
+    }
+    pthread_mutex_unlock(&g_leak_lock);
+    syslog(LOG_ERR,
+        "[pcm_media] leak table full (%d), player %p stays leaked until reboot\n",
+        PCM_MAX_LEAKED, p);
+}
+
+/* AUDIO-FIX：回收已退出的泄漏 player。由下一个 media_player_open() 在
+ * speak 线程里调用：running==0 才 join+free，否则原地保留（O(2) 无阻塞）。 */
+static void pcm_reclaim_leaked(void)
+{
+    struct pcm_media_s* free_list[PCM_MAX_LEAKED];
+    int nf = 0;
+    int i = 0;
+
+    pthread_mutex_lock(&g_leak_lock);
+    while (i < g_nleaked)
+    {
+        struct pcm_media_s* p = g_leaked[i];
+
+        if (p != NULL && p->worker_done != 0)
+        {
+            g_leaked[i] = g_leaked[--g_nleaked];
+            g_leaked[g_nleaked] = NULL;
+            free_list[nf++] = p;
+        }
+        else
+        {
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&g_leak_lock);
+
+    for (i = 0; i < nf; i++)
+    {
+        struct pcm_media_s* p = free_list[i];
+
+        syslog(LOG_INFO,
+            "[pcm_media] reclaim leaked player: worker exited -> join+free "
+            "(mq=%lu enq=%lu reap=%lu)\n",
+            p->mq_msgs, p->enq_apbs, p->reap_deqs);
+        if (p->worker_started)
+        {
+            pthread_join(p->worker, NULL);
+            p->worker_started = 0;
+        }
+        pcm_free_player(p);
+    }
+}
+
+/* AUDIO-FIX（perf-fw 建议）：统计"worker 还活着"的泄漏 player。
+ * 有僵尸 worker 时拒绝新开：设备级共享的 audio core 里旧客户端状态未清，
+ * 新 player 与僵尸 worker 抢设备会把后续 TTS 状态机搞乱（reap=0/deq=0）。
+ * 返回 >0 表示应拒绝本次 open（上层会报"音频忙"）。 */
+static int pcm_leaked_alive_count(void)
+{
+    int i;
+    int n = 0;
+
+    pthread_mutex_lock(&g_leak_lock);
+    for (i = 0; i < g_nleaked; i++)
+    {
+        if (g_leaked[i] != NULL && g_leaked[i]->worker_done == 0)
+        {
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_leak_lock);
+
+    return n;
+}
+
 void* media_player_open(const char* url)
 {
-    struct pcm_media_s* p = calloc(1, sizeof(*p));
+    struct pcm_media_s* p;
+    int zombies;
     (void)url;
+
+    /* AUDIO-FIX：先回收上一轮泄漏的 player（worker 已退出时可安全 free）。 */
+    pcm_reclaim_leaked();
+
+    zombies = pcm_leaked_alive_count();
+    if (zombies > 0)
+    {
+        syslog(LOG_ERR,
+            "[pcm_media] open REJECTED: %d leaked player(s) with worker still "
+            "alive (refuse to share audio device; retry later / reboot)\n",
+            zombies);
+        return NULL;
+    }
+
+    p = calloc(1, sizeof(*p));
     if (!p) return NULL;
     p->fd = -1;
     /* calloc 之后 mq 是 0，但 close 里的哨兵是 (mqd_t)-1。
@@ -361,7 +563,18 @@ void* media_player_open(const char* url)
     p->rate_out = PCM_OUT_RATE;
     snprintf(p->dev, sizeof(p->dev), "%s", PCM_DEV_DEFAULT);
     pthread_mutex_init(&p->lock, NULL);
-    pthread_cond_init(&p->cv, NULL);
+    pthread_mutex_init(&p->stop_lock, NULL);   /* F4：stop 串行化 */
+
+    /* AUDIO-FIX：条件变量用 MONOTONIC 时钟（配合 pcm_cond_deadline），
+     * 避免 RTC/BLE 对时跳变把 20ms 等待放大成小时级 → worker "卡死"。 */
+    {
+        pthread_condattr_t cattr;
+
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+        pthread_cond_init(&p->cv, &cattr);
+        pthread_condattr_destroy(&cattr);
+    }
     return p;
 }
 
@@ -532,9 +745,8 @@ ssize_t media_player_write_data(void* player, const void* data, size_t len)
            && waited_ms < 200 && !p->failed)
     {
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 10 * 1000 * 1000;
-        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+
+        pcm_cond_deadline(&ts, 10);
         pthread_cond_timedwait(&p->cv, &p->lock, &ts);
         waited_ms += 10;
     }
@@ -571,6 +783,34 @@ int media_player_stop(void* player)
     int worker_hung = 0;
     int pending_ms;
 
+    /* AUDIO-FIX F4（perf-fw RCA §4）：PTT 打断 + speak close 可能并发调
+     * stop（voice_channel.c:858/1733/1787 与 1920），串行化整个 stop，
+     * 避免双等待/双 pthread_join（UB）/leaked 标志撕裂。 */
+    pthread_mutex_lock(&p->stop_lock);
+
+    /* P2（perf-fw RCA）：正常/泄漏的重复 stop 直接返回，避免重跑
+     * 3–20s 预算、重复 drain 与重复 stopped 日志。
+     * 注意：并发中的 stop 仍由 stop_lock 串行等待（close 依赖它的完成），
+     * 这里只优化"已完成一次 stop 之后的再次调用"。 */
+    if (p->stop_done)
+    {
+        pthread_mutex_unlock(&p->stop_lock);
+        return 0;
+    }
+
+    /* AUDIO-FIX：已泄漏的 player 不再等待（worker 可能还活着）。重复 stop
+     * 若再等/再 JOIN 会把下一句 TTS 拖慢；close 会继续 defer 回收。 */
+    if (p->leaked)
+    {
+        syslog(LOG_WARNING,
+               "[pcm_media] stop: player already leaked (worker_started=%d "
+               "running=%d), skip wait; close will defer\n",
+               p->worker_started, (int)p->running);
+        p->stop_done = 1;
+        pthread_mutex_unlock(&p->stop_lock);
+        return 0;
+    }
+
     /* v114b8（C 报告）：按积压估算收尾预算。
      * pending = 环里字节 / 32KB/s + 设备队列 APB × 128ms；预算 = pending + 1500ms，
      * clamp 3–20s；worker 与设备两段等待共用同一预算，避免长 TTS 固定 4s 被切尾。 */
@@ -592,32 +832,62 @@ int media_player_stop(void* player)
 
         for (int i = 0; i < budget_iters && p->running; i++) pcm_delay_ms(10);
 
-        /* v113：worker 若在 pipe/网络里挂住，绝不能在这里无限 join ——
-         * 那样 ioctl(STOP) 永远发不出去，DMA 会永久循环重播最后 128ms。
-         * 超时后放弃 join（线程泄漏优于整机冻死），继续走 STOP。 */
+        /* AUDIO-FIX：再给 500ms grace —— worker 可能恰好卡在一次 ioctl/
+         * 条件等待里；立刻判死会制造"泄漏句柄 + 后续 reap=0"。 */
+        if (p->running)
+        {
+            for (int g = 0; g < 50 && p->running; g++) pcm_delay_ms(10);
+        }
+
         if (p->running)
         {
             worker_hung = 1;
+            p->failed = 1;      /* 让 worker 的下一轮 ENQUEUE 失败并退出 */
+            p->stop_timeouts++;
             syslog(LOG_ERR,
-                "[pcm_media] worker still running after 5s, skip join (leak) "
-                "enq=%lu reap=%lu running=%d\n",
-                p->enq_apbs, p->reap_deqs, (int)p->running);
+                "[pcm_media] stop: worker STILL running after %dms -> force "
+                "running=0, try short join before LEAK (worker_hung=1)\n",
+                budget_ms);
         }
+
+        /* AUDIO-FIX（按 Lead 实测补充）：无论是否 hung，先把 running 强制置 0
+         * 再广播，然后给一个短窗口（200ms）让 worker 自己走到退出点；
+         * 退出了就正常 join（不泄漏），只有真卡死才登记 leak。 */
         p->running = 0;
         pthread_cond_broadcast(&p->cv);
-        if (!worker_hung)
+
+        if (worker_hung)
+        {
+            for (int g = 0; g < 20 && p->worker_done == 0; g++) pcm_delay_ms(10);
+        }
+
+        if (p->worker_done)
         {
             pthread_join(p->worker, NULL);
+            p->worker_started = 0;
+            p->leaked = 0;
+            syslog(LOG_INFO,
+                "[pcm_media] worker exited%s, join OK (no leak)\n",
+                worker_hung ? " after force-stop" : "");
         }
-        p->worker_started = 0;
+        else
+        {
+            p->leaked = 1;
+            pcm_leak_register(p);
+            syslog(LOG_ERR,
+                "[pcm_media] stop: worker STILL alive 200ms after force-stop "
+                "-> LEAK player (keep fd/mq/APBs, no join/free; reclaimed when "
+                "worker_done)\n");
+        }
     }
 
     /* 等设备把已入队的 APB 全部播完再 STOP: worker 退出只代表"喂完"，
      * 设备队列里通常还有 ~0.5-1s 音频，直接 STOP 会把尾音切掉 —— 这是
-     * 2026-10-26 用户反馈"语音不能完整全部出来"的第二个原因。 */
+     * 2026-10-26 用户反馈"语音不能完整全部出来"的第二个原因。
+     * AUDIO-FIX：leaked 时只短等 500ms（worker 状态未知，长等只会拖慢下一句）。 */
     if (p->fd >= 0 && p->napbs > 0)
     {
-        int iters = budget_iters;
+        int iters = p->leaked ? 50 : budget_iters;
         int waited = 0;
         for (int i = 0; i < iters; i++)
         {
@@ -631,9 +901,12 @@ int media_player_stop(void* player)
             waited += 10;
         }
         syslog(LOG_INFO,
-               "[pcm_media] stop wait reason=%s waited=%dms pending=%dms rbytes=%u\n",
-               (p->nfree == p->napbs) ? "free" : "timeout",
-               waited, pending_ms, (unsigned)p->rbytes);
+               "[pcm_media] stop wait reason=%s waited=%dms pending=%dms "
+               "rbytes=%u held=%d mq=%lu leaked=%d\n",
+               p->leaked ? "worker_hung"
+                         : ((p->nfree == p->napbs) ? "free" : "timeout"),
+               waited, pending_ms, (unsigned)p->rbytes,
+               (int)(p->napbs - p->nfree), p->mq_msgs, p->leaked);
     }
 
     /* v114b4：APB 全部 reap 只代表 DMA/上层消费完，DAC/PA 里还有最后一点
@@ -646,9 +919,11 @@ int media_player_stop(void* player)
 
     syslog(LOG_INFO,
         "[pcm_media] stopped (written=%lu dropped=%lu enq=%lu reap=%lu "
-        "ring_max=%lu wait_ms=%lu)\n",
-        p->written, p->dropped, p->enq_apbs, p->reap_deqs,
-        p->ring_max, p->wait_ms_total);
+        "mq=%lu ring_max=%lu wait_ms=%lu leaked=%d stop_timeouts=%lu)\n",
+        p->written, p->dropped, p->enq_apbs, p->reap_deqs, p->mq_msgs,
+        p->ring_max, p->wait_ms_total, p->leaked, p->stop_timeouts);
+    p->stop_done = 1;                       /* P2：后续 stop 快速返回 */
+    pthread_mutex_unlock(&p->stop_lock);   /* F4 */
     return 0;
 }
 
@@ -658,33 +933,39 @@ int media_player_close(void* player, int dummy)
     (void)dummy;
     if (!p) return -EINVAL;
 
-    if (p->worker_started) media_player_stop(p);
-
-    for (int i = 0; i < p->napbs; i++)
+    /* AUDIO-FIX：未被 stop 的错误路径先尝试正常收尾（stop 幂等）。 */
+    if (p->worker_started && !p->leaked)
     {
-        if (p->apbs[i])
-        {
-            struct audio_buf_desc_s d;
-            d.u.buffer = p->apbs[i];
-            ioctl(p->fd, AUDIOIOC_FREEBUFFER, (unsigned long)&d);
-            p->apbs[i] = NULL;
-        }
-    }
-    if (p->mq != (mqd_t)-1)
-    {
-        if (p->fd >= 0) ioctl(p->fd, AUDIOIOC_UNREGISTERMQ, 0);
-        mq_close(p->mq);
-        if (p->mq_name[0]) mq_unlink(p->mq_name);
-    }
-    if (p->fd >= 0)
-    {
-        close(p->fd);
-        p->fd = -1;      /* 防止释放后仍被 media_player_set_volume 读到旧 fd */
+        media_player_stop(p);
     }
 
-    pthread_mutex_destroy(&p->lock);
-    pthread_cond_destroy(&p->cv);
-    free(p);
+    /* AUDIO-FIX（2026-11-04 v142k）：worker 仍活着（stop 超时/从未 stop）
+     * 绝不能 free 句柄：旧 worker 会继续用 p/fd/mq/APBs；free 后 fd 号被
+     * 下一次 TTS 复用，正是"前次 stop 超时 → 后续每次 reap=0/deq=0"的
+     * 根因路径。这里只登记泄漏、保留 p/fd/mq/APBs，等 worker 退出后由
+     * 下一次 media_player_open() 回收（无新线程、O(2)）。
+     * 返回 -EBUSY 让上层知道"资源仍占用（安全泄漏）"。 */
+    if (p->worker_started || p->leaked)
+    {
+        p->leaked = 1;
+        p->failed = 1;   /* 让仍活着的 worker 尽快退出（ioctl ENQUEUE 会被拒） */
+        /* 2026-11-04 v142k AUDIO-FIX（按 Lead 实测补充）：**绝不 free 存活
+         * worker 的句柄**。旧路径清了 worker_started 又不 join，随后 close
+         * free p/fd/mq/APB，旧 worker 继续用 → UAF；且 fd 号被下一次 TTS
+         * 复用后，旧 worker 的 ioctl 会打到新会话上（"前次 stop 超时 →
+         * 后续每次 reap=0/deq=0"）。
+         * 这里只登记泄漏、保留 p/fd/mq/APB 原样；worker_done 置位后由下一次
+         * media_player_open() 在既有线程里 join+free（无新线程）。 */
+        pcm_leak_register(p);
+        syslog(LOG_ERR,
+            "[pcm_media] close DEFERRED: worker alive/leaked "
+            "(worker_started=%d leaked=%d fd=%d mq=%d) -> KEEP p/fd/mq/APBs "
+            "(never free live worker); reclaimed when worker_done\n",
+            p->worker_started, p->leaked, p->fd, (int)p->mq);
+        return -EBUSY;
+    }
+
+    pcm_free_player(p);
     return 0;
 }
 

@@ -61,9 +61,33 @@
 #define VAD_NOISE_SHIFT     5            /* EMA: alpha = 1/32 */
 #define VAD_NOISE_INIT      200          /* 标定没跑完时的临时值(几乎用不到) */
 #define VAD_NOISE_MIN       8            /* 防止底噪被压到 0 后疯狂触发 */
-#define VAD_CALIB_FRAMES    15           /* 标定用的帧数(300ms) */
-#define VAD_CALIB_SKIP      15           /* v114：跳过 300ms 启动瞬态，避免标定窗口压在瞬态尾巴上 */
+/* ── VOICE-F3（task-61, audio_rca2 §2.3/§3）：冷启动窗口 600ms -> 200ms ──
+ * 旧值 15+15 帧（300ms 跳过 + 300ms 标定）会让短按 PTT（<600ms）的整段录音
+ * 全被冷启动段吃掉：RCA2 里 attempt 3/4 的日志特征 e_max=0 / kept=0 /
+ * dropped=0，随后后端返回 -ENODATA(-61)。
+ * 新值 4+6 帧（80ms 跳过 + 120ms 标定 = 200ms）：
+ *   - 标定仍取窗口内**最小**帧能量，启动满量程爆音被 min 机制自然滤掉；
+ *   - 标定没跑完就松手的短录音，由 vad_trim_finish() 的 short-recording
+ *     rescue 把预滚帧补发出去（见 finish）。
+ *   - 正常录音的判定阈值/预滚/后滚/收尾时长全部不变。
+ * 回滚：编译加 -DVOICE_VAD_FAST_START=0 恢复旧的 15+15 帧。 */
+#ifndef VOICE_VAD_FAST_START
+#  define VOICE_VAD_FAST_START 1
+#endif
+#if VOICE_VAD_FAST_START
+#  define VAD_CALIB_SKIP    4            /* 80ms：跳过录音启动满量程爆音 */
+#  define VAD_CALIB_FRAMES  6            /* 120ms：标定底噪（取窗口内最小帧能量） */
+#else
+#  define VAD_CALIB_SKIP    15
+#  define VAD_CALIB_FRAMES  15
+#endif
+#define VAD_RESCUE_MIN_FRAMES 3          /* VOICE-F3：短录音抢救最少 3 帧(60ms) */
 #define VAD_NOISE_MAX       6000         /* 底噪封顶, 免得标定坏了直接废掉 VAD */
+/* VOICE-F3：标定窗口只有 120ms（短按用户常在标定窗内就开始说话）。若窗口内
+ * 都是语音/爆音，calib_min 会把底噪抬到语音级别，noise*2 阈值再也过不去。
+ * 超过该值就认为标定不可信，退回初始底噪（VAD 至少能检测到语音，后续静音
+ * 段的 EMA 会重新收敛）。正常安静环境标定值 300~1000，远低于此。 */
+#define VAD_CALIB_MAX_TRUST 3000
 #define VAD_MIN_UTTER_FRAMES 15          /* 至少 300ms 语音才算"一句话", 防咳嗽误触发 */
 
 /* ★ 判"说完"的静音时长必须**明显长于**裁剪用的后滚(VAD_POSTROLL_FRAMES=500ms)。
@@ -143,6 +167,8 @@ static void vad_process_frame(vad_trim_t* v, const short* f, vad_emit_fn emit,
   long thr;
   int  loud;
 
+  v->fed_frames++;   /* VOICE-F3：诊断/短录音判定，含标定期与跳过帧 */
+
   /* ── 标定期: 只攒底噪, 不判语音 ─────────────────────────────────────
    * 用均值而不是最小值: 最小值容易被一个安静的下陷带偏。
    * 同时做一次粗野值剔除, 免得标定期正好在说话把底噪抬上去。 */
@@ -180,6 +206,15 @@ static void vad_process_frame(vad_trim_t* v, const short* f, vad_emit_fn emit,
           if (v->noise > VAD_NOISE_MAX)
             {
               v->noise = VAD_NOISE_MAX;
+            }
+
+          /* VOICE-F3：标定值高得离谱 = 窗口里大概率是说话/爆音，别信 */
+          if (v->noise > VAD_CALIB_MAX_TRUST)
+            {
+              syslog(LOG_WARNING,
+                     "[%s] calib suspicious: %ld -> fallback %d\n",
+                     VAD_TAG, v->noise, VAD_NOISE_INIT);
+              v->noise = VAD_NOISE_INIT;
             }
 
           v->calib_done = 1;
@@ -291,6 +326,15 @@ void vad_trim_feed(vad_trim_t* v, const short* pcm, size_t samples,
 {
   size_t i = 0;
 
+  if (v == NULL || pcm == NULL || samples == 0)
+    {
+      return;
+    }
+
+  /* VOICE-F3：finish 抢救短录音时要主动补发预滚帧，这里缓存回调。 */
+  v->emit_cb = emit;
+  v->emit_user = user;
+
   while (i < samples)
     {
       size_t need = VAD_FRAME_SAMPLES - v->pend_len;
@@ -315,13 +359,51 @@ int vad_trim_utterance_done(vad_trim_t* v)
 
 int vad_trim_finish(vad_trim_t* v)
 {
+  if (v == NULL)
+    {
+      return 1;
+    }
+
   /* 残余不足一帧: 按静音处理, 不强行放行(否则会把半帧噪声塞进去) */
   v->pend_len = 0;
 
+#if VOICE_VAD_FAST_START
+  /* ── VOICE-F3: short-recording rescue ─────────────────────────────
+   * 录音在冷启动窗口(200ms)还没跑完就结束了(用户短按 PTT)，旧逻辑
+   * emitted==0 -> 后端直接 -ENODATA(-61)，整段录音白采。这里把预滚里
+   * 已采到的帧按时间顺序补发，让后端至少分析真实音频（可能识别出短词）。
+   * 只抢救"连标定都没做完"的短录音；长录音全静音仍返回 1 -> 不上传
+   * 几十秒噪声，正常 VAD 判定不变。 */
+  if (v->emitted == 0 && v->count > 0 && v->emit_cb != NULL
+      && v->calib_done == 0 && v->fed_frames >= VAD_RESCUE_MIN_FRAMES)
+    {
+      unsigned long before = v->emitted;
+
+      vad_preroll_flush(v, v->emit_cb, v->emit_user);
+      syslog(LOG_WARNING,
+             "[%s] short-recording rescue: emitted %lu frames (%lums, "
+             "calib_done=0, fed=%lums)\n",
+             VAD_TAG, v->emitted - before,
+             (unsigned long)((v->emitted - before) * 20),
+             (unsigned long)(v->fed_frames * 20));
+    }
+  else if (v->emitted == 0 && v->fed_frames > 0 && v->fed_frames < 15)
+    {
+      /* 少于 300ms 又没得抢救(帧数不足/无回调): 明确提示，方便现场判断 */
+      syslog(LOG_INFO,
+             "[%s] short recording: fed=%lums, calib_done=%d, no speech\n",
+             VAD_TAG, (unsigned long)(v->fed_frames * 20), v->calib_done);
+    }
+#endif
+
   /* 这些数字是调阈值的依据: 底噪与最大帧能量的**比值**决定 VAD_ON_NUM 该取
-   * 多少。全程静音时 e_max 会贴近底噪, 一眼就能看出来。 */
-  syslog(LOG_INFO, "[%s] noise=%ld e_max=%ld kept=%lu dropped=%lu\n",
-         VAD_TAG, v->noise, v->e_max, v->emitted, v->dropped);
+   * 多少。全程静音时 e_max 会贴近底噪, 一眼就能看出来。
+   * F3 增加 fed/calib_done/silence_run，便于真机对比冷启动窗口修复效果。 */
+  syslog(LOG_INFO,
+         "[%s] noise=%ld e_max=%ld kept=%lu dropped=%lu fed=%lu "
+         "calib_done=%d silence_run=%d\n",
+         VAD_TAG, v->noise, v->e_max, v->emitted, v->dropped,
+         v->fed_frames, v->calib_done, v->silence_run);
 
   return v->emitted == 0 ? 1 : 0;
 }

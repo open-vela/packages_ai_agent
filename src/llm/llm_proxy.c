@@ -31,13 +31,27 @@
 #include "agent_compat.h"
 #include "agent_config.h"
 
+/* P0-NET：MiMo token-plan 网关同时承载 LLM/TTS/ASR（见 mimo_key_local.h 注释），
+ * 预连接该 host 可同时暖三条链路。头文件可能不存在（干净 checkout）→ 退回默认。 */
+#if defined(__has_include)
+#  if __has_include("voice/mimo_key_local.h")
+#    include "voice/mimo_key_local.h"
+#  endif
+#endif
+#ifndef MIMO_API_HOST
+#  define MIMO_API_HOST "token-plan-cn.xiaomimimo.com"
+#  define MIMO_API_PORT "443"
+#endif
+
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
 #include "network/network_manager.h"
 #endif
 
 #include "cJSON.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static const char* TAG = "llm";
 
@@ -198,9 +212,127 @@ int llm_set_port(const char* port)
 /* v114b10：按通道覆盖 max_tokens（0=默认） */
 static int s_max_tokens_override;
 
+/* P0-NET（2026-11-04；perf-fw 复核修正）：语音 max_tokens 默认**不降**，保持
+ * 110。原因：80 会截断工具轮/中文长回答，工具调用参数也可能被截断。
+ * 语音短答只靠 prompt 约束（1–3 句、≤80 字，见 agent_loop.c 的 voice prompt）。
+ * 如仍想实验更短回答，可显式 -DLLM_VOICE_MAX_TOKENS=80（可编译开关）。 */
+#ifndef LLM_VOICE_MAX_TOKENS
+#define LLM_VOICE_MAX_TOKENS 0
+#endif
+
+/* 把"通道标记 110"换算成实际发送值；其它覆盖值/默认值原样返回。 */
+static int llm_effective_max_tokens(int default_tokens)
+{
+    int v = s_max_tokens_override > 0 ? s_max_tokens_override
+                                      : default_tokens;
+
+    if (LLM_VOICE_MAX_TOKENS > 0 && v == AGENT_LLM_MAX_TOKENS_VOICE)
+        v = LLM_VOICE_MAX_TOKENS;
+    return v;
+}
+
+/* P0-NET：前缀缓存命中日志（DeepSeek prompt_cache_hit_tokens /
+ * OpenAI prompt_tokens_details.cached_tokens / Anthropic cache_read_input_tokens）。
+ * 只记录最近一次响应 usage；system prompt/工具 schema 保持稳定才有命中。 */
+static int s_last_prompt_tokens;
+static int s_last_cached_tokens;
+static bool s_last_usage_valid;
+
+static void llm_note_usage(cJSON* usage, int prompt_tokens)
+{
+    s_last_prompt_tokens = prompt_tokens;
+    s_last_cached_tokens = 0;
+    s_last_usage_valid = (prompt_tokens > 0);
+
+    if (!usage)
+        return;
+
+    cJSON* hit = cJSON_GetObjectItem(usage, "prompt_cache_hit_tokens");
+    if (hit && cJSON_IsNumber(hit)) {
+        s_last_cached_tokens = (int)hit->valuedouble;
+        return;
+    }
+
+    cJSON* det = cJSON_GetObjectItem(usage, "prompt_tokens_details");
+    cJSON* cached = det ? cJSON_GetObjectItem(det, "cached_tokens") : NULL;
+    if (cached && cJSON_IsNumber(cached)) {
+        s_last_cached_tokens = (int)cached->valuedouble;
+        return;
+    }
+
+    cJSON* cr = cJSON_GetObjectItem(usage, "cache_read_input_tokens");
+    if (cr && cJSON_IsNumber(cr))
+        s_last_cached_tokens = (int)cr->valuedouble;
+}
+
+static void llm_log_prefix_cache(const char* where)
+{
+    int pct = 0;
+
+    if (!s_last_usage_valid)
+        return;
+    if (s_last_prompt_tokens > 0)
+        pct = (int)((int64_t)s_last_cached_tokens * 100
+            / s_last_prompt_tokens);
+    syslog(LOG_INFO,
+        "[lat] prefix_cache %s prompt_tokens=%d cached_tokens=%d hit=%d%%\n",
+        where, s_last_prompt_tokens, s_last_cached_tokens, pct);
+}
+
 void llm_proxy_set_max_tokens(int v)
 {
     s_max_tokens_override = (v > 0) ? v : 0;
+}
+
+/* P0-NET：保守预连接（由 agent_loop 在网络就绪时调用）。
+ * 覆盖 LLM 当前 host + MiMo token-plan 网关 host（LLM/TTS/ASR 同一 host，
+ * mimo_key_local.h 注释；两条相同则去重）。只做 TCP+TLS 握手并放回连接池，
+ * 不发送请求；失败静默、不新增线程。返回 OK 表示至少一条暖连接就绪。 */
+int llm_proxy_preconnect(void)
+{
+    char hosts[2][128];
+    char ports[2][8];
+    char llm_host[128];
+    char llm_port[8];
+    int n = 0;
+    int ok = 0;
+
+    pthread_mutex_lock(&s_llm_lock);
+    memcpy(llm_host, s_llm_host, sizeof(llm_host));
+    memcpy(llm_port, s_llm_port, sizeof(llm_port));
+    pthread_mutex_unlock(&s_llm_lock);
+
+    if (llm_host[0] != '\0') {
+        strncpy(hosts[n], llm_host, sizeof(hosts[n]) - 1);
+        hosts[n][sizeof(hosts[n]) - 1] = '\0';
+        strncpy(ports[n], llm_port, sizeof(ports[n]) - 1);
+        ports[n][sizeof(ports[n]) - 1] = '\0';
+        n++;
+    }
+
+#ifdef MIMO_API_HOST
+    if (n == 0 || strcmp(hosts[0], MIMO_API_HOST) != 0) {
+        strncpy(hosts[n], MIMO_API_HOST, sizeof(hosts[n]) - 1);
+        hosts[n][sizeof(hosts[n]) - 1] = '\0';
+        strncpy(ports[n], MIMO_API_PORT, sizeof(ports[n]) - 1);
+        ports[n][sizeof(ports[n]) - 1] = '\0';
+        n++;
+    }
+#endif
+
+    if (n == 0)
+        return ERROR;
+
+    for (int i = 0; i < n; i++) {
+        int ret = vela_tls_preconnect(hosts[i], ports[i]);
+
+        syslog(LOG_INFO, "[%s] [lat] preconnect %s:%s -> %s\n",
+            TAG, hosts[i], ports[i], ret == 0 ? "ok" : "skip");
+        if (ret == 0)
+            ok++;
+    }
+
+    return ok > 0 ? OK : ERROR;
 }
 
 int llm_set_all(const char* host, const char* path,
@@ -725,12 +857,10 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 
     if (is_openai_compat_host(llm_host))
         cJSON_AddNumberToObject(body, "max_completion_tokens",
-            s_max_tokens_override > 0 ? s_max_tokens_override
-                                      : AGENT_LLM_MAX_TOKENS_OPENAI);
+            llm_effective_max_tokens(AGENT_LLM_MAX_TOKENS_OPENAI));
     else
         cJSON_AddNumberToObject(body, "max_tokens",
-            s_max_tokens_override > 0 ? s_max_tokens_override
-                                      : AGENT_LLM_MAX_TOKENS);
+            llm_effective_max_tokens(AGENT_LLM_MAX_TOKENS));
 
     cJSON* messages = cJSON_Parse(messages_json);
     if (!messages)
@@ -848,12 +978,10 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     if (is_openai_compat_host(llm_host)) {
         cJSON_AddNumberToObject(body, "max_completion_tokens",
-            s_max_tokens_override > 0 ? s_max_tokens_override
-                                      : AGENT_LLM_MAX_TOKENS_OPENAI);
+            llm_effective_max_tokens(AGENT_LLM_MAX_TOKENS_OPENAI));
     } else {
         cJSON_AddNumberToObject(body, "max_tokens",
-            s_max_tokens_override > 0 ? s_max_tokens_override
-                                      : AGENT_LLM_MAX_TOKENS);
+            llm_effective_max_tokens(AGENT_LLM_MAX_TOKENS));
     }
 
     /* Clone messages and prepend system message */
@@ -1043,6 +1171,8 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
             resp->completion_tokens = (int)ct->valuedouble;
         if (tt && cJSON_IsNumber(tt))
             resp->total_tokens = (int)tt->valuedouble;
+        /* P0-NET：记录前缀缓存命中（cached_tokens）并输出 [lat] 日志 */
+        llm_note_usage(usage, resp->prompt_tokens);
     }
 
     /* XML fallback parsers for non-standard models */
@@ -1050,6 +1180,8 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     parse_ns_xml_tool_calls(resp);
 
     cJSON_Delete(root);
+
+    llm_log_prefix_cache("chat");
 
     syslog(LOG_INFO,
         "[%s] Response: %d bytes text, %d tool calls, finish=%s\n",
@@ -1079,6 +1211,49 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 #define LLM_STREAM_TEXT_MAX      (16 * 1024)
 #define LLM_STREAM_REASON_MAX    (8 * 1024)
 
+/* ── VOICE-A（docs_ble/112 §2A；VOICE-A-FIX 按 perf-fw 复核分离预算）──
+ * 语音/离群回合实测首 token 4–45s，会把语音回合拖到 50s+。这里把两类超时分开：
+ *   - first-token deadline（LLM_FIRST_TOKEN_DEADLINE_MS=8000，**仅语音回合**）：
+ *     首个 content delta 超过它才到 -> 中止流/关闭连接、返回 -ETIMEDOUT 并
+ *     跳过非流式回退；agent_loop 对 -ETIMEDOUT 也跳过 router failover，直接
+ *     走 local_lm/短句（perf-fw A2）。
+ *   - 生成总预算（LLM_STREAM_TOTAL_DEADLINE_MS=25000，仅语音回合）：给首 token
+ *     之后的生成阶段充裕时间，避免 90 字回答在 8s 被截断（perf-fw A3）；
+ *     到点仍有 partial 时按成功保留（partial 只作异常兜底）。
+ * 计时起点 t_start 在 voice_channel_llm_begin() 之后打点（perf-fw A1）：不再把
+ * 等 TTS 会话（上限 30s）算进首 token 8s；TLS 连接/握手仍计入（空池首连
+ * 2–8s，池化复用后约 0）。
+ * 非语音通道（ble/cli 256 token 可能 >8s）保持原 90s 总预算，且不做首 token
+ * 检查（perf-fw A4）。
+ * 回滚开关：-DLLM_FIRST_TOKEN_DEADLINE_MS=0（关首 token 降级）；
+ *           -DLLM_STREAM_TOTAL_DEADLINE_MS=0（语音沿用 90s 总预算）。
+ */
+#ifndef LLM_FIRST_TOKEN_DEADLINE_MS
+#define LLM_FIRST_TOKEN_DEADLINE_MS 8000
+#endif
+#ifndef LLM_STREAM_TOTAL_DEADLINE_MS
+#define LLM_STREAM_TOTAL_DEADLINE_MS 25000
+#endif
+
+/* ── RCA-FIX-A（audio_rca2 F1，2026-11-04）：首字节主动 deadline ──
+ * 旧实现只在 SSE 解析到第一个 content delta 时才检查 8s deadline；服务端完全
+ * 静默时只能等 vela 的 20s 流空闲超时/25s 总预算（实测 18:10 首 token
+ * 17.357s 才触发）。这里给语音回合传 first_body_timeout_ms：在**首个 body
+ * 字节到达前**，vela 读循环/socket 读超时按该预算收紧，到点直接 -ETIMEDOUT。
+ * 非语音通道传 0（保持 90s 预算与旧行为）；生成阶段仍用 25s 总预算，互不影响。
+ * 回滚：-DLLM_FIRST_BODY_DEADLINE_MS=0（关闭首字节主动超时，回到事件驱动）。 */
+#ifndef LLM_FIRST_BODY_DEADLINE_MS
+#define LLM_FIRST_BODY_DEADLINE_MS 9000
+#endif
+
+static int64_t llm_proxy_mono_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 typedef struct {
     char* line;
     size_t line_cap;
@@ -1101,6 +1276,12 @@ typedef struct {
     int parse_errors;
     bool failed;        /* 内存/超长行等不可恢复错误 */
     int fail_err;
+
+    /* VOICE-A：首 token 超时判定 */
+    int64_t t_start_ms;        /* 首 token 计时起点（voice_channel_llm_begin 之后） */
+    long    first_token_ms;    /* 首个 content delta 耗时；-1 = 尚未收到 */
+    bool    first_token_timeout; /* 1 = 首 token 超过 deadline，已中止流 */
+    bool    first_token_check; /* 只对语音回合做首 token 检查（perf-fw A4） */
 } llm_sse_t;
 
 /* 释放流式期间累积到 resp 的 partial 文本/tool_calls，避免回退时泄漏。 */
@@ -1295,6 +1476,35 @@ static void llm_sse_process_line(llm_sse_t* st, char* line)
                 cJSON* content = cJSON_GetObjectItem(delta, "content");
                 if (content && cJSON_IsString(content)
                     && content->valuestring && content->valuestring[0]) {
+                    /* VOICE-A：首个 content delta 即"首 token"。超过 deadline
+                     * 才到 -> 标记失败（feed 返回负值让 vela 中止流/关闭连接），
+                     * llm_chat_tools_stream 会返回 -ETIMEDOUT 并跳过非流式回退，
+                     * agent_loop 既有失败路径直接回落 local。 */
+                    if (st->delta_count == 0) {
+                        long fd_ms = (long)(llm_proxy_mono_ms()
+                            - st->t_start_ms);
+
+                        /* RCA-FIX-A F8：首个 content delta 到达时刻（所有通道；
+                         * 语音回合同时用它判定首 token deadline）。 */
+                        syslog(LOG_INFO,
+                            "[%s] [lat] llm first_delta_ms=%ld\n",
+                            TAG, fd_ms);
+                        st->first_token_ms = fd_ms;
+                        if (st->first_token_check
+                            && LLM_FIRST_TOKEN_DEADLINE_MS > 0
+                            && st->first_token_ms
+                                >= LLM_FIRST_TOKEN_DEADLINE_MS) {
+                            st->first_token_timeout = true;
+                            st->failed = true;
+                            st->fail_err = -ETIMEDOUT;
+                            syslog(LOG_WARNING,
+                                "[%s] first-token timeout %ldms (>= %dms), "
+                                "abort streaming and close connection\n",
+                                TAG, st->first_token_ms,
+                                LLM_FIRST_TOKEN_DEADLINE_MS);
+                            return;
+                        }
+                    }
                     if (llm_sse_text_append(st, content->valuestring) == OK) {
                         st->delta_count++;
                         if (st->cb)
@@ -1340,6 +1550,8 @@ static void llm_sse_process_line(llm_sse_t* st, char* line)
                 st->resp->completion_tokens = (int)ct->valuedouble;
             if (tt && cJSON_IsNumber(tt))
                 st->resp->total_tokens = (int)tt->valuedouble;
+            /* P0-NET：流式 usage 里同样可能带 cached_tokens */
+            llm_note_usage(usage, st->resp->prompt_tokens);
         }
     }
 
@@ -1383,7 +1595,9 @@ static int llm_sse_feed(const char* data, size_t len, void* arg)
  * 代理/明文 HTTP 不支持流式，返回 ERROR 让上层走非流式（与现有
  * llm_http_call 的代理路径保持同一行为）。 */
 static int llm_http_call_stream(const char* post_data,
-    vela_http_stream_cb_t cb, void* cb_arg, int* out_status)
+    vela_http_stream_cb_t cb, void* cb_arg, int* out_status,
+    uint32_t timeout_ms, uint32_t first_body_timeout_ms,
+    int64_t* io_t_start_ms)
 {
     char api_key[128], llm_host[128], llm_path[128], llm_port[8], model[64];
     char auth_header[256];
@@ -1427,9 +1641,25 @@ static int llm_http_call_stream(const char* post_data,
 
         /* 与 TTS 会话互斥（同 llm_http_direct），整个流期间持有。 */
         voice_channel_llm_begin();
-        status = vela_https_post_json_stream(llm_host, llm_port, llm_path,
-            hdrs, post_data, cb, cb_arg,
-            (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000U);
+
+        /* VOICE-A-FIX（perf-fw A1）：首 token 计时从**等完 TTS 会话之后**才开始，
+         * 否则 voice_channel_llm_begin() 最长 30s 的等待会被算进 8s deadline，
+         * 正常 6-8s 首 token 的回合会被误杀。TLS 连接/握手仍在计时内（池化
+         * 复用后约 0；空池首连 2-8s 属于真实网络成本）。 */
+        if (io_t_start_ms != NULL)
+            *io_t_start_ms = llm_proxy_mono_ms();
+
+        /* VOICE-A / RCA-FIX-A：timeout_ms = 生成总预算（语音 25s / 其它 90s）；
+         * first_body_timeout_ms = 首个 body 字节前的主动 deadline（语音 9s，
+         * 非语音 0=旧行为）。两者独立：首字节到达后只用总预算。 */
+        if (first_body_timeout_ms > 0) {
+            status = vela_https_post_json_stream_ex(llm_host, llm_port,
+                llm_path, hdrs, post_data, cb, cb_arg, timeout_ms,
+                first_body_timeout_ms);
+        } else {
+            status = vela_https_post_json_stream(llm_host, llm_port, llm_path,
+                hdrs, post_data, cb, cb_arg, timeout_ms);
+        }
         voice_channel_llm_end();
     }
 
@@ -1459,6 +1689,11 @@ int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
     int http_err;
     int result = ERROR;
     bool usable = false;
+    bool voice_mode = false;
+    uint32_t stream_timeout_ms;
+    uint32_t first_body_timeout_ms = 0;
+    long elapsed_ms = 0;
+    int max_tokens_ov = 0;
 
     memset(resp, 0, sizeof(*resp));
 
@@ -1471,10 +1706,25 @@ int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
     memcpy(model, s_model, sizeof(model));
     memcpy(api_key, s_api_key, sizeof(api_key));
     memcpy(llm_host, s_llm_host, sizeof(llm_host));
+    max_tokens_ov = s_max_tokens_override;
     pthread_mutex_unlock(&s_llm_lock);
 
     if (api_key[0] == '\0')
         return ERROR;
+
+    /* VOICE-A-FIX（perf-fw A3/A4）：agent_loop 在语音回合用
+     * llm_proxy_set_max_tokens(AGENT_LLM_MAX_TOKENS_VOICE) 标记通道。
+     * 语音回合：流式请求总预算 = LLM_STREAM_TOTAL_DEADLINE_MS(25s)，首 token
+     * 由 8s deadline 单独判定；其它通道保持 90s 总预算且不做首 token 检查。 */
+    voice_mode = (max_tokens_ov > 0
+        && max_tokens_ov == AGENT_LLM_MAX_TOKENS_VOICE);
+    stream_timeout_ms = (voice_mode && LLM_STREAM_TOTAL_DEADLINE_MS > 0)
+        ? (uint32_t)LLM_STREAM_TOTAL_DEADLINE_MS
+        : (uint32_t)AGENT_LLM_TIMEOUT_SEC * 1000U;
+    /* RCA-FIX-A F1：语音回合在首个 body 字节前用 9s 主动 deadline；
+     * 非语音=0（完全旧行为，90s 总预算不受影响）。 */
+    first_body_timeout_ms = (voice_mode && LLM_FIRST_BODY_DEADLINE_MS > 0)
+        ? (uint32_t)LLM_FIRST_BODY_DEADLINE_MS : 0;
 
     /* 请求体：与 llm_chat_tools() 完全一致 + "stream": true */
     body = cJSON_CreateObject();
@@ -1482,12 +1732,10 @@ int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
 
     if (is_openai_compat_host(llm_host)) {
         cJSON_AddNumberToObject(body, "max_completion_tokens",
-            s_max_tokens_override > 0 ? s_max_tokens_override
-                                      : AGENT_LLM_MAX_TOKENS_OPENAI);
+            llm_effective_max_tokens(AGENT_LLM_MAX_TOKENS_OPENAI));
     } else {
         cJSON_AddNumberToObject(body, "max_tokens",
-            s_max_tokens_override > 0 ? s_max_tokens_override
-                                      : AGENT_LLM_MAX_TOKENS);
+            llm_effective_max_tokens(AGENT_LLM_MAX_TOKENS));
     }
 
     msgs = cJSON_Duplicate(messages, 1);
@@ -1526,9 +1774,32 @@ int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
         return ERROR;
     }
     st.line[0] = '\0';
+    st.first_token_ms = -1;
+    st.first_token_check = voice_mode;   /* perf-fw A4：只有语音回合做首 token 检查 */
+    st.t_start_ms = llm_proxy_mono_ms(); /* 兜底；真实起点在 llm_http_call_stream
+                                          * 里 voice_channel_llm_begin() 之后覆盖 */
 
-    http_err = llm_http_call_stream(post_data, llm_sse_feed, &st, &status);
+    /* P0-NET：记录建连序号，结束时据此判断本轮是否真的新建连接（否则=复用 cache）。 */
+    uint64_t conn_seq0 = vela_tls_conn_seq();
+
+    http_err = llm_http_call_stream(post_data, llm_sse_feed, &st, &status,
+        stream_timeout_ms, first_body_timeout_ms, &st.t_start_ms);
     free(post_data);
+
+    elapsed_ms = (long)(llm_proxy_mono_ms() - st.t_start_ms);
+
+    /* VOICE-A：首 token 超时（迟到的 delta 在 parser 里已经中止流/关闭连接）。
+     * 直接返回 -ETIMEDOUT，**跳过非流式回退**，让 agent_loop 的失败路径立刻
+     * 回落 local_lm/短句，而不是再等一次非流式请求。 */
+    if (st.first_token_timeout) {
+        syslog(LOG_WARNING,
+            "[%s] first-token timeout %ldms (deadline %dms): return -ETIMEDOUT "
+            "without non-stream fallback\n",
+            TAG, elapsed_ms, LLM_FIRST_TOKEN_DEADLINE_MS);
+        free(st.line);
+        llm_stream_resp_reset(&st);
+        return -ETIMEDOUT;
+    }
 
     if (http_err == OK && status == 200) {
         if (!st.failed && st.parse_errors == 0
@@ -1549,6 +1820,22 @@ int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
             TAG, http_err, status);
     }
 
+    /* VOICE-A-FIX（perf-fw A4）：一个 delta 都没收到且已到首 token deadline
+     * （语音回合的静默/慢首 token；此时流已被 vela 侧读超时/回退关闭）->
+     * 按首 token 超时处理：返回 -ETIMEDOUT、不重发非流式。
+     * 非语音通道保持旧行为（不走首 token 降级）。 */
+    if (!usable && voice_mode && st.delta_count == 0
+        && LLM_FIRST_TOKEN_DEADLINE_MS > 0
+        && elapsed_ms >= LLM_FIRST_TOKEN_DEADLINE_MS) {
+        syslog(LOG_WARNING,
+            "[%s] first-token timeout %ldms (deadline %dms, no delta): return "
+            "-ETIMEDOUT without non-stream fallback\n",
+            TAG, elapsed_ms, LLM_FIRST_TOKEN_DEADLINE_MS);
+        free(st.line);
+        llm_stream_resp_reset(&st);
+        return -ETIMEDOUT;
+    }
+
     if (usable && resp->tool_use && st.reasoning_cut) {
         /* Kimi thinking：tool 轮必须把完整 reasoning_content 回传，截断会
          * 400。这里宁可多一次非流式请求，也不把坏数据交给下一轮。 */
@@ -1556,6 +1843,20 @@ int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
             "[%s] streaming reasoning truncated on tool round, fallback\n",
             TAG);
         usable = false;
+    }
+
+    /* VOICE-A-FIX（perf-fw A3）：首 token 与生成总预算分离后，这里只兜底
+     * "生成阶段 25s 总预算到点"这一异常情况：首 token 已到达（delta_count>0）
+     * 的回合保留已收到的部分文本按成功返回，不整轮回退 local；正常 90 字
+     * 回答在 25s 内生成完，不再被 8s 截断（partial 仅异常兜底）。 */
+    if (!usable && voice_mode && LLM_STREAM_TOTAL_DEADLINE_MS > 0
+        && st.delta_count > 0 && st.text_len > 0 && st.parse_errors == 0
+        && !st.failed && elapsed_ms >= LLM_STREAM_TOTAL_DEADLINE_MS) {
+        syslog(LOG_WARNING,
+            "[%s] generation budget hit after first token (deltas=%d text=%zu B), "
+            "keep partial answer\n",
+            TAG, st.delta_count, st.text_len);
+        usable = true;
     }
 
     if (usable) {
@@ -1587,6 +1888,36 @@ int llm_chat_tools_stream(const char* system_prompt, cJSON* messages,
         syslog(LOG_INFO, "[%s] stream fallback non-stream result: %s\n", TAG,
             result == OK ? "OK" : "FAILED");
     }
+
+    /* P0-NET：[lat] LLM 分段延迟（首 token / 生成 / 连接 / 握手）。
+     * ttft/gen 只在流式成功时有意义；回退非流式时按 -1 记录。
+     * 连接耗时只在本轮**真的新建连接**时有效（conn_seq 变化）；否则是复用
+     * 池连接（cache）：conn/handshake 记 0，pool=1（perf-fw 复核要求）。 */
+    {
+        int64_t conn_ms = 0;
+        int64_t hs_ms = 0;
+        bool pool_hit = true;
+        long ttft_ms = (st.first_token_ms > 0) ? st.first_token_ms : -1;
+        long gen_ms = (ttft_ms > 0 && elapsed_ms >= ttft_ms)
+            ? (elapsed_ms - ttft_ms) : -1;
+
+        if (vela_tls_conn_seq() != conn_seq0) {
+            bool hit = true;
+
+            vela_tls_get_last_timing(&conn_ms, &hs_ms, &hit);
+            pool_hit = hit;
+            if (pool_hit) {   /* 预连接/其它线程已建好：本轮仍是复用 */
+                conn_ms = 0;
+                hs_ms = 0;
+            }
+        }
+        syslog(LOG_INFO,
+            "[lat] llm ttft_ms=%ld gen_ms=%ld deltas=%d text=%zu "
+            "conn=%s conn_ms=%lld handshake_ms=%lld\n",
+            ttft_ms, gen_ms, st.delta_count, resp->text_len,
+            pool_hit ? "cache" : "new", (long long)conn_ms, (long long)hs_ms);
+    }
+    llm_log_prefix_cache("stream");
 
     free(st.line);
     return result;

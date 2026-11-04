@@ -102,6 +102,19 @@ int lvgl_ui_channel_send_kind(const char* text, uint8_t kind);
 int lvgl_ui_channel_send_silent(const char* text, pet_emotion_t emotion);
 
 /**
+ * P2A-感知增强（task-62）：主动关怀跨页角标。
+ *
+ * 在 lv_layer_top() 顶层显示一条小角标：任何页面都可见（不切页）、5s 后
+ * 自动消失；连续触发会刷新文本并重新计时。线程安全：内部只 malloc +
+ * lvgl_ui_post()，LVGL 对象操作全部在 render 线程执行。
+ * 不写历史、不切页、不触发 TTS（历史/播报仍由 care_fire 各自路径处理）。
+ *
+ * @param text UTF-8 文本（非空）
+ * @return 0 已投递；-EINVAL 参数/UI 未就绪；-ENOMEM。
+ */
+int lvgl_ui_care_badge(const char* text);
+
+/**
  * 线程安全地向 LVGL 投递一次异步回调。
  * LVGL 以 LV_OS_NONE 构建（无内部锁），任何非 render 线程直接调
  * lv_async_call / lv_timer_* 都会与 lv_timer_handler 竞态并损坏定时器
@@ -131,6 +144,20 @@ int lvgl_ui_channel_send_user(const char* text);
  * @return 0 成功，负值表示错误
  */
 int lvgl_ui_channel_log(const char* text, bool is_user);
+
+/**
+ * P2A-感知增强-FIX（task-64）：主动关怀专用历史记录，**保证不切页**。
+ *
+ * 与 lvgl_ui_channel_log 的区别：只写聊天历史环 + 刷新历史浮层（若可见），
+ * 不碰气泡、不更新桌宠页文本、**不调用任何 ui_nav_goto**。表盘/闹钟/音乐等
+ * 任意页面触发主动关怀时当前页面保持不变（配合 lvgl_ui_care_badge 的顶层
+ * 角标一起用）。
+ * 线程安全：内部只 malloc + lvgl_ui_post()，LVGL 操作在 render 线程执行。
+ *
+ * @param text UTF-8 文本（非空）
+ * @return 0 已投递；-EINVAL 参数/UI 未就绪；-ENOMEM。
+ */
+int lvgl_ui_care_history_log(const char* text);
 
 /****************************************************************************
  * 流式回答显示（SPEED-B / v125）

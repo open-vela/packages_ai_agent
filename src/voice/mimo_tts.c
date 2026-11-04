@@ -59,6 +59,14 @@
 
 #define MIMO_TTS_TAG       "mimo_tts"
 
+/* v142 Fix2：非流式 MiMo TTS 的 HTTP 尝试次数。
+ * 截断（VELA_TLS_ERR_TRUNCATED）、传输错误或"HTTP 200 但 JSON 坏掉"时，
+ * 只要一个 PCM 字节都还没播出，就丢连接池连接再试一次；已播出音频不重放。
+ * 回滚开关：设为 1 即恢复"单次尝试"旧行为。 */
+#ifndef MIMO_TTS_HTTP_ATTEMPTS
+#define MIMO_TTS_HTTP_ATTEMPTS 2
+#endif
+
 /* 一句 100 字播报约 100~200KB MP3, base64 后 ~140~270KB; 给 512KB 余量。 */
 #define MIMO_TTS_RESP_CAP  (512u * 1024u)
 #define MIMO_TTS_BODY_CAP  (8u * 1024u)
@@ -125,7 +133,8 @@ static int mimo_tts_synthesize_mp3(const char* text,
   edge_mp3_t* dec = NULL;
   struct mimo_tts_sink_s sink;
   vela_header_t hdrs[2];
-  int   status;
+  int   status = -EIO;
+  int   attempt;
   int   ret = -EIO;
 
   if (!s_ready && mimo_tts_init() != 0)
@@ -172,13 +181,6 @@ static int mimo_tts_synthesize_mp3(const char* text,
       return -ENOMEM;
     }
 
-  resp = (char*)malloc(MIMO_TTS_RESP_CAP);
-  if (resp == NULL)
-    {
-      free(body);
-      return -ENOMEM;
-    }
-
   hdrs[0].name  = "Authorization";
   hdrs[0].value = s_auth;
   hdrs[1].name  = NULL;
@@ -188,24 +190,74 @@ static int mimo_tts_synthesize_mp3(const char* text,
          MIMO_TTS_TAG, MIMO_API_PATH, (unsigned)strlen(body),
          (unsigned)strlen(text));
 
-  status = vela_https_post_json(MIMO_API_HOST, MIMO_API_PORT, MIMO_API_PATH,
-                                hdrs, body, resp, MIMO_TTS_RESP_CAP);
+  /* v142 Fix2：TLS 截断（VELA_TLS_ERR_TRUNCATED=-6）/ 传输错误 / "HTTP 200
+   * 但 JSON 坏掉" 且**一个 PCM 字节都还没播出**时，丢弃连接池里可能带残留
+   * body 的连接（vela_tls_pool_invalidate）后重试一次。
+   *
+   * 背景（.v3_work/plan/reset_rca.md）：v132 真机 cl=46119/body=34797 被旧
+   * vela_tls 当 200 返回 -> 这里 bad JSON(-EPROTO) -> 直接进 voice_tts 回退链
+   * （minimax 必死/Edge -0x4C 30s/volc 无凭证）-> ~70s 后整机看门狗复位。
+   * 重试一次 TTS 请求（≤46KB）远小于回退链代价。
+   *
+   * 注意：只在"尚未播出 PCM"时重试；已播出部分沿用后面的"可播即播"策略，
+   * 不重放。回滚开关：MIMO_TTS_HTTP_ATTEMPTS=1。 */
+  for (attempt = 0; attempt < MIMO_TTS_HTTP_ATTEMPTS; attempt++)
+    {
+      resp = (char*)malloc(MIMO_TTS_RESP_CAP);
+      if (resp == NULL)
+        {
+          free(body);
+          body = NULL;
+          return -ENOMEM;
+        }
+
+      status = vela_https_post_json(MIMO_API_HOST, MIMO_API_PORT,
+                                    MIMO_API_PATH, hdrs, body, resp,
+                                    MIMO_TTS_RESP_CAP);
+
+      if (status == 200)
+        {
+          root = cJSON_Parse(resp);
+          if (root != NULL)
+            {
+              break;                     /* 成功，跳出重试循环 */
+            }
+          syslog(LOG_ERR, "[%s] bad JSON (attempt %d/%d): %.160s\n",
+                 MIMO_TTS_TAG, attempt + 1, MIMO_TTS_HTTP_ATTEMPTS, resp);
+        }
+      else
+        {
+          syslog(LOG_ERR, "[%s] HTTP %d (attempt %d/%d): %.160s\n",
+                 MIMO_TTS_TAG, status, attempt + 1, MIMO_TTS_HTTP_ATTEMPTS,
+                 resp);
+        }
+
+      free(resp);
+      resp = NULL;
+      if (root != NULL)
+        {
+          cJSON_Delete(root);
+          root = NULL;
+        }
+
+      if (attempt + 1 >= MIMO_TTS_HTTP_ATTEMPTS)
+        {
+          break;
+        }
+
+      syslog(LOG_WARNING,
+             "[%s] retry after truncated/bad response "
+             "(status=%d, attempt %d/%d)\n",
+             MIMO_TTS_TAG, status, attempt + 1, MIMO_TTS_HTTP_ATTEMPTS);
+      vela_tls_pool_invalidate();   /* 丢弃可能带残留 body 的池连接 */
+    }
+
   free(body);
   body = NULL;
 
-  if (status != 200)
-    {
-      syslog(LOG_ERR, "[%s] HTTP %d: %.160s\n", MIMO_TTS_TAG, status, resp);
-      ret = (status < 0) ? status : -EIO;
-      goto out;
-    }
-
-  /* ── 解析 base64 MP3 ── */
-  root = cJSON_Parse(resp);
   if (root == NULL)
     {
-      syslog(LOG_ERR, "[%s] bad JSON: %.160s\n", MIMO_TTS_TAG, resp);
-      ret = -EPROTO;
+      ret = (status < 0) ? status : -EPROTO;
       goto out;
     }
 

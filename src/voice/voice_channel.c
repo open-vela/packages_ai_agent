@@ -34,6 +34,7 @@
 #include "voice/edge_tts.h"
 #include "voice/minimax_tts.h"
 #include "voice/voice_tts.h"
+#include "voice/voice_tts_cache.h"   /* VOICE-C：模板 TTS 离线缓存（speak_internal 先查） */
 #include "voice/volc_asr.h"
 #include "voice/minimax_asr.h"
 #include "voice/mimo_tts.h"
@@ -53,6 +54,15 @@
 
 static const char* TAG = "voice";
 static int s_backends_registered;
+
+/* VOICE-B：voice_channel_start() 在文件前半段就要判断"还有未播完的流式
+ * TTS/队列"，因此先声明实现（实体在 speak_enqueue 之后）。 */
+static bool voice_channel_tts_pending(void);
+static bool voice_llm_active(void);   /* P2A-COLLISION：LLM 回合是否仍在进行 */
+
+/* VOICE-B-FIX：防止 stream_abort <-> tts_abort 互相递归（tts_abort 内部也会
+ * 调 stream_abort；stream_abort 只在"确实有残句"时回调 tts_abort）。 */
+static volatile int s_tts_abort_in_progress;
 
 /* ── Audio preprocessing (NS + AGC via BES ec2float) ────── */
 
@@ -602,7 +612,10 @@ static volatile int s_tts_sessions;  /* v113b：本 boot 已发起的 TTS 会话
 #define VOICE_TURN_MAX_S  90
 /* v113b：真机实测第 3 次 TTS 复用 TLS 连接时会在读取阶段整机停摆；
  * 演示期先限制每 boot 最多 2 次播报，第 3 次起只上屏不出声（日志可查）。 */
-#define TTS_MAX_SESSIONS_PER_BOOT  5   /* v113d：v113c 已验证第 3 次 TTS 安全，升到 5 做最终验证 */
+/* v142c（2026-11-04）：v142 TLS 截断检测/keep=false/回退链预算后，5 次/ boot
+ * 对正常使用太低（用户第 6 次起只上屏不出声）。升到 20 并保留可回滚；
+ * 若复现旧 TLS 复用停摆，再降回 5。 */
+#define TTS_MAX_SESSIONS_PER_BOOT  20
 
 int voice_channel_turn_active(void)
 {
@@ -698,6 +711,9 @@ static void* asr_and_dispatch(void* arg)
  *     把"后端说成功、播放器 0 字节"从间接日志变成直接证据。 */
 static struct timespec s_tts_start;
 static int s_tts_first_chunk;
+/* P0-NET：最近一次 TTS 首块延迟与序号（供 agent_loop [lat] 聚合；只读）。 */
+static long s_last_tts_first_ms = -1;
+static unsigned s_last_tts_first_seq;
 static struct timespec s_asr_done_ts;
 /* v125 P0-B（2026-11-03）：本句实际写进播放器的 PCM 字节数与写失败次数。
  * 旧 tts_stream_cb 忽略 audio_playback_write() 的返回值，真机上出现过
@@ -705,6 +721,15 @@ static struct timespec s_asr_done_ts;
  * （perf-net §3.5 / log:1949）。现在 speak 结束时把这两个数直接打出来。 */
 static size_t s_tts_pcm_written;
 static int s_tts_write_errors;
+
+/* P0-NET：只读 getter（见 voice_channel.h 注释）。 */
+void voice_channel_get_last_tts_first_ms(long* ms, unsigned* seq)
+{
+    if (ms != NULL)
+        *ms = s_last_tts_first_ms;
+    if (seq != NULL)
+        *seq = s_last_tts_first_seq;
+}
 
 static void tts_stream_cb(const unsigned char* pcm_data,
     size_t pcm_len, int is_last, void* user_data)
@@ -725,6 +750,8 @@ static void tts_stream_cb(const unsigned char* pcm_data,
             syslog(LOG_INFO, "[%s] TTS first chunk: %ldms\n",
                 TAG, ms);
             s_tts_first_chunk = 1;
+            s_last_tts_first_ms = ms;   /* P0-NET：[lat] tts_first_ms 数据源 */
+            s_last_tts_first_seq++;
         }
         int wrote = audio_playback_write(pb, pcm_data, pcm_len);
 
@@ -847,12 +874,17 @@ int voice_channel_start(void)
     while (sem_trywait(&s_voice.rec_ready) == 0)
         ;
 
-    /* ── AEC workaround: stop active TTS to prevent echo ── */
-    if (s_voice.tts_pb) {
+    /* ── AEC workaround: stop active TTS to prevent echo ──
+     * VOICE-B：除了正在播的 pb，还要覆盖"流式首句已入队但还没播完"的情况
+     * （s_voice.tts_pb 可能为 NULL，queue/stream 仍有句子）。 */
+    if (s_voice.tts_pb || voice_channel_tts_pending()
+        || voice_tts_cache_is_playing()) {
         syslog(LOG_INFO,
-            "[%s] PTT: stopping active TTS to prevent echo\n", TAG);
+            "[%s] PTT: stopping active/queued TTS to prevent echo\n", TAG);
         s_voice.tts_abort = 1;
-        audio_playback_stop(s_voice.tts_pb);
+        if (s_voice.tts_pb) {
+            audio_playback_stop(s_voice.tts_pb);
+        }
 
         /* Release lock so the speak thread can finish closing the
          * playback device.  Without this, we hold the lock through
@@ -862,6 +894,12 @@ int voice_channel_start(void)
          * BES hardware the shared codec (ci2s) gets confused, causing
          * incomplete or corrupted recording. */
         pthread_mutex_unlock(&s_voice.lock);
+
+        /* VOICE-B：不持 s_voice.lock 调 tts_abort（它内部会再取 s_voice.lock），
+         * 清空句子队列 + 流式状态，避免录音时的回声/旧句残留。
+         * VOICE-C：缓存播放也在这里就近打断（tts_abort 内部亦会 stop）。 */
+        voice_tts_cache_stop();
+        voice_channel_tts_abort();
 
         /* Wait for the speak thread to finish — speak_lock is held
          * for the entire duration of voice_channel_speak(). */
@@ -1264,6 +1302,11 @@ static void tts_strip_markdown(char* s)
  * worker 常驻到进程结束(不 join、不退出)：退出路径上没有它要保存的状态，
  * 停机时随进程一起消失即可，避免引入 teardown 顺序问题。 */
 #define SPEAK_QUEUE_DEPTH 8
+/* P2A-COLLISION（task-57）：队列条目来源。用户回答（USER）优先于主动关怀
+ * 本地语音（CARE）；care 队列另有独立上限且满时绝不淘汰用户回答。 */
+#define SPEAK_ORIGIN_USER 0
+#define SPEAK_ORIGIN_CARE 1
+#define SPEAK_CARE_MAX    2
 /* 16KB(NuttX 默认): Edge 路径(TLS + minimp3)本来就在默认栈上出过声; 24KB 只从
  * 只有 ~70KB 的 SRAM 堆里永久多拿 8KB, 并不是挂死的原因(审查结论)。 */
 #define SPEAK_WORKER_STACK (32 * 1024)
@@ -1273,6 +1316,7 @@ static struct {
     pthread_cond_t cond;
     char* slots[SPEAK_QUEUE_DEPTH]; /* slots[0] 最旧, slots[count-1] 最新 */
     bool  budget[SPEAK_QUEUE_DEPTH]; /* 该句是否占用每 boot TTS 会话额度 */
+    uint8_t origin[SPEAK_QUEUE_DEPTH]; /* SPEAK_ORIGIN_USER / SPEAK_ORIGIN_CARE */
     int count;
     pthread_t thread;
     int started;
@@ -1280,6 +1324,135 @@ static struct {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
 };
+
+/* ══ P2A-COLLISION（task-57）：队列来源/诊断 + care cache-only 播放 ══════ */
+
+static uint32_t speak_hash(const char* text)
+{
+    uint32_t h = 2166136261u;
+
+    while (text != NULL && *text != '\0')
+    {
+        h ^= (uint8_t)*text++;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* 调用方持 s_speak_q.lock：移除下标 idx（数组整体前移）。 */
+static void speak_queue_remove_locked(int idx)
+{
+    int i;
+    int last = s_speak_q.count - 1;
+
+    if (idx < 0 || idx > last)
+    {
+        return;
+    }
+    free(s_speak_q.slots[idx]);
+    for (i = idx; i < last; i++)
+    {
+        s_speak_q.slots[i] = s_speak_q.slots[i + 1];
+        s_speak_q.budget[i] = s_speak_q.budget[i + 1];
+        s_speak_q.origin[i] = s_speak_q.origin[i + 1];
+    }
+    s_speak_q.slots[last] = NULL;
+    s_speak_q.budget[last] = false;
+    s_speak_q.origin[last] = SPEAK_ORIGIN_USER;
+    s_speak_q.count = last;
+}
+
+static int speak_queue_origin_count_locked(uint8_t origin)
+{
+    int i;
+    int n = 0;
+
+    for (i = 0; i < s_speak_q.count; i++)
+    {
+        if (s_speak_q.origin[i] == origin)
+        {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* 调用方持 s_speak_q.lock：返回最旧的指定来源条目下标，找不到 -1。 */
+static int speak_queue_find_locked(uint8_t origin)
+{
+    int i;
+
+    for (i = 0; i < s_speak_q.count; i++)
+    {
+        if (s_speak_q.origin[i] == origin)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* P2A-COLLISION F4：care 队列条目的唯一播放路径。
+ * cache-only：只查模板缓存并本地 PCM 播放；**不** tts_begin（不占媒体回合、
+ * 不会被 LLM 阻塞）、不占每 boot TTS 额度；未命中/-EBUSY/其它错误直接丢弃，
+ * **绝不回退网络 TTS**。录音态丢弃（PTT 优先）。故意不动 s_turn_active
+ * （care 不管理用户回合）。 */
+static void voice_care_cache_only(const char* text)
+{
+    const void* pcm = NULL;
+    size_t bytes = 0;
+    bool recording;
+    int rc;
+
+    if (text == NULL || text[0] == '\0')
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&s_voice.lock);
+    recording = (s_voice.state != VOICE_IDLE);
+    pthread_mutex_unlock(&s_voice.lock);
+    if (recording)
+    {
+        syslog(LOG_INFO,
+            "[%s] care-voice: drop (recording, cache_only=1)\n", TAG);
+        return;
+    }
+
+    if (voice_tts_cache_lookup(text, &pcm, &bytes) != 0)
+    {
+        syslog(LOG_INFO,
+            "[%s] care-voice: drop (cache miss, cache_only=1, no network TTS)\n",
+            TAG);
+        return;
+    }
+
+    /* P2A-感知增强（task-62）：care 专用播放 —— 同一 audio_playback 会话内
+     * 先播短提示音 + 关怀音量，再播缓存正文（不二次 open）。 */
+    rc = voice_tts_cache_play_care(text);
+    if (rc == 0)
+    {
+        syslog(LOG_INFO,
+            "[%s] care-voice: played (cache_only=1, prompt_tone=1, "
+            "pcm=%zu, no tts session)\n",
+            TAG, bytes);
+    }
+    else if (rc == -EBUSY)
+    {
+        syslog(LOG_INFO,
+            "[%s] care-voice: drop (cache busy, cache_only=1)\n", TAG);
+    }
+    else if (rc == -ECANCELED)
+    {
+        syslog(LOG_INFO, "[%s] care-voice: canceled (PTT stop)\n", TAG);
+    }
+    else
+    {
+        syslog(LOG_WARNING,
+            "[%s] care-voice: drop rc=%d (cache_only=1, no network fallback)\n",
+            TAG, rc);
+    }
+}
 
 /* 后台线程里念一句话。TTS 要走网络+解码+播放, 正常也要几秒到几十秒, 绝不能
  * 占住 UI 线程或 agent 的派发线程 —— 之前的"屏幕卡死"就是同步调用造成的。 */
@@ -1289,6 +1462,7 @@ static void* speak_worker(void* arg)
 
     for (;;) {
         char* text;
+        uint8_t origin;
         int ret;
         int i;
 
@@ -1299,22 +1473,52 @@ static void* speak_worker(void* arg)
         /* FIFO 出队(队列本身只有 1~2 项, 直接搬数组) */
         text = s_speak_q.slots[0];
         bool count_budget = s_speak_q.budget[0];
+        origin = s_speak_q.origin[0];
         for (i = 1; i < s_speak_q.count; i++) {
             s_speak_q.slots[i - 1] = s_speak_q.slots[i];
             s_speak_q.budget[i - 1] = s_speak_q.budget[i];
+            s_speak_q.origin[i - 1] = s_speak_q.origin[i];
         }
+        s_speak_q.slots[s_speak_q.count - 1] = NULL;
+        s_speak_q.budget[s_speak_q.count - 1] = false;
+        s_speak_q.origin[s_speak_q.count - 1] = SPEAK_ORIGIN_USER;
         s_speak_q.count--;
         pthread_mutex_unlock(&s_speak_q.lock);
 
-        /* voice_channel_speak() 自己会打断上一句正在播的 TTS, 因此即使
-         * 队列里排了两句, 也只会听到最新那句(与旧行为一致)。 */
+        /* P2A-COLLISION F4：care 走独立 cache-only 路径 —— 不 tts_begin
+         * （因此不会被 LLM 回合阻塞）、不占每 boot TTS 额度、未命中/-EBUSY
+         * 直接丢弃且绝不回退网络 TTS；也不清 s_turn_active。 */
+        if (origin == SPEAK_ORIGIN_CARE) {
+            syslog(LOG_INFO,
+                "[%s] queue dequeue: origin=care budget=0 text_hash=%08x\n",
+                TAG, (unsigned)speak_hash(text));
+            voice_care_cache_only(text);
+            free(text);
+            continue;
+        }
+
+        /* 用户回答：正常网络 TTS 路径（F2：voice_channel_tts_begin 已有 30s
+         * 等待上限，不会永久卡在 LLM 互斥上）。 */
+        syslog(LOG_INFO,
+            "[%s] queue dequeue: origin=user budget=%d text_hash=%08x\n",
+            TAG, (int)count_budget, (unsigned)speak_hash(text));
         voice_channel_tts_begin();
         ret = voice_channel_speak_internal(text, count_budget);
         voice_channel_tts_end();
-        s_turn_active = 0;      /* v111：本轮回答播报结束，允许下一句 */
+
+        /* B7 / P2A-COLLISION：多句排队、流式仍在进行、或 LLM 回合还未结束
+         * 都不能提前清 turn_active（否则 PTT 会在 LLM/TTS 窗口里开始录音，
+         * 与用户回答抢音频）。只有"队列空 + 无流式 + LLM 已结束"才结束本轮。 */
+        if (!voice_channel_tts_pending() && !voice_llm_active())
+        {
+            s_turn_active = 0;  /* v111：本轮回答播报结束，允许下一句 */
+        }
         if (ret != 0) {
             syslog(LOG_WARNING, "[%s] async speak failed: %d\n", TAG, ret);
         }
+        syslog(LOG_INFO,
+            "[%s] user-speak done: origin=user budget=%d turn_active=%d\n",
+            TAG, (int)count_budget, (int)s_turn_active);
 
         free(text);
     }
@@ -1464,11 +1668,28 @@ static void speak_text_cap(char *s, size_t cap)
  * edge/minimax 自带 TLS 是短连接且单次有界（403/鉴权失败秒级返回）。
  * TTS 侧等 LLM 的语义保持不变（TTS 由异步 worker 承担，不值得冒并发险）。 */
 #define LLM_WAIT_TTS_MAX_MS 30000
+/* P2A-COLLISION F2：TTS 侧等 LLM 回合的上限。原来无限 cond_wait：LLM 请求
+ * 漏调 llm_end/异常时 speak worker 永久卡在 tts_begin，队列里用户回答一起
+ * 被堵死（"TTS 再也不响"）。30s 后打 WARNING 并继续，避免永久静默。 */
+#define TTS_WAIT_LLM_MAX_MS 30000
 
 static pthread_mutex_t s_media_turn_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_media_turn_cond = PTHREAD_COND_INITIALIZER;
 static int s_llm_active_count;
 static int s_tts_active_count;
+
+/* P2A-COLLISION：speak worker 判定"用户回合是否真的结束"用（决定能否清
+ * s_turn_active）。加锁读计数，与 llm_begin/end 保持一致。 */
+static bool voice_llm_active(void)
+{
+    bool active;
+
+    pthread_mutex_lock(&s_media_turn_lock);
+    active = (s_llm_active_count > 0);
+    pthread_mutex_unlock(&s_media_turn_lock);
+
+    return active;
+}
 
 void voice_channel_llm_begin(void)
 {
@@ -1525,17 +1746,44 @@ void voice_channel_llm_end(void)
 
 void voice_channel_tts_begin(void)
 {
-    int waited = 0;
+    struct timespec deadline;
+    bool waited = false;
+    int rc;
 
     pthread_mutex_lock(&s_media_turn_lock);
     while (s_llm_active_count > 0)
     {
         if (!waited)
         {
-            syslog(LOG_INFO, "[%s] tts waits for llm to finish\n", TAG);
-            waited = 1;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += (time_t)(TTS_WAIT_LLM_MAX_MS / 1000);
+            deadline.tv_nsec +=
+                (long)(TTS_WAIT_LLM_MAX_MS % 1000) * 1000000L;
+            if (deadline.tv_nsec >= 1000000000L)
+            {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            waited = true;
+            syslog(LOG_INFO,
+                "[%s] tts waits for llm to finish (max %dms, llm_active=%d)\n",
+                TAG, TTS_WAIT_LLM_MAX_MS, s_llm_active_count);
         }
-        pthread_cond_wait(&s_media_turn_cond, &s_media_turn_lock);
+
+        rc = pthread_cond_timedwait(&s_media_turn_cond, &s_media_turn_lock,
+            &deadline);
+        if (rc != 0)
+        {
+            syslog(LOG_WARNING,
+                "[%s] tts_begin: wait llm timeout %dms (llm_active=%d) -> "
+                "proceed (F2, avoid permanent TTS block)\n",
+                TAG, TTS_WAIT_LLM_MAX_MS, s_llm_active_count);
+            break;      /* F2：超时不再等，避免永久阻塞 */
+        }
+    }
+    if (waited && s_llm_active_count == 0)
+    {
+        syslog(LOG_INFO, "[%s] tts_begin: llm finished, proceed\n", TAG);
     }
     s_tts_active_count++;
     pthread_mutex_unlock(&s_media_turn_lock);
@@ -1575,14 +1823,28 @@ int voice_channel_is_busy(void)
         busy = 1;
     }
 
+    /* VOICE-C：模板缓存本地播放不经过 speak 队列/tts_pb，但同样占着音频
+     * 设备；对 agent_loop 的回合门禁必须算 busy。 */
+    if (!busy && voice_tts_cache_is_playing())
+    {
+        busy = 1;
+    }
+
     return busy;
 }
 
-/* 入队一句；budget=true 表示占用每 boot TTS 会话额度（每轮回答只第一句占）。 */
-static int speak_enqueue(const char* text, bool budget, bool drop_oldest)
+/* 入队一句；budget=true 表示占用每 boot TTS 会话额度（每轮回答只第一句占）。
+ * P2A-COLLISION：增加 origin（用户回答/主动关怀），队列满时按来源取舍：
+ *   - care 条目：只淘汰最旧 care，care 上限 SPEAK_CARE_MAX；队列全被用户
+ *     回答占满时丢弃新 care，**绝不淘汰用户回答**；
+ *   - user 条目：先淘汰 care，仍满再按旧语义淘汰最旧 user（新回答优先）。
+ * 每次入队/淘汰都打诊断日志（origin/hash/qlen/evicted）。 */
+static int speak_enqueue_ex(const char* text, bool budget, bool drop_oldest,
+                            uint8_t origin)
 {
     char* copy;
-    int i;
+    int before;
+    int evicted = -1;
 
     if (!text || text[0] == '\0') {
         return -EINVAL;
@@ -1598,34 +1860,468 @@ static int speak_enqueue(const char* text, bool budget, bool drop_oldest)
     }
 
     pthread_mutex_lock(&s_speak_q.lock);
-    if (s_speak_q.count >= SPEAK_QUEUE_DEPTH) {
-        if (!drop_oldest) {
+    before = s_speak_q.count;
+
+    if (origin == SPEAK_ORIGIN_CARE)
+    {
+        /* care 队列上限：多了先淘汰最旧 care（绝不淘汰 user 回答）。 */
+        while (speak_queue_origin_count_locked(SPEAK_ORIGIN_CARE)
+               >= SPEAK_CARE_MAX)
+        {
+            int idx = speak_queue_find_locked(SPEAK_ORIGIN_CARE);
+            if (idx < 0)
+            {
+                break;
+            }
+            speak_queue_remove_locked(idx);
+            evicted = SPEAK_ORIGIN_CARE;
+        }
+        if (s_speak_q.count >= SPEAK_QUEUE_DEPTH)
+        {
+            int idx = speak_queue_find_locked(SPEAK_ORIGIN_CARE);
+            if (idx >= 0)
+            {
+                speak_queue_remove_locked(idx);
+                evicted = SPEAK_ORIGIN_CARE;
+            }
+            else
+            {
+                pthread_mutex_unlock(&s_speak_q.lock);
+                free(copy);
+                syslog(LOG_WARNING,
+                    "[%s] care enqueue dropped: queue full of user answers "
+                    "(qlen=%d, never drop user)\n", TAG, before);
+                return -ENOMEM;
+            }
+        }
+    }
+    else if (s_speak_q.count >= SPEAK_QUEUE_DEPTH)
+    {
+        /* 用户回答优先：先淘汰 care，再按旧语义淘汰最旧 user。 */
+        int idx = speak_queue_find_locked(SPEAK_ORIGIN_CARE);
+
+        if (idx >= 0)
+        {
+            speak_queue_remove_locked(idx);
+            evicted = SPEAK_ORIGIN_CARE;
+        }
+        else if (drop_oldest)
+        {
+            speak_queue_remove_locked(0);
+            evicted = SPEAK_ORIGIN_USER;
+        }
+        else
+        {
             pthread_mutex_unlock(&s_speak_q.lock);
             free(copy);
-            syslog(LOG_WARNING, "[%s] speak queue full, drop new sentence\n", TAG);
+            syslog(LOG_WARNING,
+                "[%s] speak queue full, drop new sentence (origin=user)\n",
+                TAG);
             return -ENOMEM;
         }
-        syslog(LOG_INFO, "[%s] speak queue full, dropping oldest\n", TAG);
-        free(s_speak_q.slots[0]);
-        for (i = 1; i < s_speak_q.count; i++) {
-            s_speak_q.slots[i - 1] = s_speak_q.slots[i];
-            s_speak_q.budget[i - 1] = s_speak_q.budget[i];
-        }
-        s_speak_q.count--;
     }
+
     s_speak_q.slots[s_speak_q.count] = copy;
     s_speak_q.budget[s_speak_q.count] = budget;
+    s_speak_q.origin[s_speak_q.count] = origin;
     s_speak_q.count++;
     pthread_cond_signal(&s_speak_q.cond);
+
+    syslog(LOG_INFO,
+        "[%s] queue enqueue: origin=%s hash=%08x budget=%d drop_oldest=%d "
+        "qlen=%d->%d evicted=%s\n",
+        TAG, (origin == SPEAK_ORIGIN_CARE) ? "care" : "user",
+        (unsigned)speak_hash(text), (int)budget, (int)drop_oldest,
+        before, s_speak_q.count,
+        (evicted == SPEAK_ORIGIN_CARE) ? "care"
+            : ((evicted == SPEAK_ORIGIN_USER) ? "user" : "none"));
+
     pthread_mutex_unlock(&s_speak_q.lock);
     return 0;
+}
+
+/* 旧入口：用户回答（dispatch/分句/流式）统一 origin=user，语义不变。 */
+static int speak_enqueue(const char* text, bool budget, bool drop_oldest)
+{
+    return speak_enqueue_ex(text, budget, drop_oldest, SPEAK_ORIGIN_USER);
+}
+
+/* P2A-COLLISION F4：主动关怀本地语音专用入队（详见 voice_channel.h）。
+ * 不占每 boot TTS 额度、cache-only、低优先级；返回 0 已入队，负 errno
+ * 表示被拒（care 永不让用户回答被淘汰）。 */
+int voice_channel_speak_care_async(const char* text)
+{
+    int rc = speak_enqueue_ex(text, false, false, SPEAK_ORIGIN_CARE);
+
+    if (rc != 0)
+    {
+        syslog(LOG_INFO,
+            "[%s] care voice rejected: rc=%d (cache_only=1, no user drop)\n",
+            TAG, rc);
+    }
+    return rc;
+}
+
+/* ── VOICE-B：LLM 流式首句 TTS（docs_ble/112 §2B）───────────────────
+ *
+ * agent_loop 的 voice 流式 delta 线程调用 begin/feed/end：
+ *   begin -> 清状态；
+ *   feed  -> 攒到第一个完整句子（。！？；ASCII .!?; 或换行）就 speak_enqueue，
+ *            不阻塞网络回调；后续句子继续入队（首句 budget=true，其余不扣额度）；
+ *   end   -> flush 尾句 + 登记 takeover（随后 outbound dispatch 对同一段文本
+ *            调 speak_async 时被哈希+长度匹配跳过，不重复整段）；
+ *   abort -> 失败/工具轮/PTT 打断：丢弃流式状态，dispatch 回退原整段 TTS。
+ * 播放器所有权仍在既有 speak worker；PTT abort 会清队列+清 stream 状态。 */
+#define STREAM_BUF_BYTES   224
+#define STREAM_TAKEOVER_MS 30000
+
+typedef struct
+{
+    pthread_mutex_t lock;
+    bool     active;
+    bool     failed;
+    bool     budget_used;
+    int      sentences;
+    char     buf[STREAM_BUF_BYTES];
+    size_t   len;
+    bool     takeover;
+    uint32_t take_hash;
+    uint32_t take_len;
+    uint32_t take_deadline_ms;
+} voice_stream_t;
+
+static voice_stream_t s_stream = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static uint32_t stream_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+static uint32_t stream_hash(const char* s)
+{
+    uint32_t h = 2166136261u;
+
+    while (s != NULL && *s != '\0')
+    {
+        h ^= (uint8_t)*s++;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* 3 字节 CJK 句末标点：。！？； */
+static bool stream_is_term3(const char* p)
+{
+    const unsigned char* q = (const unsigned char*)p;
+
+    return (q[0] == 0xE3 && q[1] == 0x80 && q[2] == 0x82)
+        || (q[0] == 0xEF && q[1] == 0xBC && q[2] == 0x81)
+        || (q[0] == 0xEF && q[1] == 0xBC && q[2] == 0x9F)
+        || (q[0] == 0xEF && q[1] == 0xBC && q[2] == 0x9B);
+}
+
+/* 调用方持 stream lock：把一段（含标点）入队给 speak worker。
+ * 返回 false 表示入队失败（end 不再 takeover，上层回退整段 TTS）。 */
+static bool stream_emit_locked(const char* seg, size_t n)
+{
+    char tmp[STREAM_BUF_BYTES + 8];
+    char* p;
+    size_t plen;
+    bool budget;
+
+    if (n == 0 || n >= sizeof(tmp))
+    {
+        return true;
+    }
+
+    memcpy(tmp, seg, n);
+    tmp[n] = '\0';
+
+    p = tmp;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    {
+        p++;
+    }
+    plen = strlen(p);
+    while (plen > 0
+           && (p[plen - 1] == ' ' || p[plen - 1] == '\t'
+               || p[plen - 1] == '\r' || p[plen - 1] == '\n'))
+    {
+        p[--plen] = '\0';
+    }
+    if (plen == 0)
+    {
+        return true;
+    }
+
+    budget = !s_stream.budget_used;
+    if (speak_enqueue(p, budget, false) != 0)
+    {
+        s_stream.failed = true;
+        syslog(LOG_WARNING,
+            "[%s] stream TTS enqueue failed (sentence %d), fallback full speak\n",
+            TAG, s_stream.sentences + 1);
+        return false;
+    }
+
+    s_stream.budget_used = true;
+    s_stream.sentences++;
+    syslog(LOG_INFO,
+        "[%s] stream TTS sentence #%d queued (%zu bytes, budget=%d)\n",
+        TAG, s_stream.sentences, plen, (int)budget);
+    return true;
+}
+
+void voice_channel_stream_begin(void)
+{
+    pthread_mutex_lock(&s_stream.lock);
+    if (!s_stream.active)
+    {
+        s_stream.active = true;
+        s_stream.failed = false;
+        s_stream.budget_used = false;
+        s_stream.sentences = 0;
+        s_stream.len = 0;
+        s_stream.takeover = false;
+        syslog(LOG_INFO, "[%s] stream TTS begin (voice delta streaming)\n", TAG);
+    }
+    pthread_mutex_unlock(&s_stream.lock);
+}
+
+void voice_channel_stream_feed(const char* delta)
+{
+    size_t i;
+
+    if (delta == NULL || delta[0] == '\0')
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&s_stream.lock);
+    if (!s_stream.active)
+    {
+        /* 没有 begin / 已被 tts_abort（PTT 打断）清掉：丢弃后续 delta，
+         * 避免用户开始录音后还把上一条回答的句子排进队列。 */
+        pthread_mutex_unlock(&s_stream.lock);
+        return;
+    }
+
+    for (i = 0; delta[i] != '\0'; i++)
+    {
+        unsigned char c = (unsigned char)delta[i];
+        bool term = false;
+
+        /* 超长无标点：先硬切，避免首句等太久/缓冲越界。
+         * 切点回退到 UTF-8 字符起始，保证不把半个汉字交给 TTS。 */
+        if (s_stream.len >= STREAM_BUF_BYTES)
+        {
+            size_t cut = s_stream.len - 1;
+
+            while (cut > 0
+                   && ((unsigned char)s_stream.buf[cut] & 0xC0) == 0x80)
+            {
+                cut--;
+            }
+            if (cut > 0)
+            {
+                stream_emit_locked(s_stream.buf, cut);
+                memmove(s_stream.buf, s_stream.buf + cut,
+                    s_stream.len - cut);
+                s_stream.len -= cut;
+            }
+            else
+            {
+                stream_emit_locked(s_stream.buf, s_stream.len);
+                s_stream.len = 0;
+            }
+        }
+
+        s_stream.buf[s_stream.len++] = (char)c;
+
+        if (c == '\n' || c == '!' || c == '?' || c == ';' || c == '.')
+        {
+            term = true;
+        }
+        else if (s_stream.len >= 3
+                 && stream_is_term3(&s_stream.buf[s_stream.len - 3]))
+        {
+            term = true;
+        }
+
+        if (term)
+        {
+            if (s_stream.len >= 4)
+            {
+                /* 至少 2 个汉字左右才念：避免“。”单独成句 */
+                stream_emit_locked(s_stream.buf, s_stream.len);
+                s_stream.len = 0;
+            }
+            /* 太短（如“好。”）先留着，与后文合并成一句 */
+        }
+    }
+
+    {
+        bool failed = s_stream.failed;
+        pthread_mutex_unlock(&s_stream.lock);
+
+        /* VOICE-B-FIX（B2）：入队失败不能留残句——立刻 tts_abort 清队列 +
+         * 清 stream 状态，让 dispatch 只走一次整段 TTS 兜底。 */
+        if (failed)
+        {
+            syslog(LOG_WARNING,
+                "[%s] stream TTS feed: enqueue failed -> abort/clear queue, "
+                "dispatch will full-speak once\n", TAG);
+            voice_channel_tts_abort();
+        }
+    }
+}
+
+void voice_channel_stream_end(const char* full_text)
+{
+    bool takeover = false;
+    bool failed;
+    int sentences;
+
+    pthread_mutex_lock(&s_stream.lock);
+    if (!s_stream.active)
+    {
+        pthread_mutex_unlock(&s_stream.lock);
+        return;
+    }
+
+    if (s_stream.len > 0)
+    {
+        stream_emit_locked(s_stream.buf, s_stream.len);
+        s_stream.len = 0;
+    }
+
+    sentences = s_stream.sentences;
+    failed = s_stream.failed;
+
+    if (!failed && sentences > 0 && full_text != NULL
+        && full_text[0] != '\0')
+    {
+        s_stream.takeover = true;
+        s_stream.take_hash = stream_hash(full_text);
+        s_stream.take_len = (uint32_t)strlen(full_text);
+        s_stream.take_deadline_ms = stream_now_ms() + STREAM_TAKEOVER_MS;
+        takeover = true;
+    }
+
+    s_stream.active = false;
+    s_stream.len = 0;
+    s_stream.failed = false;
+    pthread_mutex_unlock(&s_stream.lock);
+
+    syslog(LOG_INFO,
+        "[%s] stream TTS end: sentences=%d takeover=%d failed=%d (full=%zu)\n",
+        TAG, sentences, (int)takeover, (int)failed,
+        (full_text != NULL) ? strlen(full_text) : (size_t)0);
+
+    if (failed)
+    {
+        /* VOICE-B-FIX（B2）：有句子入队失败 -> 清掉已入队残句，避免
+         * "残句 + dispatch 整段" 双重播放；dispatch 会整段 TTS 一次。 */
+        syslog(LOG_WARNING,
+            "[%s] stream TTS end failed -> tts_abort residual queue\n", TAG);
+        voice_channel_tts_abort();
+    }
+}
+
+void voice_channel_stream_abort(void)
+{
+    int sentences;
+    bool active;
+
+    pthread_mutex_lock(&s_stream.lock);
+    active = s_stream.active;
+    sentences = s_stream.sentences;
+    s_stream.active = false;
+    s_stream.failed = false;
+    s_stream.budget_used = false;
+    s_stream.sentences = 0;
+    s_stream.len = 0;
+    s_stream.takeover = false;
+    pthread_mutex_unlock(&s_stream.lock);
+
+    if (active || sentences > 0)
+    {
+        syslog(LOG_INFO,
+            "[%s] stream TTS abort: sentences=%d -> flush queue (tts_abort) + "
+            "dispatch full-speak fallback\n", TAG, sentences);
+
+        /* VOICE-B-FIX（B1）：失败/工具轮/watchdog/cascade 等 abort 路径必须
+         * 同时清掉已入队的残句并停当前播放，否则 dispatch 再整段 TTS 时
+         * 用户会听到"残句 + 整段"重复播放。
+         * 注意：tts_abort 内部也会回调本函数，用 in_progress 防递归。 */
+        if (!s_tts_abort_in_progress)
+        {
+            voice_channel_tts_abort();
+        }
+    }
+}
+
+/* 流式 end 成功后，outbound dispatch 会用同一段文本调 speak_async/speak；
+ * 这里哈希+长度匹配则跳过（一次性，30s 内有效）。 */
+static bool voice_channel_stream_consume_takeover(const char* text)
+{
+    bool hit = false;
+
+    if (text == NULL)
+    {
+        return false;
+    }
+
+    pthread_mutex_lock(&s_stream.lock);
+    if (s_stream.takeover
+        && stream_now_ms() <= s_stream.take_deadline_ms
+        && (uint32_t)strlen(text) == s_stream.take_len
+        && stream_hash(text) == s_stream.take_hash)
+    {
+        s_stream.takeover = false;
+        hit = true;
+    }
+    pthread_mutex_unlock(&s_stream.lock);
+    return hit;
+}
+
+/* PTT 打断用：还有流式句/队列未播完？ */
+static bool voice_channel_tts_pending(void)
+{
+    bool pending;
+
+    pthread_mutex_lock(&s_speak_q.lock);
+    pending = (s_speak_q.count > 0);
+    pthread_mutex_unlock(&s_speak_q.lock);
+
+    if (!pending)
+    {
+        pthread_mutex_lock(&s_stream.lock);
+        pending = s_stream.active;
+        pthread_mutex_unlock(&s_stream.lock);
+    }
+
+    return pending;
 }
 
 /* 返回 0 表示文本已入队(不代表念成功, 失败只记日志)。 */
 int voice_channel_speak_async(const char* text)
 {
+    if (voice_channel_stream_consume_takeover(text))
+    {
+        syslog(LOG_INFO,
+            "[%s] stream takeover: skip duplicate full TTS (%zu bytes)\n",
+            TAG, strlen(text));
+        return 0;
+    }
     return speak_enqueue(text, true, true);
 }
+
 
 /* 2026-11-03 分句 TTS：把最终回答按句号/问号/感叹号/分号拆开，逐句入队。
  *
@@ -1713,14 +2409,39 @@ void voice_channel_tts_abort(void)
 {
     int i;
 
-    /* 清空 speak 队列（如果有排队中的句子） */
-    pthread_mutex_lock(&s_speak_q.lock);
-    for (i = 0; i < s_speak_q.count; i++) {
-        free(s_speak_q.slots[i]);
-        s_speak_q.slots[i] = NULL;
+    if (s_tts_abort_in_progress)
+    {
+        return;     /* 防 stream_abort <-> tts_abort 递归 */
     }
-    s_speak_q.count = 0;
-    pthread_mutex_unlock(&s_speak_q.lock);
+    s_tts_abort_in_progress = 1;
+
+    /* VOICE-C：缓存播放也要立刻停（PTT/新回合打断时 cache 可能正占播放器） */
+    voice_tts_cache_stop();
+
+    /* 清空 speak 队列（如果有排队中的句子）；诊断按来源计数，
+     * 便于确认 PTT/失败路径是否清掉了 care 残句。 */
+    pthread_mutex_lock(&s_speak_q.lock);
+    {
+        int care_n = speak_queue_origin_count_locked(SPEAK_ORIGIN_CARE);
+        int user_n = s_speak_q.count - care_n;
+
+        for (i = 0; i < s_speak_q.count; i++) {
+            free(s_speak_q.slots[i]);
+            s_speak_q.slots[i] = NULL;
+        }
+        s_speak_q.count = 0;
+        pthread_mutex_unlock(&s_speak_q.lock);
+
+        if (care_n > 0 || user_n > 0) {
+            syslog(LOG_INFO,
+                "[%s] tts_abort: cleared queue (user=%d care=%d)\n",
+                TAG, user_n, care_n);
+        }
+    }
+
+    /* VOICE-B：清掉流式首句 TTS 状态（begin/feed 可能还在网络回调里跑，
+     * 清 active 后后续 feed 会自启新流；PTT 场景下新回合会重新 begin）。 */
+    voice_channel_stream_abort();
 
     /* 中断正在进行的 TTS 流/播放 */
     pthread_mutex_lock(&s_voice.lock);
@@ -1732,6 +2453,7 @@ void voice_channel_tts_abort(void)
     pthread_mutex_unlock(&s_voice.lock);
 
     s_turn_active = 0;
+    s_tts_abort_in_progress = 0;
     syslog(LOG_INFO, "[%s] tts_abort: queue cleared\n", TAG);
 }
 
@@ -1762,6 +2484,46 @@ static int voice_channel_speak_internal(const char* text, bool count_budget)
         }
         s_last_hash = h;
         s_last_ms = now;
+    }
+
+    /* ── VOICE-C 接线（docs/112 §2C，perf-fw C1/C5）──────────────────
+     * 顺序：PTT 录音态检查 -> 缓存 -> 每 boot TTS 额度检查/自增。
+     * - 命中：本地 PCM 播放（无网络 TTS、**不占 TTS session 额度**）；
+     * - 未命中/忙/设备错误：回落原网络 TTS 路径，行为不变；
+     * - 录音态不查缓存（AEC，后面原逻辑会 -EBUSY）；
+     * - speak_internal 在 speak worker 线程内调用（同步 NSH 路径也会经这里，
+     *   缓存播放器自身用 trylock 防多播放器，无并发风险）。 */
+    {
+        bool recording;
+
+        pthread_mutex_lock(&s_voice.lock);
+        recording = (s_voice.state != VOICE_IDLE);
+        pthread_mutex_unlock(&s_voice.lock);
+
+        if (!recording) {
+            int cache_ret = voice_tts_cache_play(text);
+
+            if (cache_ret == 0) {
+                syslog(LOG_INFO,
+                    "[%s] voice_cache hit -> local PCM played, skip network TTS\n",
+                    TAG);
+                return 0;
+            }
+            if (cache_ret == -ECANCELED) {
+                syslog(LOG_INFO,
+                    "[%s] voice_cache canceled by stop (PTT), silent done\n",
+                    TAG);
+                return 0;
+            }
+            if (cache_ret == -EBUSY) {
+                syslog(LOG_WARNING,
+                    "[%s] voice_cache busy -> fallback network TTS\n", TAG);
+            } else if (cache_ret != -ENOENT) {
+                syslog(LOG_WARNING,
+                    "[%s] voice_cache play failed: %d -> fallback network TTS\n",
+                    TAG, cache_ret);
+            }
+        }
     }
 
     /* v113b：每 boot TTS 次数上限（真机第 3 次复用 TLS 连接会整机停摆）
@@ -1954,6 +2716,14 @@ static int voice_channel_speak_internal(const char* text, bool count_budget)
 
 int voice_channel_speak(const char* text)
 {
+    /* VOICE-B：若本轮已流式播过同一段文本，跳过整段重复 TTS。 */
+    if (voice_channel_stream_consume_takeover(text))
+    {
+        syslog(LOG_INFO,
+            "[%s] stream takeover: skip duplicate full TTS (sync, %zu bytes)\n",
+            TAG, strlen(text));
+        return 0;
+    }
     return voice_channel_speak_internal(text, true);
 }
 

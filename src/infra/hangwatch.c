@@ -64,11 +64,70 @@
 #define HW_WDT_TIMEOUT_MS  20000
 #define HW_WDT_DEVPATH     "/dev/watchdog0"
 
+/* ── V142-FIX: 复位后不清零的心跳计数（RTC 备份寄存器，AON 域）──────────
+ * 板上 ld.script 没有 .noinit 段（不能改 ld），改用 RTC BKP 寄存器
+ * idx5(heartbeat)/idx6(boot)：看门狗复位后仍然保持，只有掉电/换电池才丢。
+ * 用途：复位后日志打印 hb=/boot=；与复位前最后一条 [alive] 的 hb 对比，
+ * 可区分两种停摆：
+ *   - 重启后读到的 hb ≈ 复位前最后打印的 hb → UI 心跳先停（真冻屏/关中断）
+ *   - 重启后读到的 hb 明显更大               → UI 还在跑，是 hangwatch/
+ *     日志线程自己死了（本线程优先级 240，能跑但没打日志）
+ * 数据格式：高字节 magic 区分"我方数据"与冷启动/其它使用者。
+ * 风险：HAL 的 RTC_BACKUP 枚举只用到 idx 0/1/2/3/4/7/8/9/11；idx5/6 在
+ * 当前树内无人使用（全仓 grep 确认）。若后续被第三方占用需更换 idx。
+ * 写入频率 1Hz（AON 寄存器，不进 flash），开销可忽略。
+ */
+#define HW_BKP_HB_IDX     5u
+#define HW_BKP_BOOT_IDX   6u
+#define HW_BKP_HB_MAGIC   0x48000000u   /* 'H' */
+#define HW_BKP_BOOT_MAGIC 0xB1000000u
+#define HW_BKP_VAL_MASK   0x00FFFFFFu
+
+extern void HAL_Set_backup(uint8_t idx, uint32_t value);
+extern uint32_t HAL_Get_backup(uint8_t idx);
+
 /****************************************************************************
  * Private Data
  ****************************************************************************/
 
-static volatile uint32_t g_ui_tick;      /* LVGL 任务心跳(1Hz) */
+static volatile uint32_t g_ui_tick;      /* LVGL 任务心跳(1Hz)，本 boot 内 */
+static volatile uint32_t g_hb_total;     /* 跨复位累计心跳（RTC BKP 镜像） */
+static volatile uint32_t g_boot_no;      /* 跨复位 boot 序号 */
+static bool              g_hb_inited;
+
+/* 懒初始化：UI 可能先于 hangwatch_start 开始 tick，不能等 start 才读 */
+static void hw_hb_lazy_init(void)
+{
+  uint32_t hb;
+  uint32_t boot;
+
+  if (g_hb_inited)
+    {
+      return;
+    }
+  g_hb_inited = true;
+
+  hb = HAL_Get_backup(HW_BKP_HB_IDX);
+  boot = HAL_Get_backup(HW_BKP_BOOT_IDX);
+
+  g_hb_total = ((hb & 0xFF000000u) == HW_BKP_HB_MAGIC)
+               ? (hb & HW_BKP_VAL_MASK) : 0;
+  g_boot_no = ((boot & 0xFF000000u) == HW_BKP_BOOT_MAGIC)
+              ? (boot & HW_BKP_VAL_MASK) : 0;
+}
+
+static void hw_hb_persist(void)
+{
+  HAL_Set_backup(HW_BKP_HB_IDX,
+                 HW_BKP_HB_MAGIC | (g_hb_total & HW_BKP_VAL_MASK));
+}
+
+static void hw_boot_persist(void)
+{
+  HAL_Set_backup(HW_BKP_BOOT_IDX,
+                 HW_BKP_BOOT_MAGIC | (g_boot_no & HW_BKP_VAL_MASK));
+}
+
 static volatile bool     g_hw_running;
 static int               g_wdt_fd = -1;  /* /dev/watchdog0, <0 = 未启用 */
 
@@ -78,7 +137,10 @@ static int               g_wdt_fd = -1;  /* /dev/watchdog0, <0 = 未启用 */
 
 void hangwatch_ui_tick(void)
 {
+  hw_hb_lazy_init();
   g_ui_tick++;
+  g_hb_total++;
+  hw_hb_persist();   /* 1Hz 写 RTC 备份寄存器：复位后还能读回 */
 }
 
 /****************************************************************************
@@ -270,8 +332,9 @@ static void *hw_thread(FAR void *arg)
             }
 
           syslog(LOG_INFO,
-                 "[alive] up=%us ui=%u stuck=%ums tasks=%d st=[%s]%s\n",
+                 "[alive] up=%us ui=%u hb=%lu boot=%lu stuck=%ums tasks=%d st=[%s]%s\n",
                  (unsigned)((now - t0) / 1000u), (unsigned)ui_now,
+                 (unsigned long)g_hb_total, (unsigned long)g_boot_no,
                  (unsigned)ui_stuck_ms, s.total, hist,
                  stall ? " UI-FROZEN" : "");
         }
@@ -307,6 +370,19 @@ int hangwatch_start(void)
     {
       return 0;
     }
+
+  hw_hb_lazy_init();
+  g_boot_no = (g_boot_no + 1u) & HW_BKP_VAL_MASK;
+  if (g_boot_no == 0)
+    {
+      g_boot_no = 1;
+    }
+  hw_boot_persist();
+
+  syslog(LOG_INFO,
+         "[alive] boot #%lu (retained heartbeat=%lu, +%lums poll, WDT=%dms)\n",
+         (unsigned long)g_boot_no, (unsigned long)g_hb_total,
+         (unsigned long)HW_POLL_MS, HW_WDT_TIMEOUT_MS);
 
   g_hw_running = true;
 
