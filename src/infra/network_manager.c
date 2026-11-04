@@ -319,7 +319,7 @@ static void load_net_config(void)
         && buf[0] != '\0') {
         g_net_config.read_timeout = atoi(buf);
     } else {
-        g_net_config.read_timeout = 30;
+        g_net_config.read_timeout = 200;
     }
 
     /* retry_max: default 3 */
@@ -832,6 +832,13 @@ int network_wifi_connect(const char* iface, const char* ssid,
 
     snprintf(cmd, sizeof(cmd), "wapi mode %s 2", dev); /* MANAGED */
     system(cmd);
+    /* [WIFI-FIX] set country CN (channels 1-13) before associating.
+     * esp_wifi default country is "01"/world = channels 1-11; Chinese APs
+     * commonly use 12/13 which the default scan set cannot see -> NO_AP_FOUND.
+     * CN (1-13) is a superset and safe on any channel. */
+    snprintf(cmd, sizeof(cmd), "wapi country %s CN", dev);
+    system(cmd);
+
 
     if (pass && pass[0]) {
         snprintf(cmd, sizeof(cmd), "wapi psk %s %s 3", dev, q_pass);
@@ -890,6 +897,23 @@ int network_wifi_connect(const char* iface, const char* ssid,
 
 int network_wifi_reconnect(void)
 {
+    /* The NuttX-native netinit (CONFIG_NETINIT_WAPI_SSID + CONFIG_NETINIT_
+     * DHCPC, both set for this board) associates wlan0 with the AP and
+     * obtains a DHCP lease during NSH bring-up.  If that already happened,
+     * re-running the low-level 'wapi' sequence below would tear a healthy
+     * association down and rebuild it (and, on the esp32s3 driver, may race
+     * with netinit).  So first give netinit a few seconds to finish; if a
+     * usable IPv4 address is present we are already online and must not
+     * touch the interface.  Only fall back to the manual wapi path when the
+     * link is still down (e.g. netinit failed, or the link dropped later). */
+
+    if (network_wait_connected(8000) == OK) {
+        syslog(LOG_INFO,
+            "[%s] Network already up: %s (netinit handled WiFi)\n",
+            TAG, network_get_ip());
+        return OK;
+    }
+
     char ssid[64] = { 0 };
     char pass[128] = { 0 };
     if (agent_config_get(AGENT_CFG_KEY_WIFI_SSID, ssid, sizeof(ssid)) != OK || !ssid[0]) {
