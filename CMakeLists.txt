@@ -19,6 +19,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/core/message_bus.c
     src/core/message_bus_tap.c
     src/core/agent_loop.c
+    src/core/point_reply.c
     src/core/agent_trace.c
     src/core/context_builder.c
     src/core/memory_store.c
@@ -30,6 +31,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/llm/llm_router.c
     src/llm/llm_cache.c
     src/infra/http_proxy.c
+    src/infra/agent_timing.c
     src/infra/vela_tls.c
     src/infra/config_store.c
     src/infra/network_manager.c
@@ -41,6 +43,8 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/channels/cmd_channel.c
     src/channels/ws_server.c
     src/tools/tool_registry.c
+    src/tools/tool_audit.c
+    src/tools/voice_scope.c
     src/tools/tool_files.c
     src/tools/tool_get_time.c
     src/tools/tool_web_search.c
@@ -50,6 +54,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/tools/tool_feishu_chat.c
     src/tools/tool_vision.c
     src/tools/tool_shell.c
+    src/tools/tool_shell_runner.c
     src/tools/tool_system.c
     src/tools/tool_health.c
     src/tools/tool_control.c

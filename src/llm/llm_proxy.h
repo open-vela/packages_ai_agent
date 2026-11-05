@@ -22,9 +22,14 @@
 
 #pragma once
 
+#include <agent_http.h>
+
 #include "cJSON.h"
 #include "agent_compat.h"
 #include "agent_config.h"
+#include "infra/agent_timing.h"
+#include "infra/req_ctl.h"
+#include "infra/vela_tls.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -44,6 +49,11 @@ int llm_set_port(const char* port);
 int llm_set_all(const char* host, const char* path,
     const char* port, const char* api_key,
     const char* model);
+/* Select an existing backend for a controlled round without rewriting its
+ * credentials/configuration to storage on every request. */
+int llm_set_all_runtime(const char *host, const char *path, const char *port,
+    const char *api_key, const char *model);
+
 
 int llm_chat(const char* system_prompt, const char* messages_json,
     char* response_buf, size_t buf_size);
@@ -71,12 +81,56 @@ typedef struct {
     int total_tokens;
 } llm_response_t;
 
+/* Same tool-call parser, with one shared deadline and no automatic 429 retry. */
+int llm_chat_tools_controlled(const char *system_prompt, cJSON *messages,
+    const char *tools_json, llm_response_t *resp,
+    agent_llm_timing_t *out_timing, const vela_req_ctl_t *ctl);
+
 void llm_response_free(llm_response_t* resp);
 
+/**
+ * One tool-calling chat round-trip (with 429 retries).
+ *
+ * @param out_timing  Optional.  Receives the phases of the last attempt and
+ *                    the totals for the whole call.  Reset internally, so
+ *                    the caller may hand over uninitialised storage.
+ */
 int llm_chat_tools(const char* system_prompt,
     cJSON* messages,
     const char* tools_json,
-    llm_response_t* resp);
+    llm_response_t* resp,
+    agent_llm_timing_t* out_timing);
+
+bool llm_proxy_echo_reasoning(void);
+
+/**
+ * One POST to the configured LLM endpoint, bounded by ctl.
+ *
+ * The request body is either post_data or a source that produces it in
+ * pieces; the response is either buffered into resp_buf or handed to sink
+ * as it arrives.  Used by the voice path, where a 15 s recording is 640 KB
+ * once base64-encoded and a TTS reply can be 400 KB.
+ *
+ * Returns 0 when a complete HTTP response was read (the status may still be
+ * 4xx/5xx), or a negative VELA_TLS_ERR_* / ERROR on a transport failure.
+ * The TLS connection is closed before returning in every case.
+ */
+int llm_http_call_stream(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl);
+
+/* Same request through the voice-dedicated keep-alive slot. */
+int llm_http_call_stream_voice(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl);
 
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).

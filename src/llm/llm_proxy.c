@@ -22,7 +22,11 @@
 
 #include "llm/llm_internal.h"
 #include "llm/llm_parse.h"
+#include "tools/voice_scope.h"
 #include "llm/llm_proxy.h"
+#include "llm/llm_router.h"
+#include "llm/llm_cache.h"
+#include "agent_llm.h"
 #include "core/message_bus.h"
 #include "infra/config_store.h"
 #include "infra/http_proxy.h"
@@ -59,6 +63,37 @@ bool is_openai_compat_host(const char* host)
     return strstr(host, "openai.com")
         || strstr(host, "openrouter.ai")
         || strstr(host, "xiaomimimo.com");
+}
+
+bool llm_proxy_echo_reasoning(void)
+{
+    char host[128];
+
+    pthread_mutex_lock(&s_llm_lock);
+    memcpy(host, s_llm_host, sizeof(host));
+    pthread_mutex_unlock(&s_llm_lock);
+
+    return strstr(host, "moonshot") != NULL
+        || strstr(host, "kimi") != NULL;
+}
+
+/* MiMo/OpenAI-compat: null content and unknown fields break the API. */
+static void llm_sanitize_messages_for_api(cJSON* msgs)
+{
+    cJSON* msg;
+
+    cJSON_ArrayForEach(msg, msgs)
+    {
+        cJSON* content = cJSON_GetObjectItem(msg, "content");
+
+        if (content && cJSON_IsNull(content)) {
+            cJSON_DeleteItemFromObject(msg, "content");
+        }
+
+        if (!llm_proxy_echo_reasoning()) {
+            cJSON_DeleteItemFromObject(msg, "reasoning_content");
+        }
+    }
 }
 
 
@@ -174,33 +209,33 @@ int llm_set_port(const char* port)
     return OK;
 }
 
-int llm_set_all(const char* host, const char* path,
-    const char* port, const char* api_key, const char* model)
+static int llm_update_all(const char* host, const char* path,
+    const char* port, const char* api_key, const char* model, bool persist)
 {
     pthread_mutex_lock(&s_llm_lock);
 
     if (host && host[0]) {
-        claw_config_set(AGENT_CFG_KEY_LLM_HOST, host);
+        if (persist) claw_config_set(AGENT_CFG_KEY_LLM_HOST, host);
         strncpy(s_llm_host, host, sizeof(s_llm_host) - 1);
         s_llm_host[sizeof(s_llm_host) - 1] = '\0';
     }
     if (path && path[0]) {
-        claw_config_set(AGENT_CFG_KEY_LLM_PATH, path);
+        if (persist) claw_config_set(AGENT_CFG_KEY_LLM_PATH, path);
         strncpy(s_llm_path, path, sizeof(s_llm_path) - 1);
         s_llm_path[sizeof(s_llm_path) - 1] = '\0';
     }
     if (port && port[0]) {
-        claw_config_set("llm_port", port);
+        if (persist) claw_config_set("llm_port", port);
         strncpy(s_llm_port, port, sizeof(s_llm_port) - 1);
         s_llm_port[sizeof(s_llm_port) - 1] = '\0';
     }
     if (api_key && api_key[0]) {
-        claw_config_set(AGENT_CFG_KEY_API_KEY, api_key);
+        if (persist) claw_config_set(AGENT_CFG_KEY_API_KEY, api_key);
         strncpy(s_api_key, api_key, sizeof(s_api_key) - 1);
         s_api_key[sizeof(s_api_key) - 1] = '\0';
     }
     if (model && model[0]) {
-        claw_config_set(AGENT_CFG_KEY_MODEL, model);
+        if (persist) claw_config_set(AGENT_CFG_KEY_MODEL, model);
         strncpy(s_model, model, sizeof(s_model) - 1);
         s_model[sizeof(s_model) - 1] = '\0';
     }
@@ -211,6 +246,19 @@ int llm_set_all(const char* host, const char* path,
         TAG, s_llm_host, s_llm_path, s_model);
     return OK;
 }
+
+int llm_set_all(const char *host, const char *path, const char *port,
+    const char *api_key, const char *model)
+{
+    return llm_update_all(host, path, port, api_key, model, true);
+}
+
+int llm_set_all_runtime(const char *host, const char *path, const char *port,
+    const char *api_key, const char *model)
+{
+    return llm_update_all(host, path, port, api_key, model, false);
+}
+
 
 /* ── Config snapshot (used by llm_vision.c) ───────────────── */
 
@@ -321,7 +369,7 @@ const char* model_name_for_api(const char* model, const char* host)
 
 /* Direct path via vela_tls */
 static int llm_http_direct(const char* post_data, resp_buf_t* rb,
-    int* out_status)
+    int* out_status, agent_llm_timing_t* timing)
 {
     /* Snapshot config under lock */
     char api_key[128], llm_host[128], llm_path[128], llm_port[8], model[64];
@@ -336,8 +384,10 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
     /* Allocate the response buffer once and hand it directly to the
      * TLS layer.  Previously we allocated a separate raw_buf and then
      * copied into resp_buf — doubling peak memory usage.  Now the
-     * resp_buf IS the raw buffer, eliminating the copy. */
-    size_t raw_cap = AGENT_LLM_STREAM_BUF_SIZE;
+     * resp_buf IS the raw buffer, eliminating the copy.  The capacity
+     * has to clear a whole tool-calling reply: this path cannot grow
+     * the buffer the way the proxy path does. */
+    size_t raw_cap = AGENT_LLM_DIRECT_RESP_CAP;
     if (resp_buf_init(rb, raw_cap) != OK)
         return ERROR;
 
@@ -356,20 +406,33 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
         memcpy(provider, model, plen);
     }
 
-    vela_header_t hdrs[] = { { "Authorization", auth_header },
+    vela_header_t hdrs[] = { { "Content-Type", "application/json" },
+        { "Authorization", auth_header },
         { provider[0] ? "X-Model-Provider-Id" : NULL,
             provider[0] ? provider : NULL },
         { NULL, NULL } };
 
+    size_t body_len = 0;
     int status;
     int use_tls = (strcmp(llm_port, "443") == 0);
 
     if (use_tls) {
-        status = vela_https_post_json(llm_host, llm_port, llm_path, hdrs, post_data,
-            rb->data, raw_cap);
+        /* Call the request API rather than the post_json wrapper: the wrapper
+         * discards the body length, and without it a reply that filled the
+         * buffer is indistinguishable from a complete one. */
+        status = vela_https_request_timed(llm_host, llm_port, "POST", llm_path,
+            hdrs, post_data, strlen(post_data), rb->data, raw_cap, &body_len,
+            timing);
     } else {
         status = vela_http_post_json(llm_host, llm_port, llm_path, hdrs, post_data,
             rb->data, raw_cap);
+        if (timing != NULL) {
+            /* The plain-HTTP helper has no phase hooks; it is used for
+             * intranet endpoints only, never the MiMo path.  Say the phases
+             * are unknown rather than borrowing the TLS ones. */
+
+            agent_timing_no_transport(timing);
+        }
     }
 
     if (status < 0) {
@@ -378,7 +441,18 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
     }
 
     /* Update length — TLS layer NUL-terminated the buffer */
-    rb->len = strlen(rb->data);
+    rb->len = (body_len > 0) ? body_len : strlen(rb->data);
+
+    /* vela_tls stops reading at resp_cap-1, so a body that lands exactly there
+     * was cut off.  Say so: the caller's cJSON_Parse then reports a syntax
+     * error that lives nowhere in the model's output, and the real cause (a
+     * reply larger than the buffer) is invisible. */
+    if (rb->len >= raw_cap - 1) {
+        syslog(LOG_ERR, "[%s] response truncated at %zu bytes (cap %zu)\n",
+            TAG, rb->len, raw_cap);
+        resp_buf_free(rb);
+        return ERROR;
+    }
 
     *out_status = status;
     return OK;
@@ -386,8 +460,17 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
 
 /* Proxy path via CONNECT tunnel */
 static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
-    int* out_status)
+    int* out_status, agent_llm_timing_t* timing)
 {
+    if (timing != NULL) {
+        /* proxy_conn_* hides the tunnel, the handshake and the read loop
+         * behind one opaque API, so only the total is measurable.  The
+         * caller's llm_total_ms still brackets this call. */
+
+        timing->proxy = true;
+        agent_timing_no_transport(timing);
+    }
+
     /* Snapshot config under lock */
     char api_key[128], llm_host[128], llm_path[128], llm_port[8], model[64];
     pthread_mutex_lock(&s_llm_lock);
@@ -478,7 +561,7 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
 }
 
 int llm_http_call(const char* post_data, resp_buf_t* rb,
-    int* out_status)
+    int* out_status, agent_llm_timing_t* timing)
 {
     /* For plain HTTP endpoints (port != 443), always use direct path.
      * The proxy does CONNECT + TLS which fails on non-TLS endpoints.
@@ -488,6 +571,10 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
     pthread_mutex_lock(&s_llm_lock);
     use_tls = (strcmp(s_llm_port, "443") == 0);
     pthread_mutex_unlock(&s_llm_lock);
+
+    /* timing, when present, describes one attempt.  The caller fills in
+     * backoff_ms and attempt before each call, so nothing is overwritten
+     * here except what this attempt itself measured. */
 
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
     int retry_max = network_get_retry_max();
@@ -507,9 +594,9 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
         }
 
         if (use_tls && http_proxy_is_enabled()) {
-            ret = llm_http_via_proxy(post_data, rb, out_status);
+            ret = llm_http_via_proxy(post_data, rb, out_status, timing);
         } else {
-            ret = llm_http_direct(post_data, rb, out_status);
+            ret = llm_http_direct(post_data, rb, out_status, timing);
         }
 
         if (ret == OK) {
@@ -536,9 +623,262 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
     return ERROR;
 #else
     if (use_tls && http_proxy_is_enabled())
-        return llm_http_via_proxy(post_data, rb, out_status);
-    return llm_http_direct(post_data, rb, out_status);
+        return llm_http_via_proxy(post_data, rb, out_status, timing);
+    return llm_http_direct(post_data, rb, out_status, timing);
 #endif
+}
+
+/* ── Deadline-bounded streaming POST ────────────────────────── */
+
+struct llm_mem_body {
+    const char *p;
+    size_t      len;
+    size_t      off;
+};
+
+static int llm_mem_body_read(void *ctx, char *buf, size_t cap)
+{
+    struct llm_mem_body *m = (struct llm_mem_body *)ctx;
+    size_t left = m->len - m->off;
+    size_t take = (left < cap) ? left : cap;
+
+    if (take == 0) {
+        return 0;
+    }
+
+    memcpy(buf, m->p + m->off, take);
+    m->off += take;
+    return (int)take;
+}
+
+/* Everything a streaming request needs from the llm configuration:
+ * endpoint snapshot, auth/provider headers and the wrapped body source.
+ * Shared by the plain and the voice-slot entries so their requests are
+ * identical apart from the transport. */
+struct llm_stream_req
+{
+    char llm_host[128];
+    char llm_port[8];
+    char llm_path[128];
+    char auth_header[256];
+    char provider[64];
+    vela_header_t hdrs[4];
+    struct llm_mem_body mem;
+    vela_body_src_t mem_src;
+    const vela_body_src_t *src;
+};
+
+static int llm_stream_prepare(struct llm_stream_req *r,
+                              const char *post_data,
+                              const vela_body_src_t *body)
+{
+    char api_key[128];
+    char model[64];
+    const char *slash;
+    int n = 0;
+
+    /* Callers allocate this snapshot on the stack.  In particular a model
+     * without a provider prefix must not publish an uninitialized header. */
+    memset(r, 0, sizeof(*r));
+
+    pthread_mutex_lock(&s_llm_lock);
+    memcpy(api_key, s_api_key, sizeof(api_key));
+    memcpy(r->llm_host, s_llm_host, sizeof(r->llm_host));
+    memcpy(r->llm_path, s_llm_path, sizeof(r->llm_path));
+    memcpy(r->llm_port, s_llm_port, sizeof(r->llm_port));
+    memcpy(model, s_model, sizeof(model));
+    pthread_mutex_unlock(&s_llm_lock);
+
+    if (api_key[0] == '\0') {
+        syslog(LOG_ERR, "[%s] no API key for a streaming request\n", TAG);
+        return ERROR;
+    }
+
+    /* The voice path is HTTPS only.  A plain-HTTP endpoint would need a
+     * second streaming implementation, and there is no such endpoint. */
+
+    if (strcmp(r->llm_port, "443") != 0) {
+        syslog(LOG_ERR, "[%s] streaming request requires port 443\n", TAG);
+        return ERROR;
+    }
+
+    snprintf(r->auth_header, sizeof(r->auth_header), "Bearer %s", api_key);
+
+    slash = strchr(model, '/');
+    if (slash != NULL) {
+        size_t plen = (size_t)(slash - model);
+
+        if (plen >= sizeof(r->provider)) {
+            plen = sizeof(r->provider) - 1;
+        }
+
+        memcpy(r->provider, model, plen);
+        r->provider[plen] = '\0';
+    }
+
+    r->hdrs[n++] = (vela_header_t) { "Content-Type", "application/json" };
+    r->hdrs[n++] = (vela_header_t) { "Authorization", r->auth_header };
+
+    if (r->provider[0] != '\0') {
+        r->hdrs[n++] = (vela_header_t) { "X-Model-Provider-Id", r->provider };
+    }
+
+    r->hdrs[n] = (vela_header_t) { NULL, NULL };
+
+    r->src = body;
+    if (r->src == NULL && post_data != NULL && post_data[0] != '\0') {
+        r->mem.p = post_data;
+        r->mem.len = strlen(post_data);
+        r->mem.off = 0;
+
+        r->mem_src.len = r->mem.len;
+        r->mem_src.read = llm_mem_body_read;
+        r->mem_src.ctx = &r->mem;
+        r->src = &r->mem_src;
+    }
+
+    return OK;
+}
+
+int llm_http_call_stream(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    struct llm_stream_req r;
+
+    if (llm_stream_prepare(&r, post_data, body) != OK) {
+        return ERROR;
+    }
+
+    return vela_https_request_stream(r.llm_host, r.llm_port, "POST",
+        r.llm_path, r.hdrs, r.src, sink, ctl, resp_buf, resp_cap,
+        out_body_len, out_status, timing);
+}
+
+int llm_http_call_stream_voice(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    struct llm_stream_req r;
+
+    if (llm_stream_prepare(&r, post_data, body) != OK) {
+        return ERROR;
+    }
+
+    return vela_https_request_stream_voice(r.llm_host, r.llm_port, "POST",
+        r.llm_path, r.hdrs, r.src, sink, ctl, resp_buf, resp_cap,
+        out_body_len, out_status, timing);
+}
+
+int agent_http_post_stream(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    const vela_req_ctl_t *ctl)
+{
+    return llm_http_call_stream(post_data, body, sink, resp_buf, resp_cap,
+        out_body_len, out_status, NULL, ctl);
+}
+
+int agent_http_post_stream_timed(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    return llm_http_call_stream(post_data, body, sink, resp_buf, resp_cap,
+        out_body_len, out_status, timing, ctl);
+}
+
+int agent_http_post_stream_voice_timed(const char *post_data,
+    const vela_body_src_t *body,
+    const vela_resp_sink_t *sink,
+    char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status,
+    agent_llm_timing_t *timing,
+    const vela_req_ctl_t *ctl)
+{
+    return llm_http_call_stream_voice(post_data, body, sink, resp_buf,
+        resp_cap, out_body_len, out_status, timing, ctl);
+}
+
+void agent_http_set_req_dump(int on)
+{
+    vela_tls_set_req_dump(on);
+}
+
+int agent_http_voice_preconnect(const vela_req_ctl_t *ctl,
+                                agent_llm_timing_t *timing)
+{
+    struct llm_stream_req r;
+
+    if (llm_stream_prepare(&r, NULL, NULL) != OK) {
+        return ERROR;
+    }
+
+    return vela_https_voice_preconnect(r.llm_host, r.llm_port, ctl, timing);
+}
+
+int agent_http_probe_post_stream(const char *host, const char *port,
+    const char *path, const char *post_data, const vela_body_src_t *body,
+    const vela_resp_sink_t *sink, char *resp_buf, size_t resp_cap,
+    size_t *out_body_len, int *out_status, const vela_req_ctl_t *ctl)
+{
+    static const vela_header_t headers[] = {
+        { "Content-Type", "application/json" },
+        { "Authorization", "Bearer velaguard-invalid-test-credential" },
+        { NULL, NULL }
+    };
+    struct llm_mem_body mem = {0};
+    vela_body_src_t mem_src;
+    if (!host || !port || !path || path[0] != '/' ||
+        strpbrk(host, "\r\n \t") || strpbrk(port, "\r\n \t") ||
+        strpbrk(path, "\r\n \t")) return AGENT_HTTP_ERR_CONNECT;
+    if (!body && post_data) {
+        mem.p = post_data; mem.len = strlen(post_data);
+        mem_src = (vela_body_src_t){.len=mem.len,.read=llm_mem_body_read,.ctx=&mem};
+        body = &mem_src;
+    }
+    return vela_https_request_stream(host, port, "POST", path, headers, body,
+        sink, ctl, resp_buf, resp_cap, out_body_len, out_status, NULL);
+}
+
+int agent_http_probe(const char *host, const char *port, const char *path,
+    const vela_req_ctl_t *ctl, size_t *out_body_len, int *out_status)
+{
+    static const vela_header_t headers[] = {
+        { "Content-Type", "application/json" },
+        { "Authorization", "Bearer velaguard-invalid-test-credential" },
+        { NULL, NULL }
+    };
+    static const char probe_json[] =
+        "{\"model\":\"mimo-v2.6-flash\",\"messages\":[{\"role\":\"user\","
+        "\"content\":\"test\"}]}";
+    struct llm_mem_body mem = { .p = probe_json, .len = sizeof(probe_json) - 1 };
+    vela_body_src_t body = { .len = sizeof(probe_json) - 1,
+        .read = llm_mem_body_read, .ctx = &mem };
+    char response[512];
+
+    if (host == NULL || port == NULL || path == NULL || path[0] != '/'
+        || strpbrk(host, "\r\n \t") != NULL
+        || strpbrk(path, "\r\n \t") != NULL) {
+        return AGENT_HTTP_ERR_CONNECT;
+    }
+
+    return vela_https_request_stream(host, port, "POST", path, headers,
+        &body, NULL, ctl, response, sizeof(response), out_body_len,
+        out_status, NULL);
 }
 
 /* ── JSON helpers ─────────────────────────────────────────── */
@@ -634,7 +974,7 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 
         rb.len = 0;
         status = 0;
-        err = llm_http_call(post_data, &rb, &status);
+        err = llm_http_call(post_data, &rb, &status, NULL);
 
         if (err != OK) {
             resp_buf_free(&rb);
@@ -681,11 +1021,90 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 
 /* ── Public: chat with tools ──────────────────────────────── */
 
+/* Controlled-stream sink: appends to the response buffer and, until the
+ * first SSE "data:" line arrives, watches for it byte by byte so the
+ * timing records when the model produced its first visible output.  The
+ * transport ttfb (the HTTP status line) is a different, earlier mark and
+ * both are reported; neither is renamed to mean the other.  The state is
+ * a fixed-size struct on the caller's stack: no allocation on this path. */
 
-int llm_chat_tools(const char* system_prompt, cJSON* messages,
-    const char* tools_json, llm_response_t* resp)
+struct llm_sink_obs {
+    resp_buf_t *rb;
+    agent_llm_timing_t *t;
+    uint32_t req_mark; /* request start; anchor fallback when send_done is unknown */
+    bool first_seen;
+    bool line_start; /* the next byte begins an SSE line */
+    size_t head_len; /* bytes of the "data:" prefix matched so far */
+};
+
+static int llm_control_sink(void *ctx, const char *data, size_t len)
 {
+    static const char prefix[] = "data:";
+    struct llm_sink_obs *obs = ctx;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        char c = data[i];
+
+        if (!obs->first_seen) {
+            if (obs->head_len == 0) {
+                if (obs->line_start && c == prefix[0]) {
+                    obs->head_len = 1;
+                }
+            } else if (c == prefix[obs->head_len]) {
+                obs->head_len++;
+                if (obs->head_len == sizeof(prefix) - 1) {
+                    uint32_t anchor = obs->t->send_done_mono;
+
+                    obs->first_seen = true;
+                    obs->t->first_data_ms = agent_elapsed_ms(
+                        anchor != 0 ? anchor : obs->req_mark,
+                        agent_mono_ms());
+                }
+            } else {
+                obs->head_len = 0;
+            }
+        }
+
+        obs->line_start = (c == '\n');
+    }
+
+    return resp_buf_append(obs->rb, data, len) == OK ? 0 : -1;
+}
+
+int llm_chat_tools(const char *system_prompt, cJSON *messages,
+    const char *tools_json, llm_response_t *resp,
+    agent_llm_timing_t *out_timing)
+{
+    return llm_chat_tools_controlled(system_prompt, messages, tools_json,
+        resp, out_timing, NULL);
+}
+
+int llm_chat_tools_controlled(const char* system_prompt, cJSON* messages,
+    const char* tools_json, llm_response_t* resp,
+    agent_llm_timing_t* out_timing, const vela_req_ctl_t *ctl)
+{
+    /* Local timing always exists so the code paths stay identical whether or
+     * not the caller asked for it.  out_timing is a one-time copy at the end:
+     * there is no shared state and no allocation. */
+
+    agent_llm_timing_t local;
+    agent_llm_timing_t* timing = &local;
+    uint32_t call_t0 = agent_mono_ms();
+    uint32_t mark = call_t0;
+
+    agent_timing_reset(timing);
+
     memset(resp, 0, sizeof(*resp));
+    if (agent_http_stop(ctl, call_t0)) {
+        int stopped = agent_http_cancelled(ctl) ? AGENT_HTTP_ERR_CANCELLED
+                                               : AGENT_HTTP_ERR_TIMEOUT;
+        timing->http_rc = stopped;
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
+        return stopped;
+    }
 
     /* Snapshot config under lock */
     char model[64];
@@ -699,6 +1118,10 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     pthread_mutex_unlock(&s_llm_lock);
 
     if (api_key[0] == '\0') {
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -715,6 +1138,10 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
             AGENT_LLM_MAX_TOKENS);
     }
 
+    if (vg_voice_scope_model_options(body, system_prompt, llm_host, model,
+                                    ctl != NULL))
+        syslog(LOG_INFO, "[%s] scoped voice model: thinking disabled, max_tokens=1024\n", TAG);
+
     /* Clone messages and prepend system message */
     cJSON* msgs = cJSON_Duplicate(messages, 1);
     cJSON* sys_msg = cJSON_CreateObject();
@@ -722,6 +1149,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     cJSON_AddStringToObject(sys_msg, "role", "system");
     cJSON_AddStringToObject(sys_msg, "content", system_prompt);
     cJSON_InsertItemInArray(msgs, 0, sys_msg);
+    llm_sanitize_messages_for_api(msgs);
     cJSON_AddItemToObject(body, "messages", msgs);
 
     /* Convert tools to OpenAI format */
@@ -735,8 +1163,25 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     cJSON_Delete(body);
     if (!post_data) {
+        timing->build_ms = agent_lap_ms(&mark);
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
+
+    /* Fix the moment the request body was ready.  Retries must report the
+     * same build cost; taking it from mark again later would fold the
+     * previous HTTP call into it.  mark has not moved since call_t0 on this
+     * path, so it is advanced here rather than measured against itself. */
+
+    mark = agent_mono_ms();
+
+    uint32_t build_ms = agent_elapsed_ms(call_t0, mark);
+
+    timing->build_ms = build_ms;
+    timing->req_bytes = (uint32_t)strlen(post_data);
 
     syslog(LOG_INFO,
         "[%s] OpenAI API with tools (model: %s, %d bytes)\n",
@@ -747,21 +1192,60 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     int err = ERROR;
     int retry;
 
-    for (retry = 0; retry <= AGENT_LLM_MAX_RETRIES; retry++) {
+    /* Only the last attempt's transport phases are kept; backoff_ms and
+     * attempt say how many tries it took to get there.  Attempts are not
+     * summed because the phases would no longer add up to one request. */
+
+    for (retry = 0; retry <= (ctl == NULL ? AGENT_LLM_MAX_RETRIES : 0); retry++) {
+        unsigned int delay = 0;
+
         if (retry > 0) {
-            unsigned int delay = AGENT_LLM_RETRY_BASE_SEC << (retry - 1);
+            delay = AGENT_LLM_RETRY_BASE_SEC << (retry - 1);
             syslog(LOG_WARNING, "[%s] Rate limited (429), retry %d/%d after %us\n",
                 TAG, retry, AGENT_LLM_MAX_RETRIES, delay);
             sleep(delay);
         }
 
+        agent_timing_reset(timing);
+        timing->build_ms = build_ms;
+        timing->req_bytes = (uint32_t)strlen(post_data);
+        timing->backoff_ms = (int32_t)(delay * 1000u);
+        timing->attempt = (uint16_t)(retry + 1);
+
         rb.len = 0;
         status = 0;
-        err = llm_http_call(post_data, &rb, &status);
+        mark = agent_mono_ms();
+        if (ctl != NULL) {
+            if (resp_buf_init(&rb, 4096) != OK) {
+                err = ERROR;
+            } else {
+                struct llm_sink_obs obs = {
+                    .rb = &rb,
+                    .t = timing,
+                    .req_mark = mark,
+                    .first_seen = false,
+                    .line_start = true,
+                    .head_len = 0,
+                };
+                vela_resp_sink_t sink = { .write = llm_control_sink, .ctx = &obs };
+                size_t received = 0;
+                err = llm_http_call_stream(post_data, NULL, &sink,
+                    NULL, 0, &received, &status, timing, ctl);
+            }
+        } else {
+            err = llm_http_call(post_data, &rb, &status, timing);
+        }
+        timing->http_total_ms = agent_elapsed_ms(mark, agent_mono_ms());
+        timing->http_rc = err;
+        timing->http_status = status;
 
         if (err != OK) {
+            timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
             resp_buf_free(&rb);
             free(post_data);
+            if (out_timing != NULL) {
+                *out_timing = local;
+            }
             return err;
         }
 
@@ -774,10 +1258,25 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     free(post_data);
 
+    /* Size of the reply as it arrived, before any parsing.  This is what the
+     * body phase waited for; the parsed counters below say what was in it. */
+
+    timing->resp_bytes = (uint32_t)rb.len;
+
+    /* Parsing is timed from here, so it excludes the request build and the
+     * network wait and can be compared with them directly. */
+
+    mark = agent_mono_ms();
+
     if (status != 200) {
         syslog(LOG_ERR, "[%s] API error %d: %.500s\n", TAG, status,
             rb.data ? rb.data : "");
+        timing->parse_ms = agent_lap_ms(&mark);
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
         resp_buf_free(&rb);
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -786,6 +1285,12 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     resp_buf_free(&rb);
     if (!root) {
         syslog(LOG_ERR, "[%s] Failed to parse API JSON\n", TAG);
+        timing->parse_ms = agent_lap_ms(&mark);
+        timing->parse_ok = false;
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -794,6 +1299,12 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     if (!choices || !cJSON_IsArray(choices) || !choices->child) {
         cJSON_Delete(root);
+        timing->parse_ms = agent_lap_ms(&mark);
+        timing->parse_ok = false;
+        timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+        if (out_timing != NULL) {
+            *out_timing = local;
+        }
         return ERROR;
     }
 
@@ -900,10 +1411,85 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
 
     cJSON_Delete(root);
 
+    timing->parse_ms = agent_lap_ms(&mark);
+    timing->parse_ok = true;
+    timing->llm_total_ms = agent_elapsed_ms(call_t0, agent_mono_ms());
+    if (out_timing != NULL) {
+        *out_timing = local;
+    }
+
+    /* Response composition.
+     *
+     * A body that takes minutes to arrive says nothing by itself about what
+     * is inside it.  These counters split the bytes by the part of the reply
+     * they belong to (visible text, reasoning, tool-call arguments), and put
+     * them next to the server's own token counts, so an oversized reply can
+     * be attributed instead of guessed at.  Sizes only: no content is logged.
+     */
+
+    {
+        size_t reasoning_bytes = resp->reasoning_content
+            ? strlen(resp->reasoning_content) : 0;
+        size_t tool_arg_bytes = 0;
+
+        for (int i = 0; i < resp->call_count; i++) {
+            if (resp->calls[i].input != NULL) {
+                tool_arg_bytes += resp->calls[i].input_len;
+            }
+        }
+
+        syslog(LOG_INFO,
+            "[%s] Resp bytes=%u text=%u reasoning=%u toolargs=%u calls=%d "
+            "finish=%s tokens=%d/%d/%d\n",
+            TAG, (unsigned)timing->resp_bytes, (unsigned)resp->text_len,
+            (unsigned)reasoning_bytes, (unsigned)tool_arg_bytes,
+            resp->call_count,
+            resp->tool_use ? "tool_calls" : "end_turn",
+            resp->prompt_tokens, resp->completion_tokens, resp->total_tokens);
+    }
+
     syslog(LOG_INFO,
         "[%s] Response: %d bytes text, %d tool calls, finish=%s\n",
         TAG, (int)resp->text_len, resp->call_count,
         resp->tool_use ? "tool_calls" : "end_turn");
 
     return OK;
+}
+
+/* Replace the model of backend 0 and keep host, path and key.  The key never
+ * leaves the backend structure, so a caller that only needs to correct a
+ * model name does not have to handle the credential. */
+
+void agent_llm_cache_forget(const char *prompt)
+{
+    if (prompt != NULL && prompt[0] != '\0') {
+        llm_cache_forget(prompt, strlen(prompt));
+    }
+}
+
+int agent_llm_set_model(const char *model)
+{
+    llm_backend_t backend;
+    size_t len;
+
+    if (model == NULL || model[0] == '\0') {
+        return -EINVAL;
+    }
+
+    len = strlen(model);
+    if (len >= sizeof(backend.model)) {
+        return -E2BIG;
+    }
+
+    if (llm_router_get_backend(0, &backend) != 0) {
+        return -ENODEV;
+    }
+
+    memcpy(backend.model, model, len + 1);
+
+    if (llm_router_set_backend(0, &backend) != 0) {
+        return -EIO;
+    }
+
+    return (llm_router_apply(0) == 0) ? 0 : -EIO;
 }

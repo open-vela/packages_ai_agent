@@ -147,6 +147,11 @@ int memory_store_init(void)
 
 int memory_read_long_term(char *buf, size_t size)
 {
+    /* size == 0 时 size - 1 是 size_t 下溢，fread 会无界写入。 */
+    if (size == 0) {
+        return ERROR;
+    }
+
     FILE *f = fopen(AGENT_MEMORY_FILE, "r");
     if (!f) {
         buf[0] = '\0';
@@ -196,6 +201,11 @@ int memory_append_today(const char *note)
 
 int memory_read_recent(char *buf, size_t size, int days)
 {
+    /* size == 0 时 buf[0] 与 size - 1 都越界。 */
+    if (size == 0) {
+        return ERROR;
+    }
+
     size_t offset = 0;
     buf[0] = '\0';
 
@@ -210,7 +220,14 @@ int memory_read_recent(char *buf, size_t size, int days)
         if (!f) continue;
 
         if (offset > 0 && offset < size - 4) {
-            offset += snprintf(buf + offset, size - offset, "\n---\n");
+            /* snprintf 返回本该长度，直接累加会让 offset 越过 size，
+             * 随后的 size - offset - 1 下溢成极大值交给 fread，就是一次
+             * 无界读入，结尾的 buf[offset] = '\0' 也落到界外。 */
+            int n = snprintf(buf + offset, size - offset, "\n---\n");
+            if (n < 0 || (size_t)n >= size - offset) {
+                break;      /* 放不下分隔符就停在已写入的内容上 */
+            }
+            offset += (size_t)n;
         }
         size_t n = fread(buf + offset, 1, size - offset - 1, f);
         offset += n;

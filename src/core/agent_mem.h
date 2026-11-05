@@ -46,13 +46,23 @@ typedef struct {
 
 /**
  * Query current heap memory status via mallinfo().
+ *
+ * CONFIG_VG_HMI: do not walk the heap. mallinfo/mm_foreach asserts or
+ * HARDFAULTs once a ReAct/TLS round has smashed a free-node (VelaGuard
+ * H750B-DK). Callers must treat free_heap as unknown.
  */
 static inline void agent_mem_get_status(agent_mem_status_t* st)
 {
+#ifdef CONFIG_VG_HMI
+    st->total_heap = 0;
+    st->free_heap = (size_t)-1 / 4;
+    st->largest_block = (size_t)-1 / 4;
+#else
     struct mallinfo mi = mallinfo();
     st->total_heap = mi.arena;
     st->free_heap = mi.fordblks;
     st->largest_block = mi.fordblks; /* conservative estimate */
+#endif
 }
 
 /**
@@ -61,7 +71,9 @@ static inline void agent_mem_get_status(agent_mem_status_t* st)
  * available free heap. Reserves AGENT_MEM_RESERVE_BYTES for
  * other subsystems.
  */
+#ifndef AGENT_MEM_RESERVE_BYTES
 #define AGENT_MEM_RESERVE_BYTES (32 * 1024)
+#endif
 
 static inline size_t agent_mem_safe_size(size_t requested, size_t min_size)
 {

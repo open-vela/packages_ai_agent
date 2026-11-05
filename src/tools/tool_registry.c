@@ -21,6 +21,7 @@
  */
 
 #include "tools/tool_registry.h"
+#include "tools/tool_audit.h"
 #ifdef CONFIG_AI_AGENT_MCP
 #include "tools/mcp_client.h"
 #include "tools/mcp_bridge.h"
@@ -46,12 +47,23 @@
 
 #include "cJSON.h"
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 static const char* TAG = "tools";
 
 #define MAX_TOOLS 48
 #define MAX_PROVIDERS 4
+
+/* ── Persistent tool-call audit ─────────────────────────────── */
+
+/* 拒绝和执行都经 C 层脱敏审计。HMI 使用有界队列和一个批量写线程；
+ * 其他构建保持同步落盘，队列溢出或存储失败均计入审计统计。 */
+#define VG_TOOL_AUDIT_BLOCKED (-2)
+#define VG_TOOL_AUDIT_UNKNOWN (-3)
+#define audit_tool_call tool_audit_submit
 
 /* ── External tool provider registry ───────────────────────── */
 
@@ -88,6 +100,14 @@ void tool_registry_register_provider(const char* name,
 
 static void register_tool(const agent_tool_t* tool)
 {
+#ifdef CONFIG_VG_HMI
+    if (!tool_guard_is_enabled(tool->name)) {
+        syslog(LOG_INFO, "[%s] Product policy hides tool: %s\n",
+            TAG, tool->name);
+        return;
+    }
+#endif
+
     if (s_tool_count >= MAX_TOOLS) {
         syslog(LOG_ERR, "[%s] Tool registry full\n", TAG);
         return;
@@ -559,6 +579,7 @@ int tool_registry_execute(const char *name, const char *input_json,
         snprintf(output, output_size,
                  "Error: tool '%s' blocked — %s",
                  name ? name : "(null)", reason);
+        audit_tool_call(name, input_json, VG_TOOL_AUDIT_BLOCKED);
         return ERROR;
     }
 
@@ -567,9 +588,7 @@ int tool_registry_execute(const char *name, const char *input_json,
         if (strcmp(s_tools[i].name, name) == 0) {
             syslog(LOG_INFO, "[%s] Executing tool: %s\n", TAG, name);
             int ret = s_tools[i].execute(input_json, output, output_size);
-            if (ret == OK) {
-                tool_guard_record_call(name);
-            }
+            audit_tool_call(name, input_json, ret);
             return ret;
         }
     }
@@ -578,7 +597,7 @@ int tool_registry_execute(const char *name, const char *input_json,
 #ifdef CONFIG_AI_AGENT_MCP
     if (mcp_bridge_execute(name, input_json, output, output_size) == OK) {
         syslog(LOG_INFO, "[%s] Executed MCP tool: %s\n", TAG, name);
-        tool_guard_record_call(name);
+        audit_tool_call(name, input_json, OK);
         return OK;
     }
 #endif
@@ -592,12 +611,13 @@ int tool_registry_execute(const char *name, const char *input_json,
         if (ret == OK) {
             syslog(LOG_INFO, "[%s] Executed %s tool: %s\n",
                    TAG, s_providers[p].name, name);
-            tool_guard_record_call(name);
+            audit_tool_call(name, input_json, OK);
             return OK;
         }
     }
 
     syslog(LOG_WARNING, "[%s] Unknown tool: %s\n", TAG, name);
     snprintf(output, output_size, "Error: unknown tool '%s'", name);
+    audit_tool_call(name, input_json, VG_TOOL_AUDIT_UNKNOWN);
     return ERROR;
 }

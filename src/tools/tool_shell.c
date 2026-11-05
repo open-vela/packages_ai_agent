@@ -15,6 +15,7 @@
  */
 
 #include "tools/tool_shell.h"
+#include "tools/tool_shell_runner.h"
 #include "agent_config.h"
 #include "agent_compat.h"
 
@@ -27,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/wait.h>
+#include <stdarg.h>
 
 #include "cJSON.h"
 
@@ -34,6 +36,23 @@ static const char *TAG = "shell";
 
 #define SHELL_OUTPUT_MAX  4096
 #define SHELL_CMD_MAX     256
+
+static size_t shell_append(char *out, size_t cap, size_t off,
+                            const char *fmt, ...)
+{
+    if (!cap) return 0;
+    if (off >= cap - 1) { out[cap - 1] = 0; return cap - 1; }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - off) {
+        out[off] = 0;
+        syslog(LOG_WARNING, "[%s] metadata output truncated at %zu/%zu\n", TAG, off, cap);
+        return cap - 1;
+    }
+    return off + (size_t)n;
+}
 
 /* Commands that are too dangerous to run from LLM */
 #if AGENT_SHELL_SECURITY == AGENT_SHELL_SECURITY_ALLOWLIST
@@ -90,8 +109,41 @@ static const char *s_allowed[] = {
     "set_gateway", "set_mqtt",
     "session_list", "memory_read",
     "mcp_list", "mcp_discover",
-    
+
+    /* VelaGuard read-only bring-up tools (stage1 ai_agent).  Being listed
+     * here means "reachable at all"; s_vg_readonly below narrows each one to
+     * the subcommands that cannot change board state. */
+    "vgmodbus", "vgstats", "vgruntime", "vgcfg", "vgnet",
+
     NULL
+};
+
+/* Per-command gate for the VelaGuard tools.  This has to live in C rather
+ * than in the skill text: these commands are reachable through the generic
+ * run_shell tool, and vgstats inject/reset mutate frame counters, vgnet
+ * inject/wifi rewrite network policy, and vgruntime report <path> writes an
+ * arbitrary file.
+ *
+ *   subcmd == NULL  read-only by construction, the whole command is fine
+ *   subcmd == ""    no subcommand is permitted at all
+ *   otherwise       the first token after the command must equal subcmd   */
+
+static const struct {
+    const char *name;
+    const char *subcmd;
+} s_vg_readonly[] = {
+#ifdef CONFIG_VG_HMI
+    { "vgmodbus",   ""       }, /* Operational AI reads snapshots, not the bus. */
+#else
+    { "vgmodbus",   NULL     },
+#endif
+    { "vgstats",    "dump"   },
+    { "vgruntime",  "dump"   },
+    { "vgcfg",      "dump"   },
+    { "vgnet",      "status" },
+    { "vgpoint",    ""       },
+    { "vgdiscover", ""       },
+    { NULL, NULL }
 };
 #endif
 
@@ -104,6 +156,57 @@ static bool has_shell_meta(const char *cmd)
         if (strchr(meta, *p)) return true;
     }
     return false;
+}
+#endif
+
+/* date is in the metadata allowlist, but its -s option changes the realtime
+ * clock.  Keep the read-only forms and reject every other argument shape.
+ * The gate must decide this from C, not from what the model happens to emit.
+ */
+
+#if AGENT_SHELL_SECURITY == AGENT_SHELL_SECURITY_ALLOWLIST
+static bool date_arg_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+           c == '\v' || c == '\f';
+}
+
+static const char *date_skip_spaces(const char *args)
+{
+    while (date_arg_space(*args))
+        args++;
+
+    return args;
+}
+
+static bool date_args_read_only(const char *args)
+{
+    args = date_skip_spaces(args);
+
+    if (strncmp(args, "-u", 2) == 0 &&
+        (args[2] == '\0' || date_arg_space(args[2]))) {
+        args += 2;
+        args = date_skip_spaces(args);
+    }
+
+    if (*args == '\0')
+        return true;
+
+    if (*args != '+')
+        return false;
+
+    args++;
+    if (*args == '\0' || date_arg_space(*args))
+        return false;
+
+    while (*args != '\0' && !date_arg_space(*args))
+        args++;
+
+    /* A format is one operand.  Options after it remain options to a backend
+     * that scans past the first non-option, so the C gate must reject them
+     * before execution. */
+
+    return *date_skip_spaces(args) == '\0';
 }
 #endif
 
@@ -158,6 +261,44 @@ static int is_blocked(const char *cmd)
     const char *basename = strrchr(first, '/');
     const char *name = basename ? basename + 1 : first;
 
+    if (strcmp(name, "date") == 0)
+        return date_args_read_only(cmd + i) ? 0 : 1;
+
+    /* VelaGuard: the agent may read board state, never change it. */
+    for (int k = 0; s_vg_readonly[k].name; k++) {
+        if (strcmp(name, s_vg_readonly[k].name) != 0)
+            continue;
+
+        const char *want = s_vg_readonly[k].subcmd;
+
+        if (want == NULL)
+            return 0;           /* read-only by construction */
+
+        if (want[0] == '\0')
+            return 1;           /* nothing permitted, including bare name */
+
+        while (cmd[i] == ' ') i++;
+        size_t wlen = strlen(want);
+        if (strncmp(cmd + i, want, wlen) != 0)
+            return 1;
+        if (cmd[i + wlen] != '\0' && cmd[i + wlen] != ' ')
+            return 1;           /* "dumpsters" must not pass as "dump" */
+        return 0;
+    }
+
+#ifdef CONFIG_VG_HMI
+    /* Product shell tools only expose metadata. File operations use the
+     * guarded file tools; general utilities could bypass their path policy. */
+    static const char *metadata[] = {
+        "free", "ps", "df", "uptime", "uname", "date", "heap_info",
+        "net_status", "router_status", NULL
+    };
+    bool metadata_ok = false;
+    for (int k = 0; metadata[k]; k++)
+        if (!strcmp(name, metadata[k])) metadata_ok = true;
+    if (!metadata_ok) return 1;
+#endif
+
     /* Check whitelist first */
     for (int k = 0; s_allowed[k]; k++) {
         if (strcmp(name, s_allowed[k]) == 0)
@@ -203,12 +344,12 @@ static int builtin_ps(char *output, size_t output_size)
     if (!d) return ERROR;
 
     size_t off = 0;
-    off += snprintf(output + off, output_size - off,
+    off = shell_append(output, output_size, off,
                     "%-6s %-4s %-8s %-20s %s\n",
                     "PID", "PRI", "STACK", "STATUS", "NAME");
 
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && off < output_size - 128) {
+    while ((ent = readdir(d)) != NULL && off < output_size && output_size - off > 128) {
         /* Only numeric dirs are PIDs */
         if (ent->d_name[0] < '0' || ent->d_name[0] > '9')
             continue;
@@ -216,12 +357,12 @@ static int builtin_ps(char *output, size_t output_size)
         char path[128];
         char buf[512] = {0};
 
-        snprintf(path, sizeof(path), "/proc/%s/status", ent->d_name);
+        snprintf(path, sizeof(path), "/proc/%.32s/status", ent->d_name);
         if (read_proc_file(path, buf, sizeof(buf)) > 0) {
             /* Trim trailing newline */
             char *nl = strchr(buf, '\n');
             if (nl) *nl = '\0';
-            off += snprintf(output + off, output_size - off,
+            off = shell_append(output, output_size, off,
                             "%-6s %s\n", ent->d_name, buf);
         }
     }
@@ -234,7 +375,7 @@ static int builtin_df(char *output, size_t output_size)
 {
     static const char *mounts[] = { "/", "/tmp", "/data", NULL };
     size_t off = 0;
-    off += snprintf(output + off, output_size - off,
+    off = shell_append(output, output_size, off,
                     "%-12s %12s %12s %12s\n",
                     "Filesystem", "Total", "Used", "Free");
 
@@ -244,7 +385,7 @@ static int builtin_df(char *output, size_t output_size)
             unsigned long total = (unsigned long)sfs.f_blocks * sfs.f_bsize;
             unsigned long avail = (unsigned long)sfs.f_bavail * sfs.f_bsize;
             unsigned long used  = total - avail;
-            off += snprintf(output + off, output_size - off,
+            off = shell_append(output, output_size, off,
                             "%-12s %10luKB %10luKB %10luKB\n",
                             mounts[i], total / 1024, used / 1024, avail / 1024);
         }
@@ -278,7 +419,7 @@ static int builtin_uname(char *output, size_t output_size)
 
 /* Allowed path prefixes for file access (symlink escape protection) */
 static const char *s_allowed_prefixes[] = {
-    "/proc/", "/data/agent/", "/tmp/", NULL
+    "/proc/", "/data/agent/", "/data/velaguard/", "/tmp/", NULL
 };
 
 static bool is_path_allowed(const char *path)
@@ -339,32 +480,16 @@ static int builtin_dmesg(char *output, size_t output_size)
     return OK;
 }
 
-/* Built-in command via popen — execute a whitelisted command and capture output */
+/* Bounded command capture; keep a failure visible even when stdout exists. */
 static int builtin_popen_cmd(const char *cmd, char *output, size_t output_size)
 {
-#ifdef CONFIG_SYSTEM_POPEN
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        snprintf(output, output_size,
-                 "Failed to execute: %s (%s)", cmd, strerror(errno));
-        return ERROR;
+    int rc = tool_shell_run(cmd, output, output_size, 10000);
+    if (rc) {
+        syslog(LOG_WARNING, "[%s] command failed rc=%d (10s limit)\n", TAG, rc);
+        /* A timeout is actionable even when the command printed a prefix. */
+        snprintf(output, output_size, "Command failed: %s (%d)", strerror(-rc), rc);
     }
-
-    size_t n = fread(output, 1, output_size - 1, fp);
-    output[n] = '\0';
-    int status = pclose(fp);
-    if (status != 0 && n == 0) {
-        snprintf(output, output_size,
-                 "Command failed with exit code %d", WEXITSTATUS(status));
-        return ERROR;
-    }
-
-    return (status == 0) ? OK : ERROR;
-#else
-    (void)cmd;
-    snprintf(output, output_size, "popen not available (enable CONFIG_SYSTEM_POPEN)");
-    return ERROR;
-#endif
+    return rc == 0 ? OK : ERROR;
 }
 
 /* Built-in "ls" — list directory (with path restriction) */
@@ -395,8 +520,8 @@ static int builtin_ls(const char *path, char *output, size_t output_size)
 
     size_t off = 0;
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && off < output_size - 64) {
-        off += snprintf(output + off, output_size - off, "%s\n", ent->d_name);
+    while ((ent = readdir(d)) != NULL && off < output_size && output_size - off > 64) {
+        off = shell_append(output, output_size, off, "%s\n", ent->d_name);
     }
     closedir(d);
     if (off == 0)
@@ -406,6 +531,7 @@ static int builtin_ls(const char *path, char *output, size_t output_size)
 
 int tool_run_shell_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     const char *command = NULL;
 
     cJSON *root = cJSON_Parse(input_json);
@@ -476,61 +602,42 @@ int tool_run_shell_execute(const char *input_json, char *output, size_t output_s
     } else if (strncmp(command, "am ", 3) == 0 || strcmp(command, "am") == 0) {
         ret = builtin_popen_cmd(command, cmd_buf, SHELL_OUTPUT_MAX);
     } else {
-#ifdef CONFIG_SYSTEM_POPEN
-        /* Execute via popen() - available when CONFIG_SYSTEM_POPEN is enabled.
-         * Command has already passed security checks (is_blocked). */
-        FILE *fp = popen(command, "r");
-        if (fp) {
-            size_t n = fread(cmd_buf, 1, SHELL_OUTPUT_MAX - 1, fp);
-            cmd_buf[n] = '\0';
-            int status = pclose(fp);
-            ret = (status == 0) ? OK : ERROR;
-            if (ret != OK && n == 0) {
-                snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                         "Command failed with exit code %d", WEXITSTATUS(status));
-            }
-            syslog(LOG_INFO, "[%s] popen(%s) exit=%d, %zu bytes\n",
-                   TAG, command, status, n);
-        } else {
-            syslog(LOG_ERR, "[%s] popen(%s) failed: %s\n",
-                   TAG, command, strerror(errno));
-            snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                     "Failed to execute: %s (%s)", command, strerror(errno));
-            ret = ERROR;
-        }
-#else
-        /* popen() not available - only builtin commands work */
-        syslog(LOG_WARNING, "[%s] Unsupported command: %s\n", TAG, command);
-        snprintf(cmd_buf, SHELL_OUTPUT_MAX,
-                 "Unsupported command: %s (enable CONFIG_SYSTEM_POPEN for external commands)",
-                 command);
-        ret = ERROR;
-#endif
+        ret = builtin_popen_cmd(command, cmd_buf, SHELL_OUTPUT_MAX);
     }
 
     cJSON_Delete(root);
 
-    if (ret != OK) {
-        snprintf(output, output_size, "{\"error\":\"Command failed: %s\"}", command);
+    /* Always return structured JSON so the LLM sees stdout even on non-zero exit. */
+    {
+        int exit_code = (ret == OK) ? 0 : 1;
+        cJSON *result = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(result, "exit_code", exit_code);
+        cJSON_AddStringToObject(result, "output", cmd_buf);
+        if (exit_code != 0) {
+            cJSON_AddStringToObject(result, "error", "non-zero exit");
+        }
+
+        char *json_str = cJSON_PrintUnformatted(result);
+        cJSON_Delete(result);
         free(cmd_buf);
-        return ERROR;
-    }
 
-    /* Build JSON result */
-    cJSON *result = cJSON_CreateObject();
-    cJSON_AddNumberToObject(result, "exit_code", 0);
-    cJSON_AddStringToObject(result, "output", cmd_buf);
-    free(cmd_buf);
+        if (!json_str) {
+            snprintf(output, output_size, "{\"exit_code\":1,\"output\":\"\"}");
+            return ERROR;
+        }
 
-    char *json_str = cJSON_PrintUnformatted(result);
-    cJSON_Delete(result);
-
-    if (json_str) {
+        if (strlen(json_str) >= output_size) {
+            free(json_str);
+            syslog(LOG_WARNING, "[%s] structured output exceeds %zu bytes\n", TAG, output_size);
+            snprintf(output, output_size, "{\"exit_code\":1,\"error\":\"output too large\"}");
+            return ERROR;
+        }
         strncpy(output, json_str, output_size - 1);
         output[output_size - 1] = '\0';
-        syslog(LOG_INFO, "[%s] Result: %d bytes\n", TAG, (int)strlen(output));
         free(json_str);
+        syslog(LOG_INFO, "[%s] Result: %d bytes (exit=%d)\n",
+            TAG, (int)strlen(output), exit_code);
+        return OK;
     }
-
-    return OK;
 }

@@ -22,6 +22,8 @@
 config EXAMPLES_AI_AGENT_VELA
 	tristate "Vela AI Agent"
 	default n
+	select SCHED_HAVE_PARENT if SYSTEM_POPEN
+	select SCHED_CHILD_STATUS if SYSTEM_POPEN
 	---help---
 		Enable the AI Agent ported to Vela/NuttX.
 		Requires network connectivity and mbedTLS.
@@ -41,6 +43,14 @@ config EXAMPLES_AI_AGENT_VELA_PRIORITY
 config EXAMPLES_AI_AGENT_VELA_STACKSIZE
 	int "Agent main stack size"
 	default 32768
+
+config EXAMPLES_AI_AGENT_VELA_TIME_OFFSET_SEC
+	int "Seconds added to the system clock for local time (CST=28800)"
+	default 28800
+	---help---
+		get_current_time and the system prompt header compute local
+		time as clock + this offset. Set 0 when the system clock already
+		runs local wall time (e.g. VelaGuard HMI syncs Beijing time).
 
 config EXAMPLES_AI_AGENT_VELA_DATA_DIR
 	string "Persistent data directory"
@@ -283,6 +293,53 @@ config AI_AGENT_TLS_CONN_POOL_SIZE
 		Number of persistent TLS connections kept alive for
 		reuse. Each slot uses ~12KB BSS (TLS context + raw
 		buffer). Set to 1 on memory-constrained boards.
+
+config AI_AGENT_VOICE_CONN_SLOT
+	bool "Voice-dedicated keep-alive TLS slot (ASR/TTS)"
+	default n
+	---help---
+		P2 phase 1: the voice round's ASR and TTS requests (same
+		worker thread, same endpoint) reuse one connection slot
+		instead of a full DNS+TCP+TLS handshake per request.  The
+		slot is separate from the buffered pool above so background
+		requests cannot evict the foreground connection.  A slot is
+		only kept when the response framing completed (or a bounded
+		drain reached the boundary after the TTS sink's early
+		completion); errors, cancellations and truncations destroy
+		it.  A reused connection failing before any response byte
+		is retried once on a fresh connection.  LLM requests (agent
+		loop thread) keep the plain entry in this phase.
+
+config AI_AGENT_TLS_FORENSICS
+	bool "TLS handshake forensics capture (diagnostics only)"
+	default n
+	---help---
+		Capture the handshake BIO byte stream into two independent
+		copies plus one send copy and, when the handshake fails with
+		a crypto error, dump the peer certificate, the failing
+		handshake message, the randoms and buffer addresses to
+		/data/forensics/tls-<n>/. Root-cause instrumentation for the
+		intermittent RSA verify / ASN.1 parse failures; never enable
+		in production images.
+
+config AI_AGENT_TLS_POOL
+	bool "Dedicated static mbedTLS allocation pool (diagnostics only)"
+	default n
+	select MBEDTLS_PLATFORM_MEMORY
+	---help---
+		Route every mbedTLS allocation through a dedicated static
+		first-fit pool with canaries instead of the general heap, so
+		TLS data lives outside the SDRAM heap region. A/B experiment
+		for locating the handshake corruption; never enable in
+		production images.
+
+config AI_AGENT_TLS_POOL_SIZE
+	int "TLS pool arena size in bytes"
+	default 102400
+	depends on AI_AGENT_TLS_POOL
+	---help---
+		Static arena size. Two concurrent TLS connections with 16 KB
+		content buffers plus certificate chains need roughly 84 KB.
 
 config AI_AGENT_BLE_GATT
 	bool "Enable BLE GATT data channel"

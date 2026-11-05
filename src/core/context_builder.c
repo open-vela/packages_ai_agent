@@ -31,12 +31,50 @@
 #endif
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "cJSON.h"
 
 static const char *TAG = "context";
+
+/* 饱和式追加：返回新的 off，恒满足 off <= size - 1。
+ *
+ * snprintf 返回的是本该写入的长度，直接累加到 off 会让 off 越过 size，
+ * 随后的 size - off 作为 size_t 下溢成极大值，再交给 snprintf / fread
+ * 就是一次无界写。这里把「缓冲区已满」与「刚刚写满」都收敛到 size - 1，
+ * 调用者不需要再判断。 */
+static size_t ctx_append(char *buf, size_t size, size_t off,
+                         const char *fmt, ...)
+{
+    if (size == 0) {
+        return 0;
+    }
+
+    if (off >= size - 1) {
+        buf[size - 1] = '\0';
+        return size - 1;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, size - off, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) {
+        return off;
+    }
+
+    if ((size_t)n >= size - off) {
+        buf[size - 1] = '\0';
+        return size - 1;
+    }
+
+    return off + (size_t)n;
+}
 
 /* Build a comma-separated list of registered tool names.
  * Returns number of bytes written (excluding NUL). */
@@ -60,25 +98,44 @@ static size_t build_tool_names(char *buf, size_t size)
 
     cJSON_ArrayForEach(item, arr) {
         cJSON *name = cJSON_GetObjectItem(item, "name");
-        if (name && cJSON_IsString(name) && off < size - 1) {
-            off += snprintf(buf + off, size - off, "%s%s",
+        if (name && cJSON_IsString(name)) {
+            off = ctx_append(buf, size, off, "%s%s",
                 first ? "" : ", ", name->valuestring);
             first = false;
         }
     }
 
     cJSON_Delete(arr);
+
+    /* 能力边界被截断会让模型拒绝本来可用的工具，单独告警。 */
+    if (size > 0 && off >= size - 1) {
+        syslog(LOG_WARNING,
+            "[%s] Tool name list truncated at %d/%d bytes; "
+            "the model may refuse tools that are still available\n",
+            TAG, (int)off, (int)size);
+    }
+
     return off;
 }
 
 static size_t append_file(char *buf, size_t size, size_t offset,
                            const char *path, const char *header)
 {
+    if (size == 0) {
+        return 0;
+    }
+
+    /* ctx_append 保证 offset <= size - 1；这里的夹取只为防御后续新增调用者，
+     * 因为写错时下溢的长度会直接交给 fread。 */
+    if (offset >= size) {
+        return size - 1;
+    }
+
     FILE *f = fopen(path, "r");
     if (!f) return offset;
 
     if (header && offset < size - 1) {
-        offset += snprintf(buf + offset, size - offset, "\n## %s\n\n", header);
+        offset = ctx_append(buf, size, offset, "\n## %s\n\n", header);
     }
 
     size_t n = fread(buf + offset, 1, size - offset - 1, f);
@@ -88,8 +145,123 @@ static size_t append_file(char *buf, size_t size, size_t offset,
     return offset;
 }
 
+/* ── Cached prompt body ───────────────────────────────────────────
+ *
+ * The body is the part of the prompt that needs file reads: the
+ * bootstrap files, the long-term memory, the recent notes and the
+ * skills summary.  On this board those files live on the eMMC, and one
+ * round of reads costs about 4.6 s, while their content does not change
+ * between rounds.  The body is therefore kept in RAM and refreshed by a
+ * background thread; the header above it still carries the current time,
+ * so the model never reads a stale clock.
+ */
+
+#define CONTEXT_BODY_MAX 3072
+#ifndef CONTEXT_BODY_REFRESH_MS
+#  define CONTEXT_BODY_REFRESH_MS 30000
+#endif
+
+static char s_body_cache[CONTEXT_BODY_MAX];
+static size_t s_body_len;
+static pthread_mutex_t s_body_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool s_body_refresher_started;
+static pthread_once_t s_body_once = PTHREAD_ONCE_INIT;
+
+static size_t build_prompt_body(char *buf, size_t size)
+{
+    size_t off = 0;
+
+    if (size == 0) {
+        return 0;
+    }
+
+    /* Bootstrap files */
+    off = append_file(buf, size, off, AGENT_SOUL_FILE, "Personality");
+    off = append_file(buf, size, off, AGENT_USER_FILE, "User Info");
+
+    /* Long-term memory */
+    off = ctx_append(buf, size, off, "\n## Long-term Memory\n\n");
+    {
+        /* off <= size - 1 由 ctx_append 保证，故 avail 恒非负。 */
+        size_t avail = size - off - 1;
+        if (avail > 0 && memory_read_long_term(buf + off, avail) == OK && buf[off]) {
+            off += strlen(buf + off);
+            off = ctx_append(buf, size, off, "\n");
+        }
+    }
+
+    /* Recent daily notes */
+    off = ctx_append(buf, size, off, "\n## Recent Notes\n\n");
+    {
+        size_t avail = size - off - 1;
+        if (avail > 0 && memory_read_recent(buf + off, avail, 3) == OK && buf[off]) {
+            off += strlen(buf + off);
+            off = ctx_append(buf, size, off, "\n");
+        }
+    }
+
+    /* Skills summary — use smaller stack buffer.
+     * 10 个技能摘要按当前内容约 1086 字节，封顶后若仍用 1024 会整条丢掉一个，
+     * 扩到 1280 让提示词内容与修复前保持一致。 */
+    {
+        char skills_buf[1280];
+        size_t skills_len = skill_loader_build_summary(skills_buf, sizeof(skills_buf));
+        if (skills_len > 0) {
+            off = ctx_append(buf, size, off, "\n## Skills\n%s\n", skills_buf);
+        }
+    }
+
+    buf[off] = '\0';
+    return off;
+}
+
+/* File I/O happens outside the publication lock. A request may use the
+ * previous complete snapshot while a slow refresh is in progress. */
+static void context_body_refresh(void)
+{
+    char *next = malloc(CONTEXT_BODY_MAX);
+    if (!next) return;
+    size_t len = build_prompt_body(next, CONTEXT_BODY_MAX);
+    pthread_mutex_lock(&s_body_lock);
+    memcpy(s_body_cache, next, len + 1);
+    s_body_len = len;
+    pthread_mutex_unlock(&s_body_lock);
+    free(next);
+}
+
+static void *context_body_refresher(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        usleep(CONTEXT_BODY_REFRESH_MS * 1000);
+        context_body_refresh();
+    }
+    return NULL;
+}
+
+static void context_body_init(void)
+{
+    pthread_t tid;
+    pthread_attr_t attr;
+    context_body_refresh();
+    pthread_attr_init(&attr);
+    if (pthread_attr_setstacksize(&attr, 16 * 1024) == 0 &&
+        pthread_create(&tid, &attr, context_body_refresher, NULL) == 0) {
+        s_body_refresher_started = true;
+        pthread_detach(tid);
+    } else {
+        syslog(LOG_ERR, "[%s] prompt refresh thread failed; refresh synchronously\n", TAG);
+    }
+    pthread_attr_destroy(&attr);
+}
+
 int context_build_system_prompt(char *buf, size_t size)
 {
+    /* 下面每处 ctx_append / append_file 都依赖 size >= 1。 */
+    if (size == 0) {
+        return OK;
+    }
+
     size_t off = 0;
 
     /* Current time — essential for cron scheduling.
@@ -97,12 +269,12 @@ int context_build_system_prompt(char *buf, size_t size)
      * lookup errors (romfs doesn't have "CST-8" zoneinfo file). */
     time_t now = time(NULL);
     struct tm tm_now;
-    time_t local_epoch = now + 8 * 3600;
+    time_t local_epoch = now + AGENT_TIME_OFFSET_SEC;
     gmtime_r(&local_epoch, &tm_now);
     char time_str[64];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_now);
 
-    off += snprintf(buf + off, size - off,
+    off = ctx_append(buf, size, off,
         "# AI Agent\n\n"
         "Personal AI on Vela/NuttX. Channels: Feishu, WebSocket, CLI.\n"
         "Time: %s CST (UTC+8, tz=%s). For epoch, call get_current_time.\n\n"
@@ -127,7 +299,7 @@ int context_build_system_prompt(char *buf, size_t size)
         char tool_names[1024];
         size_t names_len = build_tool_names(tool_names, sizeof(tool_names));
         if (names_len > 0) {
-            off += snprintf(buf + off, size - off,
+            off = ctx_append(buf, size, off,
                 "## Capability Boundary\n"
                 "Your ONLY tools: %s.\n"
                 "If a user request needs a tool not in this list, "
@@ -137,43 +309,31 @@ int context_build_system_prompt(char *buf, size_t size)
         }
     }
 
-    off += snprintf(buf + off, size - off,
+    off = ctx_append(buf, size, off,
         "## Memory\n"
         "Long-term: %s/memory/MEMORY.md | Daily: %s/memory/daily/<YYYY-MM-DD>.md\n\n"
         "## Skills\n"
         "Skill files in %s. Match task→read full file.\n",
         AGENT_DATA_DIR, AGENT_DATA_DIR, AGENT_SKILLS_DIR);
 
-    /* Bootstrap files */
-    off = append_file(buf, size, off, AGENT_SOUL_FILE, "Personality");
-    off = append_file(buf, size, off, AGENT_USER_FILE, "User Info");
+    /* The file-backed part of the prompt is cached in RAM: the first
+     * round builds it and a background thread keeps it fresh, so a
+     * question does not pay for the eMMC reads. */
 
-    /* Long-term memory — write directly into buf */
-    off += snprintf(buf + off, size - off, "\n## Long-term Memory\n\n");
+    pthread_once(&s_body_once, context_body_init);
+    if (!s_body_refresher_started) context_body_refresh();
     {
         size_t avail = size - off - 1;
-        if (avail > 0 && memory_read_long_term(buf + off, avail) == OK && buf[off]) {
-            off += strlen(buf + off);
-            off += snprintf(buf + off, size - off, "\n");
+        pthread_mutex_lock(&s_body_lock);
+        if (avail >= s_body_len) {
+            memcpy(buf + off, s_body_cache, s_body_len + 1);
+            off += s_body_len;
+            pthread_mutex_unlock(&s_body_lock);
+        } else {
+            pthread_mutex_unlock(&s_body_lock);
+            /* The returned length is relative to this remaining region. */
+            off += build_prompt_body(buf + off, avail + 1);
         }
-    }
-
-    /* Recent daily notes — write directly into buf */
-    off += snprintf(buf + off, size - off, "\n## Recent Notes\n\n");
-    {
-        size_t avail = size - off - 1;
-        if (avail > 0 && memory_read_recent(buf + off, avail, 3) == OK && buf[off]) {
-            off += strlen(buf + off);
-            off += snprintf(buf + off, size - off, "\n");
-        }
-    }
-
-    /* Skills summary — use smaller stack buffer */
-    char skills_buf[1024];
-    size_t skills_len = skill_loader_build_summary(skills_buf, sizeof(skills_buf));
-    if (skills_len > 0) {
-        off += snprintf(buf + off, size - off,
-            "\n## Skills\n%s\n", skills_buf);
     }
 
     /* Remote Node devices */
@@ -181,12 +341,21 @@ int context_build_system_prompt(char *buf, size_t size)
     char node_buf[512];
     int node_count = node_manager_list(node_buf, sizeof(node_buf));
     if (node_count > 0) {
-        off += snprintf(buf + off, size - off,
+        off = ctx_append(buf, size, off,
             "\n## Nodes\n"
             "Remote devices. Use node:<id>:<cmd> tools for remote queries.\n%s\n",
             node_buf);
     }
 #endif
+
+    /* 截断可观测：当前构建里提示词离满只有约 600 字节，缺这条日志就看不到
+     * 逼近上限。 */
+    if (off >= size - 1) {
+        syslog(LOG_WARNING,
+            "[%s] System prompt truncated at %d/%d bytes; "
+            "some sections were shortened\n",
+            TAG, (int)off, (int)size);
+    }
 
     syslog(LOG_INFO, "[%s] System prompt built: %d bytes\n", TAG, (int)off);
     return OK;

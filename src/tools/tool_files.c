@@ -29,57 +29,123 @@
 #include <string.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "cJSON.h"
 
 static const char *TAG = "tool_files";
 
 #define MAX_FILE_SIZE (32 * 1024)
 
+/* VelaGuard reports/alarms live outside AGENT_DATA_DIR but on the same /data mount. */
+#ifndef VG_DATA_ROOT
+#define VG_DATA_ROOT "/data/velaguard"
+#endif
+
+static bool path_under_resolved_root(const char *resolved, const char *logical_root)
+{
+    char root[PATH_MAX];
+    const char *base = logical_root;
+
+    if (realpath(logical_root, root) != NULL) {
+        base = root;
+    }
+
+    size_t len = strlen(base);
+    return strncmp(resolved, base, len) == 0
+        && (resolved[len] == '/' || resolved[len] == '\0');
+}
+
+static bool logical_path_allowed(const char *path)
+{
+    size_t agent_len = strlen(AGENT_DATA_DIR);
+
+    if (strncmp(path, AGENT_DATA_DIR, agent_len) == 0
+        && (path[agent_len] == '/' || path[agent_len] == '\0')) {
+        return true;
+    }
+
+    if (strncmp(path, VG_DATA_ROOT, sizeof(VG_DATA_ROOT) - 1) == 0
+        && (path[sizeof(VG_DATA_ROOT) - 1] == '/'
+            || path[sizeof(VG_DATA_ROOT) - 1] == '\0')) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool path_has_prefix(const char *path, const char *prefix)
+{
+    if (!prefix || prefix[0] == '\0') {
+        return true;
+    }
+
+    size_t plen = strlen(prefix);
+    while (plen > 0 && prefix[plen - 1] == '/') {
+        plen--;
+    }
+
+    if (strlen(path) < plen) {
+        return false;
+    }
+
+    if (strncmp(path, prefix, plen) != 0) {
+        return false;
+    }
+
+    return path[plen] == '\0' || path[plen] == '/';
+}
+
 /**
  * Validate that path resolves to a location under AGENT_DATA_DIR.
  * Uses realpath() to resolve symlinks, preventing symlink escape attacks.
  * Falls back to raw path check if the file does not yet exist.
  */
+static bool resolve_target(const char *path, char *resolved)
+{
+    char parent[PATH_MAX];
+    char base[PATH_MAX];
+    if (!path || strlen(path) >= sizeof(parent)) return false;
+    if (realpath(path, resolved)) return true;
+    strcpy(parent, path);
+    for (;;) {
+        char *slash = strrchr(parent, '/');
+        const char *tail;
+        if (!slash) {
+            if (!realpath(".", base)) return false;
+            return snprintf(resolved, PATH_MAX, "%s/%s", base, path) < PATH_MAX;
+        }
+        *slash = 0;
+        tail = path + (slash - parent);
+        if (realpath(parent[0] ? parent : "/", base))
+            return snprintf(resolved, PATH_MAX, "%s%s", base, tail) < PATH_MAX;
+    }
+}
+
 static bool validate_path(const char *path)
 {
-    if (!path) {
-        return false;
-    }
-
-    size_t dlen = strlen(AGENT_DATA_DIR);
-
-    /* Quick reject: raw path must at least start with data dir */
-    if (strncmp(path, AGENT_DATA_DIR, dlen) != 0
-        || (path[dlen] != '/' && path[dlen] != '\0')) {
-        return false;
-    }
-
-    /* Reject explicit traversal components */
-    if (strstr(path, "..") != NULL) {
-        return false;
-    }
-
-    /* Resolve symlinks to get the real path */
     char resolved[PATH_MAX];
+    if (!path || strstr(path, "..") || !logical_path_allowed(path)) return false;
+    /* A missing file can still have a parent symlink out of the sandbox. */
+    return resolve_target(path, resolved) &&
+        (path_under_resolved_root(resolved, AGENT_DATA_DIR) ||
+         path_under_resolved_root(resolved, VG_DATA_ROOT));
+}
 
-    if (realpath(path, resolved) != NULL) {
-        /* File exists — verify resolved path is still under data dir */
-        if (strncmp(resolved, AGENT_DATA_DIR, dlen) != 0
-            || (resolved[dlen] != '/' && resolved[dlen] != '\0')) {
-            syslog(LOG_WARNING,
-                   "[%s] Path escaped data dir via symlink: %s -> %s\n",
-                   TAG, path, resolved);
-            return false;
-        }
-    }
+static bool under_path(const char *path, const char *root)
+{
+    char resolved[PATH_MAX];
+    return path_has_prefix(path, root) ||
+        (resolve_target(path, resolved) && path_under_resolved_root(resolved, root));
+}
 
-    /* If realpath fails (file doesn't exist yet), the raw path checks
-     * above are sufficient — no symlink to follow. */
-
-    return true;
+static bool is_read_protected(const char *path)
+{
+    return under_path(path, AGENT_CONFIG_DIR) ||
+           under_path(path, VG_DATA_ROOT "/provision");
 }
 
 /* Files that the LLM must not overwrite via write_file / edit_file.
@@ -88,24 +154,28 @@ static const char *s_protected_files[] = {
     AGENT_CONFIG_FILE,   /* /data/agent/config/config.json */
     AGENT_SOUL_FILE,     /* /data/agent/config/SOUL.md     */
     AGENT_USER_FILE,     /* /data/agent/config/USER.md     */
+    /* VelaGuard: the firmware writes this from its own frame counters and
+     * the report page falls back to it whenever the agent's daily report is
+     * missing or fails validation.  Keeping it out of write_file's reach is
+     * what makes that fallback trustworthy, so the rule lives here and not
+     * only in the skill wording. */
+    VG_DATA_ROOT "/reports/runtime-report.md",
     NULL
 };
 
 static bool is_write_protected(const char *path)
 {
     char resolved[PATH_MAX];
-    const char *check = path;
-
-    if (realpath(path, resolved) != NULL) {
-        check = resolved;
-    }
-
+    if (under_path(path, AGENT_CONFIG_DIR)) return true;
+    if (!resolve_target(path, resolved)) return true;
+    if (under_path(path, VG_DATA_ROOT) &&
+        !path_under_resolved_root(resolved, VG_DATA_ROOT "/reports")) return true;
     for (int i = 0; s_protected_files[i]; i++) {
-        if (strcmp(check, s_protected_files[i]) == 0) {
-            return true;
-        }
+        char protected_path[PATH_MAX];
+        if (!strcmp(path, s_protected_files[i]) ||
+            (resolve_target(s_protected_files[i], protected_path) &&
+             !strcmp(resolved, protected_path))) return true;
     }
-
     return false;
 }
 /**
@@ -115,10 +185,18 @@ static bool is_write_protected(const char *path)
 static void ensure_parent_dirs(const char *path)
 {
     char tmp[512];
+    size_t start;
+
     snprintf(tmp, sizeof(tmp), "%s", path);
 
-    /* Walk from the first '/' after AGENT_DATA_DIR to the last '/' */
-    size_t start = strlen(AGENT_DATA_DIR);
+    if (strncmp(path, AGENT_DATA_DIR, strlen(AGENT_DATA_DIR)) == 0) {
+        start = strlen(AGENT_DATA_DIR);
+    } else if (strncmp(path, VG_DATA_ROOT, sizeof(VG_DATA_ROOT) - 1) == 0) {
+        start = sizeof(VG_DATA_ROOT) - 1;
+    } else {
+        return;
+    }
+
     for (char *p = tmp + start; *p; p++) {
         if (*p == '/') {
             *p = '\0';
@@ -132,6 +210,7 @@ static void ensure_parent_dirs(const char *path)
 
 int tool_read_file_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");
@@ -141,7 +220,14 @@ int tool_read_file_execute(const char *input_json, char *output, size_t output_s
     const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(root, "path"));
     if (!validate_path(path)) {
         snprintf(output, output_size,
-                 "Error: path must start with %s/ and must not contain '..'", AGENT_DATA_DIR);
+                 "Error: path must be under %s/ or %s/ and must not contain '..'",
+                 AGENT_DATA_DIR, VG_DATA_ROOT);
+        cJSON_Delete(root);
+        return ERROR;
+    }
+
+    if (is_read_protected(path)) {
+        snprintf(output, output_size, "Error: protected configuration");
         cJSON_Delete(root);
         return ERROR;
     }
@@ -169,6 +255,7 @@ int tool_read_file_execute(const char *input_json, char *output, size_t output_s
 
 int tool_write_file_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");
@@ -180,7 +267,8 @@ int tool_write_file_execute(const char *input_json, char *output, size_t output_
 
     if (!validate_path(path)) {
         snprintf(output, output_size,
-                 "Error: path must start with %s/ and must not contain '..'", AGENT_DATA_DIR);
+                 "Error: path must be under %s/ or %s/ and must not contain '..'",
+                 AGENT_DATA_DIR, VG_DATA_ROOT);
         cJSON_Delete(root);
         return ERROR;
     }
@@ -199,9 +287,18 @@ int tool_write_file_execute(const char *input_json, char *output, size_t output_
 
     ensure_parent_dirs(path);
 
-    FILE *f = fopen(path, "w");
-    if (!f) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (fd < 0) {
         snprintf(output, output_size, "Error: cannot open file for writing: %s (errno=%d)", path, errno);
+        cJSON_Delete(root);
+        return ERROR;
+    }
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        int err = errno;
+        close(fd);
+        snprintf(output, output_size, "Error: cannot open file stream: %s (errno=%d)", path, err);
         cJSON_Delete(root);
         return ERROR;
     }
@@ -227,6 +324,7 @@ int tool_write_file_execute(const char *input_json, char *output, size_t output_
 
 int tool_edit_file_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");
@@ -239,7 +337,8 @@ int tool_edit_file_execute(const char *input_json, char *output, size_t output_s
 
     if (!validate_path(path)) {
         snprintf(output, output_size,
-                 "Error: path must start with %s/ and must not contain '..'", AGENT_DATA_DIR);
+                 "Error: path must be under %s/ or %s/ and must not contain '..'",
+                 AGENT_DATA_DIR, VG_DATA_ROOT);
         cJSON_Delete(root);
         return ERROR;
     }
@@ -333,6 +432,7 @@ static size_t list_dir_recursive(const char *dir_path, const char *prefix,
                                   char *output, size_t output_size, size_t off,
                                   int *count, int depth)
 {
+    if (output_size == 0 || off >= output_size - 1) return off;
     if (depth > 4) return off;  /* prevent infinite recursion */
 
     DIR *dir = opendir(dir_path);
@@ -347,15 +447,27 @@ static size_t list_dir_recursive(const char *dir_path, const char *prefix,
         char full_path[512];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
 
-        if (prefix && strncmp(full_path, prefix, strlen(prefix)) != 0) continue;
+        if (prefix && !path_has_prefix(full_path, prefix)) continue;
 
         struct stat st;
         if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-            off += snprintf(output + off, output_size - off, "%s/\n", full_path);
+            int n = snprintf(output + off, output_size - off, "%s/\n", full_path);
+            if (n < 0 || (size_t)n >= output_size - off) {
+                output[off] = 0;
+                syslog(LOG_WARNING, "[%s] directory output truncated\n", TAG);
+                break;
+            }
+            off += (size_t)n;
             (*count)++;
             off = list_dir_recursive(full_path, prefix, output, output_size, off, count, depth + 1);
         } else {
-            off += snprintf(output + off, output_size - off, "%s\n", full_path);
+            int n = snprintf(output + off, output_size - off, "%s\n", full_path);
+            if (n < 0 || (size_t)n >= output_size - off) {
+                output[off] = 0;
+                syslog(LOG_WARNING, "[%s] directory output truncated\n", TAG);
+                break;
+            }
+            off += (size_t)n;
             (*count)++;
         }
     }
@@ -365,6 +477,7 @@ static size_t list_dir_recursive(const char *dir_path, const char *prefix,
 
 int tool_list_dir_execute(const char *input_json, char *output, size_t output_size)
 {
+    if (!output || !output_size) return ERROR;
     cJSON *root = cJSON_Parse(input_json);
     const char *prefix = NULL;
     if (root) {

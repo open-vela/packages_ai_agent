@@ -71,6 +71,35 @@ static pthread_mutex_t s_guard_mtx = PTHREAD_MUTEX_INITIALIZER;
 #define GUARD_KEY_PREFIX "tool_enabled_"
 #define GUARD_KEY_BUF    64
 
+#ifdef CONFIG_VG_HMI
+/* VelaGuard exposes only the tools used by its Skills and board-driven
+ * rounds.  This is a hard ceiling: runtime config may disable an allowed
+ * tool, but it cannot opt an unrelated builtin back in. */
+
+static bool vg_product_tool_allowed(const char *tool_name)
+{
+    static const char *const allowed[] = {
+        "read_file",
+        "write_file",
+        "get_current_time",
+        "run_shell",
+        "vg_point_read",
+        "vg_run_report",
+        "vg_anomaly_read",
+        "vg_alarm_recovery",
+        NULL
+    };
+
+    for (int i = 0; allowed[i] != NULL; i++) {
+        if (strcmp(tool_name, allowed[i]) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+#endif
+
 /* ── Sensitive field names to redact in logs ───────────────── */
 
 static const char *s_redact_keys[] = {
@@ -102,7 +131,9 @@ static int find_sensitive_index(const char *name)
     return -1;
 }
 
-static bool check_rate_limit(int idx)
+static void record_rate(int idx);
+
+static bool check_and_reserve_rate(int idx)
 {
     rate_state_t *rs = &s_rate[idx];
     time_t now = time(NULL);
@@ -118,7 +149,11 @@ static bool check_rate_limit(int idx)
         }
     }
 
-    return rs->count >= AGENT_TOOL_RATE_LIMIT_MAX_CALLS;
+    if (rs->count >= AGENT_TOOL_RATE_LIMIT_MAX_CALLS)
+        return false;
+
+    record_rate(idx);
+    return true;
 }
 
 static void record_rate(int idx)
@@ -217,10 +252,10 @@ tool_guard_result_t tool_guard_check(const char *tool_name,
         int idx = find_sensitive_index(tool_name);
         if (idx >= 0) {
             pthread_mutex_lock(&s_guard_mtx);
-            bool limited = check_rate_limit(idx);
+            bool reserved = check_and_reserve_rate(idx);
             pthread_mutex_unlock(&s_guard_mtx);
 
-            if (limited) {
+            if (!reserved) {
                 syslog(LOG_WARNING,
                        "[%s] Tool '%s' rate limited "
                        "(%d calls in %ds window)\n",
@@ -233,18 +268,6 @@ tool_guard_result_t tool_guard_check(const char *tool_name,
     }
 
     return GUARD_ALLOW;
-}
-
-void tool_guard_record_call(const char *tool_name)
-{
-    int idx = find_sensitive_index(tool_name);
-    if (idx < 0) {
-        return;
-    }
-
-    pthread_mutex_lock(&s_guard_mtx);
-    record_rate(idx);
-    pthread_mutex_unlock(&s_guard_mtx);
 }
 
 int tool_guard_set_enabled(const char *tool_name, bool enabled)
@@ -262,6 +285,16 @@ bool tool_guard_is_enabled(const char *tool_name)
 {
     char key[GUARD_KEY_BUF];
     char val[8];
+
+    if (tool_name == NULL || tool_name[0] == '\0') {
+        return false;
+    }
+
+#ifdef CONFIG_VG_HMI
+    if (!vg_product_tool_allowed(tool_name)) {
+        return false;
+    }
+#endif
 
     int n = snprintf(key, sizeof(key), "%s%s",
                      GUARD_KEY_PREFIX, tool_name);

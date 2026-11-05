@@ -25,6 +25,8 @@
 #include "core/agent_loop.h"
 #include "core/agent_mem.h"
 #include "core/agent_trace.h"
+#include "core/point_reply.h"
+#include "infra/agent_timing.h"
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
@@ -33,16 +35,18 @@
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
 #include "tools/tool_guard.h"
+#include "tools/voice_scope.h"
 #include "tools/tool_registry.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
 #include <pthread.h>
+#include <velaclaw/client.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/time.h>
+#include <time.h>
 
 #include "cJSON.h"
 
@@ -51,6 +55,27 @@ static const char* TAG = "agent";
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
 #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+
+#ifdef CONFIG_VG_HMI
+#undef TOOL_OUTPUT_SIZE
+#undef TOOL_OUTPUT_SIZE_LARGE
+#undef TOOL_OUTPUT_SIZE_MIN
+#define TOOL_OUTPUT_SIZE (4 * 1024)
+#define TOOL_OUTPUT_SIZE_LARGE (8 * 1024)
+#define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+#endif
+
+/* Heap scan between ReAct phases: mallinfo walks the heap; with the
+ * mm_foreach corruption guard enabled (CONFIG_MM_RECORD_STACK builds)
+ * a smashed node is reported with the owning allocation's backtrace,
+ * which brackets the corrupting phase to a single step. */
+
+#ifdef CONFIG_VG_HMI
+/* Heap walk itself HARDFAULTs after a smashed free-node; do not scan. */
+#define VG_HEAP_SCAN(phase) ((void)(phase))
+#else
+#define VG_HEAP_SCAN(phase)
+#endif
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -65,31 +90,33 @@ static bool llm_call_timed_out(uint32_t latency_ms);
 #define LLM_TIMEOUT_TASK_COMPLETE_MSG \
     "任务已完成，但生成确认消息超时。"
 
-/* ── Clock-safe elapsed time calculation ───────────────────── */
+/* ── Monotonic elapsed time (immune to wall-clock jumps) ───── */
 
-static inline uint32_t calc_elapsed_ms(const struct timeval* t0,
-    const struct timeval* t1)
+static inline void mono_now(struct timespec* ts)
 {
-    int32_t sec_diff = (int32_t)(t1->tv_sec - t0->tv_sec);
-    int32_t usec_diff = (int32_t)(t1->tv_usec - t0->tv_usec);
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
 
-    /* Clock went backwards (NTP jump, manual adjustment) */
+static inline uint32_t calc_elapsed_ms(const struct timespec* t0,
+    const struct timespec* t1)
+{
+    int64_t sec_diff = (int64_t)(t1->tv_sec - t0->tv_sec);
+    int64_t nsec_diff = (int64_t)(t1->tv_nsec - t0->tv_nsec);
+
     if (sec_diff < 0) {
-        syslog(LOG_WARNING, "[%s] Clock went backwards, ignoring\n", TAG);
         return 0;
     }
 
-    /* Microsecond borrow */
-    if (usec_diff < 0) {
+    if (nsec_diff < 0) {
         sec_diff--;
-        usec_diff += 1000000;
+        nsec_diff += 1000000000L;
     }
 
     if (sec_diff < 0) {
         return 0;
     }
 
-    return (uint32_t)sec_diff * 1000 + (uint32_t)usec_diff / 1000;
+    return (uint32_t)sec_diff * 1000 + (uint32_t)(nsec_diff / 1000000L);
 }
 
 /* ── Memory pool (pre-allocated tool output buffers) ───────── */
@@ -105,12 +132,12 @@ static void add_assistant_message(cJSON* messages, const llm_response_t* resp)
 
     if (resp->text && resp->text_len > 0) {
         cJSON_AddStringToObject(asst_msg, "content", resp->text);
-    } else {
-        cJSON_AddNullToObject(asst_msg, "content");
     }
+    /* Omit content when empty — MiMo rejects explicit null (400 Invalid JSON). */
 
-    /* Kimi thinking mode: echo back reasoning_content or the API returns 400 */
-    if (resp->reasoning_content && resp->reasoning_content[0]) {
+    /* Kimi thinking mode only — other hosts reject unknown fields. */
+    if (resp->reasoning_content && resp->reasoning_content[0]
+        && llm_proxy_echo_reasoning()) {
         cJSON_AddStringToObject(asst_msg, "reasoning_content",
             resp->reasoning_content);
     }
@@ -168,6 +195,8 @@ typedef struct {
     char* output;
     size_t output_size;
     bool from_pool;
+    uint32_t start_ms; /* monotonic, set by the worker when it starts */
+    int32_t elapsed_ms; /* AGENT_T_NA until the worker finishes */
     char channel[16];
     char chat_id[64];
 } tool_task_t;
@@ -179,39 +208,79 @@ static void* tool_exec_thread(void* arg)
     t->output[0] = '\0';
     char* patched = inject_cron_context(
         t->call->name, t->call->input, t->channel, t->chat_id);
+    t->start_ms = agent_mono_ms();
     agent_tool_exec_streamed(t->call->name,
         patched ? patched : t->call->input,
         t->output, t->output_size);
+    t->elapsed_ms = agent_elapsed_ms(t->start_ms, agent_mono_ms());
     free(patched);
-    syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n",
-        TAG, t->call->name, (int)strlen(t->output));
+    syslog(LOG_INFO, "[%s] Tool %s result: %d bytes, %ld ms\n",
+        TAG, t->call->name, (int)strlen(t->output), (long)t->elapsed_ms);
     return NULL;
 }
 
+/* Adapter from the per-tool callback to the structured trace. */
+
+static void trace_tool_done(void* ctx, int iteration, const char* name,
+    uint32_t ms, size_t out_bytes, bool ok)
+{
+    agent_trace_tool((agent_trace_t*)ctx, iteration, name, ms, out_bytes, ok);
+}
+
+/* ── Deterministic single-point reply ──────────────────────── */
+
+/* A question like "what is the UPS load" costs two LLM round-trips: one to
+ * pick vg_point_read and one to restate the number the tool already
+ * returned.  The second call exists only to reword a value that is already
+ * decided, and it carries the same multi-second server wait as the first.
+ *
+ * The rendering lives in core/point_reply.c so the host test can exercise
+ * every shape without linking the agent loop.  It returns NULL for anything
+ * that needs wording rather than echoing, and this caller then leaves the
+ * reply to the model as before. */
+
 /* Add one role:"tool" message per tool result (OpenAI format).
  * When call_count > 1, all tools run in parallel threads.
- * Uses memory pool for parallel buffers, with heap fallback. */
+ * Uses memory pool for parallel buffers, with heap fallback.
+ *
+ * Each result is reported through on_tool() so the trace can record the real
+ * tool time.  Before this, the only number near a tool name was the LLM call
+ * time, which made a 97 s model response look like a 97 s tool. */
+
+typedef void (*tool_done_fn)(void* ctx, int iteration, const char* name,
+    uint32_t ms, size_t out_bytes, bool ok);
+
 static void add_tool_result_messages(cJSON* messages,
     const llm_response_t* resp, char* tool_output,
     size_t tool_output_size, const char* msg_channel,
-    const char* msg_chat_id)
+    const char* msg_chat_id, int iteration, tool_done_fn on_tool, void* ctx)
 {
     int n = resp->call_count;
 
     if (n == 1) {
         const llm_tool_call_t* call = &resp->calls[0];
+        uint32_t t0;
+        int32_t tool_ms;
 
         syslog(LOG_INFO, "[%s] Tool call: %s args=%.500s\n", TAG,
             call->name, call->input ? call->input : "(null)");
         tool_output[0] = '\0';
         char* patched = inject_cron_context(
             call->name, call->input, msg_channel, msg_chat_id);
+        t0 = agent_mono_ms();
         agent_tool_exec_streamed(call->name,
             patched ? patched : call->input,
             tool_output, tool_output_size);
+        tool_ms = agent_elapsed_ms(t0, agent_mono_ms());
         free(patched);
-        syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n", TAG,
-            call->name, (int)strlen(tool_output));
+        syslog(LOG_INFO, "[%s] Tool %s result: %d bytes, %ld ms\n", TAG,
+            call->name, (int)strlen(tool_output), (long)tool_ms);
+
+        if (on_tool != NULL) {
+            on_tool(ctx, iteration, call->name,
+                tool_ms == AGENT_T_NA ? 0u : (uint32_t)tool_ms,
+                strlen(tool_output), true);
+        }
 
         cJSON* result_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(result_msg, "role", "tool");
@@ -233,6 +302,7 @@ static void add_tool_result_messages(cJSON* messages,
             sizeof(tasks[i].channel) - 1);
         strncpy(tasks[i].chat_id, msg_chat_id ? msg_chat_id : "",
             sizeof(tasks[i].chat_id) - 1);
+        tasks[i].elapsed_ms = AGENT_T_NA;
 
         char* buf = s_pool_ready
             ? agent_pool_acquire(&s_tool_pool)
@@ -249,12 +319,20 @@ static void add_tool_result_messages(cJSON* messages,
 
         if (!tasks[i].output) {
             threads[i] = 0;
+            tasks[i].elapsed_ms = AGENT_T_NA;
             continue;
         }
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
+#ifdef CONFIG_VG_HMI
+        /* Tool workers share the tight HMI heap; 16 KiB was the same
+         * class of overflow that corrupted mm freelist on the loop
+         * stack before AGENT_AI_AGENT_STACK was raised to 32 KiB. */
+        pthread_attr_setstacksize(&attr, 24 * 1024);
+#else
         pthread_attr_setstacksize(&attr, 16 * 1024);
+#endif
         if (pthread_create(&threads[i], &attr,
                 tool_exec_thread, &tasks[i])
             != 0) {
@@ -299,6 +377,19 @@ static void add_tool_result_messages(cJSON* messages,
                     ? tasks[i].output
                     : "{}");
             cJSON_AddItemToArray(messages, result_msg);
+
+            /* Parallel rounds run one thread per call, so wall time and CPU
+             * time differ; report each tool's own span and let the reader
+             * compare them instead of summing. */
+
+            if (on_tool != NULL) {
+                on_tool(ctx, iteration, resp->calls[i].name,
+                    tasks[i].elapsed_ms == AGENT_T_NA
+                        ? 0u
+                        : (uint32_t)tasks[i].elapsed_ms,
+                    tasks[i].output ? strlen(tasks[i].output) : 0u,
+                    tasks[i].elapsed_ms != AGENT_T_NA);
+            }
         }
 
         if (tasks[i].from_pool) {
@@ -310,6 +401,38 @@ static void add_tool_result_messages(cJSON* messages,
 }
 
 /* ── Fast path counters ─────────────────────────────────── */
+
+/* A/B switch for the single-point reply shortcut.  Default on: the board
+ * measurement (2026-10-20, docs/maintenance-evidence/2026-10-20/
+ * rsp03-shortcut-ab.md) showed 1 request instead of 2-4 for a hit, a median
+ * round of 5.82 s against 10.68 s, and 11/11 correct values, with every
+ * explanation, multi-point, stale, offline and ambiguous round still falling
+ * through to the model.  The NSH command "point_shortcut off" restores the
+ * two-request path so a regression can be re-measured without a reflash.
+ * Not persisted: a reboot restores the default. */
+
+static volatile bool s_point_reply_disabled = false;
+
+void agent_point_reply_set_enabled(bool enabled)
+{
+    s_point_reply_disabled = !enabled;
+
+    /* Both arms receive the same user message, so a response cached under
+     * one arm would be replayed verbatim under the other and hide the effect
+     * under test.  The cache also bypasses the model completely, which turns
+     * a two-request round into a zero-request one.  Dropping it on every
+     * switch keeps each measured round honest. */
+
+    llm_cache_cleanup();
+
+    syslog(LOG_INFO, "[%s] point reply shortcut %s\n", TAG,
+        enabled ? "enabled" : "disabled");
+}
+
+bool agent_point_reply_enabled(void)
+{
+    return !s_point_reply_disabled;
+}
 
 static int s_fast_path_count = 0;
 static int s_llm_path_count = 0;
@@ -803,26 +926,26 @@ static char* strip_tool_call_markup(char* text)
 /* ── Extracted: force finish when iteration limit reached ─── */
 
 static char* force_finish_reply(const char* system_prompt,
-    cJSON* messages)
+    cJSON* messages, const char* reason, const vela_req_ctl_t *ctl)
 {
     syslog(LOG_WARNING,
-        "[%s] Tool iteration limit (%d) reached, forcing finish\n",
-        TAG, AGENT_AI_AGENT_MAX_TOOL_ITER);
+        "[%s] %s (max %d iters), forcing finish\n",
+        TAG, reason, AGENT_AI_AGENT_MAX_TOOL_ITER);
 
     cJSON* hint = cJSON_CreateObject();
     cJSON_AddStringToObject(hint, "role", "system");
     cJSON_AddStringToObject(hint, "content",
-        "You have used all available tool iterations. "
-        "Do NOT call any more tools. Summarize what you have "
-        "learned so far and reply to the user in plain text now.");
+        "Stop calling tools now. Summarize what you have learned "
+        "from the tool results above and reply to the user in "
+        "plain text.");
     cJSON_AddItemToArray(messages, hint);
 
     llm_response_t resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
-    int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
-    gettimeofday(&t1, NULL);
+    struct timespec t0, t1;
+    mono_now(&t0);
+    int err = llm_chat_tools_controlled(system_prompt, messages, NULL, &resp, NULL, ctl);
+    mono_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -841,11 +964,16 @@ static char* force_finish_reply(const char* system_prompt,
 /* ── Extracted: dispatch response to outbound bus ─────────── */
 
 static void dispatch_response(const agent_msg_t* msg,
-    char* final_text)
+    char* final_text, bool persist)
 {
+    if (!persist && (!final_text || !final_text[0])) {
+        velaclaw_request_failed(msg->chat_id, -EIO);
+    }
     if (final_text && final_text[0]) {
-        session_append(msg->chat_id, "user", msg->content);
-        session_append(msg->chat_id, "assistant", final_text);
+        if (persist) {
+            session_append(msg->chat_id, "user", msg->content);
+            session_append(msg->chat_id, "assistant", final_text);
+        }
 
         agent_msg_t out = { 0 };
         strncpy(out.channel, msg->channel,
@@ -902,6 +1030,7 @@ static void send_working_status(const agent_msg_t* msg, int iteration)
     }
 
     agent_msg_t status = { 0 };
+    status.is_progress = true;
 
     strncpy(status.channel, msg->channel, sizeof(status.channel) - 1);
     strncpy(status.chat_id, msg->chat_id, sizeof(status.chat_id) - 1);
@@ -976,7 +1105,7 @@ static bool llm_call_timed_out(uint32_t latency_ms)
 /* Handle TASK_COMPLETE: inject hint and do one final LLM call.
  * If the LLM call times out, *out_timed_out is set to true. */
 static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
-    bool* out_timed_out)
+    bool* out_timed_out, const vela_req_ctl_t *ctl)
 {
     cJSON* hint = cJSON_CreateObject();
 
@@ -989,10 +1118,10 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
 
     llm_response_t final_resp;
     char* result = NULL;
-    struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
-    int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
-    gettimeofday(&t1, NULL);
+    struct timespec t0, t1;
+    mono_now(&t0);
+    int err = llm_chat_tools_controlled(sys_prompt, messages, NULL, &final_resp, NULL, ctl);
+    mono_now(&t1);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
 
@@ -1014,7 +1143,7 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
 /* Run the ReAct tool-calling loop. Returns final_text (caller owns). */
 static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     const char* tools_json, char* tool_output, size_t tool_size,
-    const agent_msg_t* msg)
+    const agent_msg_t* msg, const vela_req_ctl_t *ctl)
 {
     char prev_sig[512];
     int dup_count;
@@ -1029,6 +1158,17 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     name_repeat = 0;
     int last_total_tokens = 0;
     bool watchdog_fired = false;
+    bool tool_break = false;
+    bool scope_failed = false;
+    bool voice_scope = ctl != NULL
+        && vg_voice_scope_request(msg->channel, msg->chat_id);
+
+    /* Set when the reply was rendered from a live sample.  Such a reply
+     * carries a value and an age that were true at render time; replaying it
+     * from the response cache minutes later would state an old reading as
+     * the current one. */
+    bool reply_from_sample = false;
+    VG_HEAP_SCAN("react_enter");
 
     /* Router: select and apply best backend before first LLM call.
      * Estimate complexity from the last user message. */
@@ -1039,7 +1179,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
     int router_idx = llm_router_select(complexity);
     if (router_idx >= 0) {
-        llm_router_apply(router_idx);
+        if (ctl != NULL) llm_router_apply_runtime(router_idx);
+        else llm_router_apply(router_idx);
     }
 
     /* Structured trace: begin */
@@ -1047,8 +1188,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     agent_trace_begin(&trace, msg->chat_id, msg->channel);
     trace.backend_idx = router_idx;
 
-    /* Cache check: for simple queries, try cache before LLM call */
-    if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
+    /* Cache check: for simple queries, try cache before LLM call.
+     * HEARTBEAT/system prompts are identical every cycle; a hit would
+     * replay the previous reply and skip tools (no report rewrite). */
+    if (ctl == NULL && msg->content && complexity == LLM_COMPLEXITY_SIMPLE
+        && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
         char* cached = llm_cache_get(msg->content, strlen(msg->content));
         if (cached) {
             syslog(LOG_INFO, "[%s] Cache hit, skipping LLM call\n", TAG);
@@ -1061,17 +1205,44 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
     for (iteration = 0; iteration < AGENT_AI_AGENT_MAX_TOOL_ITER;
          iteration++) {
+        if (agent_http_stop(ctl, agent_mono_ms())) {
+            watchdog_fired = true;
+            break;
+        }
         send_working_status(msg, iteration);
 
         llm_response_t resp;
-        struct timeval tv_start, tv_end;
-        gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
-        gettimeofday(&tv_end, NULL);
+        struct timespec tv_start, tv_end;
+        agent_llm_timing_t timing;
+        VG_HEAP_SCAN("before_llm");
+        mono_now(&tv_start);
+        int err = llm_chat_tools_controlled(sys_prompt, messages, tools_json, &resp,
+            &timing, ctl);
+        mono_now(&tv_end);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
+        /* Per-attempt phase breakdown.  The old trace line put this number
+         * next to tool=, which read as if the tool took 97 s when it was the
+         * LLM call; the tool is timed separately below. */
+
+        {
+            char line[512];
+
+            if (agent_timing_format_http(line, sizeof(line), iteration,
+                    &timing) > 0) {
+                agent_trace_log(&trace, "http", line);
+            }
+        }
+
+        if (agent_http_stop(ctl, agent_mono_ms())) {
+            syslog(LOG_INFO, "[%s] controlled request stopped before tools\n", TAG);
+            llm_response_free(&resp);
+            watchdog_fired = true;
+            break;
+        }
+
         /* Router failover: on LLM call failure, try next backend */
-        if (err != OK && router_idx >= 0) {
+        if (ctl == NULL && err != OK && router_idx >= 0) {
             syslog(LOG_WARNING,
                 "[%s] LLM call failed on backend %d, trying failover\n",
                 TAG, router_idx);
@@ -1083,11 +1254,24 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 router_idx = next_idx;
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
-                gettimeofday(&tv_start, NULL);
-                err = llm_chat_tools(sys_prompt, messages,
-                    tools_json, &resp);
-                gettimeofday(&tv_end, NULL);
+                mono_now(&tv_start);
+                err = llm_chat_tools_controlled(sys_prompt, messages,
+                    tools_json, &resp, &timing, ctl);
+                mono_now(&tv_end);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+
+                /* The failover attempt replaces the first one in the
+                 * breakdown: they are alternatives, not parts of one
+                 * request, and summing them would overstate the wait. */
+
+                {
+                    char line[512];
+
+                    if (agent_timing_format_http(line, sizeof(line),
+                            iteration, &timing) > 0) {
+                        agent_trace_log(&trace, "http", line);
+                    }
+                }
             }
         }
 
@@ -1149,7 +1333,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
              * for a SIMPLE query but the response looks inadequate,
              * retry once with PREMIUM tier. */
             bool cascade_retry = false;
-            if (llm_router_get_profile() == LLM_ROUTE_AUTO
+            if (ctl == NULL && llm_router_get_profile() == LLM_ROUTE_AUTO
                 && complexity == LLM_COMPLEXITY_SIMPLE
                 && router_idx >= 0
                 && resp.text != NULL) {
@@ -1183,11 +1367,20 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     router_idx = prem_idx;
                     trace.backend_idx = prem_idx;
 
-                    gettimeofday(&tv_start, NULL);
-                    err = llm_chat_tools(sys_prompt, messages,
-                        tools_json, &resp);
-                    gettimeofday(&tv_end, NULL);
+                    mono_now(&tv_start);
+                    err = llm_chat_tools_controlled(sys_prompt, messages,
+                        tools_json, &resp, &timing, ctl);
+                    mono_now(&tv_end);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
+
+                    {
+                        char line[512];
+
+                        if (agent_timing_format_http(line, sizeof(line),
+                                iteration, &timing) > 0) {
+                            agent_trace_log(&trace, "http", line);
+                        }
+                    }
 
                     /* Watchdog check on cascade retry */
                     if (llm_call_timed_out(latency_ms)) {
@@ -1234,6 +1427,24 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             break;
         }
 
+        /* Check every call before either sequential or parallel dispatch.
+         * Model-generated names never widen a voice request's C scope. */
+        if (voice_scope) {
+            for (int i = 0; i < resp.call_count; i++) {
+                if (!vg_voice_scope_tool(resp.calls[i].name)) {
+                    scope_failed = true;
+                    break;
+                }
+            }
+            if (scope_failed) {
+                syslog(LOG_WARNING, "[%s] voice tool scope rejected\n", TAG);
+                velaclaw_request_failed(msg->chat_id, -EPERM);
+                llm_response_free(&resp);
+                break;
+            }
+        }
+
+        VG_HEAP_SCAN("llm_done");
         syslog(LOG_INFO, "[%s] Tool iter %d: %d calls\n",
             TAG, iteration + 1, resp.call_count);
 
@@ -1249,55 +1460,125 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         if (should_break) {
             add_assistant_message(messages, &resp);
             add_tool_result_messages(messages, &resp, tool_output,
-                tool_size, msg->channel, msg->chat_id);
+                tool_size, msg->channel, msg->chat_id, iteration,
+                trace_tool_done, &trace);
             llm_response_free(&resp);
+            tool_break = true;
             break;
         }
 
         add_assistant_message(messages, &resp);
+        VG_HEAP_SCAN("asst_added");
         add_tool_result_messages(messages, &resp, tool_output,
-            tool_size, msg->channel, msg->chat_id);
+            tool_size, msg->channel, msg->chat_id, iteration,
+            trace_tool_done, &trace);
+        VG_HEAP_SCAN("tools_done");
 
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool
          * output directly as the reply. Saves ~2s.
+         * list_dir is excluded — it is almost always a discovery step
+         * before read_file / run_shell / write_file (e.g. Skill workflows).
          * Restricted to call_count == 1: the parallel path does not
          * write into tool_output, so multi-call rounds must go through
          * the LLM to aggregate results (and tool_output would be stale
          * from a prior iteration if we allowed call_count > 1 here). */
         if (resp.call_count == 1) {
+            /* A single vg_point_read that resolved to one point needs no
+             * second round-trip: the tool output already carries the name,
+             * value, unit, age and online state.  This is checked before the
+             * file-op branch and only fires on that exact shape. */
+
+            if (strcmp(resp.calls[0].name, "vg_point_read") == 0
+                && !voice_scope
+                && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
+                if (s_point_reply_disabled) {
+                    syslog(LOG_INFO,
+                        "[%s] Point shortcut skipped: switched off\n", TAG);
+                } else {
+                    vg_point_reply_verdict_t verdict = VG_POINT_REPLY_HIT;
+                    char* direct = vg_point_reply_render(tool_output,
+                        msg->content, &verdict);
+
+                    /* One line per round, hit or not: the miss reason is the
+                     * only way to tell a correct fall-through from a
+                     * shortcut that never fires. */
+
+                    syslog(LOG_INFO, "[%s] Point shortcut: %s\n", TAG,
+                        vg_point_reply_verdict_name(verdict));
+
+                    if (direct != NULL) {
+                        final_text = direct;
+                        reply_from_sample = true;
+                        llm_response_free(&resp);
+                        break;
+                    }
+                }
+            }
+
+            /* A single VelaGuard anomaly or recovery read already carries
+             * the whole answer for non-voice channels, so the CLI keeps the
+             * one-request path.  Voice rounds stopped taking this shortcut on
+             * 2026-10-25: the operations-assistant design has the model
+             * compose the display answer and the 播报 summary line from the
+             * tool data, so the second round is the product, not overhead.
+             * System-channel work keeps the model in the loop. */
+
+            if ((strcmp(resp.calls[0].name, "vg_anomaly_read") == 0
+                 || strcmp(resp.calls[0].name, "vg_alarm_recovery") == 0)
+                && !voice_scope
+                && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0
+                && tool_output[0]) {
+                syslog(LOG_INFO,
+                    "[%s] Snapshot shortcut: skip LLM round (%s)\n",
+                    TAG, resp.calls[0].name);
+                final_text = strdup(tool_output);
+
+                /* The text is a live sample, not a model answer: keep it out
+                 * of the response cache so a later round still runs the
+                 * tool instead of replaying a stale list. */
+
+                reply_from_sample = true;
+                llm_response_free(&resp);
+                break;
+            }
+
             bool all_local = true;
             for (int i = 0; i < resp.call_count; i++) {
                 if (strcmp(resp.calls[i].name, "read_file") != 0
                     && strcmp(resp.calls[i].name, "write_file") != 0
-                    && strcmp(resp.calls[i].name, "edit_file") != 0
-                    && strcmp(resp.calls[i].name, "list_dir") != 0) {
+                    && strcmp(resp.calls[i].name, "edit_file") != 0) {
                     all_local = false;
                     break;
                 }
             }
             if (all_local && tool_output[0]) {
-                /* Don't shortcut if the tool read a skill file
-                 * from AGENT_SKILLS_DIR — the LLM needs to process
-                 * the skill content and generate a proper user-facing
-                 * response instead of dumping raw markdown to the user. */
-                bool is_skill_read = false;
-                if (strcmp(resp.calls[0].name, "read_file") == 0
+                /* Don't shortcut instruction files: skills, HEARTBEAT, or
+                 * any system-channel task. Dumping the file as the reply
+                 * skips the rest of the ReAct workflow (report rewrite). */
+                bool is_instruction_read = false;
+                if (strcmp(msg->channel, AGENT_CHAN_SYSTEM) == 0) {
+                    is_instruction_read = true;
+                }
+                else if (strcmp(resp.calls[0].name, "read_file") == 0
                     && resp.calls[0].input != NULL) {
                     cJSON *input_obj = cJSON_Parse(resp.calls[0].input);
                     if (input_obj) {
                         cJSON *path_obj = cJSON_GetObjectItem(input_obj, "path");
                         if (path_obj && cJSON_IsString(path_obj)
-                            && strncmp(path_obj->valuestring,
-                                AGENT_SKILLS_DIR,
-                                strlen(AGENT_SKILLS_DIR)) == 0) {
-                            is_skill_read = true;
+                            && path_obj->valuestring) {
+                            const char *p = path_obj->valuestring;
+                            if (strncmp(p, AGENT_SKILLS_DIR,
+                                    strlen(AGENT_SKILLS_DIR)) == 0
+                                || strcmp(p, AGENT_HEARTBEAT_FILE) == 0) {
+                                is_instruction_read = true;
+                            }
                         }
                         cJSON_Delete(input_obj);
                     }
                 }
 
-                if (!is_skill_read) {
+                if (!is_instruction_read) {
                     syslog(LOG_INFO,
                         "[%s] Local tool shortcut: skip LLM round\n",
                         TAG);
@@ -1307,7 +1588,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 }
 
                 syslog(LOG_INFO,
-                    "[%s] Skill file read — no shortcut, LLM will process\n",
+                    "[%s] Instruction file read — no shortcut, LLM will process\n",
                     TAG);
             }
         }
@@ -1321,7 +1602,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             llm_response_free(&resp);
             bool task_timed_out = false;
             final_text = handle_task_complete(sys_prompt, messages,
-                &task_timed_out);
+                &task_timed_out, ctl);
             if (task_timed_out) {
                 watchdog_fired = true;
             }
@@ -1332,9 +1613,26 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
 
     /* Iteration limit reached — force a summary reply */
-    if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
-        final_text = force_finish_reply(sys_prompt, messages);
+    if (agent_http_stop(ctl, agent_mono_ms())) {
+        free(final_text);
+        final_text = NULL;
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
+    } else if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
+        final_text = force_finish_reply(sys_prompt, messages,
+            "Tool iteration limit reached", ctl);
+        agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
+    } else if (!final_text && tool_break) {
+        /* The duplicate / tool-repeat guard cut the loop short.  The tools
+         * it did run already returned data, so ask for a summary instead of
+         * reporting failure: an error reply here throws away a round that
+         * mostly worked, which is exactly what a slightly chatty model used
+         * to produce on every multi-shell skill. */
+        final_text = force_finish_reply(sys_prompt, messages,
+            "Tool repeat guard tripped", ctl);
+        agent_trace_end(&trace, final_text ? AGENT_TRACE_OK
+                                           : AGENT_TRACE_FAIL);
+    } else if (scope_failed) {
+        agent_trace_end(&trace, AGENT_TRACE_FAIL);
     } else if (watchdog_fired) {
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
     } else if (final_text) {
@@ -1344,9 +1642,17 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     }
 
 send_reply:
-    /* Cache store: save simple query responses for future reuse */
-    if (final_text && msg->content
-        && complexity == LLM_COMPLEXITY_SIMPLE) {
+    if (ctl != NULL && watchdog_fired) {
+        free(final_text);
+        final_text = NULL;
+    }
+    /* Cache store: save simple query responses for future reuse.  A reply
+     * built from a live sample is excluded: the cache TTL is minutes and the
+     * sample age is seconds, so a hit would present a stale reading as the
+     * current value. */
+    if (ctl == NULL && final_text && msg->content && !reply_from_sample
+        && complexity == LLM_COMPLEXITY_SIMPLE
+        && strcmp(msg->channel, AGENT_CHAN_SYSTEM) != 0) {
         llm_cache_put(msg->content, strlen(msg->content), final_text);
         if (last_total_tokens > 0) {
             llm_cache_put_tokens(msg->content, strlen(msg->content),
@@ -1362,8 +1668,11 @@ send_reply:
 static cJSON* build_messages(const char* chat_id, const char* content,
     char* history_json, size_t hist_size)
 {
-    session_get_history_json(chat_id, history_json, hist_size,
-        AGENT_AI_AGENT_MAX_HISTORY);
+    history_json[0] = '\0';
+    if (chat_id != NULL) {
+        session_get_history_json(chat_id, history_json, hist_size,
+            AGENT_AI_AGENT_MAX_HISTORY);
+    }
 
     cJSON* messages = cJSON_Parse(history_json);
 
@@ -1406,8 +1715,18 @@ static void inject_session_context(char* sys_prompt, size_t size,
 static void* agent_loop_task(void* arg)
 {
     (void)arg;
+#ifndef CONFIG_VG_HMI
     agent_mem_status_t mem_st;
+#endif
 
+#ifdef CONFIG_VG_HMI
+    /* Avoid mallinfo() at start — can assert under HMI heap pressure. */
+    size_t ctx_size = AGENT_CONTEXT_BUF_SIZE;
+    size_t hist_size = AGENT_LLM_STREAM_BUF_SIZE;
+    size_t tool_size = TOOL_OUTPUT_SIZE;
+    syslog(LOG_INFO, "[%s] Agent loop started (HMI fixed buffers)\n", TAG);
+    VG_HEAP_SCAN("task_enter");
+#else
     agent_mem_get_status(&mem_st);
     syslog(LOG_INFO, "[%s] Agent loop started, free heap: %zu\n",
         TAG, mem_st.free_heap);
@@ -1418,6 +1737,7 @@ static void* agent_loop_task(void* arg)
         AGENT_LLM_STREAM_BUF_SIZE, 8 * 1024);
     size_t tool_size = agent_mem_safe_size(
         TOOL_OUTPUT_SIZE, TOOL_OUTPUT_SIZE_MIN);
+#endif
 
     char* sys_prompt = calloc(1, ctx_size);
     char* history_json = calloc(1, hist_size);
@@ -1435,8 +1755,12 @@ static void* agent_loop_task(void* arg)
         TAG, ctx_size, hist_size, tool_size);
 
     /* Initialize memory pool for parallel tool outputs */
+#ifdef CONFIG_VG_HMI
+    size_t pool_buf_size = TOOL_OUTPUT_SIZE_LARGE;
+#else
     size_t pool_buf_size = agent_mem_safe_size(
         TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
+#endif
     if (agent_pool_init(&s_tool_pool, pool_buf_size,
             AGENT_MAX_TOOL_CALLS)
         == OK) {
@@ -1452,6 +1776,7 @@ static void* agent_loop_task(void* arg)
 
     syslog(LOG_INFO, "[%s] Tools JSON loaded: %d bytes\n",
         TAG, tools_json ? (int)strlen(tools_json) : 0);
+    VG_HEAP_SCAN("loop_started");
 
     while (!agent_shutdown_requested()) {
         agent_msg_t msg;
@@ -1467,9 +1792,34 @@ static void* agent_loop_task(void* arg)
             break;
         }
 
+        char *voice_tools = NULL;
+        volatile int request_cancel = 0;
+        vela_req_ctl_t request_ctl = {0};
+        const vela_req_ctl_t *ctl = NULL;
+        if (strcmp(msg.channel, "local_client") == 0) {
+            int controlled = velaclaw_request_begin(msg.chat_id, &request_ctl,
+                &request_cancel);
+            if (controlled < 0) {
+                message_bus_msg_free(&msg);
+                continue;
+            }
+            if (controlled > 0) {
+                ctl = &request_ctl;
+            }
+        }
+        if (agent_http_stop(ctl, agent_mono_ms())) {
+            goto release_message;
+        }
+
         syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
             TAG, msg.channel, msg.chat_id);
 
+        if (strcmp(msg.channel, AGENT_CHAN_SYSTEM) == 0
+            && strcmp(msg.chat_id, "heartbeat") == 0) {
+            session_clear(msg.chat_id);
+        }
+
+#ifndef CONFIG_VG_HMI
         /* Check memory pressure */
         agent_mem_get_status(&mem_st);
         if (mem_st.free_heap < AGENT_MEM_RESERVE_BYTES) {
@@ -1487,12 +1837,16 @@ static void* agent_loop_task(void* arg)
                     free(out.content);
                 }
             }
-            free(msg.content);
-            continue;
+            goto release_message;
         }
+#endif
 
-        /* Slash commands — fast path, bypass LLM */
-        char* reply = handle_slash_command(&msg);
+        bool voice_scope = ctl != NULL
+            && vg_voice_scope_request(msg.channel, msg.chat_id);
+
+        /* Fast paths may execute file/shell tools. Voice stays in its
+         * scoped ReAct route instead of bypassing runtime checks. */
+        char* reply = voice_scope ? NULL : handle_slash_command(&msg);
 
         /* Prompt injection check — before LLM */
         if (!reply && tool_guard_check_injection(msg.content)) {
@@ -1502,13 +1856,12 @@ static void* agent_loop_task(void* arg)
             reply = strdup("I can't do that.");
             if (!reply) {
                 /* Fail-closed: skip this message entirely */
-                free(msg.content);
-                continue;
+                goto release_message;
             }
         }
 
         /* NL fast path — after injection check, before LLM */
-        if (!reply) {
+        if (!reply && !voice_scope) {
             reply = handle_nl_fast_path(msg.content);
         }
 
@@ -1522,25 +1875,39 @@ static void* agent_loop_task(void* arg)
             if (message_bus_push_outbound(&out) != OK) {
                 free(reply);
             }
-            free(msg.content);
-            continue;
+            goto release_message;
         }
 
-        /* Hot-reload skills if directory changed */
-        if (skill_loader_check_changed()) {
-            syslog(LOG_INFO, "[%s] Skills changed, refreshing\n", TAG);
-            skill_loader_refresh();
+        VG_HEAP_SCAN("ctx_pre");
+        if (voice_scope) {
+            /* Fixed read-only voice scope needs no file/memory bootstrap.
+             * The model still chooses and invokes the registered tool. */
+            snprintf(sys_prompt, ctx_size, "%s", vg_voice_scope_prompt());
+        } else {
+            if (skill_loader_check_changed()) {
+                syslog(LOG_INFO, "[%s] Skills changed, refreshing\n", TAG);
+                skill_loader_refresh();
+            }
+            context_build_system_prompt(sys_prompt, ctx_size);
+            inject_session_context(sys_prompt, ctx_size,
+                msg.channel, msg.chat_id);
         }
-
-        context_build_system_prompt(sys_prompt, ctx_size);
-        inject_session_context(sys_prompt, ctx_size,
-            msg.channel, msg.chat_id);
+        VG_HEAP_SCAN("ctx_done");
 
         /* Refresh tools JSON — Node tools are dynamic */
         free(tools_json);
         tools_json = tool_registry_get_tools_json();
 
-        cJSON* messages = build_messages(msg.chat_id, msg.content,
+        if (voice_scope) {
+            voice_tools = vg_voice_scope_schema(tools_json);
+            if (voice_tools == NULL) {
+                dispatch_response(&msg, NULL, false);
+                goto release_message;
+            }
+        }
+
+        cJSON* messages = build_messages(ctl == NULL ? msg.chat_id : NULL,
+            msg.content,
             history_json, hist_size);
 
         char* final_text = NULL;
@@ -1553,16 +1920,17 @@ static void* agent_loop_task(void* arg)
             /* ReAct loop */
             s_llm_path_count++;
             final_text = run_react_loop(sys_prompt, messages,
-                tools_json, tool_output, tool_size, &msg);
+                voice_scope ? voice_tools : tools_json,
+                tool_output, tool_size, &msg, ctl);
             cJSON_Delete(messages);
         }
 
-        dispatch_response(&msg, final_text);
+        dispatch_response(&msg, final_text, ctl == NULL);
 
-        /* Free image_b64 if not already freed by vision path */
-        free(msg.image_b64);
-        msg.image_b64 = NULL;
-        free(msg.content);
+release_message:
+        free(voice_tools);
+        velaclaw_request_end(&request_cancel);
+        message_bus_msg_free(&msg);
     }
 
     /* Cleanup (unreachable in normal operation) */
@@ -1579,6 +1947,68 @@ static void* agent_loop_task(void* arg)
 
 /* ── Public interface ─────────────────────────────────────── */
 
+static volatile bool s_agent_loop_started = false;
+#ifdef CONFIG_VG_HMI
+static volatile bool s_agent_loop_requested = false;
+#endif
+
+#ifdef CONFIG_VG_HMI
+/* HMI builds cannot allocate a 16 KB pthread stack from heap — use BSS. */
+static uint8_t s_agent_loop_stack[AGENT_AI_AGENT_STACK]
+    __attribute__((aligned(8)));
+
+static int agent_loop_start_static_stack(void)
+{
+    _agent_task_args_t* ta = malloc(sizeof(_agent_task_args_t));
+
+    if (!ta) {
+        return ERROR;
+    }
+
+    ta->func = agent_loop_task;
+    ta->arg = NULL;
+    ta->stack_size = AGENT_AI_AGENT_STACK;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstack(&attr, s_agent_loop_stack, sizeof(s_agent_loop_stack));
+
+    struct sched_param sp;
+    sp.sched_priority = AGENT_AI_AGENT_PRIO;
+    pthread_attr_setschedparam(&attr, &sp);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+
+    pthread_t tid;
+    int r = pthread_create(&tid, &attr, _agent_task_shim, ta);
+    pthread_attr_destroy(&attr);
+    if (r != 0) {
+        free(ta);
+        syslog(LOG_ERR, "[%s] agent_loop pthread_create failed: %d\n", TAG, r);
+        return ERROR;
+    }
+    pthread_detach(tid);
+    return OK;
+}
+#endif
+
+bool agent_loop_is_running(void)
+{
+    return s_agent_loop_started;
+}
+
+#ifdef CONFIG_VG_HMI
+void agent_loop_request_start(void)
+{
+    s_agent_loop_requested = true;
+}
+
+bool agent_loop_is_requested(void)
+{
+    return s_agent_loop_requested;
+}
+#endif
+
 int agent_loop_init(void)
 {
     syslog(LOG_INFO, "[%s] Agent loop initialized\n", TAG);
@@ -1587,12 +2017,48 @@ int agent_loop_init(void)
 
 int agent_loop_start(void)
 {
+    if (s_agent_loop_started) {
+        return OK;
+    }
+
+#ifdef CONFIG_VG_HMI
+    /* Do NOT call mallinfo() here — under HMI memory pressure it can assert. */
+    int ret = agent_loop_start_static_stack();
+#else
+    agent_mem_status_t st;
+    agent_mem_get_status(&st);
+    if (st.free_heap
+        < (size_t)AGENT_AI_AGENT_STACK + AGENT_MEM_RESERVE_BYTES) {
+        syslog(LOG_WARNING,
+            "[%s] Defer agent_loop: free heap %zu (need %u)\n",
+            TAG, st.free_heap,
+            (unsigned)(AGENT_AI_AGENT_STACK + AGENT_MEM_RESERVE_BYTES));
+        return ERROR;
+    }
+
     int ret = agent_task_create(agent_loop_task, "agent_loop",
         AGENT_AI_AGENT_STACK, NULL, AGENT_AI_AGENT_PRIO);
+#endif
 
     if (ret != OK) {
         syslog(LOG_ERR,
             "[%s] Failed to create agent_loop task\n", TAG);
+    } else {
+        s_agent_loop_started = true;
+#ifdef CONFIG_VG_HMI
+        s_agent_loop_requested = false;
+#endif
     }
     return ret;
+}
+
+int agent_loop_ensure_started(void)
+{
+#ifdef CONFIG_VG_HMI
+    /* CLI stack is tight — only request; network_watch starts the loop. */
+    agent_loop_request_start();
+    return OK;
+#else
+    return agent_loop_start();
+#endif
 }

@@ -47,6 +47,7 @@ CFLAGS += ${INCDIR_PREFIX}$(APPDIR)/netutils/mqttc/MQTT-C/include
 CSRCS += src/core/message_bus.c
 CSRCS += src/core/message_bus_tap.c
 CSRCS += src/core/agent_loop.c
+CSRCS += src/core/point_reply.c
 CSRCS += src/core/agent_trace.c
 CSRCS += src/core/context_builder.c
 CSRCS += src/core/memory_store.c
@@ -61,6 +62,7 @@ CSRCS += src/llm/llm_cache.c
 
 # tools/ - 工具系统（注册表、MCP、安全、技能）
 CSRCS += src/tools/tool_registry.c
+CSRCS += src/tools/tool_audit.c
 CSRCS += src/tools/tool_files.c
 CSRCS += src/tools/tool_get_time.c
 CSRCS += src/tools/tool_web_search.c
@@ -70,6 +72,7 @@ CSRCS += src/tools/tool_feishu_doc.c
 CSRCS += src/tools/tool_feishu_chat.c
 CSRCS += src/tools/tool_vision.c
 CSRCS += src/tools/tool_shell.c
+CSRCS += src/tools/tool_shell_runner.c
 CSRCS += src/tools/tool_system.c
 CSRCS += src/tools/tool_health.c
 CSRCS += src/tools/tool_control.c
@@ -84,6 +87,7 @@ CSRCS += src/tools/mcp_client.c
 endif
 CSRCS += src/tools/skill_loader.c
 CSRCS += src/tools/tool_guard.c
+CSRCS += src/tools/voice_scope.c
 
 ifeq ($(CONFIG_AI_AGENT_SKILL_SYNC),y)
 CSRCS += src/tools/skill_sync.c
@@ -130,6 +134,7 @@ CSRCS += src/infra/cron_service.c
 CSRCS += src/infra/heartbeat.c
 CSRCS += src/infra/network_manager.c
 CSRCS += src/infra/http_proxy.c
+CSRCS += src/infra/agent_timing.c
 CSRCS += src/infra/vela_tls.c
 
 ifeq ($(CONFIG_AI_AGENT_BLE_GATT),y)

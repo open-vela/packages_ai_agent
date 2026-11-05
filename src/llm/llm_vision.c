@@ -132,7 +132,7 @@ int llm_chat_vision(const char* prompt, const char* image_b64,
 
     resp_buf_t rb = { 0 };
     int status = 0;
-    int err = llm_http_call(post_data, &rb, &status);
+    int err = llm_http_call(post_data, &rb, &status, NULL);
     free(post_data);
 
     if (err != OK) {
@@ -290,7 +290,7 @@ int llm_chat_vision_raw(const char* prompt,
 
     resp_buf_t rb = { 0 };
     int status = 0;
-    int err = llm_http_call(body, &rb, &status);
+    int err = llm_http_call(body, &rb, &status, NULL);
     free(body);
 
     if (err != OK) {
