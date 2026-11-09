@@ -34,9 +34,9 @@
 #include "ui/lvgl_ui_channel.h"
 #include "ui/pet_sprite.h"
 #include "ui/frog_sprite.h"
-#include "ui/blackcat_sprite.h"
 #include "ui/dog_sprite.h"
 #include "ui/pig_sprite.h"
+#include "config/config_store.h"
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -45,6 +45,7 @@
 #include <string.h>
 #include <syslog.h>
 #include <errno.h>
+#include <time.h>
 
 #include <lvgl/lvgl.h>
 
@@ -58,6 +59,53 @@
 /* The MiSans CJK static font compiled into liblvgl.a on CP (and into the
  * ai_agent .o on qemu/AP-LVGL_UI). Declared by the font .c via LV_FONT_DECLARE. */
 LV_FONT_DECLARE(lv_font_misans_16_cjk);
+
+/* Config key holding the one species this flash runs with. */
+#define PET_TYPE_CONFIG_KEY "pet_type"
+
+/* Pick the species for this boot.
+ *
+ * The pet must NOT change as the user moves between pages, so the species is
+ * a boot-time constant rather than a UI toggle: read it back from the config
+ * store (survives reboots, wiped by a full flash), or pick one at random the
+ * first time and persist it.  The pick is logged so a test run can tell which
+ * sprite should be on screen.
+ */
+static int pet_type_fixed(void)
+{
+  char buf[8];
+  unsigned char rnd = 0;
+  int type;
+
+  if (claw_config_get(PET_TYPE_CONFIG_KEY, buf, sizeof(buf)) == OK &&
+      buf[0] != '\0')
+    {
+      type = atoi(buf);
+      if (type >= 0 && type < PET_TYPE_COUNT)
+        {
+          syslog(LOG_INFO, "[%s] fixed type %d (from config)\n", TAG, type);
+          return type;
+        }
+    }
+
+  if (agent_secure_random(&rnd, sizeof(rnd)) != 0)
+    {
+      /* No /dev/urandom: boot time + stack address is still different enough
+       * between two flashes that the choice does not look constant. */
+      rnd = (unsigned char)((uint32_t)clock() ^ (uint32_t)time(NULL) ^
+                            (uint32_t)(uintptr_t)&type);
+    }
+  type = (int)(rnd % PET_TYPE_COUNT);
+
+  snprintf(buf, sizeof(buf), "%d", type);
+  if (claw_config_set(PET_TYPE_CONFIG_KEY, buf) != OK)
+    {
+      syslog(LOG_WARNING, "[%s] type %d not persisted (no config store)\n",
+             TAG, type);
+    }
+  syslog(LOG_INFO, "[%s] fixed type %d (new random pick)\n", TAG, type);
+  return type;
+}
 
 /* Layout — sized for the 240×296 round LCD but centers on any display
  * (qemu 466 round included) via lv_display_get_*res at init. */
@@ -107,6 +155,7 @@ struct pet_state_s {
   lv_obj_t *sprite;   /* lv_image: pixel-art pet (scaled) */
   lv_obj_t *label;
   lv_obj_t *status_dot; /* colored dot next to the state caption */
+  lv_obj_t *comet;    /* lv_obj: orbiting dot (busy-state spinner) */
   lv_obj_t *prev_screen;
   /* active animation tag — one effect at a time, stopped on state change */
   bool anim_active;
@@ -141,10 +190,6 @@ static const struct pet_frames_s s_frames_by_type[PET_TYPE_COUNT] = {
     &frog_sprite_base, &frog_sprite_blink, &frog_sprite_eyes_up,
     &frog_sprite_eyes_down, &frog_sprite_focused, &frog_sprite_error,
   },
-  [PET_TYPE_BLACKCAT] = {
-    &blackcat_sprite_base, &blackcat_sprite_blink, &blackcat_sprite_eyes_up,
-    &blackcat_sprite_eyes_down, &blackcat_sprite_focused, &blackcat_sprite_error,
-  },
   [PET_TYPE_DOG] = {
     &dog_sprite_base, &dog_sprite_blink, &dog_sprite_eyes_up,
     &dog_sprite_eyes_down, &dog_sprite_focused, &dog_sprite_error,
@@ -162,18 +207,27 @@ static const struct pet_frames_s *s_frames = &s_frames_by_type[PET_TYPE_CAT];
 /* LVGL v9 exec_cb signature is lv_anim_exec_xcb_t = void(*)(void*, lv_anim_value_t),
  * i.e. the first arg is the animated var (void*), NOT lv_obj_t* nor lv_anim_t*.
  * We cast to lv_obj_t* inside for the lv_obj and lv_arc calls. */
-/* Spinner: a 90° segment rotating (THINKING / LISTENING). value = start angle. */
-static void spin_cb(void *obj, int32_t v)
-{
-  lv_obj_t *o = (lv_obj_t *)obj;
-  lv_arc_set_angles(o, v, v + 90);
-}
+/* Orbit: a small dot travels around the ring (THINKING / LISTENING / EXECUTING).
+ * value = angle 0..360.
+ *
+ * The previous spinner used lv_arc_set_rotation(), which calls
+ * lv_obj_invalidate() on the whole 150px arc (lv_arc.c) every frame, so the
+ * 13 MHz SPI re-flushed the entire ring each step and the motion read as a
+ * segmented, stuttering jump.  A single orbiting dot redraws only its own
+ * ~12px old/new rectangles, keeping the frame near the partial-refresh
+ * ceiling so the orbit reads smooth. */
+#define COMET_RADIUS 73   /* px from ring center, just inside the 4px band */
+#define COMET_SIZE    12
 
-/* Growing fill: indicator grows 0→360 (EXECUTING). value = end angle. */
-static void fill_cb(void *obj, int32_t v)
+static void comet_cb(void *obj, int32_t v)
 {
   lv_obj_t *o = (lv_obj_t *)obj;
-  lv_arc_set_angles(o, 0, v);
+  /* lv_trigo_sin is full-scale (LV_TRIGO_SIN_MAX); >> LV_TRIGO_SHIFT normalizes
+   * to a ±1 multiplier.  v+90 gives cos: x = r·cos(v), y = r·sin(v). */
+  int32_t dx = (COMET_RADIUS * lv_trigo_sin(v + 90)) >> LV_TRIGO_SHIFT;
+  int32_t dy = (COMET_RADIUS * lv_trigo_sin(v))      >> LV_TRIGO_SHIFT;
+  lv_obj_set_style_translate_x(o, dx, 0);
+  lv_obj_set_style_translate_y(o, dy, 0);
 }
 
 /* Breathing: sprite opacity pulses (IDLE). value 0..100. */
@@ -222,7 +276,7 @@ static void shake_cb(void *obj, int32_t v)
 static void stop_anim(void)
 {
   /* Delete any anim bound to our widgets. lv_anim_delete is a no-op if none. */
-  if (s_pet.ring)   lv_anim_delete(s_pet.ring,   spin_cb);
+  if (s_pet.comet)  lv_anim_delete(s_pet.comet,  comet_cb);
   if (s_pet.sprite) lv_anim_delete(s_pet.sprite, breathe_cb);
   if (s_pet.sprite) lv_anim_delete(s_pet.sprite, shake_cb);
   if (s_pet.sprite) lv_anim_delete(s_pet.sprite, blink_cb);
@@ -253,11 +307,17 @@ static void start_anim_for(enum pet_state st)
   uint32_t color = s_state_color[st];
 
   stop_anim();
-  if (!s_pet.ring || !s_pet.sprite) return;
+  if (!s_pet.ring || !s_pet.sprite || !s_pet.comet) return;
 
   /* Indicator color always tracks state (the dark track stays constant);
-   * base angles reset per effect. */
+   * base angles reset per effect.  Clear any rotation left by a previous
+   * spinner so the static rings (0..360) draw where they should. */
   lv_obj_set_style_arc_color(s_pet.ring, lv_color_hex(color), LV_PART_INDICATOR);
+  lv_arc_set_rotation(s_pet.ring, 0);
+  /* Bright white bead on the state-colored ring so the orbit reads against
+   * the tinted track (a state-colored dot would blend into the same-tone arc). */
+  lv_obj_set_style_bg_color(s_pet.comet, lv_color_hex(UI_PAL_CARD), 0);
+  lv_obj_add_flag(s_pet.comet, LV_OBJ_FLAG_HIDDEN);
 
   /* Face tracks state too — each state's expression frame (blink anim swaps it). */
   lv_image_set_src(s_pet.sprite, sprite_for(st));
@@ -266,20 +326,29 @@ static void start_anim_for(enum pet_state st)
     {
       case PET_STATE_THINKING:
       case PET_STATE_LISTENING:
+        /* Static faint ring + an orbiting dot.  Only the dot's small rect is
+         * redrawn per frame, so the orbit stays smooth on the 13 MHz SPI. */
+        lv_arc_set_angles(s_pet.ring, 0, 360);
+        lv_obj_remove_flag(s_pet.comet, LV_OBJ_FLAG_HIDDEN);
         lv_anim_init(&a);
-        lv_anim_set_var(&a, s_pet.ring);
+        lv_anim_set_var(&a, s_pet.comet);
         lv_anim_set_values(&a, 0, 360);
-        lv_anim_set_time(&a, 1400);
-        lv_anim_set_exec_cb(&a, spin_cb);
+        lv_anim_set_time(&a, 1000);
+        lv_anim_set_path_cb(&a, lv_anim_path_linear);
+        lv_anim_set_exec_cb(&a, comet_cb);
         lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
         lv_anim_start(&a);
         break;
       case PET_STATE_EXECUTING:
+        /* Same orbiting dot, faster orbit for the "working hard" feel. */
+        lv_arc_set_angles(s_pet.ring, 0, 360);
+        lv_obj_remove_flag(s_pet.comet, LV_OBJ_FLAG_HIDDEN);
         lv_anim_init(&a);
-        lv_anim_set_var(&a, s_pet.ring);
+        lv_anim_set_var(&a, s_pet.comet);
         lv_anim_set_values(&a, 0, 360);
         lv_anim_set_time(&a, 900);
-        lv_anim_set_exec_cb(&a, fill_cb);
+        lv_anim_set_path_cb(&a, lv_anim_path_linear);
+        lv_anim_set_exec_cb(&a, comet_cb);
         lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
         lv_anim_start(&a);
         break;
@@ -447,8 +516,27 @@ static void apply_type_async_cb(void *data)
 
 void pet_status_view_set_type(int type)
 {
-  if (type < 0 || type >= PET_TYPE_COUNT) type = PET_TYPE_CAT;
+  char buf[8];
+
+  /* Out of range means "no change" — the species is fixed, not a fallback
+   * toggle.  A debug switch persists so the next boot keeps it. */
+  if (type < 0 || type >= PET_TYPE_COUNT)
+    {
+      return;
+    }
+
+  snprintf(buf, sizeof(buf), "%d", type);
+  if (claw_config_set(PET_TYPE_CONFIG_KEY, buf) != OK)
+    {
+      syslog(LOG_WARNING, "[%s] type %d not persisted (no config store)\n",
+             TAG, type);
+    }
   lvgl_ui_async_call(apply_type_async_cb, (void *)(intptr_t)type);
+}
+
+int pet_status_view_get_type(void)
+{
+  return (int)s_pet.type;
 }
 
 /* ---------- screen show / hide ---------- */
@@ -472,8 +560,8 @@ static void show_async_cb(void *data)
   /* lv_screen_load already invalidates the full screen and schedules a redraw;
    * the explicit invalidate + lv_refr_now below was a qemu-goldfish-headless
    * lazy-flush workaround that is unnecessary on the real CP /dev/lcd0 panel,
-   * where it caused a full-frame (top-to-bottom) white flicker on every idle
-   * pet↔particle rotate.  Real hardware renders screen switches fine without
+   * where it caused a full-frame (top-to-bottom) white flicker on every
+   * screen switch.  Real hardware renders screen switches fine without
    * the extra synchronous refresh, so we drop it to stop the standby flicker. */
   s_pet.visible = true;
   /* Re-assert current state's animation (lv_anim may have been paused off-screen). */
@@ -527,8 +615,8 @@ int pet_status_view_init(void)
 
   memset(&s_pet, 0, sizeof(s_pet));
   s_pet.state = PET_STATE_IDLE;
-  s_pet.type = PET_TYPE_CAT;
-  s_frames = &s_frames_by_type[PET_TYPE_CAT];
+  s_pet.type = (enum pet_type)pet_type_fixed();
+  s_frames = &s_frames_by_type[s_pet.type];
 
   s_pet.screen = lv_obj_create(NULL);
   if (!s_pet.screen) return -ENOMEM;
@@ -568,6 +656,21 @@ int pet_status_view_init(void)
   lv_image_set_antialias(s_pet.sprite, false);
   lv_image_set_scale(s_pet.sprite, PET_SPRITE_SCALE * 256);
   lv_obj_align(s_pet.sprite, LV_ALIGN_CENTER, 0, -PET_LIFT_UP);
+
+  /* Orbiting comet dot for busy states — a small circle travelling around the
+   * ring, translated from the ring center each animation frame.  Mirrors the
+   * status_dot styling so it renders as a clean, borderless disc. */
+  s_pet.comet = lv_obj_create(s_pet.screen);
+  if (!s_pet.comet) goto fail;
+  lv_obj_remove_flag(s_pet.comet, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(s_pet.comet, COMET_SIZE, COMET_SIZE);
+  lv_obj_set_style_radius(s_pet.comet, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(s_pet.comet, lv_color_hex(UI_PAL_IDLE), 0);
+  lv_obj_set_style_bg_opa(s_pet.comet, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(s_pet.comet, 0, 0);
+  lv_obj_set_style_pad_all(s_pet.comet, 0, 0);
+  lv_obj_align(s_pet.comet, LV_ALIGN_CENTER, 0, -PET_LIFT_UP);
+  lv_obj_add_flag(s_pet.comet, LV_OBJ_FLAG_HIDDEN);
 
   /* Status caption row below the sprite: a colored status dot (HachimoDock
    * circular status marker) + the state text, laid out horizontally. */

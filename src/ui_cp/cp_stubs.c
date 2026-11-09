@@ -33,6 +33,27 @@
 
 #include "voice/voice_channel.h"
 #include "core/message_bus.h"
+#include "agent_compat.h"
+
+/* The CP renderer has no config store of its own (config_store.c is not part
+ * of this app).  Report every key as absent and swallow writes: pet_status_view
+ * then picks a species at random for this boot instead of persisting one. */
+int claw_config_get(const char *key, char *buf, size_t buf_size)
+{
+  (void)key;
+  if (buf != NULL && buf_size > 0)
+    {
+      buf[0] = '\0';
+    }
+  return ERROR;
+}
+
+int claw_config_set(const char *key, const char *value)
+{
+  (void)key;
+  (void)value;
+  return ERROR;
+}
 
 int voice_channel_init(void)                                 { return 0; }
 int voice_channel_start(void)                                { return 0; }

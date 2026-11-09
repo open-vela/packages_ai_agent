@@ -219,7 +219,13 @@ int main(int argc, FAR char *argv[])
         }
       else if (strcmp(cmd, "ptype") == 0)
         {
-          pet_status_view_set_type(atoi(arg));
+          /* Debug only: the species is fixed at boot (see pet_status_view.c);
+           * a value here is persisted for the next boot. */
+          if (*arg)
+            {
+              pet_status_view_set_type(atoi(arg));
+            }
+          printf("[%s] pet type %d\n", TAG, pet_status_view_get_type());
         }
       else if (strcmp(cmd, "ptt") == 0)
         {

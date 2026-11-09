@@ -51,14 +51,15 @@ enum pet_state {
     PET_STATE_ERROR     = 5, /* 错误：抖动 + 红色，眼睛 X */
 };
 
-/** 宠物类型（可选像素动物，`ptype` 调试命令切换）。 */
+/** 宠物形象。**每次烧录随机固定一只**（首次启动选中后写入 config 的
+ *  `pet_type`，整片烧录清 NVS 才会换），运行中不换、更不随页面切换：所有
+ * 页面和状态都只换这只宠物的表情。`set_ptype` 仅作调试，改了会持久化。 */
 enum pet_type {
-    PET_TYPE_CAT       = 0,  /* 白猫脸（默认，粉耳 + 腮红 + 2×2 眼） */
-    PET_TYPE_FROG      = 1,  /* 绿青蛙（2×2 大眼） */
-    PET_TYPE_BLACKCAT  = 2,  /* 黑猫（黑脸 + 白瞳 + 白胡须/下巴） */
-    PET_TYPE_DOG       = 3,  /* 棕狗（垂耳 + 黑鼻 + 粉吐舌） */
-    PET_TYPE_PIG       = 4,  /* 粉猪（大耳 + 两个黑鼻孔） */
-    PET_TYPE_COUNT     = 5,
+    PET_TYPE_CAT  = 0,  /* 白猫脸（粉耳 + 腮红 + 2×2 眼） */
+    PET_TYPE_FROG = 1,  /* 绿青蛙（2×2 大眼） */
+    PET_TYPE_DOG  = 2,  /* 棕狗（垂耳 + 黑鼻 + 粉吐舌） */
+    PET_TYPE_PIG  = 3,  /* 粉猪（大耳 + 两个黑鼻孔） */
+    PET_TYPE_COUNT = 4,
 };
 
 /**
@@ -104,10 +105,16 @@ void pet_status_view_set_state(enum pet_state state);
 void pet_status_view_set_error_text(const char *text);
 
 /**
- * 切换宠物类型（0=猫 1=青蛙 2=黑猫 3=狗 4=猪，越界按猫处理）。下一帧状态
- * 更新即生效。线程安全：异步调度到 LVGL 线程。
+ * 调试用：切换宠物类型（0=猫 1=青蛙 2=狗 3=猪）。越界值被忽略，不回落。
+ * 新值写入 config（`pet_type`），重启后保持——形象是烧录期固定的，
+ * 不要在验收里用它当「切形象」功能。线程安全：异步调度到 LVGL 线程。
  */
 void pet_status_view_set_type(int type);
+
+/**
+ * 当前固定形象（0..PET_TYPE_COUNT-1）。只读一个 int，可在任意线程调用。
+ */
+int pet_status_view_get_type(void);
 
 #ifdef __cplusplus
 }

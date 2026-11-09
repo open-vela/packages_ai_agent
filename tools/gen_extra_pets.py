@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Generate 3 extra pet sprite headers: blackcat, dog, pig.
+"""Generate 2 extra pet sprite headers: dog, pig.
 
 Each is a 16x16 front-facing animal face in the same two-tone pixel style as
 pet_sprite.h (cat) and frog_sprite.h, with 2x2 pupils at rows 7-8 (cols 4-5 and
 10-11) so the six eye-region expressions read clearly when scaled 6x to 96px.
 
-  blackcat_sprite_*  — black face, white 2x2 pupils, white muzzle/chin
   dog_sprite_*       — brown face, droopy ears, black nose, pink tongue
   pig_sprite_*       — pink face, big ears, two black nostrils
 
-All three use the same expression edit scheme (eyes-only, rows 6-9 around the
+Both use the same expression edit scheme (eyes-only, rows 6-9 around the
 2x2 pupils): base / blink / eyes_up / eyes_down / focused (brows) / error (X).
 Transparent pixels are baked to UI_PAL_BG (0x0F1011 -> RGB565 0x0882).
 
@@ -23,7 +22,6 @@ import sys
 W = H = 16
 BG = 0x0882   # RGB565 of UI_PAL_BG 0x0F1011
 BK = 0x0000   # black (pupil / nose / nostril / outline)
-WH = 0xFFFF   # white (blackcat pupils + muzzle)
 PK = 0xFDB8   # soft pink (pig face / dog tongue) ~ #FFB6C5
 DP = 0xEC54   # deep pink (pig outline) ~ #E88AA0
 BN = 0x8AC5   # dog brown (saddle brown) ~ #8B5A2B
@@ -31,29 +29,6 @@ BN = 0x8AC5   # dog brown (saddle brown) ~ #8B5A2B
 # Each pet: name, rows, color map, and (eye_color, fill) for expression edits.
 # '.'=BG everywhere; per-pet CMAP supplies the rest.
 PETS = [
-    {
-        "name": "blackcat",
-        "eye_color": WH, "fill": BK,
-        "cmap": {'.': BG, '#': BK, 'W': WH},
-        "rows": [
-            "....#......#....",
-            "...###....###...",
-            "...####..####...",
-            "...##########...",
-            "..############..",
-            "..############..",
-            "..############..",
-            "..##WW####WW##..",
-            "..##WW####WW##..",
-            "..############..",
-            "..#####WW#####..",
-            "..####WWWW####..",
-            "..############..",
-            "...##########...",
-            "...#WWWWWWWW#...",
-            "....########....",
-        ],
-    },
     {
         "name": "dog",
         "eye_color": BK, "fill": BN,
