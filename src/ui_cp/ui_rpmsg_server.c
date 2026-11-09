@@ -184,9 +184,9 @@ static int ui_rpmsg_server_rx(struct rpmsg_endpoint *ept, void *data,
 
       case UI_RPMSG_SET_PAGE:
         {
-          /* Switch the round-screen page (0=pet home, 1=particle flow).
-           * Delegates to the CP-side lvgl_ui_channel_set_page, which gates
-           * each page behind its CONFIG guard. */
+          /* Switch the round-screen page (0 = pet home; the particle page
+           * was removed).  Delegates to the CP-side
+           * lvgl_ui_channel_set_page, which rejects any other index. */
           if (m->payload_len < 1)
             {
               break;

@@ -512,20 +512,6 @@ config AI_AGENT_PET_STATUS
 	  state onto the pet and yields the foreground to the pet after chat
 	  idle, so the pet "lives" during PTT without extra AP wiring.
 
-config AI_AGENT_PARTICLE_FLOW
-	bool "Particle flow visualizer (M7 差异化页 ②, pure-LVGL)"
-	default n
-	depends on AI_AGENT_LVGL_UI || AI_AGENT_UI_RPMSG || EXAMPLES_AI_AGENT_UI_CP
-	---help---
-	  Build particle_flow_view.c: a second round-screen 差异化 page — an
-	  abstract "energy flow" of 18 particles swirling around a pulsing core,
-	  distinct from the pet's face+ring. Particle color + flow direction +
-	  core pulse mirror the same 6-state agent lifecycle (idle/listening/
-	  thinking/executing/waiting/error). Pure LVGL with integer fixed-point
-	  physics (no float / math.h), so it links on the CP without -Werror risk.
-	  Reached via the set_page command (page 1) or a future idle auto-switch;
-	  does not displace the pet home screen.
-
 config AI_AGENT_STANDBY_UI
 	bool "Standby dim digital clock (M7 待机界面)"
 	default n

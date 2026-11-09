@@ -59,9 +59,6 @@ LV_FONT_DECLARE(lv_font_misans_16_cjk);
 
 #ifdef CONFIG_AI_AGENT_PET_STATUS
 #include "ui/pet_status_view.h"
-#ifdef CONFIG_AI_AGENT_PARTICLE_FLOW
-#include "ui/particle_flow_view.h"
-#endif
 #ifdef CONFIG_AI_AGENT_STANDBY_UI
 #include "ui/standby_view.h"
 #endif
@@ -1039,12 +1036,6 @@ int lvgl_ui_channel_init(void)
       }
     pet_idle_reset();
 #endif
-#ifdef CONFIG_AI_AGENT_PARTICLE_FLOW
-    /* M7 差异化页 ②: build the particle flow screen (NOT loaded — the pet is
-     * the cold-start home screen; the particle page is reached via set_page 1).
-     * Init here so it is ready to show without a per-call create latency. */
-    (void)particle_flow_view_init();
-#endif
 #ifdef CONFIG_AI_AGENT_STANDBY_UI
     /* M7 待机界面: build the dim digital clock screen (NOT loaded — the pet is
      * the cold-start home screen; the standby timer fades it in after
@@ -1565,13 +1556,6 @@ int lvgl_ui_channel_set_pet_state(int state)
     pet_status_view_set_state((enum pet_state)state);
     rc = 0;
 #endif
-#ifdef CONFIG_AI_AGENT_PARTICLE_FLOW
-    /* Mirror the agent state onto the particle page too: when the particle
-     * page is visible its color/flow tracks the same lifecycle; when hidden
-     * this just stages the color for the next show. */
-    particle_flow_view_set_state((enum particle_state)state);
-    rc = 0;
-#endif
     (void)rc;
     if (state != s_last_pet_state)
       {
@@ -1581,43 +1565,27 @@ int lvgl_ui_channel_set_pet_state(int state)
     return rc;
 }
 
-/* Switch the round-screen 差异化 page foreground (M7 ① pet / ② particle).
- * page 0 → pet home screen, page 1 → particle flow.  The chat screen is
- * intentionally excluded — it auto-preempts on send/send_user and yields back
- * to the pet on idle.  Dispatched async on the LVGL thread. */
+/* Switch the round-screen page foreground: page 0 is the pet home screen (the
+ * only page; the former particle-flow page was removed).  Kept as a command so
+ * `set_page 0` still works as an explicit "back to the pet / wake" action.  The
+ * chat screen is intentionally excluded — it auto-preempts on send/send_user
+ * and yields back to the pet on idle.  Dispatched async on the LVGL thread. */
 int lvgl_ui_channel_set_page(int page)
 {
+    if (page != 0) {
+        return -EINVAL;
+    }
     ui_activity_reset();
-    /* Switching to pet/particle means the chat screen no longer owns the
+    /* Switching to the pet means the chat screen no longer owns the
      * foreground; keep the flag honest so the next scroll or Agent reply can
      * bring the transcript back. */
     s_state.screen_visible = false;
-    switch (page)
-      {
-        case 0:
 #ifdef CONFIG_AI_AGENT_PET_STATUS
-          /* Hide particle first so show's prev-screen restore is consistent. */
-#ifdef CONFIG_AI_AGENT_PARTICLE_FLOW
-          particle_flow_view_hide();
-#endif
-          pet_status_view_show();
-          return 0;
+    pet_status_view_show();
+    return 0;
 #else
-          return -ENOSYS;
+    return -ENOSYS;
 #endif
-        case 1:
-#ifdef CONFIG_AI_AGENT_PARTICLE_FLOW
-#ifdef CONFIG_AI_AGENT_PET_STATUS
-          pet_status_view_hide();
-#endif
-          particle_flow_view_show();
-          return 0;
-#else
-          return -ENOSYS;
-#endif
-        default:
-          return -EINVAL;
-      }
 }
 
 

@@ -49,7 +49,7 @@
 /* ── Local debug console ─────────────────────────────────────────────
  * The AP→CP RPMsg path (ui_rpmsg_server) is the production driver, but it
  * only fires once the AP agent link is up.  For on-device visual testing of
- * the pure-LVGL pages (pet ring / particle flow / chat cards) this console
+ * the pure-LVGL pages (pet ring / chat cards) this console
  * accepts a small word set so each view and agent-state animation can be
  * exercised straight from the CP NSH, without the AP or a network.  Mirrors
  * the AP nsh_commands debug words (show_chat / set_pet / set_page) and adds
@@ -58,7 +58,7 @@
 static void ui_print_help(void)
 {
   syslog(LOG_INFO,
-         "[%s] cmds: show | page <0|1> | pet <0-5> | ptype <0-4> | ptt <0|1|2> |\n"
+         "[%s] cmds: show | page 0 | pet <0-5> | ptype [0-3] | ptt <0|1|2> |\n"
          "       say <text> | sayc <hex> <text> | user <text> | demo | quit |\n"
          "       approve <tool> <hint> | unapprove | scroll <0|1>\n",
          TAG);
@@ -72,14 +72,6 @@ static void ui_demo_sequence(void)
     {
       lvgl_ui_channel_set_pet_state(st);
       usleep(1500 * 1000);
-    }
-
-  syslog(LOG_INFO, "[%s] demo: particle page (state mirrors pet)\n", TAG);
-  lvgl_ui_channel_set_page(1);
-  for (int st = 0; st <= 5; st++)
-    {
-      lvgl_ui_channel_set_pet_state(st);
-      usleep(1200 * 1000);
     }
 
   syslog(LOG_INFO, "[%s] demo: chat screen + 4 card color bars\n", TAG);

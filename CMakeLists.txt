@@ -115,12 +115,6 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_SRCS src/ui/pet_status_view.c)
   endif()
 
-  # M7 差异化页 ② (pure-LVGL 退路): round-screen particle flow visualizer.
-  # Distinct "好玩" page alongside the pet; integer-only physics, no float.
-  if(CONFIG_AI_AGENT_PARTICLE_FLOW)
-    list(APPEND AGENT_SRCS src/ui/particle_flow_view.c)
-  endif()
-
   # M7 待机界面: dim digital clock standby screen (standby_view.c), faded in by
   # lvgl_ui_channel.c after 60s of no activity.  AP-local only.
   if(CONFIG_AI_AGENT_STANDBY_UI)
@@ -317,11 +311,6 @@ if(CONFIG_EXAMPLES_AI_AGENT_UI_CP)
   # M7 差异化页 (pure-LVGL 退路): pet status ring home screen on the CP.
   if(CONFIG_AI_AGENT_PET_STATUS)
     list(APPEND AI_AGENT_UI_CP_SRCS src/ui/pet_status_view.c)
-  endif()
-
-  # M7 差异化页 ② (pure-LVGL 退路): particle flow visualizer on the CP.
-  if(CONFIG_AI_AGENT_PARTICLE_FLOW)
-    list(APPEND AI_AGENT_UI_CP_SRCS src/ui/particle_flow_view.c)
   endif()
 
   # The shared UI sources (lvgl_ui_channel.c / lvgl_toast.c / agent_config.h)

@@ -370,13 +370,14 @@ int lvgl_ui_channel_set_pet_state(int state)
 }
 
 /* Switch the CP round-screen page from the AP side (debug `set_page` nsh
- * command and idle-rotate logic).  payload[0] = page index (0=pet,1=particle). */
+ * command).  payload[0] = page index (0 = pet home; the particle page that
+ * used to be 1 was removed). */
 int lvgl_ui_channel_set_page(int page)
 {
   struct ui_rpmsg_msg m;
   int ret;
 
-  if (page < 0 || page > 1)
+  if (page != 0)
     {
       return -EINVAL;
     }

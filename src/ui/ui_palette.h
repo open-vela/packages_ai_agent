@@ -21,7 +21,7 @@
  * 的设计语言：近黑底 + 白卡片 + 深灰投影 + 浅描边 + 柔和低饱和状态色 + 品牌橙
  * 作为「主任务/焦点/积极反馈」的强调色。ink/muted 用于卡片上的主/次文字。
  *
- * 状态色语义与 pet_status_view / particle_flow_view 的 agent 状态镜像一致：
+ * 状态色语义与 pet_status_view 的 agent 状态镜像一致：
  * 灰=待机、teal=聆听、蓝=思考、橙=执行、琥珀=等待、红=错误、绿=结论/成功。
  *
  * 颜色统一为 RGB 0xRRGGBB，供 lv_color_hex() 使用（RGB565 平台自动量化）。
