@@ -427,18 +427,30 @@ static void* outbound_dispatch_task(void* arg)
                     "[%s] voice cooldown active, dropping message\n", TAG);
             } else {
                 s_voice_cooldown = false;
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+                /* A spoken reply has to reach the screen as well: until
+                 * here the voice channel only called voice_channel_speak(),
+                 * so the answer was audible but never rendered.  On these
+                 * builds lvgl_ui_channel_send() queues the chat card and
+                 * then runs the same TTS itself, so it replaces the speak
+                 * call instead of adding a second one.  When the UI channel
+                 * is not up (send() fails before speaking) fall back to
+                 * TTS-only so a headless agent still answers out loud. */
+                int uret = lvgl_ui_channel_send(msg.content);
+                if (uret != 0) {
+                    syslog(LOG_WARNING,
+                        "[%s] voice reply not rendered (rc=%d), TTS only\n",
+                        TAG, uret);
+                    (void)voice_channel_speak(msg.content);
+                }
+#else
                 int vret = voice_channel_speak(msg.content);
                 if (vret != 0) {
                     syslog(LOG_ERR, "[%s] voice_channel_speak failed: %d\n", TAG, vret);
                     s_voice_cooldown = true;
                     s_voice_cooldown_until = time(NULL) + 5;
-#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
-                    /* TTS failed — drive the pet to ERROR (red+shake) so the
-                     * user sees the failure on screen, not just a silent skip.
-                     * 5 = PET_STATE_ERROR (pet_status_view.h). */
-                    (void)lvgl_ui_channel_set_pet_state(5);
-#endif
                 }
+#endif
             }
 #if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
         } else if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) == 0) {
