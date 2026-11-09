@@ -59,6 +59,27 @@ void cmd_set_volc_asr(int argc, char** argv)
         argv[1], argv[3]);
 }
 
+void cmd_set_volc_voice(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_volc_voice <speed> [volume] [pitch]\n");
+        printf("  值 1.0 = 引擎默认;范围约 0.5~2.0。\n");
+        printf("  出厂默认: speed=1.0 volume=1.5(音量偏小→+50%%) pitch=0.9(音调偏高→-10%%)\n");
+        printf("  例: set_volc_voice 0.9 1.0 1.0  (放慢语速)\n");
+        return;
+    }
+    claw_config_set(AGENT_CFG_KEY_VOLC_SPEED, argv[1]);
+    printf("TTS speed=%s\n", argv[1]);
+    if (argc > 2 && argv[2][0] != '\0') {
+        claw_config_set(AGENT_CFG_KEY_VOLC_VOLUME, argv[2]);
+        printf("TTS volume=%s\n", argv[2]);
+    }
+    if (argc > 3 && argv[3][0] != '\0') {
+        claw_config_set(AGENT_CFG_KEY_VOLC_PITCH, argv[3]);
+        printf("TTS pitch=%s\n", argv[3]);
+    }
+}
+
 void cmd_voice_start(void)
 {
     voice_channel_start();

@@ -31,11 +31,28 @@ static const char* TAG = "volc_tts";
 /* Credentials loaded from config store */
 static char s_api_key[128];
 static char s_speaker[64];
+/* TTS 音质旋钮(1.0 = 引擎默认)。存成字符串,请求体里再 atof。 */
+static char s_speed[16];
+static char s_volume[16];
+static char s_pitch[16];
+
+/* Load one ratio knob; missing/empty falls back to the given default. */
+static void load_ratio(const char *key, const char *fallback,
+                       char *out, size_t cap)
+{
+    if (claw_config_get(key, out, cap) != OK || out[0] == '\0') {
+        strncpy(out, fallback, cap - 1);
+        out[cap - 1] = '\0';
+    }
+}
 
 static int volc_tts_init(void)
 {
     memset(s_api_key, 0, sizeof(s_api_key));
     memset(s_speaker, 0, sizeof(s_speaker));
+    memset(s_speed, 0, sizeof(s_speed));
+    memset(s_volume, 0, sizeof(s_volume));
+    memset(s_pitch, 0, sizeof(s_pitch));
 
     claw_config_get(AGENT_CFG_KEY_VOLC_API_KEY,
         s_api_key, sizeof(s_api_key));
@@ -47,6 +64,13 @@ static int volc_tts_init(void)
         strncpy(s_speaker, AGENT_VOICE_DEFAULT_SPEAKER,
             sizeof(s_speaker) - 1);
     }
+
+    load_ratio(AGENT_CFG_KEY_VOLC_SPEED, AGENT_VOICE_DEFAULT_RATIO,
+               s_speed, sizeof(s_speed));
+    load_ratio(AGENT_CFG_KEY_VOLC_VOLUME, AGENT_VOICE_DEFAULT_VOLUME,
+               s_volume, sizeof(s_volume));
+    load_ratio(AGENT_CFG_KEY_VOLC_PITCH, AGENT_VOICE_DEFAULT_PITCH,
+               s_pitch, sizeof(s_pitch));
 
     return 0;
 }
@@ -76,6 +100,18 @@ static char* build_tts_request(const char* text,
         cJSON_AddStringToObject(audio, "format", "pcm");
         cJSON_AddNumberToObject(audio, "sample_rate",
             AGENT_VOICE_SAMPLE_RATE);
+        /* 音质旋钮:值与"引擎默认"哨兵(1.0)不同才写入请求体。速度默认 1.0
+         * 不写入;音量/音调出厂默认 1.5/0.9,因此默认请求就带上这两个字段,
+         * 用户 set_volc_voice 改回 1.0 时则与旧版请求逐字节一致。 */
+        if (strcmp(s_speed, AGENT_VOICE_DEFAULT_RATIO) != 0) {
+            cJSON_AddNumberToObject(audio, "speed_ratio", atof(s_speed));
+        }
+        if (strcmp(s_volume, AGENT_VOICE_DEFAULT_RATIO) != 0) {
+            cJSON_AddNumberToObject(audio, "volume_ratio", atof(s_volume));
+        }
+        if (strcmp(s_pitch, AGENT_VOICE_DEFAULT_RATIO) != 0) {
+            cJSON_AddNumberToObject(audio, "pitch_ratio", atof(s_pitch));
+        }
         cJSON_AddItemToObject(params, "audio_params", audio);
     }
 
@@ -256,8 +292,14 @@ static int volc_tts_synthesize(const char* text,
  * The resp buffer stays at 128KB to support up to ~4s of TTS
  * audio (typical LLM reply length).  For >4s audio, true
  * chunked HTTP reception would be needed (future work).
- * Net saving vs batch: 80KB (b64 96KB→16KB). */
-#define VOLC_TTS_STREAM_RESP_SIZE (512 * 1024)
+ * Net saving vs batch: 80KB (b64 96KB→16KB).
+ *
+ * NOTE: do NOT bump resp back to 512KB — BK7258 AP has only 272KB SRAM
+ * (CONFIG_RAM_SIZE=278528) plus a flaky PSRAM heap, so a 512KB calloc
+ * lands in PSRAM and the TLS read loop blocks forever on it (batch's
+ * 128KB buffer stays in SRAM and completes).  Truncation past ~4s audio
+ * is graceful (same as batch), a hang is not. */
+#define VOLC_TTS_STREAM_RESP_SIZE (128 * 1024)
 #define VOLC_TTS_STREAM_B64_SIZE (64 * 1024)
 
 int volc_tts_synthesize_stream(const char* text,

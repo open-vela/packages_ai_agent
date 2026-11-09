@@ -457,22 +457,27 @@ static void* recording_thread(void* arg)
             write(dump_fd, chunk, (size_t)n);
         }
 
-        /* Log audio level for first few chunks and periodically
-         * to diagnose silence vs actual speech from QEMU mic. */
-        if (chunk_count <= 3 || chunk_count % 50 == 0) {
+        /* Log audio level for the first few chunks and every 10th after
+         * that: the periodic lines are what tell "user was speaking here"
+         * apart from "PTT ran but the mic heard nothing".  dc is the block
+         * mean, which exposes an analog offset riding on the signal. */
+        if (chunk_count <= 3 || chunk_count % 10 == 0) {
             int16_t* samples = (int16_t*)chunk;
             int sample_count = n / 2;
             int32_t peak = 0;
+            int64_t sum = 0;
 
             for (int i = 0; i < sample_count; i++) {
                 int32_t v = samples[i] < 0 ? -samples[i] : samples[i];
                 if (v > peak) {
                     peak = v;
                 }
+                sum += samples[i];
             }
             syslog(LOG_INFO,
-                "[%s] chunk#%d: %d bytes, peak=%ld\n",
-                TAG, chunk_count, n, (long)peak);
+                "[%s] chunk#%d: %d bytes, peak=%ld dc=%ld\n",
+                TAG, chunk_count, n, (long)peak,
+                (long)(sample_count ? sum / sample_count : 0));
         }
 
 #ifdef CONFIG_AI_AGENT_AUDIO_PREPROCESS
@@ -1036,6 +1041,74 @@ static void tts_strip_markdown(char* s)
     *w = '\0';
 }
 
+/* ── TTS sentence segmentation ─────────────────────────────── */
+
+/* Long replies sent as one TTS request sound monotonous (no inter-sentence
+ * pause) and, past ~4s of audio, hit the streaming response buffer cap and
+ * truncate the tail.  Splitting into sentence-sized segments fixes both: each
+ * segment is a short, natural utterance and its own synth request, all written
+ * to the one open playback handle in order.
+ *
+ * Segment ceiling: 180 UTF-8 bytes ≈ 60 CJK chars ≈ 12s of speech at the
+ * ~4 chars/s rate, comfortably under the 512KB stream cap. */
+#define TTS_SEGMENT_MAX 180
+
+/* UTF-8 byte length of a sentence terminator at p (0 = not a terminator):
+ * ASCII \n ! ?, or full-width 。！？； (3 bytes each). */
+static int tts_terminator_len(const char *p)
+{
+  unsigned char c = (unsigned char)p[0];
+
+  if (c == '\n' || c == '!' || c == '?') {
+    return 1;
+  }
+  /* 。 U+3002 (E3 80 82) */
+  if (c == 0xE3 && (unsigned char)p[1] == 0x80
+      && (unsigned char)p[2] == 0x82) {
+    return 3;
+  }
+  /* ！ U+FF01 / ？ U+FF1F / ； U+FF1B (EF BC 81 / 9F / 9B) */
+  if (c == 0xEF && (unsigned char)p[1] == 0xBC
+      && ((unsigned char)p[2] == 0x81 || (unsigned char)p[2] == 0x9F
+          || (unsigned char)p[2] == 0x9B)) {
+    return 3;
+  }
+  return 0;
+}
+
+/* Return the start of the segment that follows `s`: just past the first
+ * sentence terminator (trailing whitespace skipped), or — when none appears
+ * within TTS_SEGMENT_MAX bytes — a forced split rounded down to a UTF-8
+ * character boundary so a multi-byte char is never cut in half. */
+static char *tts_next_segment(char *s)
+{
+  char *p = s;
+  size_t run = 0;
+
+  while (*p) {
+    int tlen = tts_terminator_len(p);
+
+    if (tlen) {
+      p += tlen;  /* keep the terminator with the current sentence */
+      while (*p == '\n' || *p == ' ' || *p == '\t') {
+        p++;
+      }
+      return p;
+    }
+
+    p++;
+    run++;
+    if (run >= TTS_SEGMENT_MAX) {
+      /* Continuation bytes are 0x80..0xBF; back up to the leading byte. */
+      while (p > s && ((unsigned char)p[0] & 0xC0) == 0x80) {
+        p--;
+      }
+      return p;
+    }
+  }
+  return p;  /* end of string */
+}
+
 /* ── Attention beep (prompt tone) ───────────────────────── */
 
 #define BEEP_SINE_TABLE 256
@@ -1220,9 +1293,29 @@ int voice_channel_speak(const char* text)
     s_voice.tts_pb = pb;
     pthread_mutex_unlock(&s_voice.lock);
 
-    /* Use streaming TTS: each chunk writes to playback file */
-    int ret = voice_tts_speak_stream(clean,
-        tts_stream_cb, pb);
+    /* Synthesize the reply sentence-by-sentence: a long text sent as one
+     * request both truncates at the streaming buffer cap and reads as one
+     * monotonous run.  Each segment is its own synth request written, in
+     * order, to the one open playback handle — sentence terminators stay with
+     * their segment, giving the engine a natural pause at each boundary. */
+    int ret = 0;
+    char* seg = clean;
+
+    while (*seg && ret == 0 && !s_voice.tts_abort) {
+        char* next = tts_next_segment(seg);
+        char saved = *next;
+
+        if (next == seg) {
+            break;  /* defensive: no forward progress */
+        }
+
+        *next = '\0';
+        if (seg[0] != '\0') {
+            ret = voice_tts_speak_stream(seg, tts_stream_cb, pb);
+        }
+        *next = saved;
+        seg = next;
+    }
 
     struct timespec tts_net;
     clock_gettime(CLOCK_MONOTONIC, &tts_net);

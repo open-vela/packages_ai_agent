@@ -174,6 +174,15 @@ static void ptt_on_release(void)
   if (asr_text[0] == '\0')
     {
       syslog(LOG_WARNING, "[%s] no speech recognized\n", TAG);
+#if PTT_HAVE_UI
+      /* The stream finalized cleanly but produced no text.  That is a *user*
+       * miss (didn't speak / too far from the mic), not a broken link, so it
+       * must look different from the red "ASR unavailable" card above.  An
+       * amber hint tells them to try again rather than silently dropping back
+       * to the idle pet, which was indistinguishable from success. */
+      (void)lvgl_ui_channel_send_ex(
+          "没听到语音，请靠近麦克风再说一次。", 0xffa31f);
+#endif
       goto done;
     }
 

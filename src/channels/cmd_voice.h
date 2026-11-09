@@ -19,6 +19,7 @@
 void cmd_set_volc_key(int argc, char** argv);
 void cmd_set_volc_speaker(int argc, char** argv);
 void cmd_set_volc_asr(int argc, char** argv);
+void cmd_set_volc_voice(int argc, char** argv);
 void cmd_voice_start(void);
 void cmd_voice_stop(void);
 void cmd_voice_test_tts(int argc, char** argv);

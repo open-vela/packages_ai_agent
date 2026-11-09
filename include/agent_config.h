@@ -440,10 +440,22 @@
 #define AGENT_CFG_KEY_VOLC_SPEAKER "volc_speaker"
 #define AGENT_CFG_KEY_VOLC_CLUSTER "volc_cluster"
 #define AGENT_CFG_KEY_VOLC_ASR_CLUSTER "volc_asr_cluster"
+/* TTS 音质旋钮(seed-tts-2.0 audio_params 标准字段)。用 set_volc_voice 调整;
+ * 值取字符串便于 config store 存取,合成时再 atof。默认 1.0 = 引擎默认。 */
+#define AGENT_CFG_KEY_VOLC_SPEED   "volc_speed"
+#define AGENT_CFG_KEY_VOLC_VOLUME  "volc_volume"
+#define AGENT_CFG_KEY_VOLC_PITCH   "volc_pitch"
 
 /* Default TTS speaker and cluster (seed-tts-2.0 voice: *_uranus_bigtts) */
 #define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_m191_uranus_bigtts"
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
+/* TTS 音质默认值。1.0 是引擎默认(此时不把字段写进请求体,请求与旧版逐字节
+ * 相同);用户可用 set_volc_voice 覆盖。音量/音调出厂默认不再是 1.0:实机反馈
+ * "音量小、音调偏高",而 /data 是 tmpfs 重启即丢,靠手工 set_volc_voice 每次
+ * 重发不现实,故把默认直接落到音量 +50%、音调 -10%。set_volc_voice 仍可覆盖。 */
+#define AGENT_VOICE_DEFAULT_RATIO  "1.0"   /* speed 及"引擎默认"哨兵 */
+#define AGENT_VOICE_DEFAULT_VOLUME "1.5"   /* 音量小 → +50% */
+#define AGENT_VOICE_DEFAULT_PITCH  "0.9"   /* 音调偏高 → -10% */
 
 /* WebSocket TTS output sample rate (big-model voices output 24kHz) */
 #define AGENT_TTS_WS_SAMPLE_RATE 24000
