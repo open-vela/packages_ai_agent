@@ -66,6 +66,12 @@ enum remote_event_e {
     /* A session listing arrived (`ruse` refreshed it). Carries the whole
      * formatted list, ready to print. */
     REMOTE_EVENT_SESSIONS,
+    /* The gateway answered this device's `rnew`: the listing that follows
+     * marks a generation current that did not exist when the request was sent.
+     * Emitted after REMOTE_EVENT_SESSIONS and carries the new generation id,
+     * so a UI can drop the previous conversation instead of showing it on the
+     * fresh session. Never emitted for a listing that answers `ruse`. */
+    REMOTE_EVENT_SESSION_STARTED,
 };
 
 /* Presentation hook. The session never prints: the channel decides whether an
@@ -77,6 +83,9 @@ typedef void (*remote_event_fn)(void* context, enum remote_event_e event,
 /* Consistent view of the session for display, copied out under the lock. */
 struct remote_status_s {
     enum remote_state_e state;
+    /* Liveness of the coding-agent process on the PC side, not of the link.
+     * UNKNOWN means the bridge does not report it. */
+    enum remote_backend_e backend;
     char summary[REMOTE_SUMMARY_MAX + 1];
     char billing[96];
     bool has_prompt;
@@ -139,6 +148,15 @@ struct remote_session_s {
      * selected or saw marked current. */
     char session_list_text[REMOTE_SESSION_LIST_TEXT_MAX];
     char current_session[12];
+    /* A `rnew` was sent and no listing has confirmed it yet. The first listing
+     * that marks a generation current OTHER than the one running when the
+     * request left is the answer, and that is what
+     * REMOTE_EVENT_SESSION_STARTED is lit from. Remembering the old generation
+     * matters because a bridge may answer `rnew` by declining (a turn is still
+     * running); its listing still names the old current, which must not be
+     * mistaken for a new session. */
+    bool new_session_pending;
+    char session_before_new[12];
 };
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */

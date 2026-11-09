@@ -98,6 +98,9 @@ enum ui_rpmsg_op {
     UI_RPMSG_SCROLL = 14,       /* scroll the chat transcript: payload[0] =
                                  * direction (0 = up/older, 1 = down/newer);
                                  * payload_len = 1. */
+    UI_RPMSG_CLEAR_HISTORY = 15, /* drop the on-screen conversation and bring the
+                                  * (now empty) chat screen up — a new gateway
+                                  * session started; payload_len = 0. */
 };
 
 /** Fixed wire format (packed, little-endian on both M-class cores). */

@@ -240,6 +240,27 @@ static void on_session_event(void* context, enum remote_event_e event,
         }
         break;
 
+    case REMOTE_EVENT_SESSION_STARTED:
+        /* The gateway confirmed the `rnew`: the generation named in the listing
+         * is live now. The S3 long-press already said "已开启新会话" when the
+         * request left the board; this is the confirmation, so the toast
+         * carries the generation number instead of repeating itself. The
+         * screen is cleared as well — answers from the previous session
+         * sitting on a new session's page read as if they belonged to it. */
+        syslog(LOG_INFO, "[%s] new session: %s\n", TAG,
+            text != NULL ? text : "");
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        {
+            char body[64];
+
+            snprintf(body, sizeof(body), "会话 #%s 已开启",
+                     text != NULL ? text : "");
+            lvgl_ui_channel_clear_history();
+            lvgl_toast_show_async("新对话", body, 0x60c4ff, 2500);
+        }
+#endif
+        break;
+
     default:
         break;
     }
@@ -612,6 +633,15 @@ static void remote_ctrl_model_next_from_input(void *ctx)
         return;
     }
     printf("Model -> %s\n", view.options[next]);
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* The request only leaves the board; without this the press would look
+     * like nothing happened until the bridge's next `models` list arrives. */
+    {
+        char body[128];
+        snprintf(body, sizeof(body), "已切换到 %s", view.options[next]);
+        lvgl_toast_show_async("模型", body, 0xfa730b, 2000);
+    }
+#endif
 }
 
 static void remote_ctrl_session_new_from_input(void *ctx)
@@ -623,6 +653,11 @@ static void remote_ctrl_session_new_from_input(void *ctx)
         return;
     }
     printf("New session requested.\n");
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* Same reason as the model switch: the gateway owns the generation, so the
+     * screen would otherwise show no trace of the request at all. */
+    lvgl_toast_show_async("新对话", "已开启新会话", 0x60c4ff, 2000);
+#endif
 }
 
 /* Wake intent: while the standby clock is up, a key press only unlocks the
@@ -639,6 +674,20 @@ static int remote_ctrl_wake_from_input(void *ctx)
 #endif
 }
 
+/* Dismiss intent: a notification page is a short-lived overlay the user may
+ * close with any key.  It runs BEFORE the standby gate so a notice shown over
+ * an awake screen is dismissed by the first press instead of being treated as
+ * a wake attempt.  Returns 1 when it consumed the press. */
+static int remote_ctrl_dismiss_from_input(void *ctx)
+{
+    (void)ctx;
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    return lvgl_ui_channel_notice_dismiss();
+#else
+    return 0;
+#endif
+}
+
 int remote_ctrl_register_input(const struct remote_input_ops_s *ops)
 {
     if (ops == NULL || ops->attach == NULL) {
@@ -650,6 +699,7 @@ int remote_ctrl_register_input(const struct remote_input_ops_s *ops)
                        remote_ctrl_scroll_from_input,
                        remote_ctrl_model_next_from_input,
                        remote_ctrl_session_new_from_input,
+                       remote_ctrl_dismiss_from_input,
                        remote_ctrl_wake_from_input,
                        NULL);
 }
@@ -704,6 +754,13 @@ static void describe_submit_failure(const char* text, char* out,
 
     if (status.state == REMOTE_STATE_OFFLINE) {
         snprintf(out, out_size, "Error: remote agent link is offline");
+    } else if (status.backend == REMOTE_BACKEND_DOWN) {
+        /* The link is up, so "offline" would send someone to the network. The
+         * coding agent behind the bridge exited; nothing can work until the PC
+         * side restarts it. */
+        snprintf(out, out_size,
+            "Error: the PC coding agent is not running (bridge reports its "
+            "backend as down); start it on the PC and try again");
     } else if (status.has_prompt) {
         snprintf(out, out_size,
             "Error: the remote agent is waiting for a permission decision on "

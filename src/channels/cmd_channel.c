@@ -239,6 +239,10 @@ void cmd_remote_status(void)
     /* Which approval policy the agent's tools run under — the whole reason a
      * tool call asks (or does not ask) on this board. */
     printf("  Mode      : %s\n", status.approval_mode);
+    /* The PC-side coding-agent process, which the link state does not cover:
+     * the bridge can stay connected with nothing behind it. "unknown" is an
+     * older bridge that does not report it. */
+    printf("  Backend   : %s\n", remote_backend_name(status.backend));
     if (status.current_session[0] != '\0') {
         printf("  Session   : gen%s\n", status.current_session);
     }

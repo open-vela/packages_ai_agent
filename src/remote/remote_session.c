@@ -480,9 +480,13 @@ bool remote_session_new_session(struct remote_session_s* session)
     }
     /* The gateway assigns the generation; the next listing marks it current.
      * Cleared rather than guessed, so `rstat` never prints a stale number
-     * dressed up as the new one. */
+     * dressed up as the new one. The old number is kept aside: a listing that
+     * still names it is a refusal, not the answer. */
     pthread_mutex_lock(&session->lock);
+    snprintf(session->session_before_new, sizeof(session->session_before_new),
+             "%s", session->current_session);
     session->current_session[0] = '\0';
+    session->new_session_pending = true;
     pthread_mutex_unlock(&session->lock);
     return true;
 }
@@ -502,16 +506,35 @@ bool remote_session_switch_session(struct remote_session_s* session,
 void remote_session_sessions(struct remote_session_s* session,
     const char* text, const char* current)
 {
+    char started[sizeof(session->current_session)];
+    bool confirmed = false;
+
     if (session == NULL || text == NULL) {
         return;
     }
+
+    started[0] = '\0';
     pthread_mutex_lock(&session->lock);
     snprintf(session->session_list_text, sizeof(session->session_list_text), "%s", text);
     if (current != NULL && current[0] != '\0') {
+        /* A `rnew` is answered by the first listing that names a generation
+         * other than the one running when it was sent; a listing that still
+         * names that one is a refusal (turn busy) and leaves the flag set.
+         * `ruse` never sets the flag, so its listing announces nothing. */
+        if (session->new_session_pending &&
+            strcmp(current, session->session_before_new) != 0) {
+            session->new_session_pending = false;
+            confirmed = true;
+            snprintf(started, sizeof(started), "%s", current);
+        }
         snprintf(session->current_session, sizeof(session->current_session), "%s", current);
     }
     pthread_mutex_unlock(&session->lock);
+
     emit(session, REMOTE_EVENT_SESSIONS, text);
+    if (confirmed) {
+        emit(session, REMOTE_EVENT_SESSION_STARTED, started);
+    }
 }
 
 bool remote_session_query_usage(struct remote_session_s* session)
@@ -588,6 +611,7 @@ void remote_session_status(struct remote_session_s* session,
 
     pthread_mutex_lock(&session->lock);
     out->state = session->link.state;
+    out->backend = session->link.backend;
     memcpy(out->summary, session->link.summary, sizeof(out->summary));
     out->has_prompt = session->link.has_prompt;
     out->prompt = session->link.prompt;

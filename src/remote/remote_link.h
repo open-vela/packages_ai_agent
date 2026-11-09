@@ -60,8 +60,10 @@ extern "C" {
 #define REMOTE_MODEL_OPTIONS_MAX 32
 
 /* Authority-snapshot liveness. A session that stops producing snapshots is
- * treated as down even while the TCP socket looks healthy. */
-#define REMOTE_SNAPSHOT_TIMEOUT_MS 30000U
+ * treated as down even while the TCP socket looks healthy. Relaxed from 30 s
+ * to 10 min: some bridges only snapshot on turn events and never on a timer,
+ * so a 30 s window drops an idle-but-healthy link straight to Offline. */
+#define REMOTE_SNAPSHOT_TIMEOUT_MS 600000U
 
 /* Frozen link limit, in both directions. A peer cannot force an unbounded
  * allocation on the device, and an outbound message that would exceed it is
@@ -75,6 +77,18 @@ enum remote_state_e {
     REMOTE_STATE_BUSY,
     REMOTE_STATE_ATTENTION,
     REMOTE_STATE_RESULT,
+};
+
+/* Liveness of the coding-agent process behind the bridge, as reported in every
+ * snapshot. A bridge that keeps sending snapshots proves the PC link is alive,
+ * not that the agent behind it is: the process can exit while the bridge stays
+ * up, and then "Idle" means "nobody is there to work". UNKNOWN is the honest
+ * answer for a bridge that does not report it (older bridge), and never blocks
+ * a submit. */
+enum remote_backend_e {
+    REMOTE_BACKEND_UNKNOWN,
+    REMOTE_BACKEND_UP,
+    REMOTE_BACKEND_DOWN,
 };
 
 enum remote_decision_e {
@@ -107,6 +121,9 @@ struct remote_snapshot_s {
     uint8_t running;
     const char* summary;
     const struct remote_prompt_s* prompt;
+    /* Optional: "up" / "down" / NULL. A bridge that predates the field sends
+     * nothing and the link stays UNKNOWN rather than guessing. */
+    const char* backend;
 };
 
 /* Usage is optional telemetry. It is independent from authority snapshots and
@@ -214,6 +231,7 @@ struct remote_link_s {
     char model_options[REMOTE_MODEL_OPTIONS_MAX][REMOTE_MODEL_MAX + 1];
     uint8_t model_count;
     bool models_truncated;
+    enum remote_backend_e backend;
 };
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -267,7 +285,9 @@ bool remote_link_turn_result(struct remote_link_s* link,
 
 /* True when a new chat turn may be submitted with this exact text. Rejects
  * while a turn is active or a permission is pending, so a local LLM tool call
- * can never queue behind a human decision. */
+ * can never queue behind a human decision. Also rejects when the bridge has
+ * reported its coding-agent process as down: the message would be accepted and
+ * then die, and "nobody is there" is worth saying before the send, not after. */
 bool remote_link_can_submit_prompt(const struct remote_link_s* link,
     const char* text);
 
@@ -303,6 +323,7 @@ bool remote_link_can_select_model(const struct remote_link_s* link,
 bool remote_link_billing_text(const struct remote_link_s* link, char* out,
     size_t out_size);
 const char* remote_state_name(enum remote_state_e state);
+const char* remote_backend_name(enum remote_backend_e backend);
 
 /* Shared validators, also used by the codec layer. */
 bool remote_valid_utf8(const char* text);

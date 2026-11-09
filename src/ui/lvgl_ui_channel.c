@@ -1297,6 +1297,48 @@ void lvgl_ui_channel_show(void)
     lvgl_ui_async_call(show_screen_async_cb, NULL);
 }
 
+/* Async: drop the whole conversation, then bring the (now empty) chat screen
+ * up. Used when the gateway starts a new session — the turns on screen belong
+ * to the previous generation, and leaving them there would present old answers
+ * as part of the new one. Every bubble lives under chat_list and a history slot
+ * only caches a pointer into it, so one lv_obj_clean plus a reset is complete. */
+static void chat_view_clear_async_cb(void* data)
+{
+    (void)data;
+    chat_history_t* h = &s_state.history;
+    int i;
+
+    if (!s_state.initialized || !s_state.running) {
+        return;
+    }
+
+    if (s_state.chat_list != NULL) {
+        lv_obj_clean(s_state.chat_list);
+    }
+    for (i = 0; i < CHAT_HISTORY_MAX; i++) {
+        h->msgs[i].bubble = NULL;
+        h->msgs[i].text[0] = '\0';
+    }
+    h->head = 0;
+    h->count = 0;
+
+    /* "Jump to the new session": the empty chat page is the visible result. */
+    ui_activity_reset();
+    if (!s_state.screen_visible) {
+        show_screen_async_cb(NULL);
+    }
+}
+
+int lvgl_ui_channel_clear_history(void)
+{
+    if (!s_state.initialized || !s_state.running) {
+        syslog(LOG_ERR, "[%s] clear_history: channel not ready\n", TAG);
+        return -EINVAL;
+    }
+
+    return lvgl_ui_async_call(chat_view_clear_async_cb, NULL);
+}
+
 int lvgl_ui_channel_send(const char* text)
 {
     async_msg_t* payload;

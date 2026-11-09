@@ -500,6 +500,25 @@ int lvgl_ui_channel_notice_visible(void)
   return ret;
 }
 
+/* Drop the CP-side conversation and bring the empty chat screen up (a new
+ * gateway session started). payload_len = 0. */
+int lvgl_ui_channel_clear_history(void)
+{
+  struct ui_rpmsg_msg m;
+  int ret;
+
+  memset(&m, 0, sizeof(m));
+  m.op = UI_RPMSG_CLEAR_HISTORY;
+  m.payload_len = 0;
+
+  ret = ui_rpmsg_send(&m);
+  if (ret < 0)
+    {
+      syslog(LOG_WARNING, "[%s] clear history on CP failed: %d\n", TAG, ret);
+    }
+  return ret;
+}
+
 void lvgl_toast_show_async(const char *title, const char *body,
                            uint32_t bar_color, uint32_t duration_ms)
 {

@@ -250,6 +250,10 @@ void remote_link_down(struct remote_link_s* link)
     clear_models(link);
     link->chat_epoch[0] = '\0';
     link->chat_supported = false;
+    /* The backend state belongs to the connection that reported it. A stale
+     * "down" must not survive the reconnect: the next snapshot is the only
+     * thing allowed to say what the far side looks like now. */
+    link->backend = REMOTE_BACKEND_UNKNOWN;
     clear_turn(link, true);
     link->state = REMOTE_STATE_OFFLINE;
 }
@@ -304,6 +308,24 @@ bool remote_link_snapshot(struct remote_link_s* link,
     flatten_summary(next_summary);
 
     changed = link->state != next_state || strcmp(link->summary, next_summary) != 0 || link->has_prompt != next_has_prompt || (next_has_prompt && !same_prompt(&link->prompt, snapshot->prompt));
+
+    /* The coding agent's own liveness travels with each snapshot. A value the
+     * device does not know is ignored rather than downgrading a good state: an
+     * unknown word from a newer bridge must not make the board refuse work. */
+    if (snapshot->backend != NULL) {
+        enum remote_backend_e next_backend = link->backend;
+
+        if (strcmp(snapshot->backend, "up") == 0) {
+            next_backend = REMOTE_BACKEND_UP;
+        } else if (strcmp(snapshot->backend, "down") == 0) {
+            next_backend = REMOTE_BACKEND_DOWN;
+        }
+
+        if (next_backend != link->backend) {
+            changed = true;
+            link->backend = next_backend;
+        }
+    }
 
     link->next_seq++;
     link->last_snapshot_ms = now_ms;
@@ -553,8 +575,10 @@ bool remote_link_can_submit_prompt(const struct remote_link_s* link,
     const char* text)
 {
     /* Refusing while has_prompt is set keeps a local tool call from waiting
-     * behind a human permission decision on the remote agent. */
-    return link != NULL && link->state != REMOTE_STATE_OFFLINE && link->chat_supported && strcmp(link->chat_epoch, link->epoch) == 0 && !link->turn_active && !link->has_prompt && text != NULL && text[0] != '\0' && strlen(text) <= REMOTE_PROMPT_TEXT_MAX && remote_valid_utf8(text) && has_nonspace(text);
+     * behind a human permission decision on the remote agent. A backend that
+     * reported itself down is refused too: the send would succeed and the turn
+     * would die on the far side, which reads as a device problem. */
+    return link != NULL && link->state != REMOTE_STATE_OFFLINE && link->backend != REMOTE_BACKEND_DOWN && link->chat_supported && strcmp(link->chat_epoch, link->epoch) == 0 && !link->turn_active && !link->has_prompt && text != NULL && text[0] != '\0' && strlen(text) <= REMOTE_PROMPT_TEXT_MAX && remote_valid_utf8(text) && has_nonspace(text);
 }
 
 bool remote_prompt_text_problem(const char* text, char* out, size_t out_size)
@@ -698,5 +722,18 @@ const char* remote_state_name(enum remote_state_e state)
         return "Result";
     default:
         return "Unknown";
+    }
+}
+
+const char* remote_backend_name(enum remote_backend_e backend)
+{
+    switch (backend) {
+    case REMOTE_BACKEND_UP:
+        return "up";
+    case REMOTE_BACKEND_DOWN:
+        return "down";
+    case REMOTE_BACKEND_UNKNOWN:
+    default:
+        return "unknown";
     }
 }

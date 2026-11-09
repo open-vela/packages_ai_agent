@@ -135,6 +135,7 @@ typedef int  (*remote_pending_fn)(void *ctx);      /* 1 when an approval is up *
 typedef void (*remote_scroll_fn)(int dir, void *ctx); /* 0=older, 1=newer */
 typedef void (*remote_action_fn)(void *ctx);          /* model-next / new-session */
 typedef int  (*remote_wake_fn)(void *ctx);            /* 1 when it ate the press as a wake */
+typedef int  (*remote_dismiss_fn)(void *ctx);         /* 1 when it ate the press as a page dismiss */
 
 struct remote_input_ops_s
 {
@@ -146,12 +147,15 @@ struct remote_input_ops_s
    * optional -- a product with no transcript leaves `scroll` NULL and the
    * channel simply never offers it.  `pending` lets the adapter pick a key
    * context (idle keys scroll, approval keys decide) without reading session
-   * state itself. */
+   * state itself.  `dismiss` and `wake` are "consume or pass" gates the
+   * adapter must try BEFORE the keymap: a notice page (5 s) or the standby
+   * clock owns the press and swallows it. */
   int (*attach)(remote_decide_fn decide,
                 remote_pending_fn pending,
                 remote_scroll_fn scroll,
                 remote_action_fn model_next,
                 remote_action_fn session_new,
+                remote_dismiss_fn dismiss,
                 remote_wake_fn wake,
                 void *ctx);
   void (*detach)(void);

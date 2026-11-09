@@ -239,6 +239,10 @@ static int ui_rpmsg_server_rx(struct rpmsg_endpoint *ept, void *data,
         }
         break;
 
+      case UI_RPMSG_CLEAR_HISTORY:
+        (void)lvgl_ui_channel_clear_history();
+        break;
+
       case UI_RPMSG_TOAST:
         {
           if (m->payload_len < 2 * sizeof(uint32_t))

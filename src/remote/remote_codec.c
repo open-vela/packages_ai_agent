@@ -289,6 +289,7 @@ static void receive_snapshot(struct remote_session_s* session,
     const cJSON* running = field(root, "running");
     const cJSON* message = field(root, "msg");
     const cJSON* prompt = field(root, "prompt");
+    const cJSON* backend = field(root, "backend");
     struct remote_snapshot_s snapshot;
     struct remote_prompt_s prompt_value;
     uint32_t sequence;
@@ -305,6 +306,9 @@ static void receive_snapshot(struct remote_session_s* session,
     snapshot.running = (uint8_t)running_value;
     snapshot.summary = message->valuestring;
     snapshot.prompt = cJSON_IsNull(prompt) ? NULL : &prompt_value;
+    /* Optional field: an older bridge omits it, and a value the link does not
+     * know is ignored there rather than here, so nothing is rejected over it. */
+    snapshot.backend = valid_string(backend) && strlen(backend->valuestring) <= 8 ? backend->valuestring : NULL;
     remote_session_snapshot(session, &snapshot, now_ms, &display_changed);
 }
 
