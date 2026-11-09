@@ -164,6 +164,7 @@ static void cmd_help(void)
         "  set_volc_key <api_key>       - Set Doubao voice API key\n"
         "  set_volc_asr <id> <tok> <cluster> - Set ASR credentials\n"
         "  set_volc_speaker <id>  - Set TTS voice (e.g. zh_female_cancan)\n"
+        "  set_volc_voice <speed> [volume] [pitch] - Tune TTS rate/volume/pitch (1.0=default)\n"
         "  voice_start            - Start voice channel\n"
         "  voice_stop             - Stop voice channel\n"
         "  voice_test_tts <text> [out.pcm] - Test TTS synthesis\n"
@@ -196,14 +197,14 @@ static void cmd_help(void)
         "  notify_start          - Start Gerrit/Jira background polling\n"
         "  notify_status         - Show notify service status (cursor/new)\n"
         "  notify_stop           - Stop background polling\n"
-        "  notify_inject <g|j> <key> <text> - Pop a test toast (gerrit/jira)\n"
+        "  notify_inject <g|j> <key> <text> - Pop the test notice page (gerrit/jira)\n"
 #endif
 #if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
         "  show_chat            - Show chat UI on screen\n"
         "  set_pet <0-5>        - Drive pet to a state (debug; 0=idle 1=listen 2=think 3=exec 4=wait 5=err)\n"
-        "  set_page <0|1>       - Switch round-screen page (0=pet home, 1=particle flow)\n"
+        "  set_page <0>         - Back to the pet home screen (also wakes standby)\n"
 #ifdef CONFIG_AI_AGENT_PET_STATUS
-        "  set_ptype <0-4>      - Switch pet species (0=cat 1=frog 2=blackcat 3=dog 4=pig)\n"
+        "  set_ptype [0-3]      - Show/set the fixed pet species (0=cat 1=frog 2=dog 3=pig)\n"
 #endif
 #endif
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
@@ -576,6 +577,9 @@ static void cmd_config_show(void)
     SHOW_CFG("Volc Token", AGENT_CFG_KEY_VOLC_TOKEN, true);
     SHOW_CFG("Volc API Key", AGENT_CFG_KEY_VOLC_API_KEY, true);
     SHOW_CFG("Volc Speaker", AGENT_CFG_KEY_VOLC_SPEAKER, false);
+    SHOW_CFG("Volc Speed", AGENT_CFG_KEY_VOLC_SPEED, false);
+    SHOW_CFG("Volc Volume", AGENT_CFG_KEY_VOLC_VOLUME, false);
+    SHOW_CFG("Volc Pitch", AGENT_CFG_KEY_VOLC_PITCH, false);
 
 #undef SHOW_CFG
 
@@ -1287,6 +1291,8 @@ static void* cli_thread(void* arg)
             cmd_set_volc_asr(argc, argv);
         else if (strcmp(cmd, "set_volc_speaker") == 0)
             cmd_set_volc_speaker(argc, argv);
+        else if (strcmp(cmd, "set_volc_voice") == 0)
+            cmd_set_volc_voice(argc, argv);
         else if (strcmp(cmd, "voice_start") == 0)
             cmd_voice_start();
         else if (strcmp(cmd, "voice_stop") == 0)
@@ -1347,15 +1353,26 @@ static void* cli_thread(void* arg)
          * a network/LLM round-trip. pet_status_view.h: enum pet_state. */
         else if (strcmp(cmd, "set_pet") == 0 && argc >= 2)
             lvgl_ui_channel_set_pet_state(atoi(argv[1]));
-        /* Debug: switch the round-screen 差异化 page foreground.
-         * 0 = pet status ring home screen, 1 = particle flow visualizer. */
+        /* Debug: bring the pet status ring home screen back to the foreground
+         * (page 0 only; the former particle page 1 was removed). */
         else if (strcmp(cmd, "set_page") == 0 && argc >= 2)
-            lvgl_ui_channel_set_page(atoi(argv[1]));
+        {
+            if (lvgl_ui_channel_set_page(atoi(argv[1])) != 0)
+                printf("set_page: only page 0 (pet home) exists\n");
+        }
 #ifdef CONFIG_AI_AGENT_PET_STATUS
-        /* Debug: switch the pet species without rebuilding (pet_status_view.h:
-         * enum pet_type).  The sprite is swapped on the LVGL thread. */
-        else if (strcmp(cmd, "set_ptype") == 0 && argc >= 2)
-            pet_status_view_set_type(atoi(argv[1]));
+        /* Debug: print or set the ONE pet species this flash runs with
+         * (pet_status_view.h: enum pet_type).  The species is fixed at boot —
+         * randomly picked on the first boot after a flash and persisted in
+         * config — so it must not change when the user moves between pages.
+         * Setting it here persists the new value for the next boot. */
+        else if (strcmp(cmd, "set_ptype") == 0)
+        {
+            if (argc >= 2)
+                pet_status_view_set_type(atoi(argv[1]));
+            printf("pet type: %d (0=cat 1=frog 2=dog 3=pig; fixed per flash)\n",
+                   pet_status_view_get_type());
+        }
 #endif
 #endif
 #ifdef CONFIG_AI_AGENT_TEST
