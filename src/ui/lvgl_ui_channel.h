@@ -108,11 +108,9 @@ int lvgl_ui_channel_set_pet_state(int state);
  * set_pet_state(5)。线程安全（异步调度到 LVGL 线程）。 */
 int lvgl_ui_channel_set_pet_error(const char *reason);
 
-/* 切换圆屏差异化页前台（M7 ① pet / ② particle）。page:
- *   0 = 宠物状态环首屏 (pet_status_view)
- *   1 = 粒子流差异化页 (particle_flow_view)
+/* 切回圆屏宠物首屏（page 只接受 0；粒子页已移除，其余值返回 -EINVAL）。
  * 聊天气泡屏由 send/send_user 自动抢占、空闲自动让位回宠物屏，故不在此列。
- * 经 lv_async_call 在 LVGL 线程执行；返回 0 成功，-ENOSYS 表示该页未编入。 */
+ * 经 lv_async_call 在 LVGL 线程执行；返回 0 成功，-ENOSYS 表示宠物页未编入。 */
 int lvgl_ui_channel_set_page(int page);
 
 /* 审批页（远程权限请求 pending 时跳转，让用户明确当前短按是审批语义）。
@@ -120,7 +118,7 @@ int lvgl_ui_channel_set_page(int page);
  * 上序列化为 UI_RPMSG_SET_APPROVAL。tool/hint 均为 UTF-8，可空。 */
 int lvgl_ui_channel_set_approval(const char* tool, const char* hint);
 
-/* 退出审批页，恢复之前的页面（pet/particle/chat）。审批被决定、被取消或
+/* 退出审批页，恢复之前的页面（pet/chat）。审批被决定、被取消或
  * 超时后由 AP 驱动。返回 0 成功，负值错误。 */
 int lvgl_ui_channel_clear_approval(void);
 
@@ -128,6 +126,35 @@ int lvgl_ui_channel_clear_approval(void);
  * 判断宠物状态能否回落到 IDLE —— pending 期间审批页持有 WAITING，不能被
  * 工具返回值覆盖。返回 1 pending，0 无。 */
 int lvgl_ui_channel_approval_pending(void);
+
+/* ── 通知页（Gerrit / Jira 通知）───────────────────────────────
+ *
+ * 圆屏太小，屏顶 toast 会把正文裁掉，所以通知改成和审批页同构的整屏
+ * 卡片：进来的通知写进卡片，停留 NOTICE_MS 后自动返回原页面；任意用户
+ * 键可提前退出（由输入适配器先调 lvgl_ui_channel_notice_dismiss()）。
+ *
+ * 规则：
+ *   - 审批优先：审批页在场时通知不抢屏，只记住最新一条，审批结束后再显示；
+ *   - 后到覆盖：通知页在场时又来一条，直接换内容并重新计时；
+ *   - 待机时钟在场时不弹（不打断待机），该条丢弃。
+ *
+ * 线程安全：任意线程可调用，内部经 lv_async_call 调度到 LVGL 线程。
+ */
+
+/* 通知页停留时长（毫秒）。5s 时用户反馈「来不及看清」，提到 10s。 */
+#define LVGL_UI_NOTICE_MS 10000
+
+/* 显示一条通知。title/body 为 UTF-8，bar_color 是卡片左侧色条颜色
+ * （0 = 用状态蓝）。返回 0 成功，负值错误。 */
+int lvgl_ui_channel_show_notice(const char* title, const char* body,
+                                uint32_t bar_color);
+
+/* 关掉通知页。返回 1 表示"本次按键被通知页吃掉"（当时通知页在前台），
+ * 0 表示没有可见的通知页、按键应照常派发。 */
+int lvgl_ui_channel_notice_dismiss(void);
+
+/* 通知页是否在前台。 */
+int lvgl_ui_channel_notice_visible(void);
 
 /* 滚动聊天记录：dir 0 = 上翻（更早），1 = 下翻（更新）。首次调用会自动把
  * 聊天屏切到前台。经 lv_async_call 调度到 LVGL 线程。 */
@@ -138,6 +165,11 @@ int lvgl_ui_channel_scroll(int dir);
  * 键适配器据此在待机可见时吞掉第一下按键,避免"唤醒"顺带答掉挂在审批页上的
  * 请求。线程安全:ui_activity_reset 异步调度 hide。 */
 int lvgl_ui_channel_wake_from_standby(void);
+
+/* 清空聊天屏:删掉全部气泡、重置环形缓冲,并把聊天屏切到前台(空会话页)。
+ * 给"网关开了新会话"用 —— 上一代会话的问答留在新会话页上会误导。只动屏幕,
+ * 不碰 /data 下的会话文件。经 lv_async_call 调度到 LVGL 线程。 */
+int lvgl_ui_channel_clear_history(void);
 
 /* ── LVGL 线程安全锁 ───────────────────────────────────────────
  *

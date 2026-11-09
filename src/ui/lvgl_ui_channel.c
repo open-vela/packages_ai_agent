@@ -75,6 +75,10 @@ LV_FONT_DECLARE(lv_font_misans_16_cjk);
 
 static const char* TAG = "lvgl_ui";
 
+/* Separate tag for the notification page so a serial capture can tell its
+ * lines apart from the rest of the channel's chatter. */
+static const char* NOTICE_TAG = "lvgl_notice";
+
 /* ── Reply-card hang probe (BUG-20261021-01) ────────────────────
  * Step markers written from the LVGL thread around every call in
  * chat_view_add_message()/chat_view_build_agent_card().  A log whose
@@ -343,6 +347,25 @@ typedef struct {
     lv_obj_t* approval_hint;    /* hint text label */
     bool approval_visible;
     lv_obj_t* approval_prev_screen;
+    bool approval_was_standby;  /* clock was up when the prompt arrived */
+
+    /* Notification page (Gerrit / Jira notices).  The round panel is too small
+     * for a top toast (the body was clipped), so a notice gets its own screen,
+     * held for LVGL_UI_NOTICE_MS and exiting on any user key.  It yields to the
+     * approval page: while an approval is pending, notices are stashed here and
+     * the newest one is shown when the approval clears (later replaces older). */
+    lv_obj_t* notice_screen;
+    lv_obj_t* notice_title;
+    lv_obj_t* notice_body;
+    lv_obj_t* notice_bar;
+    lv_timer_t* notice_timer;
+    volatile bool notice_visible;
+    lv_obj_t* notice_prev_screen;
+    bool notice_was_standby;   /* clock was up when the notice arrived */
+    bool notice_pending;        /* a stashed notice waits for the approval */
+    char notice_pending_title[40];
+    char notice_pending_body[200];
+    lv_color_t notice_pending_color;
 
     /* Chat history */
     chat_history_t history;
@@ -647,6 +670,11 @@ static void approval_screen_build(void);
 static void set_approval_async_cb(void* data);
 static void clear_approval_async_cb(void* data);
 static void scroll_async_cb(void* data);
+static void notice_screen_build(void);
+static void notice_hide(const char* why);
+static void notice_show_locked(const char* title, const char* body,
+                               lv_color_t bar_color);
+static void notice_maybe_show_pending(void);
 
 /* ── Ring buffer ──────────────────────────────────────────────── */
 
@@ -744,8 +772,9 @@ static void pet_idle_timer_cb(lv_timer_t *t)
     if (!s_state.initialized || !s_state.screen_visible) return;
     /* A pending remote permission request owns the foreground: never yield it
      * back to the pet home screen while the approval page is up, or the user
-     * loses the S2/S3 approve/cancel cue mid-decision. */
-    if (s_state.approval_visible) return;
+     * loses the S2/S3 approve/cancel cue mid-decision.  Same for the notice
+     * page, which is only up for a few seconds. */
+    if (s_state.approval_visible || s_state.notice_visible) return;
     /* Judge by the active screen, not the cached visible flag: opening the
      * chat screen does not call pet_status_view_hide(), so the flag stays true
      * and the yield below would never fire (blank chat page stuck forever). */
@@ -785,9 +814,9 @@ static int s_approval_pet_saved = 0;
 /* ── Standby dim clock (M7 待机界面) ────────────────────────────── */
 /* After STANDBY_TIMEOUT_MS with no real activity — no chat bubble, no PTT,
  * no pet-state change, no page switch, no approval, no scroll — and no busy
- * agent state (IDLE and WAITING both qualify; WAITING is a pending approval
- * the device is waiting on), fade the foreground over to a dim digital clock
- * (standby_view).  Any of those activity points calls ui_activity_reset(),
+ * agent state (only IDLE qualifies; WAITING is a pending approval the device
+ * is waiting on and stays awake), fade the foreground over to a dim digital
+ * clock (standby_view).  Any of those activity points calls ui_activity_reset(),
  * which both restarts the countdown and (if the clock is up) fades it away,
  * restoring the screen that was up before standby. */
 #define STANDBY_TIMEOUT_MS 60000
@@ -806,14 +835,16 @@ static void standby_timer_cb(lv_timer_t *t)
     (void)t;
     if (!s_state.initialized || !s_state.running) return;
     if (standby_view_is_visible()) return;
-    /* A busy agent (listening / thinking / executing, or an error being shown)
-     * keeps postponing standby so the animation is never interrupted mid-task.
-     * WAITING (4) is the exception: it means a permission prompt is up and the
-     * device is waiting for a human, so dimming after the timeout is exactly
-     * right -- the first key then only wakes the clock and the approval page
-     * comes back untouched (see lvgl_ui_channel_wake_from_standby). */
-    if (s_last_pet_state != PET_STATE_IDLE &&
-        s_last_pet_state != PET_STATE_WAITING)
+    /* An alert page owns the foreground: never fade the clock over it, or the
+     * first key press is eaten by the wake gate instead of answering. */
+    if (s_state.approval_visible || s_state.notice_visible) return;
+    /* A busy agent (listening / thinking / executing, an error being shown, or
+     * a permission prompt awaiting a decision) keeps postponing standby so the
+     * animation is never interrupted mid-task.  A pending approval is a live
+     * question for the human: dimming it to the clock here swallowed the first
+     * key (wake only) and made the approval page feel unresponsive, so WAITING
+     * now postpones standby like every other non-idle state. */
+    if (s_last_pet_state != PET_STATE_IDLE)
       {
         s_last_activity_tick = lv_tick_get();
         return;
@@ -987,6 +1018,10 @@ int lvgl_ui_channel_init(void)
      * independent screen reached via lvgl_ui_channel_set_approval. */
     approval_screen_build();
 
+    /* Build the notification page (Gerrit/Jira notices) — hidden until
+     * lvgl_ui_channel_show_notice; approval outranks it. */
+    notice_screen_build();
+
 #ifdef CONFIG_AI_AGENT_PET_STATUS
     /* Build the pet status ring home screen (M7 差异化页).  It is NOT loaded
      * here — cp_ui_main (or the AP via RPMsg) decides when to show it.  The
@@ -1060,6 +1095,13 @@ cleanup:
         s_state.approval_screen = NULL;
         s_state.approval_tool = NULL;
         s_state.approval_hint = NULL;
+    }
+    if (s_state.notice_screen) {
+        lv_obj_del(s_state.notice_screen);
+        s_state.notice_screen = NULL;
+        s_state.notice_title = NULL;
+        s_state.notice_body = NULL;
+        s_state.notice_bar = NULL;
     }
 
     syslog(LOG_ERR, "[%s] init failed (rc=%d)\n", TAG, ret);
@@ -2043,7 +2085,28 @@ static void set_approval_async_cb(void* data)
         lv_obj_clear_flag(s_state.approval_tool, LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* Save the page we were on (pet/particle/chat) so clear can restore it. */
+    /* Approval outranks a notice: if a notice page is up, drop it first so the
+     * page saved below is the underlying pet/chat screen, not the notice.
+     * Carry the "we came from the clock" memory over so the clock can come back
+     * once the approval is resolved. */
+    if (s_state.notice_visible) {
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+        if (s_state.notice_was_standby) s_state.approval_was_standby = true;
+        s_state.notice_was_standby = false;
+#endif
+        notice_hide("dismissed (approval page up)");
+    }
+
+    /* A prompt that arrives on the dim clock must wake it: otherwise the first
+     * key press is eaten by the wake gate and never reaches approve/cancel. */
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+    if (!s_state.approval_visible && standby_view_is_visible()) {
+        s_state.approval_was_standby = true;
+        standby_view_hide_now();
+    }
+#endif
+
+    /* Save the page we were on (pet/chat) so clear can restore it. */
     if (!s_state.approval_visible) {
         s_state.approval_prev_screen = lv_screen_active();
         lv_screen_load_anim(s_state.approval_screen, LV_SCR_LOAD_ANIM_FADE_IN,
@@ -2062,12 +2125,356 @@ static void clear_approval_async_cb(void* data)
     if (!s_state.approval_visible) {
         return;
     }
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+    /* The prompt woke the clock; put the user back on the lock screen once it
+     * is resolved.  Restore the underlying screen first and immediately (no
+     * fade) so the clock remembers the right screen to return to on wake. */
+    bool back_to_clock = s_state.approval_was_standby;
+    s_state.approval_was_standby = false;
+    if (back_to_clock && !standby_view_is_visible())
+      {
+        if (s_state.approval_prev_screen)
+            lv_screen_load(s_state.approval_prev_screen);
+        standby_view_show_now();
+        s_state.approval_visible = false;
+        s_state.approval_prev_screen = NULL;
+        notice_maybe_show_pending();
+        return;
+      }
+#endif
+
     if (s_state.approval_prev_screen) {
-        lv_screen_load_anim(s_state.approval_prev_screen, LV_SCR_LOAD_ANIM_FADE_IN,
+        lv_screen_load_anim(s_state.approval_prev_screen,
+                            LV_SCR_LOAD_ANIM_FADE_IN,
                             SCREEN_FADE_MS, 0, false);
     }
     s_state.approval_visible = false;
     s_state.approval_prev_screen = NULL;
+
+    /* A notice that arrived while the approval was pending takes the screen
+     * now (only the newest one was kept). */
+    notice_maybe_show_pending();
+}
+
+/* ── Notification page ────────────────────────────────────────────────────
+ *
+ * The round panel is too small for a top-of-screen toast — a Gerrit/Jira body
+ * was clipped to a few characters.  A notice therefore gets the same treatment
+ * as the approval page: its own screen with a white card, a colored left bar
+ * and the full text, held for LVGL_UI_NOTICE_MS and exiting on any user key.
+ *
+ * Precedence: approval > notice > chat/pet.  A notice that arrives while an
+ * approval is pending is remembered (newest wins) and shown once the approval
+ * clears.  A notice that arrives while the standby clock is up is dropped:
+ * waking the screen is the user's call, not the notifier's.
+ */
+
+typedef struct {
+    char title[96];
+    char body[512];
+    uint32_t bar_color;
+} async_notice_t;
+
+static void notice_screen_build(void)
+{
+    lv_coord_t disp_w = LVGL_UI_SCREEN_W;
+    lv_coord_t disp_h = LVGL_UI_SCREEN_H;
+    lv_display_t* disp = lv_display_get_default();
+    lv_coord_t card_w;
+    lv_obj_t* card;
+    lv_obj_t* title;
+    lv_obj_t* body;
+    lv_obj_t* hint;
+
+    if (disp) {
+        lv_coord_t rw = lv_display_get_horizontal_resolution(disp);
+        lv_coord_t rh = lv_display_get_vertical_resolution(disp);
+        if (rw > 0 && rh > 0) { disp_w = rw; disp_h = rh; }
+    }
+
+    bool round_panel = (disp_w == 240 && disp_h == 296);
+    int32_t round_d = round_panel ? 224 : ((disp_w < disp_h) ? disp_w : disp_h);
+    card_w = (round_d * 82) / 100;
+    if (card_w < 160) card_w = 160;
+
+    s_state.notice_screen = lv_obj_create(NULL);
+    if (!s_state.notice_screen) {
+        syslog(LOG_ERR, "[%s] notice screen create failed\n", TAG);
+        return;
+    }
+    lv_obj_set_style_bg_color(s_state.notice_screen, lv_color_hex(UI_PAL_BG), 0);
+    lv_obj_set_style_bg_opa(s_state.notice_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(s_state.notice_screen, &lv_font_misans_16_cjk, 0);
+
+    /* The card itself carries the colored left bar (4 px left border), the same
+     * status-bar cue the chat cards use.  The color is swapped per notice. */
+    card = lv_obj_create(s_state.notice_screen);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(card, card_w);
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_center(card);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(UI_PAL_CARD), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 4, 0);
+    lv_obj_set_style_border_side(card, LV_BORDER_SIDE_LEFT, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(UI_PAL_THINK), 0);
+    lv_obj_set_style_shadow_width(card, 4, 0);
+    lv_obj_set_style_shadow_offset_x(card, 2, 0);
+    lv_obj_set_style_shadow_offset_y(card, 4, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(UI_PAL_CARD_SHADOW), 0);
+    lv_obj_set_style_shadow_opa(card, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(card, 6, 0);
+    /* Cap the card so a very long summary scrolls inside it instead of pushing
+     * it past the round face — the old LV_SIZE_CONTENT card grew taller than
+     * the panel and clipped the tail of the text below the screen edge. */
+    lv_obj_set_style_max_height(card, disp_h - 16, 0);
+    s_state.notice_bar = card;
+
+    title = lv_label_create(card);
+    lv_label_set_text(title, "");
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(title, card_w - 2 * 14 - 4);
+    lv_obj_set_style_text_color(title, lv_color_hex(UI_PAL_INK), 0);
+    s_state.notice_title = title;
+
+    body = lv_label_create(card);
+    lv_label_set_text(body, "");
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(body, card_w - 2 * 14 - 4);
+    /* The body is the one element that can be arbitrarily long: let it shrink
+     * (min height 0) and scroll inside the bounded card rather than overflowing. */
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_style_min_height(body, 0, 0);
+    lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_text_color(body, lv_color_hex(UI_PAL_MUTED), 0);
+    s_state.notice_body = body;
+
+    /* Font subset check: 任意键返回 all exist in both the AP font and the CP
+     * subset.  Purely informational — the key handling is in the board's
+     * button input layer, which asks the channel to dismiss first. */
+    hint = lv_label_create(card);
+    lv_label_set_text(hint, "任意键返回");
+    lv_obj_set_style_text_color(hint, lv_color_hex(UI_PAL_IDLE), 0);
+}
+
+static void notice_timer_cancel(void)
+{
+    if (s_state.notice_timer) {
+        lv_timer_delete(s_state.notice_timer);
+        s_state.notice_timer = NULL;
+    }
+}
+
+/* Must run on the LVGL thread. */
+static void notice_hide(const char* why)
+{
+    lv_obj_t* prev;
+
+    notice_timer_cancel();
+    if (!s_state.notice_visible) {
+        return;
+    }
+
+    prev = s_state.notice_prev_screen;
+    s_state.notice_visible = false;
+    s_state.notice_prev_screen = NULL;
+
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+    /* The notice woke us from the dim clock: hand the screen back to the lock
+     * screen.  Restore the saved screen first and *immediately* (no fade) so
+     * the clock records the right screen to fade back to on wake — with a fade
+     * the switch happens later in the anim timer and races that capture. */
+    bool back_to_clock = s_state.notice_was_standby;
+    s_state.notice_was_standby = false;
+    if (back_to_clock && !standby_view_is_visible())
+      {
+        if (prev) lv_screen_load(prev);
+        standby_view_show_now();
+        syslog(LOG_INFO, "[%s] hidden (%s)\n", NOTICE_TAG, why);
+        return;
+      }
+#endif
+
+    /* If the clock faded in behind the notice, leave it alone: restoring the
+     * saved screen would silently end standby. */
+    if (prev) {
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+        if (!standby_view_is_visible())
+#endif
+            lv_screen_load_anim(prev, LV_SCR_LOAD_ANIM_FADE_IN,
+                                SCREEN_FADE_MS, 0, false);
+    }
+    syslog(LOG_INFO, "[%s] hidden (%s)\n", NOTICE_TAG, why);
+}
+
+static void notice_timeout_cb(lv_timer_t* t)
+{
+    (void)t;
+    s_state.notice_timer = NULL;   /* one-shot + auto-delete */
+    notice_hide("auto-dismiss");
+    notice_maybe_show_pending();
+}
+
+/* Hold time scales with how much there is to read: a fixed window makes a
+ * one-line Gerrit change linger long past the point of usefulness while a long
+ * Jira summary gets yanked away mid-sentence.  ~60ms per UTF-8 byte ≈ 180ms per
+ * CJK char (a slow skim), floored at LVGL_UI_NOTICE_MS and capped at 30s. */
+static uint32_t notice_duration_ms(const char* title, const char* body)
+{
+    size_t n = (title ? strlen(title) : 0) + (body ? strlen(body) : 0);
+    uint32_t ms = 5000 + (uint32_t)(n * 60);
+    if (ms < LVGL_UI_NOTICE_MS) ms = LVGL_UI_NOTICE_MS;
+    if (ms > 30000) ms = 30000;
+    return ms;
+}
+
+/* Must run on the LVGL thread. */
+static void notice_show_locked(const char* title, const char* body,
+                               lv_color_t bar_color)
+{
+    if (!s_state.notice_screen) {
+        return;
+    }
+
+    /* The dim clock must never swallow a notice: wake the page (a key has to
+     * reach the notice, not just the wake gate) and remember to hand the screen
+     * back to the clock once the notice closes.  Hide it synchronously — the
+     * queued async hide would run after our screen load and yank the notice. */
+#ifdef CONFIG_AI_AGENT_STANDBY_UI
+    if (!s_state.notice_visible) {
+        s_state.notice_was_standby = standby_view_is_visible();
+        if (s_state.notice_was_standby) standby_view_hide_now();
+    }
+#endif
+
+    ui_activity_reset();   /* a notice is user-relevant activity */
+
+    if (s_state.notice_title) lv_label_set_text(s_state.notice_title, title ? title : "");
+    if (s_state.notice_body)  lv_label_set_text(s_state.notice_body, body ? body : "");
+    if (s_state.notice_bar)   lv_obj_set_style_border_color(s_state.notice_bar, bar_color, 0);
+
+    if (!s_state.notice_visible) {
+        s_state.notice_prev_screen = lv_screen_active();
+        lv_screen_load_anim(s_state.notice_screen, LV_SCR_LOAD_ANIM_FADE_IN,
+                            SCREEN_FADE_MS, 0, false);
+        s_state.notice_visible = true;
+    }
+
+    /* Later notice replaces the current one and restarts the window. */
+    notice_timer_cancel();
+    s_state.notice_timer = lv_timer_create(notice_timeout_cb,
+                                           notice_duration_ms(title, body), NULL);
+    if (s_state.notice_timer) {
+        lv_timer_set_repeat_count(s_state.notice_timer, 1);
+        lv_timer_set_auto_delete(s_state.notice_timer, true);
+    }
+
+    syslog(LOG_INFO, "[%s] show: %s | %s\n", NOTICE_TAG,
+           title ? title : "", body ? body : "");
+}
+
+static void notice_maybe_show_pending(void)
+{
+    if (!s_state.notice_pending || s_state.approval_visible) {
+        return;
+    }
+    if (!s_state.initialized || !s_state.running) {
+        return;
+    }
+
+    s_state.notice_pending = false;
+    /* No standby gate here: notice_show_locked() wakes the page and hands the
+     * screen back to the clock when it closes. */
+    notice_show_locked(s_state.notice_pending_title, s_state.notice_pending_body,
+                       s_state.notice_pending_color);
+}
+
+static void notice_show_async_cb(void* data)
+{
+    async_notice_t* p = (async_notice_t*)data;
+
+    if (!p) {
+        return;
+    }
+    if (!s_state.initialized || !s_state.running || !s_state.notice_screen) {
+        free(p);
+        return;
+    }
+
+    if (s_state.approval_visible) {
+        /* Approval wins the screen; keep only the newest notice for later. */
+        strlcpy(s_state.notice_pending_title, p->title,
+                sizeof(s_state.notice_pending_title));
+        strlcpy(s_state.notice_pending_body, p->body,
+                sizeof(s_state.notice_pending_body));
+        s_state.notice_pending_color = lv_color_hex(p->bar_color);
+        s_state.notice_pending = true;
+        syslog(LOG_INFO, "[%s] deferred (approval page up): %s\n",
+               NOTICE_TAG, p->title);
+        free(p);
+        return;
+    }
+
+    /* A notice always wins over the dim clock now: it wakes the page and the
+     * clock comes back when the notice closes (see notice_show_locked()). */
+    notice_show_locked(p->title, p->body, lv_color_hex(p->bar_color));
+    free(p);
+}
+
+static void notice_dismiss_async_cb(void* data)
+{
+    (void)data;
+    if (!s_state.notice_visible) {
+        return;
+    }
+    notice_hide("dismissed by key");
+    notice_maybe_show_pending();
+}
+
+int lvgl_ui_channel_show_notice(const char* title, const char* body,
+                                uint32_t bar_color)
+{
+    async_notice_t* p;
+
+    if (!s_state.initialized || !s_state.running) {
+        return -EINVAL;
+    }
+    if (!s_state.notice_screen) {
+        return -ENOSYS;
+    }
+
+    p = malloc(sizeof(*p));
+    if (!p) {
+        syslog(LOG_ERR, "[%s] notice: payload alloc failed\n", TAG);
+        return -ENOMEM;
+    }
+    chat_view_copy_text(p->title, title ? title : "", sizeof(p->title));
+    chat_view_copy_text(p->body, body ? body : "", sizeof(p->body));
+    p->bar_color = bar_color ? bar_color : UI_PAL_THINK;
+
+    return lvgl_ui_async_call(notice_show_async_cb, p);
+}
+
+int lvgl_ui_channel_notice_dismiss(void)
+{
+    if (!s_state.initialized || !s_state.running) {
+        return 0;
+    }
+    if (!s_state.notice_visible) {
+        return 0;
+    }
+    lvgl_ui_async_call(notice_dismiss_async_cb, NULL);
+    return 1;
+}
+
+int lvgl_ui_channel_notice_visible(void)
+{
+    return s_state.notice_visible ? 1 : 0;
 }
 
 static void scroll_async_cb(void* data)

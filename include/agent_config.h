@@ -343,10 +343,15 @@
 #define CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC 60
 #endif
 #define AGENT_NOTIFY_INTERVAL_SEC CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC
-/* JSON buffer for one poll response (Gerrit/Jira ~4-8KB) */
-#define AGENT_NOTIFY_JSON_BUF_SIZE 8192
+/* JSON buffer for one poll response.  mcp_client_execute() copies the
+ * tools/call payload into this buffer with strncpy, so a payload larger
+ * than the buffer is silently truncated and the dedup parser then sees
+ * broken JSON.  Measured: jira_search payload is ~0.7KB per issue plus
+ * wrapper — 7.2KB at limit=10 (the default below), 40KB at limit=50.
+ * 16KB covers the default with headroom for long summaries; the old 8KB
+ * sat right at the limit=10 boundary and could not hold limit=50 at all. */
+#define AGENT_NOTIFY_JSON_BUF_SIZE 16384
 #define AGENT_NOTIFY_MAX_NEW 16          /* cap new records per poll */
-#define AGENT_NOTIFY_TOAST_MS 4000       /* toast auto-dismiss */
 #define AGENT_NOTIFY_GERRIT_COLOR 0x2196f3 /* blue */
 #define AGENT_NOTIFY_JIRA_COLOR   0xff9800 /* orange (== LVGL_UI_CARD_COLOR_JIRA) */
 #endif

@@ -175,6 +175,20 @@ void standby_view_hide(void)
   lvgl_ui_async_call(hide_async_cb, NULL);
 }
 
+/* 同步变体:调用者已在本线程(LVGL),且马上要加载自己的屏。必须先同步换屏,
+ * 否则排队的 hide_async_cb 会在之后把调用者的屏换成 prev_screen。 */
+void standby_view_hide_now(void)
+{
+  if (!s_sb.initialized) return;
+  hide_async_cb(NULL);
+}
+
+void standby_view_show_now(void)
+{
+  if (!s_sb.initialized) return;
+  show_async_cb(NULL);
+}
+
 bool standby_view_is_visible(void)
 {
   return s_sb.visible;

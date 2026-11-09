@@ -57,6 +57,8 @@
 #include <nuttx/rpmsg/rpmsg.h>
 
 #include "ui_rpmsg_proto.h"
+#include "ui/lvgl_ui_channel.h"
+#include "ui/lvgl_toast.h"
 #include "infra/network_manager.h" /* network_is_connected — gate TTS */
 #include "voice/voice_channel.h"   /* voice_channel_speak — real on AP */
 
@@ -454,8 +456,29 @@ int lvgl_ui_channel_clear_approval(void)
   return ret;
 }
 
-/* Scroll the CP chat transcript. payload[0] = dir (0=up, 1=down). */
-int lvgl_ui_channel_scroll(int dir)
+/* Notification page shim.  In this build the screen is owned by the other
+ * core, so this side has no page state to track: keep the existing RPMsg toast
+ * opcode (it renders on the CP) instead of inventing a second notice opcode.
+ * Callers that need the approval-priority rules must run on the core that owns
+ * the screen (the AP-LVGL_UI build). */
+int lvgl_ui_channel_show_notice(const char *title, const char *body,
+                                uint32_t bar_color)
+{
+  lvgl_toast_show_async(title, body, bar_color, LVGL_UI_NOTICE_MS);
+  return 0;
+}
+
+int lvgl_ui_channel_notice_dismiss(void)
+{
+  return 0;
+}
+
+int lvgl_ui_channel_notice_visible(void)
+{
+  return 0;
+}
+
+/* Scroll the CP chat transcript. payload[0] = dir (0=up, 1=down). */int lvgl_ui_channel_scroll(int dir)
 {
   struct ui_rpmsg_msg m;
   int ret;

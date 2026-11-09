@@ -15,7 +15,7 @@
  */
 
 /**
- * notify_service.c — Gerrit/Jira polling → LVGL toast.
+ * notify_service.c — Gerrit/Jira polling → LVGL notification page.
  *
  * Thread model: a single detached notify_thread, cond_timedwait-driven,
  * each source keeping its own next-due timestamp.  Polling is a sync
@@ -38,7 +38,7 @@
 #include "core/message_bus.h"
 #include "infra/config_store.h"
 #include "tools/mcp_client.h"
-#include "ui/lvgl_toast.h"
+#include "ui/lvgl_ui_channel.h"
 
 #include "cJSON.h"
 
@@ -145,17 +145,25 @@ static void notify_load_cfg(void)
     cfg_load_str(NOTIFY_SRC_JIRA, "tool", j->tool_query,
                  sizeof(j->tool_query), "jira.jira_search");
     {
-        /* Default JQL: issues updated since boot time.  If a cursor was
-         * persisted we use it; otherwise we fall back to "updated >= now". */
-        char ts[32];
-        time_t now = time(NULL);
-        struct tm tm;
-        gmtime_r(&now, &tm);
-        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M", &tm);
+        /* Default JQL: the last hour of updates, as a RELATIVE date.
+         *
+         * Relative dates are evaluated by Jira at query time, so the window
+         * slides with every poll.  The previous absolute timestamp was built
+         * once at boot, which froze the window: anything updated after boot
+         * could never match, so the Jira leg could only ever report pre-boot
+         * history.
+         *
+         * A relative date also sidesteps the timezone entirely.  This image
+         * has no CONFIG_LIBC_LOCALTIME (localtime_r() is a UTC alias), and a
+         * UTC-formatted "YYYY-MM-DD HH:MM" is read by Jira as local time
+         * (UTC+8), widening the window by 8h (measured: 595 issues).
+         *
+         * limit=10 keeps one poll at ~16KB of HTTP body / ~7.3KB of payload
+         * (measured) — inside MCP_RESP_BUF_SIZE (64KB) and
+         * AGENT_NOTIFY_JSON_BUF_SIZE (16KB) respectively. */
         snprintf(j->query_args, sizeof(j->query_args),
-                 "{\"jql\":\"updated >= \\\"%s\\\" ORDER BY updated DESC\","
-                 "\"fields\":\"summary,status,priority,assignee\",\"limit\":50}",
-                 ts);
+                 "{\"jql\":\"updated >= -1h ORDER BY updated DESC\","
+                 "\"fields\":\"summary,status,priority,assignee\",\"limit\":10}");
     }
     j->interval_sec = cfg_load_int(NOTIFY_SRC_JIRA, "interval_sec",
                                    AGENT_NOTIFY_INTERVAL_SEC * 2);
@@ -198,8 +206,8 @@ static void push_notify(notify_source_t src, const char *key,
 {
     const char *title;
     uint32_t color;
-    char body[200];   /* toast body (no prefix) */
-    char text[256];   /* bus content (with prefix, for cli mirror / log) */
+    char body[512];  /* toast body (no prefix) */
+    char text[576];  /* bus content (with prefix, for cli mirror / log) */
 
     if (src == NOTIFY_SRC_GERRIT) {
         title = "Gerrit";
@@ -213,12 +221,12 @@ static void push_notify(notify_source_t src, const char *key,
         snprintf(text, sizeof(text), "Jira %s", body);
     }
 
-    /* Pop the toast directly — the notify thread knows the exact title
-     * and color, so it builds the toast here rather than letting the
-     * outbound dispatcher guess from content text.  The dispatcher
-     * still sees the message (for cli mirror / logging) but skips
-     * re-popping a toast for the lvgl_notify channel. */
-    lvgl_toast_show_async(title, body, color, AGENT_NOTIFY_TOAST_MS);
+    /* Notification page, not a toast: the round panel is too small for a top
+     * banner (the body was clipped).  The page holds a length-scaled window
+     * (10s floor, up to 30s for long summaries; see notice_duration_ms in
+     * lvgl_ui_channel.c), any user key exits early, and the approval page
+     * outranks it. */
+    lvgl_ui_channel_show_notice(title, body, color);
 
     agent_msg_t msg;
     memset(&msg, 0, sizeof(msg));
@@ -262,7 +270,7 @@ static void gerrit_scan_text(const char *text, notify_source_t src,
                 const char *subj = end + 2;
                 size_t slen = len - (size_t)(subj - p);
                 char key[24];
-                char summary[80];
+                char summary[256];
 
                 snprintf(key, sizeof(key), "%ld", id);
                 snprintf(summary, sizeof(summary), "%.*s",

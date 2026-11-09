@@ -54,6 +54,14 @@ void standby_view_show(void);
 void standby_view_hide(void);
 
 /**
+ * 同步版本:调用者已经处在 LVGL 线程里(例如审批/通知的 async 回调),需要
+ * 在紧接着加载自己的屏之前把待机屏让开,不能等异步回调排到后面(否则异步的
+ * 退屏会把刚加载的审批页/通知页又顶掉)。只允许在 LVGL 线程调用。
+ */
+void standby_view_show_now(void);
+void standby_view_hide_now(void);
+
+/**
  * 待机屏当前是否可见。
  */
 bool standby_view_is_visible(void);
