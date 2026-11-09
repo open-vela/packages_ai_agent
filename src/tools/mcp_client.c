@@ -997,11 +997,21 @@ int mcp_client_execute(const char* name, const char* input_json,
         return ERROR;
     }
 
-    /* Parse result -> content[0] -> text */
+    /* Parse result -> content[0] -> text.  A body that filled the receive
+     * buffer was cut off mid-JSON and cannot parse; report that instead of
+     * the generic "bad response" so an oversized query is diagnosable
+     * (Jira jira_search at limit=50 returned 80666 bytes here). */
+    size_t resp_len = strlen(resp_buf);
     cJSON* result = parse_jsonrpc_result(resp_buf);
     free(resp_buf);
 
     if (!result) {
+        if (resp_len + 1 >= MCP_RESP_BUF_SIZE) {
+            syslog(LOG_ERR,
+                "[%s] %s response truncated at %u bytes (raise "
+                "MCP_RESP_BUF_SIZE or lower the query limit)\n",
+                TAG, remote_name, (unsigned)resp_len);
+        }
         snprintf(output, output_size,
             "{\"error\":\"MCP remote: bad response\"}");
         return ERROR;
@@ -1013,6 +1023,14 @@ int mcp_client_execute(const char* name, const char* input_json,
         if (first) {
             cJSON* text = cJSON_GetObjectItem(first, "text");
             if (text && cJSON_IsString(text)) {
+                size_t payload_len = strlen(text->valuestring);
+                if (payload_len >= output_size) {
+                    syslog(LOG_ERR,
+                        "[%s] %s payload %u bytes truncated to %u bytes "
+                        "(raise the caller buffer or lower the query limit)\n",
+                        TAG, remote_name, (unsigned)payload_len,
+                        (unsigned)output_size);
+                }
                 strncpy(output, text->valuestring, output_size - 1);
                 output[output_size - 1] = '\0';
                 cJSON_Delete(result);
