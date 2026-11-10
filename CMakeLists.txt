@@ -106,7 +106,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     # App-owned like xiaozhi_gui's font_awesome_*.c: LV_FONT_DECLARE in code,
     # no patching of apps_graphics_lvgl. The file header carries the exact
     # regeneration command.
-    list(APPEND AGENT_SRCS src/ui/lv_font_misans_16_cjk.c)
+    list(APPEND AGENT_SRCS src/ui/lv_font_misans_12_cjk.c)
   endif()
 
   # M7 差异化页 (pure-LVGL 退路): round-screen pet status ring home screen.
@@ -294,10 +294,11 @@ endif()
 ################################################################################
 if(CONFIG_EXAMPLES_AI_AGENT_UI_CP)
 
-  # NOTE: lv_font_misans_16_cjk.c is NOT listed here. The canonical font
+  # NOTE: lv_font_misans_12_cjk.c is NOT listed here. The canonical font
   # lives in the LVGL tree (apps/graphics/lvgl/.../font/) and is compiled into
-  # liblvgl.a when CONFIG_LV_FONT_MISANS_16_CJK=y (set in the CP defconfig).
-  # We only LV_FONT_DECLARE + reference &lv_font_misans_16_cjk from
+  # liblvgl.a when CONFIG_LV_FONT_MISANS_16_CJK=y (set in the CP defconfig;
+  # the symbol name there still carries the 16 px spelling).
+  # We only LV_FONT_DECLARE + reference &lv_font_misans_12_cjk from
   # lvgl_ui_channel.c; the symbol is provided by the LVGL lib at link time,
   # the same way the built-in Montserrat fonts are consumed.
   set(AI_AGENT_UI_CP_SRCS

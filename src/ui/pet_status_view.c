@@ -58,10 +58,14 @@
 
 /* The MiSans CJK static font compiled into liblvgl.a on CP (and into the
  * ai_agent .o on qemu/AP-LVGL_UI). Declared by the font .c via LV_FONT_DECLARE. */
-LV_FONT_DECLARE(lv_font_misans_16_cjk);
+LV_FONT_DECLARE(lv_font_misans_12_cjk);
 
 /* Config key holding the one species this flash runs with. */
 #define PET_TYPE_CONFIG_KEY "pet_type"
+
+/* 出厂形象。旧行为是「每次烧录随机一只」;2026-11-10 用户要求先固定为
+ * 白猫,故改为常量。要恢复随机,把下面的赋值换回 rnd % PET_TYPE_COUNT。 */
+#define PET_TYPE_FACTORY_DEFAULT PET_TYPE_CAT
 
 /* Pick the species for this boot.
  *
@@ -74,7 +78,6 @@ LV_FONT_DECLARE(lv_font_misans_16_cjk);
 static int pet_type_fixed(void)
 {
   char buf[8];
-  unsigned char rnd = 0;
   int type;
 
   if (claw_config_get(PET_TYPE_CONFIG_KEY, buf, sizeof(buf)) == OK &&
@@ -88,14 +91,7 @@ static int pet_type_fixed(void)
         }
     }
 
-  if (agent_secure_random(&rnd, sizeof(rnd)) != 0)
-    {
-      /* No /dev/urandom: boot time + stack address is still different enough
-       * between two flashes that the choice does not look constant. */
-      rnd = (unsigned char)((uint32_t)clock() ^ (uint32_t)time(NULL) ^
-                            (uint32_t)(uintptr_t)&type);
-    }
-  type = (int)(rnd % PET_TYPE_COUNT);
+  type = PET_TYPE_FACTORY_DEFAULT;
 
   snprintf(buf, sizeof(buf), "%d", type);
   if (claw_config_set(PET_TYPE_CONFIG_KEY, buf) != OK)
@@ -103,7 +99,7 @@ static int pet_type_fixed(void)
       syslog(LOG_WARNING, "[%s] type %d not persisted (no config store)\n",
              TAG, type);
     }
-  syslog(LOG_INFO, "[%s] fixed type %d (new random pick)\n", TAG, type);
+  syslog(LOG_INFO, "[%s] fixed type %d (factory default)\n", TAG, type);
   return type;
 }
 
@@ -132,17 +128,45 @@ static const char *const s_state_text[] = {
   "待机", "聆听中", "思考中", "执行中", "等待确认", "出错了",
 };
 
-/* Idle caption: the on-device button legend (replaces the old status line).
+/* Idle caption: the on-device button legend.  Each line is a compact key
+ * caption ("S1"/"S2"/"S3") followed by the action text, and only the three
+ * *action texts* are justified to a common left and right edge (两端对齐) —
+ * the key captions stay tight and left-aligned, never stretched.
+ *
  * S1 (GPIO13) = push-to-talk; S2/S3 long-press = model / new session; the
- * plain tap on S2/S3 scrolls the chat transcript. */
-static const char *const s_idle_hint =
-  "S1 按住说话\n"
-  "S2 长按切换模型\n"
-  "S3 长按新建会话";
+ * plain tap on S2/S3 scrolls the chat transcript.
+ *
+ * LVGL v9 has no "justify" text align, so each action text is its own
+ * fixed-width, centre-aligned label and the slack between its natural width
+ * and the block width becomes that label's letter spacing (see
+ * pet_view_create). */
+static const char *const s_hint_key[]  = { "S1", "S2", "S3" };
+static const char *const s_hint_text[] = {
+  "按住说话",
+  "长按切换模型",
+  "长按新建会话",
+};
+
+#define IDLE_HINT_LINES \
+  ((int)(sizeof(s_hint_text) / sizeof(s_hint_text[0])))
+
+/* Glyph count of a UTF-8 string (continuation bytes 10xxxxxx don't count). */
+static uint32_t utf8_glyph_count(const char *s)
+{
+  uint32_t n = 0;
+
+  for (; *s != '\0'; s++)
+    {
+      if (((uint8_t)*s & 0xc0u) != 0x80u) n++;
+    }
+
+  return n;
+}
 
 static const char *display_text_for(enum pet_state st)
 {
-  return (st == PET_STATE_IDLE) ? s_idle_hint : s_state_text[st];
+  /* IDLE is drawn by the justified hint block, not by the caption label. */
+  return (st == PET_STATE_IDLE) ? "" : s_state_text[st];
 }
 
 struct pet_state_s {
@@ -155,6 +179,9 @@ struct pet_state_s {
   lv_obj_t *sprite;   /* lv_image: pixel-art pet (scaled) */
   lv_obj_t *label;
   lv_obj_t *status_dot; /* colored dot next to the state caption */
+  lv_obj_t *hint_box;   /* IDLE only: button legend (key captions + justified text) */
+  lv_obj_t *hint_key[IDLE_HINT_LINES];  /* per-line "S1"/"S2"/"S3" captions */
+  lv_obj_t *hint_lbl[IDLE_HINT_LINES];  /* per-line justified action text */
   lv_obj_t *comet;    /* lv_obj: orbiting dot (busy-state spinner) */
   lv_obj_t *prev_screen;
   /* active animation tag — one effect at a time, stopped on state change */
@@ -440,6 +467,14 @@ static void apply_state_async_cb(void *data)
       lv_obj_remove_flag(s_pet.status_dot, LV_OBJ_FLAG_HIDDEN);
   }
 
+  /* The justified button legend replaces the status caption while idle. */
+  if (s_pet.hint_box) {
+    if (st == PET_STATE_IDLE)
+      lv_obj_remove_flag(s_pet.hint_box, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_add_flag(s_pet.hint_box, LV_OBJ_FLAG_HIDDEN);
+  }
+
   start_anim_for(st);
   syslog(LOG_INFO, "[%s] state → %s\n", TAG, s_state_text[st]);
 }
@@ -622,7 +657,7 @@ int pet_status_view_init(void)
   if (!s_pet.screen) return -ENOMEM;
   lv_obj_set_style_bg_color(s_pet.screen, lv_color_hex(UI_PAL_BG), 0);
   lv_obj_set_style_bg_opa(s_pet.screen, LV_OPA_COVER, 0);
-  lv_obj_set_style_text_font(s_pet.screen, &lv_font_misans_16_cjk, 0);
+  lv_obj_set_style_text_font(s_pet.screen, &lv_font_misans_12_cjk, 0);
 
   /* Ring (arc) — centered, subtle dark track, state-colored indicator. */
   s_pet.ring = lv_arc_create(s_pet.screen);
@@ -707,8 +742,99 @@ int pet_status_view_init(void)
       {
         lv_label_set_text(s_pet.label, display_text_for(PET_STATE_IDLE));
         lv_obj_set_style_text_color(s_pet.label, lv_color_hex(UI_PAL_TEXT_DIM), 0);
-        lv_obj_set_style_text_font(s_pet.label, &lv_font_misans_16_cjk, 0);
+        lv_obj_set_style_text_font(s_pet.label, &lv_font_misans_12_cjk, 0);
         lv_obj_set_style_text_align(s_pet.label, LV_TEXT_ALIGN_LEFT, 0);
+      }
+  }
+
+  /* IDLE button legend.  Only the action texts are justified (common left and
+   * right edge); the "S1"/"S2"/"S3" key captions stay compact and left-aligned.
+   *
+   * LVGL v9 has no justify align, so each action text is its own fixed-width
+   * label centred inside the block, and the slack between its natural width
+   * and the block width is spread into its letter spacing.  Integer px letter
+   * spacing means one or two px of the slack may be left over; the centre
+   * align splits it between the two edges so both stay flush within half a
+   * pixel of the gutter. */
+  {
+    int32_t text_w[IDLE_HINT_LINES];
+    uint32_t glyphs[IDLE_HINT_LINES];
+    int32_t block_w = 0;   /* widest action text -> all texts flush both edges */
+    int32_t key_w   = 0;   /* widest key caption -> texts share one left edge */
+    int i;
+
+    for (i = 0; i < IDLE_HINT_LINES; i++)
+      {
+        const char *t = s_hint_text[i];
+        int32_t kw    = lv_text_get_width(s_hint_key[i],
+                                          (uint32_t)strlen(s_hint_key[i]),
+                                          &lv_font_misans_12_cjk, 0);
+
+        glyphs[i] = utf8_glyph_count(t);
+        text_w[i] = lv_text_get_width(t, (uint32_t)strlen(t),
+                                      &lv_font_misans_12_cjk, 0);
+        if (text_w[i] > block_w) block_w = text_w[i];
+        if (kw > key_w)           key_w   = kw;
+      }
+
+    s_pet.hint_box = lv_obj_create(s_pet.screen);
+    if (!s_pet.hint_box) goto fail;
+    lv_obj_remove_flag(s_pet.hint_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_pet.hint_box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(s_pet.hint_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_pet.hint_box, 0, 0);
+    lv_obj_set_style_pad_all(s_pet.hint_box, 0, 0);
+    lv_obj_set_style_pad_row(s_pet.hint_box, 6, 0);
+    lv_obj_set_flex_flow(s_pet.hint_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_pet.hint_box, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_align(s_pet.hint_box, LV_ALIGN_CENTER, 0, PET_LABEL_DY);
+
+    for (i = 0; i < IDLE_HINT_LINES; i++)
+      {
+        int32_t gaps = (int32_t)glyphs[i] - 1;
+        int32_t ls   = 0;
+        lv_obj_t *row = lv_obj_create(s_pet.hint_box);
+
+        if (!row) goto fail;
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 4, 0);   /* gap after the key caption */
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_START);
+
+        s_pet.hint_key[i] = lv_label_create(row);
+        if (!s_pet.hint_key[i]) goto fail;
+        lv_label_set_text(s_pet.hint_key[i], s_hint_key[i]);
+        lv_obj_set_width(s_pet.hint_key[i], key_w);   /* common left edge */
+        lv_obj_set_style_text_align(s_pet.hint_key[i], LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_set_style_text_color(s_pet.hint_key[i],
+                                    lv_color_hex(UI_PAL_TEXT_DIM), 0);
+        lv_obj_set_style_text_font(s_pet.hint_key[i], &lv_font_misans_12_cjk, 0);
+
+        if (gaps > 0 && block_w > text_w[i])
+          {
+            /* Round to nearest px: (n + gaps/2) / gaps. */
+            ls = (block_w - text_w[i] + gaps / 2) / gaps;
+          }
+
+        s_pet.hint_lbl[i] = lv_label_create(row);
+        if (!s_pet.hint_lbl[i]) goto fail;
+        lv_label_set_text(s_pet.hint_lbl[i], s_hint_text[i]);
+        lv_obj_set_width(s_pet.hint_lbl[i], block_w);
+        lv_obj_set_style_text_align(s_pet.hint_lbl[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_letter_space(s_pet.hint_lbl[i], ls, 0);
+        lv_obj_set_style_text_color(s_pet.hint_lbl[i],
+                                    lv_color_hex(UI_PAL_TEXT_DIM), 0);
+        lv_obj_set_style_text_font(s_pet.hint_lbl[i], &lv_font_misans_12_cjk, 0);
+
+        syslog(LOG_INFO, "[%s] hint[%d] text_w=%d glyphs=%d letter_space=%d"
+               " block=%d key_w=%d\n", TAG, i, (int)text_w[i], (int)glyphs[i],
+               (int)ls, (int)block_w, (int)key_w);
       }
   }
 

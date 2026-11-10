@@ -51,9 +51,10 @@ enum pet_state {
     PET_STATE_ERROR     = 5, /* 错误：抖动 + 红色，眼睛 X */
 };
 
-/** 宠物形象。**每次烧录随机固定一只**（首次启动选中后写入 config 的
- *  `pet_type`，整片烧录清 NVS 才会换），运行中不换、更不随页面切换：所有
- * 页面和状态都只换这只宠物的表情。`set_ptype` 仅作调试，改了会持久化。 */
+/** 宠物形象。**烧录期固定**：首次启动写入 config 的 `pet_type`（出厂默认
+ *  白猫，见 pet_status_view.c 的 PET_TYPE_FACTORY_DEFAULT；整片烧录清 NVS
+ *  才会重新取默认值），运行中不换、更不随页面切换：所有页面和状态都只换
+ *  这只宠物的表情。`set_ptype` 仅作调试，改了会持久化。 */
 enum pet_type {
     PET_TYPE_CAT  = 0,  /* 白猫脸（粉耳 + 腮红 + 2×2 眼） */
     PET_TYPE_FROG = 1,  /* 绿青蛙（2×2 大眼） */

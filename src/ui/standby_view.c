@@ -58,7 +58,7 @@
  * 整帧 SPI flush 带宽不再是淡入瓶颈,故可缩短到 300ms 仍保持顺滑。 */
 #define SCREEN_FADE_MS 300
 
-LV_FONT_DECLARE(lv_font_misans_16_cjk);
+LV_FONT_DECLARE(lv_font_misans_12_cjk);
 
 static const char *const s_wday_cn[] = {
   "周日", "周一", "周二", "周三", "周四", "周五", "周六",
@@ -232,13 +232,13 @@ int standby_view_init(void)
   s_sb.date = lv_label_create(col);
   if (!s_sb.date) goto fail;
   lv_label_set_text(s_sb.date, "待机中");
-  lv_obj_set_style_text_font(s_sb.date, &lv_font_misans_16_cjk, 0);
+  lv_obj_set_style_text_font(s_sb.date, &lv_font_misans_12_cjk, 0);
   lv_obj_set_style_text_color(s_sb.date, lv_color_hex(UI_PAL_MUTED), 0);
 
   s_sb.hint = lv_label_create(col);
   if (!s_sb.hint) goto fail;
   lv_label_set_text(s_sb.hint, "待机中");
-  lv_obj_set_style_text_font(s_sb.hint, &lv_font_misans_16_cjk, 0);
+  lv_obj_set_style_text_font(s_sb.hint, &lv_font_misans_12_cjk, 0);
   lv_obj_set_style_text_color(s_sb.hint, lv_color_hex(UI_PAL_MUTED), 0);
 
   s_sb.timer = lv_timer_create(timer_cb, 1000, NULL);

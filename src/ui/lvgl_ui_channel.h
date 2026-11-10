@@ -142,7 +142,7 @@ int lvgl_ui_channel_approval_pending(void);
  */
 
 /* 通知页停留时长（毫秒）。5s 时用户反馈「来不及看清」，提到 10s。 */
-#define LVGL_UI_NOTICE_MS 10000
+#define LVGL_UI_NOTICE_MS 15000
 
 /* 显示一条通知。title/body 为 UTF-8，bar_color 是卡片左侧色条颜色
  * （0 = 用状态蓝）。返回 0 成功，负值错误。 */

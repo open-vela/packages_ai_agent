@@ -37,9 +37,9 @@
 #include <stdint.h>   /* uintptr_t — printing pthread_t as a pointer on 64-bit */
 
 /* App-owned pre-rasterized MiSans-16 CJK font (compiled from
- * src/ui/lv_font_misans_16_cjk.c, same pattern as xiaozhi_gui's
+ * src/ui/lv_font_misans_12_cjk.c, same pattern as xiaozhi_gui's
  * font_awesome_*.c) — declared here instead of patching apps_graphics_lvgl. */
-LV_FONT_DECLARE(lv_font_misans_16_cjk);
+LV_FONT_DECLARE(lv_font_misans_12_cjk);
 #ifdef CONFIG_STACK_COLORATION
 #include <nuttx/arch.h>   /* up_check_tcbstack — LVGL thread stack high-water */
 #include <nuttx/sched.h>  /* nxsched_self / nxsched_get_stackinfo */
@@ -62,10 +62,6 @@ LV_FONT_DECLARE(lv_font_misans_16_cjk);
 #ifdef CONFIG_AI_AGENT_STANDBY_UI
 #include "ui/standby_view.h"
 #endif
-/* Idle time (ms) after the last chat message before yielding the foreground
- * back to the pet status ring home screen.  Only active when PET_STATUS is on
- * and the chat screen currently owns the foreground. */
-#define PET_IDLE_YIELD_MS  8000
 #endif
 
 /* ── Constants ────────────────────────────────────────────────── */
@@ -177,8 +173,8 @@ extern volatile const char* lv_dbg_class;
  * Hold this lock around any LVGL entry point called from a non-LVGL
  * thread, and around lv_timer_handler() itself.
  *
- * Recursion is required: LVGL-thread callbacks (pet_idle_timer_cb,
- * standby_timer_cb) themselves queue async calls.  CONFIG_PTHREAD_MUTEX_TYPES
+ * Recursion is required: LVGL-thread callbacks (standby_timer_cb)
+ * themselves queue async calls.  CONFIG_PTHREAD_MUTEX_TYPES
  * is disabled in this build, so a recursive pthread mutex is unavailable;
  * emulate it with owner + depth instead.
  */
@@ -273,7 +269,7 @@ int lvgl_ui_async_call(void (*cb)(void*), void* data)
  * show_chat, for visual verification of all four color-bar variants.
  * Leave undefined in normal builds. */
 /* #define LVGL_UI_CARD_SELFTEST */
-/* Verified 2026-08-17: static lv_font_misans_16_cjk renders full CJK (no
+/* Verified 2026-08-17: static lv_font_misans_12_cjk renders full CJK (no
  * tofu) and does NOT crash the heap — self-test confirmed via screendump.
  * Also verified: 1024-byte msg buffer + UTF-8-aware truncation shows full
  * ~568-byte Agent summaries without mid-char cut. */
@@ -281,9 +277,9 @@ int lvgl_ui_async_call(void (*cb)(void*), void* data)
 /* Layout constants for 466x466 round screen */
 #define LVGL_UI_SCREEN_W 466
 #define LVGL_UI_SCREEN_H 466
-#define LVGL_UI_CHAT_GAP 10
-#define LVGL_UI_BUBBLE_RADIUS 14
-#define LVGL_UI_BUBBLE_PAD 10
+#define LVGL_UI_CHAT_GAP 8
+#define LVGL_UI_BUBBLE_RADIUS 12
+#define LVGL_UI_BUBBLE_PAD 8
 /* Max message text stored per bubble.  1024 bytes ≈ 340 simplified-Chinese
  * chars (UTF-8, 3 bytes/char) — enough for typical Agent LLM summaries.
  * Truncation is UTF-8-aware (chat_view_copy_text) so a multi-byte char is
@@ -360,8 +356,8 @@ typedef struct {
     lv_obj_t* notice_prev_screen;
     bool notice_was_standby;   /* clock was up when the notice arrived */
     bool notice_pending;        /* a stashed notice waits for the approval */
-    char notice_pending_title[40];
-    char notice_pending_body[200];
+    char notice_pending_title[64];
+    char notice_pending_body[512];
     lv_color_t notice_pending_color;
 
     /* Chat history */
@@ -755,45 +751,17 @@ static chat_msg_t* chat_history_add(chat_history_t* h, const char* text, bool is
 
 /* ── Public API stubs (filled in by later tasks) ──────────────── */
 
-#ifdef CONFIG_AI_AGENT_PET_STATUS
-/* Idle-yield support: when the pet status ring is enabled, the chat screen
- * yields the foreground to the pet after PET_IDLE_YIELD_MS of message silence.
- * All access is confined to the LVGL thread (init creates the timer; the send
- * async cb resets the tick; the timer cb does the yield). */
-static lv_timer_t *s_pet_idle_timer = NULL;
-static uint32_t    s_pet_last_msg_tick = 0;
-
-static void pet_idle_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    if (!s_state.initialized || !s_state.screen_visible) return;
-    /* A pending remote permission request owns the foreground: never yield it
-     * back to the pet home screen while the approval page is up, or the user
-     * loses the S2/S3 approve/cancel cue mid-decision.  Same for the notice
-     * page, which is only up for a few seconds. */
-    if (s_state.approval_visible || s_state.notice_visible) return;
-    /* Judge by the active screen, not the cached visible flag: opening the
-     * chat screen does not call pet_status_view_hide(), so the flag stays true
-     * and the yield below would never fire (blank chat page stuck forever). */
-    if (!pet_status_view_is_active() &&
-        (lv_tick_get() - s_pet_last_msg_tick) >= PET_IDLE_YIELD_MS)
-      {
-        /* Yield: the chat screen stays alive but releases the foreground so
-         * the pet home screen shows.  Clearing screen_visible lets the next
-         * incoming message re-take the foreground via lvgl_ui_channel_show. */
-        s_state.screen_visible = false;
-        pet_status_view_show();
-        syslog(LOG_INFO, "[%s] idle → pet home screen\n", TAG);
-      }
-}
-
-static void pet_idle_reset(void)
-{
-    s_pet_last_msg_tick = lv_tick_get();
-}
-#else
-static void pet_idle_reset(void) {}
-#endif
+/* Screen dwell policy (settled 2026-11-09):
+ *
+ *   Any page — chat or pet home — stays up until the user stops interacting
+ *   for STANDBY_TIMEOUT_MS, then the dim clock takes over.  There is no
+ *   chat → pet auto-yield any more: an answer used to disappear 8 s after it
+ *   arrived, which read as the screen yanking itself away mid-read.
+ *
+ *   Pet home → chat is a deliberate gesture: an S2/S3 tap (lvgl_ui_channel_
+ *   scroll) when the transcript has something in it.  An empty conversation
+ *   stays on the pet page instead of showing a blank dark page.
+ */
 
 /* Agent lifecycle state, mirrored by set_pet_state().  The standby timer
  * reads it to postpone standby while the agent is busy (non-idle). */
@@ -946,15 +914,16 @@ int lvgl_ui_channel_init(void)
     int32_t cy       = disp_h / 2;
     int32_t face_r   = round_d / 2;
 
-    /* Inner gutters as fractions of the circle.  Real-face values (Ø224,
-     * R=112, center (120,148)):
-     *   side_m 13 — chat_list side gutter
-     *   top_m  31 — chat_list top y=67
-     *   bot_m   0 — chat_list bottom flush with the round-face bottom edge
-     *               (y=260) */
-    int32_t side_m   = (round_d * 6)  / 100;   /* chat_list side gutter */
-    int32_t top_m    = (round_d * 14) / 100;   /* chat_list top gutter */
-    int32_t bot_m    = 0;                       /* chat_list bottom gutter */
+    /* Inner gutters.  The old 6%/14% split (13/31 px) was derived from the
+     * inscribed Ø224 circle and left a visible black frame around every
+     * bubble, plus a 31 px dead band above the first message.  The panel is a
+     * 240x296 rectangle whose corners are what the round case clips (the list
+     * scrolls to the bottom, where an inscribed circle would be only ~90 px
+     * wide, and bubbles render fine there today) — so lay the column out on
+     * the rectangle with a hairline gutter instead. */
+    int32_t side_m   = round_panel ? 4  : (round_d * 6)  / 100;  /* side gutter */
+    int32_t top_m    = round_panel ? 8  : (round_d * 14) / 100;  /* top gutter  */
+    int32_t bot_m    = round_panel ? 2  : 0;                     /* bottom gutter */
 
     /* Create main screen with dark background */
     s_state.screen = lv_obj_create(NULL);
@@ -970,18 +939,31 @@ int lvgl_ui_channel_init(void)
      * demand when the user activates the chat UI, to avoid
      * hijacking the system's current screen at boot. */
 
-    /* Default text font: the app-owned statically-compiled MiSans-16 CJK font
+    /* Default text font: the app-owned statically-compiled MiSans-14 CJK font
      * (3755 GB2312-1 common chars + ASCII + fullwidth punctuation, baked into
      * the binary via lv_font_conv — zero runtime malloc/rasterization) so
      * Agent reply Chinese text renders on qemu with full coverage and cannot
      * corrupt the heap.  Falls back to SimSun-16 (1000 chars) then Montserrat. */
-    lv_obj_set_style_text_font(s_state.screen, &lv_font_misans_16_cjk, 0);
+    lv_obj_set_style_text_font(s_state.screen, &lv_font_misans_12_cjk, 0);
 
-    /* Step 5: Create Chat View container — sized to the inscribed circle so
-     * the message list stays inside the round face (top and bottom leave
-     * bezel gutters). */
-    int32_t chat_list_w = round_d - 2 * side_m;
-    chat_h = 2 * face_r - top_m - bot_m;
+    /* Step 5: Create Chat View container.  On the 240x296 panel the column
+     * occupies the whole rectangle (hairline gutter) — see the gutter comment
+     * above for why the inscribed-circle inset was wrong there.  On other
+     * panels it stays inside the inscribed circle. */
+    int32_t chat_list_w;
+    int32_t chat_list_x;
+    int32_t chat_list_y;
+    if (round_panel) {
+        chat_list_w = disp_w - 2 * side_m;
+        chat_h = disp_h - top_m - bot_m;
+        chat_list_x = side_m;
+        chat_list_y = top_m;
+    } else {
+        chat_list_w = round_d - 2 * side_m;
+        chat_h = 2 * face_r - top_m - bot_m;
+        chat_list_x = cx - chat_list_w / 2;
+        chat_list_y = cy - face_r + top_m;
+    }
 
     s_state.chat_list = lv_obj_create(s_state.screen);
     if (!s_state.chat_list) {
@@ -991,16 +973,16 @@ int lvgl_ui_channel_init(void)
     }
 
     lv_obj_set_size(s_state.chat_list, chat_list_w, chat_h);
-    lv_obj_set_pos(s_state.chat_list, cx - chat_list_w / 2, cy - face_r + top_m);
+    lv_obj_set_pos(s_state.chat_list, chat_list_x, chat_list_y);
     lv_obj_set_scroll_dir(s_state.chat_list, LV_DIR_VER);
     lv_obj_set_flex_flow(s_state.chat_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_state.chat_list, LVGL_UI_CHAT_GAP, 0);
     lv_obj_set_style_bg_opa(s_state.chat_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_state.chat_list, 0, 0);
-    lv_obj_set_style_pad_left(s_state.chat_list, 4, 0);
-    lv_obj_set_style_pad_right(s_state.chat_list, 4, 0);
-    lv_obj_set_style_pad_top(s_state.chat_list, 4, 0);
-    lv_obj_set_style_pad_bottom(s_state.chat_list, 4, 0);
+    lv_obj_set_style_pad_left(s_state.chat_list, 2, 0);
+    lv_obj_set_style_pad_right(s_state.chat_list, 2, 0);
+    lv_obj_set_style_pad_top(s_state.chat_list, 2, 0);
+    lv_obj_set_style_pad_bottom(s_state.chat_list, 2, 0);
     lv_obj_set_scrollbar_mode(s_state.chat_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(s_state.chat_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
@@ -1021,20 +1003,12 @@ int lvgl_ui_channel_init(void)
 
 #ifdef CONFIG_AI_AGENT_PET_STATUS
     /* Build the pet status ring home screen (M7 差异化页).  It is NOT loaded
-     * here — cp_ui_main (or the AP via RPMsg) decides when to show it.  The
-     * idle-yield timer runs in the LVGL thread and only fires when the chat
-     * screen owns the foreground. */
+     * here — cp_ui_main (or the AP via RPMsg) decides when to show it. */
     (void)pet_status_view_init();
     /* Surface the pet as the boot/home screen immediately.  On CP this is
      * idempotent with cp_ui_main's explicit show(); on qemu (no cp_ui_main,
      * no AP→CP RPMsg) it is the only thing that brings the pet up at boot. */
     pet_status_view_show();
-    s_pet_idle_timer = lv_timer_create(pet_idle_timer_cb, 1000, NULL);
-    if (s_pet_idle_timer)
-      {
-        lv_timer_set_repeat_count(s_pet_idle_timer, -1);
-      }
-    pet_idle_reset();
 #endif
 #ifdef CONFIG_AI_AGENT_STANDBY_UI
     /* M7 待机界面: build the dim digital clock screen (NOT loaded — the pet is
@@ -1232,7 +1206,7 @@ static void show_screen_async_cb(void* data)
     }
 
     /* CJK font selection happens at init() time via the statically-compiled
-     * lv_font_misans_16_cjk (preferred: 3755 GB2312-1 common chars, baked into
+     * lv_font_misans_12_cjk (preferred: 3755 GB2312-1 common chars, baked into
      * the binary by lv_font_conv — zero runtime malloc, zero rasterization,
      * cannot corrupt the heap).  No runtime TTF loading here.
      *
@@ -1242,7 +1216,7 @@ static void show_screen_async_cb(void* data)
      * chunk metadata, leading to recursive-assert reboots (mm_foreach /
      * nxsched_add_readytorun / nxsem_post_slow in the timer IRQ).  Subsetting
      * to 857 KB only delayed the crash; the root cause is the rasterizer, so
-     * we moved to a pre-rasterized static font.  See lv_font_misans_16_cjk.c
+     * we moved to a pre-rasterized static font.  See lv_font_misans_12_cjk.c
      * and the fontgen notes in docs. */
     /* Already set in init(); nothing to do at show time. */
     syslog(LOG_INFO, "[%s] using static MiSans-16 CJK font\n", TAG);
@@ -1605,10 +1579,6 @@ static void chat_view_add_message_async_cb(void* data)
         return;
     }
 
-    /* A new chat message resets the pet-yield idle timer (the conversation
-     * is alive).  No-op when PET_STATUS is off. */
-    pet_idle_reset();
-
     /* Entry/exit markers: if a hang reports "add msg" without "add msg
      * done", the fault is inside widget construction/rendering, not in
      * the caller or the lock. */
@@ -1831,10 +1801,44 @@ static void chat_view_add_message(const char* text, bool is_user,
         return;
     }
 
-    /* Agent cards are a uniform 85%-wide panel; the user bubble hugs its text
-     * (auto-width) so a short "你好" reads as a compact orange chip rather than
-     * a full-width bar.  The label's max_width (set below) caps long lines. */
-    lv_obj_set_width(bubble, is_user ? LV_SIZE_CONTENT : lv_pct(85));
+    /* Both bubbles hug their text: a short message reads as a compact chip
+     * instead of a full-width bar.  Long text wraps at 80% of the *screen*
+     * width (the user asked the bubble to only wrap once it exceeds that cap).
+     * The agent card needs a fixed pixel width so its inner lv_pct(100)
+     * children (title bar / divider / body row) resolve deterministically
+     * without the content-size-vs-percentage oscillation documented in
+     * chat_view_build_agent_card(); so we measure the reply once and set an
+     * explicit width, clamped to the cap. */
+    int32_t disp_w = LVGL_UI_SCREEN_W;
+    lv_display_t* mdisp = lv_display_get_default();
+    if (mdisp) {
+        lv_coord_t rw = lv_display_get_horizontal_resolution(mdisp);
+        if (rw > 0) disp_w = rw;
+    }
+    int32_t bubble_max = (disp_w * 80) / 100;   /* 80% of screen width */
+
+    if (is_user) {
+        lv_obj_set_width(bubble, LV_SIZE_CONTENT);
+    } else {
+        int32_t text_w;
+        if (strchr(slot->text, '\n') != NULL) {
+            text_w = bubble_max;                 /* multi-line: fill to the cap */
+        } else {
+            text_w = lv_text_get_width(slot->text, strlen(slot->text),
+                                       &lv_font_misans_12_cjk, 0);
+        }
+        int32_t bw = text_w + 2 * LVGL_UI_BUBBLE_PAD
+                   + LVGL_UI_CARD_COLOR_BAR_W + LVGL_UI_CARD_GAP;
+        if (bw > bubble_max) bw = bubble_max;
+        /* Never narrower than the title bar ("Agent" + status dot). */
+        int32_t title_w = lv_text_get_width(LVGL_UI_CARD_TITLE,
+                                            strlen(LVGL_UI_CARD_TITLE),
+                                            &lv_font_misans_12_cjk, 0)
+                        + 8 /* dot */ + LVGL_UI_CARD_GAP
+                        + 2 * LVGL_UI_BUBBLE_PAD;
+        if (bw < title_w) bw = title_w;
+        lv_obj_set_width(bubble, bw);
+    }
     lv_obj_set_height(bubble, LV_SIZE_CONTENT);
     lv_obj_set_style_radius(bubble, LVGL_UI_BUBBLE_RADIUS, 0);
     lv_obj_set_style_pad_all(bubble, LVGL_UI_BUBBLE_PAD, 0);
@@ -1886,12 +1890,10 @@ static void chat_view_add_message(const char* text, bool is_user,
         lv_label_set_text(lbl, slot->text);
         UITRACE(16);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-        /* Cap the label so a long user line wraps (the content-sized bubble then
-         * hugs the wrapped text) while a short message stays a compact chip.
-         * Max = 85% of the chat column content width minus the bubble padding,
-         * keeping the wrapped bubble inside the round face. */
-        int32_t list_cw = lv_obj_get_content_width(s_state.chat_list);
-        int32_t lbl_max = (list_cw * 85) / 100 - 2 * LVGL_UI_BUBBLE_PAD;
+        /* Cap the label so a long user line wraps at 80% of the screen width
+         * (the content-sized bubble then hugs the wrapped text) while a short
+         * message stays a compact chip. */
+        int32_t lbl_max = bubble_max - 2 * LVGL_UI_BUBBLE_PAD;
         if (lbl_max < 40) lbl_max = 40;
         lv_obj_set_style_max_width(lbl, lbl_max, 0);
         UITRACE(17);
@@ -2204,7 +2206,7 @@ static void notice_screen_build(void)
 
     bool round_panel = (disp_w == 240 && disp_h == 296);
     int32_t round_d = round_panel ? 224 : ((disp_w < disp_h) ? disp_w : disp_h);
-    card_w = (round_d * 82) / 100;
+    card_w = round_panel ? (disp_w * 90) / 100 : (round_d * 90) / 100;
     if (card_w < 160) card_w = 160;
 
     s_state.notice_screen = lv_obj_create(NULL);
@@ -2214,17 +2216,19 @@ static void notice_screen_build(void)
     }
     lv_obj_set_style_bg_color(s_state.notice_screen, lv_color_hex(UI_PAL_BG), 0);
     lv_obj_set_style_bg_opa(s_state.notice_screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_font(s_state.notice_screen, &lv_font_misans_16_cjk, 0);
+    lv_obj_set_style_text_font(s_state.notice_screen, &lv_font_misans_12_cjk, 0);
 
     /* The card itself carries the colored left bar (4 px left border), the same
      * status-bar cue the chat cards use.  The color is swapped per notice. */
     card = lv_obj_create(s_state.notice_screen);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    /* Scrollable on purpose: max_height below caps the card, so a long body
+     * must be reachable by scrolling instead of being clipped. */
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(card, card_w);
     lv_obj_set_height(card, LV_SIZE_CONTENT);
     lv_obj_center(card);
     lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(UI_PAL_CARD), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(card, 4, 0);
@@ -2239,28 +2243,32 @@ static void notice_screen_build(void)
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(card, 6, 0);
-    /* Cap the card so a very long summary scrolls inside it instead of pushing
-     * it past the round face — the old LV_SIZE_CONTENT card grew taller than
-     * the panel and clipped the tail of the text below the screen edge. */
-    lv_obj_set_style_max_height(card, disp_h - 16, 0);
+    /* Cap the card inside the panel with a 6 px gutter top and bottom.  The
+     * old `disp_h - 16` (=280) is fine on the 240x296 rectangle; the earlier
+     * round-face cap (224 - 16) was reverted together with the chat column —
+     * see the gutter comment in lvgl_ui_channel_init(). */
+    lv_obj_set_style_max_height(card, disp_h - 12, 0);
     s_state.notice_bar = card;
 
     title = lv_label_create(card);
     lv_label_set_text(title, "");
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(title, card_w - 2 * 14 - 4);
+    lv_obj_set_width(title, card_w - 2 * 10 - 4);
     lv_obj_set_style_text_color(title, lv_color_hex(UI_PAL_INK), 0);
     s_state.notice_title = title;
 
     body = lv_label_create(card);
     lv_label_set_text(body, "");
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(body, card_w - 2 * 14 - 4);
-    /* The body is the one element that can be arbitrarily long: let it shrink
-     * (min height 0) and scroll inside the bounded card rather than overflowing. */
-    lv_obj_set_flex_grow(body, 1);
-    lv_obj_set_style_min_height(body, 0, 0);
-    lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(body, card_w - 2 * 10 - 4);
+    /* The body is the one element that can be arbitrarily long.  It used to
+     * carry flex_grow(1) + min_height(0) + SCROLLABLE inside a
+     * LV_SIZE_CONTENT card, and LVGL cannot resolve a growing child against
+     * an auto-sized main axis: the label collapsed to zero height and the
+     * notice body never appeared (only the title did).  Derive the height
+     * from the wrapped text instead; the card's max_height still bounds the
+     * worst case and the card itself scrolls if it ever overflows. */
+    lv_obj_set_height(body, LV_SIZE_CONTENT);
     lv_obj_set_style_text_color(body, lv_color_hex(UI_PAL_MUTED), 0);
     s_state.notice_body = body;
 
@@ -2333,13 +2341,15 @@ static void notice_timeout_cb(lv_timer_t* t)
 /* Hold time scales with how much there is to read: a fixed window makes a
  * one-line Gerrit change linger long past the point of usefulness while a long
  * Jira summary gets yanked away mid-sentence.  ~60ms per UTF-8 byte ≈ 180ms per
- * CJK char (a slow skim), floored at LVGL_UI_NOTICE_MS and capped at 30s. */
+ * CJK char (a slow skim), floored at LVGL_UI_NOTICE_MS (15 s — 10 s was measured
+ * as too short to read a summary) and capped at 45 s.  Any key closes it early,
+ * so the long tail costs nothing when the user already read it. */
 static uint32_t notice_duration_ms(const char* title, const char* body)
 {
     size_t n = (title ? strlen(title) : 0) + (body ? strlen(body) : 0);
     uint32_t ms = 5000 + (uint32_t)(n * 60);
     if (ms < LVGL_UI_NOTICE_MS) ms = LVGL_UI_NOTICE_MS;
-    if (ms > 30000) ms = 30000;
+    if (ms > 45000) ms = 45000;
     return ms;
 }
 
@@ -2571,8 +2581,12 @@ int lvgl_ui_channel_scroll(int dir)
      * wake the pet home screen instead. */
     if (!s_state.screen_visible) {
         if (s_state.history.count == 0) {
+            syslog(LOG_INFO, "[%s] scroll: empty transcript, staying on pet\n",
+                   TAG);
             return 0;
         }
+        syslog(LOG_INFO, "[%s] scroll: pet → chat (%d msgs)\n", TAG,
+               s_state.history.count);
         lvgl_ui_channel_show();
     }
 

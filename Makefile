@@ -173,7 +173,7 @@ CSRCS += src/ui/qrcode_display.c
 ifeq ($(CONFIG_AI_AGENT_LVGL_UI),y)
 CSRCS += src/ui/lvgl_ui_channel.c
 CSRCS += src/ui/lvgl_toast.c
-CSRCS += src/ui/lv_font_misans_16_cjk.c
+CSRCS += src/ui/lv_font_misans_12_cjk.c
 endif
 
 ifeq ($(CONFIG_AI_AGENT_TEST),y)
