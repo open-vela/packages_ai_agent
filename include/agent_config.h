@@ -452,15 +452,29 @@
 #define AGENT_CFG_KEY_VOLC_PITCH   "volc_pitch"
 
 /* Default TTS speaker and cluster (seed-tts-2.0 voice: *_uranus_bigtts) */
-#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_m191_uranus_bigtts"
+/* seed-tts-2.0 该账号实测可用的 20 个音色见 set_volc_speaker(2026-11-10 逐个
+ * 拉样音确认)。用户先选 vv(反馈"刺耳/不喜欢")→ sophie(更沉温和、齿音少)
+ * → 最终 2026-11-10 敲定 zh_male_liufei(低沉男声,基频 ~118Hz)。备选女声:
+ * gaolengyujie / shuangkuaisisi / xiaohe / cancan。 */
+#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_liufei_uranus_bigtts"
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
-/* TTS 音质默认值。1.0 是引擎默认(此时不把字段写进请求体,请求与旧版逐字节
- * 相同);用户可用 set_volc_voice 覆盖。音量/音调出厂默认不再是 1.0:实机反馈
- * "音量小、音调偏高",而 /data 是 tmpfs 重启即丢,靠手工 set_volc_voice 每次
- * 重发不现实,故把默认直接落到音量 +50%、音调 -10%。set_volc_voice 仍可覆盖。 */
-#define AGENT_VOICE_DEFAULT_RATIO  "1.0"   /* speed 及"引擎默认"哨兵 */
-#define AGENT_VOICE_DEFAULT_VOLUME "1.5"   /* 音量小 → +50% */
-#define AGENT_VOICE_DEFAULT_PITCH  "0.9"   /* 音调偏高 → -10% */
+/* TTS 音质默认值(浮点比例语义,1.0 = 引擎原速/原音量)。
+ *
+ * 注意:实际 TTS 走 v3(/api/v3/tts/unidirectional, seed-tts-2.0),请求体里
+ * 只认整数 speech_rate / loudness_rate(-50..100),由这里的 speed/volume 换算
+ * 而来(见 volc_tts.c 的 tts_ratio_to_rate)。v1 的 speed_ratio/volume_ratio
+ * 浮点字段在 v3 上会被静默忽略。
+ *
+ * 音色对齐参考样音(/tmp/tts_voices2/*.wav,按引擎默认 speech_rate=0 /
+ * loudness_rate=0 生成)。早先默认 speed 0.5(半速,整句时长翻倍、听感与
+ * 样音"对不上"),2026-11-10 改回 speed/volume/pitch 全 1.0 对齐样音。
+ * pitch 在 v3 seed-tts-2.0 上无对应字段(pitch_ratio 照发被静默忽略),想改
+ * 音色只能换 AGENT_VOICE_DEFAULT_SPEAKER。
+ * /data 是 tmpfs,set_volc_voice 只在本次开机有效,故默认值落在代码里。 */
+#define AGENT_VOICE_DEFAULT_RATIO  "1.0"   /* 引擎默认,也是"省略该字段"的哨兵 */
+#define AGENT_VOICE_DEFAULT_SPEED  "1.0"   /* 2026-11-10 用户改回 1 倍速 */
+#define AGENT_VOICE_DEFAULT_VOLUME "1.0"   /* 对齐样音:引擎原音量 */
+#define AGENT_VOICE_DEFAULT_PITCH  "1.0"   /* v3 忽略,对齐样音 */
 
 /* WebSocket TTS output sample rate (big-model voices output 24kHz) */
 #define AGENT_TTS_WS_SAMPLE_RATE 24000

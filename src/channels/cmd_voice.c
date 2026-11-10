@@ -21,6 +21,7 @@
 #include "voice/voice_asr.h"
 #include "voice/voice_channel.h"
 #include "voice/voice_tts.h"
+#include "voice/volc_tts.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,8 +65,9 @@ void cmd_set_volc_voice(int argc, char** argv)
     if (argc < 2) {
         printf("Usage: set_volc_voice <speed> [volume] [pitch]\n");
         printf("  值 1.0 = 引擎默认;范围约 0.5~2.0。\n");
-        printf("  出厂默认: speed=1.0 volume=1.5(音量偏小→+50%%) pitch=0.9(音调偏高→-10%%)\n");
-        printf("  例: set_volc_voice 0.9 1.0 1.0  (放慢语速)\n");
+        printf("  出厂默认: speed=0.5(语速偏快→-50%%) volume=1.3(响度偏小→+30%%)"
+               " pitch=0.8(v3 无此字段,不生效)\n");
+        printf("  例: set_volc_voice 0.5 1.3 0.8  (恢复出厂默认)\n");
         return;
     }
     claw_config_set(AGENT_CFG_KEY_VOLC_SPEED, argv[1]);
@@ -78,6 +80,12 @@ void cmd_set_volc_voice(int argc, char** argv)
         claw_config_set(AGENT_CFG_KEY_VOLC_PITCH, argv[3]);
         printf("TTS pitch=%s\n", argv[3]);
     }
+
+    /* The backend caches the knobs at registration; apply them now so the
+     * next speak uses the new values (config lives on tmpfs and would be
+     * lost on reboot, so waiting for one is not an option). */
+    volc_tts_reload_ratios();
+    printf("Applied (see [volc_tts] ratios reloaded log for effective values)\n");
 }
 
 void cmd_voice_start(void)

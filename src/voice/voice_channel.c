@@ -598,7 +598,19 @@ static void* asr_and_dispatch(void* arg)
 
 static struct timespec s_tts_start;
 static int s_tts_first_chunk;
+static int s_tts_chunks;
+static long s_tts_last_chunk_ms;
+static size_t s_tts_bytes;
 static struct timespec s_asr_done_ts;
+
+static long tts_ms_since_start(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - s_tts_start.tv_sec) * 1000
+        + (now.tv_nsec - s_tts_start.tv_nsec) / 1000000;
+}
 
 static void tts_stream_cb(const unsigned char* pcm_data,
     size_t pcm_len, int is_last, void* user_data)
@@ -611,16 +623,47 @@ static void tts_stream_cb(const unsigned char* pcm_data,
     }
 
     if (pcm_data && pcm_len > 0 && pb) {
+        long recv_ms = tts_ms_since_start();
+
         if (!s_tts_first_chunk) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long ms = (now.tv_sec - s_tts_start.tv_sec) * 1000
-                + (now.tv_nsec - s_tts_start.tv_nsec) / 1000000;
             syslog(LOG_INFO, "[%s] TTS first chunk: %ldms\n",
-                TAG, ms);
+                TAG, recv_ms);
             s_tts_first_chunk = 1;
         }
-        audio_playback_write(pb, pcm_data, pcm_len);
+        /* A dropped chunk is 0.7-0.8s of audio and used to disappear without
+         * a trace, which is indistinguishable from the speaker cutting out.
+         * The write duration tells the two apart: a write that blocks means
+         * the DMA queue is behind (audio still playing); one that returns at
+         * once means the queue ran dry and the card may already be silent. */
+        struct timespec w0, w1;
+
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        int wr = audio_playback_write(pb, pcm_data, pcm_len);
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+
+        long write_ms = (w1.tv_sec - w0.tv_sec) * 1000
+            + (w1.tv_nsec - w0.tv_nsec) / 1000000;
+
+        s_tts_chunks++;
+        s_tts_bytes += pcm_len;
+
+        /* The byte rate tells network starvation (few KB/s) apart from a
+         * playback-side stall: an utterance only plays smoothly while this
+         * stays at or above the PCM rate (32KB/s at 16k/16bit). */
+        syslog(LOG_INFO,
+            "[%s] tts chunk %d: +%ldms (gap %ldms) len=%zu write=%ldms "
+            "total=%zu (%ldB/s)\n",
+            TAG, s_tts_chunks, recv_ms,
+            s_tts_chunks > 1 ? recv_ms - s_tts_last_chunk_ms : 0,
+            pcm_len, write_ms, s_tts_bytes,
+            (long)(recv_ms > 0 ? (1000 * s_tts_bytes) / (long)recv_ms : 0));
+
+        if (wr < 0) {
+            syslog(LOG_ERR, "[%s] playback write failed: %d (chunk %zu bytes)\n",
+                TAG, wr, pcm_len);
+        }
+
+        s_tts_last_chunk_ms = recv_ms;
     }
 
     (void)is_last;
@@ -1051,7 +1094,13 @@ static void tts_strip_markdown(char* s)
  *
  * Segment ceiling: 180 UTF-8 bytes ≈ 60 CJK chars ≈ 12s of speech at the
  * ~4 chars/s rate, comfortably under the 512KB stream cap. */
-#define TTS_SEGMENT_MAX 180
+/* Largest slice of text sent as one synth request.  Each slice is a separate
+ * HTTPS request, and whatever the keep-alive pool can reuse still costs one
+ * round trip plus the engine's first-chunk latency; on a weak Wi-Fi link that
+ * is audible as a hole between sentences.  600 UTF-8 bytes (~200 hanzi) is
+ * well inside the engine's per-request limit and cuts the number of requests
+ * on a long reply by 3x compared with the old 180. */
+#define TTS_SEGMENT_MAX 600
 
 /* UTF-8 byte length of a sentence terminator at p (0 = not a terminator):
  * ASCII \n ! ?, or full-width 。！？； (3 bytes each). */
@@ -1260,6 +1309,9 @@ int voice_channel_speak(const char* text)
 
     clock_gettime(CLOCK_MONOTONIC, &s_tts_start);
     s_tts_first_chunk = 0;
+    s_tts_chunks = 0;
+    s_tts_last_chunk_ms = 0;
+    s_tts_bytes = 0;
 
     if (s_asr_done_ts.tv_sec > 0) {
         long llm_ms = (s_tts_start.tv_sec - s_asr_done_ts.tv_sec) * 1000
@@ -1311,6 +1363,11 @@ int voice_channel_speak(const char* text)
 
         *next = '\0';
         if (seg[0] != '\0') {
+            /* Segment boundaries are where a new TLS request (and, without a
+             * pooled connection, a handshake) starts; logging the split point
+             * makes an audible inter-sentence gap attributable. */
+            syslog(LOG_INFO, "[%s] TTS segment start +%ldms: \"%.*s\"\n",
+                TAG, tts_ms_since_start(), 40, seg);
             ret = voice_tts_speak_stream(seg, tts_stream_cb, pb);
         }
         *next = saved;

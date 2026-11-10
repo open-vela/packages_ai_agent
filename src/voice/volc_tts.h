@@ -25,6 +25,11 @@ extern "C" {
 /* Register the Volcengine TTS backend with the voice_tts framework. */
 int volc_tts_register(void);
 
+/* Re-read speed/volume/pitch from the config store.  volc_tts_register()
+ * caches them once; call this after set_volc_voice so the next synthesis
+ * request uses the new values without restarting the agent. */
+void volc_tts_reload_ratios(void);
+
 /* Legacy direct-call API (kept for backward compatibility). */
 int volc_tts_synthesize_compat(const char *text,
                                const char *appid,
