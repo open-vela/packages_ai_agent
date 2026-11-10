@@ -330,6 +330,12 @@ void vela_tls_pool_cleanup(void)
 static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
 {
     int ret;
+    struct timespec t_start;
+
+    /* A setup on this SoC is normally 1-3s; when it is tens of seconds the
+     * cause is on the wire (name resolution or lost TCP segments), not the
+     * crypto.  The elapsed time below makes that call without a guess. */
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     mbedtls_ssl_init(&ctx->ssl);
     mbedtls_ssl_config_init(&ctx->cfg);
@@ -536,8 +542,17 @@ static int tls_ctx_connect(tls_ctx_t* ctx, const char* host, const char* port)
         }
     }
 
-    syslog(LOG_INFO, "[%s] Handshake OK: %s / %s\n", TAG, mbedtls_ssl_get_version(&ctx->ssl),
-        mbedtls_ssl_get_ciphersuite(&ctx->ssl));
+    {
+        struct timespec t_end;
+        long ms;
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        ms = (t_end.tv_sec - t_start.tv_sec) * 1000
+            + (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
+        syslog(LOG_INFO, "[%s] Handshake OK (%ldms): %s / %s\n", TAG, ms,
+            mbedtls_ssl_get_version(&ctx->ssl),
+            mbedtls_ssl_get_ciphersuite(&ctx->ssl));
+    }
 
     return 0;
 }
@@ -789,6 +804,508 @@ static int tls_read_response(tls_ctx_t* ctx, char* resp_buf, size_t resp_cap,
 
     if (out_body_len)
         *out_body_len = resp_pos;
+
+    return http_status;
+}
+
+/* ── Streaming body reader ───────────────────────────────────── */
+
+/* A byte-oriented reader over one TLS connection: it refills from the
+ * socket on demand so the chunked-transfer state machine below can be
+ * written as plain sequential reads. */
+typedef struct {
+    tls_ctx_t* ctx;
+    char* buf;
+    size_t len;
+    size_t pos;
+    int eof;
+    int err;
+    long long last_data_ms;  /* wall clock of the last byte received */
+} stream_reader_t;
+
+/* Give up only when the peer has sent nothing at all for this long.  A plain
+ * iteration counter is useless here: the socket is non-blocking, so
+ * mbedtls_ssl_read() returns WANT_READ immediately and a few thousand spins
+ * elapse in milliseconds — which aborted perfectly healthy synthesis gaps
+ * (2026-11-10: every third TTS segment died this way). */
+#define STREAM_IDLE_LIMIT_MS 30000
+
+static long long stream_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Make at least one byte available.  Returns 0 on success, -1 on EOF/error. */
+static int sr_fill(stream_reader_t* r)
+{
+    int ret;
+
+    while (r->pos >= r->len) {
+        if (r->eof) {
+            return -1;
+        }
+        ret = mbedtls_ssl_read(&r->ctx->ssl, (unsigned char*)r->buf,
+                               TLS_RAW_BUF_SIZE);
+        if (ret > 0) {
+            r->pos = 0;
+            r->len = (size_t)ret;
+            r->last_data_ms = stream_now_ms();
+            return 0;
+        }
+        if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            r->eof = 1;
+            return -1;
+        }
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ
+            || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (stream_now_ms() - r->last_data_ms > STREAM_IDLE_LIMIT_MS) {
+                syslog(LOG_ERR, "[%s] stream: no data for %dms, giving up\n",
+                       TAG, STREAM_IDLE_LIMIT_MS);
+                r->err = VELA_TLS_ERR_READ;
+                r->eof = 1;
+                return -1;
+            }
+            usleep(2000);  /* don't spin the CPU while the peer thinks */
+            continue;
+        }
+        syslog(LOG_ERR, "[%s] ssl_read (stream) ret=0x%x\n", TAG, -ret);
+        r->err = VELA_TLS_ERR_READ;
+        r->eof = 1;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int sr_byte(stream_reader_t* r, char* out)
+{
+    if (sr_fill(r) != 0) {
+        return -1;
+    }
+    *out = r->buf[r->pos++];
+    return 0;
+}
+
+/* Hand every complete '\n'-terminated line to the callback.
+ *
+ * A line larger than the buffer drops *that line only* and resynchronises on
+ * the next newline: losing one chunk of audio is a click in the output,
+ * whereas aborting the transfer silences the rest of the utterance. */
+static int stream_feed_lines(char* acc, size_t* acc_len, size_t acc_cap,
+    int* discarding, const char* data, size_t len,
+    vela_stream_line_cb cb, void* user)
+{
+    size_t off = 0;
+
+    while (off < len) {
+        if (*discarding) {
+            const char* skip = (const char*)memchr(data + off, '\n',
+                                                   len - off);
+
+            if (!skip) {
+                return 0;  /* still discarding this oversized line */
+            }
+            off = (size_t)(skip - data) + 1;
+            *discarding = 0;
+            continue;
+        }
+
+        const char* nl = (const char*)memchr(data + off, '\n', len - off);
+        size_t take = nl ? (size_t)(nl - (data + off)) + 1 : len - off;
+
+        if (*acc_len + take > acc_cap - 1) {
+            syslog(LOG_WARNING, "[%s] stream: dropping line over %zu bytes\n",
+                   TAG, acc_cap);
+            *acc_len = 0;
+            *discarding = 1;
+            continue;
+        }
+
+        memcpy(acc + *acc_len, data + off, take);
+        *acc_len += take;
+        off += take;
+
+        if (nl) {
+            size_t l = *acc_len;
+
+            while (l > 0 && (acc[l - 1] == '\n' || acc[l - 1] == '\r')) {
+                l--;
+            }
+            acc[l] = '\0';
+
+            int rc = cb(acc, l, user);
+
+            *acc_len = 0;
+            if (rc != 0) {
+                return VELA_TLS_ERR_READ;  /* callback asked to stop */
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* Read the HTTP response header block into raw[0..*len).  Returns 0 once the
+ * blank line that ends the block is buffered, or a VELA_TLS_ERR_* code.  A
+ * pooled keep-alive link that was silently dropped by the peer looks exactly
+ * like a quiet server here, so the caller may reconnect and call this again
+ * while *len is still 0. */
+static int stream_read_headers(mbedtls_ssl_context* ssl, char* raw,
+    size_t* len)
+{
+    int ret;
+
+    for (;;) {
+        ret = mbedtls_ssl_read(ssl, (unsigned char*)(raw + *len),
+                               TLS_RAW_BUF_SIZE - 1 - *len);
+
+        if (ret > 0) {
+            *len += (size_t)ret;
+            if (memmem(raw, *len, "\r\n\r\n", 4)) {
+                return 0;
+            }
+            if (*len >= TLS_RAW_BUF_SIZE - 1) {
+                syslog(LOG_ERR, "[%s] stream: header block too large\n", TAG);
+                return VELA_TLS_ERR_OVERFLOW;
+            }
+        } else if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            return VELA_TLS_ERR_READ;
+        } else if (ret != MBEDTLS_ERR_SSL_WANT_READ
+                   && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            syslog(LOG_ERR, "[%s] ssl_read (header) ret=0x%x\n", TAG, -ret);
+            return VELA_TLS_ERR_READ;
+        }
+    }
+}
+
+int vela_https_request_stream(const char* host, const char* port,
+    const char* method, const char* path,
+    const vela_header_t* headers,
+    const char* body, size_t body_len,
+    vela_stream_line_cb cb, void* user)
+{
+    enum { ST_SIZE = 0, ST_DATA, ST_CRLF };
+    conn_slot_t* slot;
+    stream_reader_t r;
+    char* raw = NULL;
+    char* acc = NULL;
+    char szline[24];
+    size_t szlen = 0;
+    size_t acc_len = 0;
+    long chunk_left = 0;
+    long content_left = -1;
+    int chunked = 0;
+    int state = ST_SIZE;
+    int discarding = 0;
+    int complete = 0;   /* body consumed to its framing end -> poolable */
+    int no_reuse = 0;   /* peer asked for Connection: close           */
+    int saw_final = 0;  /* chunked body terminated by the 0 chunk     */
+    int http_status = 0;
+    int ret;
+    int err = 0;
+
+    if (!cb) {
+        return VELA_TLS_ERR_READ;
+    }
+
+    slot = pool_acquire(host, port);
+
+    if (!slot) {
+        return VELA_TLS_ERR_CONNECT;
+    }
+
+    /* Reuse a pooled connection when one is available.  A cold TLS handshake
+     * costs ~1-3s on this SoC; streaming callers (TTS) issue one request per
+     * sentence, so paying it every time leaves audible silence at each
+     * boundary.  A connection is only pooled again when its body was consumed
+     * to the last byte (see `complete` below), but the tail of a chunked body
+     * (the CRLF after the final chunk) is left unread, so drain it first. */
+    int reused = 0;
+
+    if (slot->valid) {
+        int stale = (slot->ctx.net.fd < 0);
+
+        if (!stale) {
+            unsigned char drain[512];
+            struct timeval tv_drain = { .tv_sec = 0, .tv_usec = 10000 };
+            struct timeval tv_orig = { .tv_sec = AGENT_LLM_SOCKET_TIMEOUT_SEC,
+                                       .tv_usec = 0 };
+            int dr;
+
+            setsockopt(slot->ctx.net.fd, SOL_SOCKET, SO_RCVTIMEO,
+                &tv_drain, sizeof(tv_drain));
+            while ((dr = mbedtls_ssl_read(&slot->ctx.ssl, drain,
+                        sizeof(drain))) > 0) {
+                /* discard the leftover tail of the previous response */
+            }
+            setsockopt(slot->ctx.net.fd, SOL_SOCKET, SO_RCVTIMEO,
+                &tv_orig, sizeof(tv_orig));
+
+            if (dr == 0 || dr == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                stale = 1;  /* idle keep-alive the peer has since closed */
+            }
+        }
+
+        if (stale) {
+            tls_ctx_free(&slot->ctx);
+            slot->valid = false;
+        } else {
+            reused = 1;  /* tls_ctx_connect must not re-init a live ctx */
+        }
+    }
+
+    if (!reused && (ret = tls_ctx_connect(&slot->ctx, host, port)) != 0) {
+        pool_release(slot, host, port, false);
+        return ret;
+    }
+
+    ret = tls_write_request(&slot->ctx, method, host, path,
+             headers, body, body_len);
+
+    if (ret != 0 && reused) {
+        /* The pooled connection died between the drain and the write. */
+        syslog(LOG_WARNING,
+            "[%s] stream: pooled connection stale (%d), reconnecting\n",
+            TAG, ret);
+        tls_ctx_free(&slot->ctx);
+        slot->valid = false;
+
+        if ((ret = tls_ctx_connect(&slot->ctx, host, port)) == 0) {
+            ret = tls_write_request(&slot->ctx, method, host, path,
+                     headers, body, body_len);
+        }
+    }
+
+    if (ret != 0) {
+        syslog(LOG_ERR, "[%s] stream: write request failed: %d\n", TAG, ret);
+        pool_release(slot, host, port, false);
+        return ret;
+    }
+
+    /* Private read buffer: the shared tls_raw_* pool must not be held for
+     * the whole duration of a streaming body, or concurrent requests block. */
+    raw = malloc(TLS_RAW_BUF_SIZE);
+    acc = malloc(VELA_TLS_STREAM_LINE_MAX);
+
+    if (!raw || !acc) {
+        err = VELA_TLS_ERR_OVERFLOW;
+        goto out;
+    }
+
+    r.ctx = &slot->ctx;
+    r.buf = raw;
+    r.len = 0;
+    r.pos = 0;
+    r.eof = 0;
+    r.err = 0;
+    r.last_data_ms = stream_now_ms();
+
+    /* Read the header block first so we can see the status line and the
+     * framing (chunked vs content-length) before streaming the body.  A
+     * reused keep-alive link can have been dropped silently while idle; the
+     * header read then stalls until the socket timeout.  Nothing has been
+     * consumed yet, so one reconnect + retry is free and saves the caller a
+     * 120s stall. */
+    err = stream_read_headers(&r.ctx->ssl, raw, &r.len);
+
+    if (err != 0 && reused) {
+        syslog(LOG_WARNING,
+            "[%s] stream: pooled link dead (%d), reconnecting\n", TAG, err);
+        tls_ctx_free(&slot->ctx);
+        slot->valid = false;
+        reused = 0;
+        r.len = 0;
+
+        if (tls_ctx_connect(&slot->ctx, host, port) == 0
+            && tls_write_request(&slot->ctx, method, host, path,
+                   headers, body, body_len) == 0) {
+            err = stream_read_headers(&r.ctx->ssl, raw, &r.len);
+        } else {
+            err = VELA_TLS_ERR_CONNECT;
+        }
+    }
+
+    if (err != 0) {
+        goto out;
+    }
+
+    syslog(LOG_INFO, "[%s] stream: connection %s\n",
+        TAG, reused ? "reused" : "new");
+
+    raw[r.len] = '\0';
+
+    if (sscanf(raw, "HTTP/1.%*d %d", &http_status) != 1) {
+        syslog(LOG_ERR, "[%s] stream: bad status line: %.40s\n", TAG, raw);
+        err = VELA_TLS_ERR_READ;
+        goto out;
+    }
+
+    {
+        char* body_start = (char*)memmem(raw, r.len, "\r\n\r\n", 4);
+
+        if (!body_start) {
+            err = VELA_TLS_ERR_READ;
+            goto out;
+        }
+
+        char* te_hdr = strcasestr(raw, "Transfer-Encoding:");
+
+        if (te_hdr && te_hdr < body_start) {
+            chunked = (strcasestr(te_hdr, "chunked") != NULL);
+        }
+
+        char* cl_hdr = strcasestr(raw, "Content-Length:");
+
+        if (!chunked && cl_hdr && cl_hdr < body_start) {
+            cl_hdr += strlen("Content-Length:");
+            content_left = strtol(cl_hdr, NULL, 10);
+            if (content_left < 0 || content_left > 64L * 1024 * 1024) {
+                content_left = -1;
+            }
+        }
+
+        {
+            char* conn_hdr = strcasestr(raw, "Connection:");
+
+            if (conn_hdr && conn_hdr < body_start
+                && strcasestr(conn_hdr, "close") != NULL) {
+                no_reuse = 1;
+            }
+        }
+
+        body_start += 4;
+        r.pos = (size_t)(body_start - raw);
+    }
+    if (!chunked) {
+        /* Content-Length or read-to-EOF framing. */
+        while (content_left != 0) {
+            size_t avail;
+            size_t take;
+            int rc;
+
+            if (sr_fill(&r) != 0) {
+                break;
+            }
+
+            avail = r.len - r.pos;
+            take = avail;
+            if (content_left > 0 && (long)take > content_left) {
+                take = (size_t)content_left;
+            }
+
+            rc = stream_feed_lines(acc, &acc_len, VELA_TLS_STREAM_LINE_MAX,
+                                   &discarding, r.buf + r.pos, take, cb, user);
+            r.pos += take;
+            if (content_left > 0) {
+                content_left -= (long)take;
+            }
+            if (rc != 0) {
+                err = rc;
+                goto out;
+            }
+        }
+
+        if (err == 0 && content_left == 0) {
+            complete = 1;
+        }
+    } else {
+        /* chunked: <hex-size>CRLF <data>CRLF ... 0CRLF CRLF */
+        for (;;) {
+            if (state == ST_SIZE) {
+                char c;
+
+                if (sr_byte(&r, &c) != 0) {
+                    break;
+                }
+                if (c == '\n') {
+                    szline[szlen] = '\0';
+                    chunk_left = strtol(szline, NULL, 16);
+                    szlen = 0;
+                    if (chunk_left <= 0) {
+                        saw_final = 1;
+                        break;  /* final chunk */
+                    }
+                    state = ST_DATA;
+                } else if (c != '\r' && c != ' ') {
+                    if (szlen + 1 >= sizeof(szline)) {
+                        syslog(LOG_ERR, "[%s] stream: bad chunk header\n", TAG);
+                        err = VELA_TLS_ERR_READ;
+                        break;
+                    }
+                    szline[szlen++] = c;
+                }
+            } else if (state == ST_DATA) {
+                size_t avail;
+                size_t take;
+                int rc;
+
+                if (sr_fill(&r) != 0) {
+                    break;
+                }
+
+                avail = r.len - r.pos;
+                take = (size_t)chunk_left < avail ? (size_t)chunk_left : avail;
+
+                rc = stream_feed_lines(acc, &acc_len, VELA_TLS_STREAM_LINE_MAX,
+                                       &discarding, r.buf + r.pos, take, cb, user);
+                r.pos += take;
+                chunk_left -= (long)take;
+                if (rc != 0) {
+                    err = rc;
+                    break;
+                }
+                if (chunk_left == 0) {
+                    state = ST_CRLF;
+                }
+            } else {
+                char c;
+
+                if (sr_byte(&r, &c) != 0) {
+                    break;
+                }
+                if (c == '\n') {
+                    state = ST_SIZE;
+                    szlen = 0;
+                }
+            }
+        }
+
+        if (err == 0 && saw_final) {
+            complete = 1;
+        }
+    }
+
+    if (err == 0 && r.err != 0) {
+        err = r.err;
+    }
+
+    /* Flush a trailing line that arrived without a newline */
+    if (err == 0 && acc_len > 0) {
+        while (acc_len > 0
+               && (acc[acc_len - 1] == '\n' || acc[acc_len - 1] == '\r')) {
+            acc_len--;
+        }
+        acc[acc_len] = '\0';
+        if (cb(acc, acc_len, user) != 0) {
+            err = VELA_TLS_ERR_READ;
+        }
+    }
+
+out:
+    free(raw);
+    free(acc);
+    pool_release(slot, host, port,
+        err == 0 && complete && !no_reuse && http_status > 0);
+
+    if (err != 0) {
+        /* A non-2xx body is an error report: the caller needs the status
+         * code far more than the read error that the callback's abort (or
+         * the peer's early close) produced. */
+        return (http_status >= 400) ? http_status : err;
+    }
 
     return http_status;
 }
