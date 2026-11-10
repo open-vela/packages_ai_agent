@@ -82,6 +82,7 @@ struct audio_playback {
     unsigned int nbuffers;
     unsigned int free_count;
     unsigned int buf_bytes;
+    unsigned int prefill_bufs;   /* queue depth required before START */
     int started;
 #endif
 
@@ -253,17 +254,20 @@ static int open_nuttx_playback(audio_playback_t* pb, const char* dev_path,
         info.buffer_size = 4096;
     }
 
-    if (info.nbuffers > PB_MAX_BUFS) {
-        info.nbuffers = PB_MAX_BUFS;
-    }
-    if (info.nbuffers == 0) {
-        info.nbuffers = 4;
-    }
+    /* Deepen the queue.  The chip feeds the DMA one buffer at a time and
+     * hands each back only after it has played, so this pool IS the jitter
+     * buffer between the network-fed producer and the card.  The chip
+     * reports 4 x 4KB (0.5s at 16k/16bit), which runs dry on any link
+     * hiccup and is heard as choppy, disconnected speech; ask the upper
+     * half for PB_MAX_BUFS x buffer_size (1s) and fall back to whatever the
+     * heap can still give. */
+    unsigned int nb = PB_MAX_BUFS;
+
     if (info.buffer_size == 0) {
         info.buffer_size = 4096;
     }
 
-    for (i = 0; i < (unsigned int)info.nbuffers; i++) {
+    for (i = 0; i < nb; i++) {
         struct ap_buffer_s* apb = NULL;
 
         memset(&buf_desc, 0, sizeof(buf_desc));
@@ -271,6 +275,12 @@ static int open_nuttx_playback(audio_playback_t* pb, const char* dev_path,
         buf_desc.u.pbuffer = &apb;
         ret = ioctl(fd, AUDIOIOC_ALLOCBUFFER, (unsigned long)&buf_desc);
         if (ret < 0 || apb == NULL) {
+            /* Two buffers is the floor: one in flight, one being filled. */
+            if (i >= 2) {
+                nb = i;
+                break;
+            }
+
             syslog(LOG_ERR, "[%s] AUDIOIOC_ALLOCBUFFER failed: %d\n",
                 TAG, ret);
             while (i > 0) {
@@ -290,10 +300,16 @@ static int open_nuttx_playback(audio_playback_t* pb, const char* dev_path,
     }
 
     pb->fd             = fd;
-    pb->nbuffers       = (unsigned int)info.nbuffers;
-    pb->free_count     = pb->nbuffers;
+    pb->nbuffers       = nb;
+    pb->free_count     = nb;
     pb->buf_bytes      = (unsigned int)info.buffer_size;
     pb->started        = 0;
+
+    /* Do not start the card on the first buffer: hold it until a few
+     * buffers (~0.4s) are queued so a bursty producer cannot open with an
+     * immediate underrun.  nuttx_close() starts a clip that never reached
+     * the threshold, so short cues (beep) still play. */
+    pb->prefill_bufs   = (nb >= 4) ? 3 : 2;
     pb->bytes_per_frame = (int)((bits_per_sample / 8) * channels);
 
     syslog(LOG_INFO,
@@ -358,6 +374,20 @@ static struct ap_buffer_s* nuttx_get_free_buffer(audio_playback_t* pb)
     }
 }
 
+/* Release the queued buffers to the DMA engine. */
+static int nuttx_start(audio_playback_t* pb)
+{
+    int ret = ioctl(pb->fd, AUDIOIOC_START, 0);
+
+    if (ret < 0) {
+        syslog(LOG_ERR, "[%s] AUDIOIOC_START failed: %d\n", TAG, ret);
+        return ret;
+    }
+
+    pb->started = 1;
+    return 0;
+}
+
 static int nuttx_write(audio_playback_t* pb, const void* buf, size_t len)
 {
     const uint8_t* src = (const uint8_t*)buf;
@@ -390,13 +420,12 @@ static int nuttx_write(audio_playback_t* pb, const void* buf, size_t len)
             return ret;
         }
 
-        if (!pb->started) {
-            ret = ioctl(pb->fd, AUDIOIOC_START, 0);
+        if (!pb->started
+            && (pb->nbuffers - pb->free_count) >= pb->prefill_bufs) {
+            ret = nuttx_start(pb);
             if (ret < 0) {
-                syslog(LOG_ERR, "[%s] AUDIOIOC_START failed: %d\n", TAG, ret);
                 return ret;
             }
-            pb->started = 1;
         }
 
         src += chunk;
@@ -436,7 +465,13 @@ static void nuttx_close(audio_playback_t* pb)
 {
     unsigned int i;
 
-    /* Let enqueued audio finish playing before stopping (unless aborted). */
+    /* Let enqueued audio finish playing before stopping (unless aborted).
+     * A clip too short to reach the prefill threshold was never started;
+     * start it now so the drain below plays it instead of discarding it. */
+    if (!pb->started && pb->free_count < pb->nbuffers) {
+        nuttx_start(pb);
+    }
+
     nuttx_drain(pb, 5000);
 
     ioctl(pb->fd, AUDIOIOC_STOP, 0);
