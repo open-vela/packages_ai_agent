@@ -156,15 +156,28 @@ static void ptt_on_release(void)
   /* Blocks until ASR finalizes the stream.  Fine here — dedicated thread. */
   asr_text[0] = '\0';
   ret = voice_channel_stop_with_text(asr_text, sizeof(asr_text));
+
+  /* -ENODATA is not a link failure: the stream finalized fine and ASR simply
+   * heard no words.  volc_asr returns it when the final text is empty, so it
+   * must land in the same "user miss" bucket as the empty-text branch below —
+   * treating it as a red "ASR unavailable" card made a silent press look
+   * identical to a broken network (log: "stream: no text recognized" followed
+   * by rc=-61). */
+  if (ret == -ENODATA)
+    {
+      syslog(LOG_WARNING, "[%s] ASR produced no text (ENODATA)\n", TAG);
+      asr_text[0] = '\0';
+      ret = 0;
+    }
+
   if (ret != 0)
     {
       syslog(LOG_ERR, "[%s] voice_channel_stop_with_text failed rc=%d\n",
              TAG, ret);
       asr_failed = true;
 #if PTT_HAVE_UI
-      /* ASR cannot run without the network (or its credentials).  Show a
-       * red-bar card that says so; otherwise the screen simply drops back
-       * to the pet with no clue about what went wrong. */
+      /* Distinct from "no speech": a real transport/credential failure.  Red
+       * card + pet ERROR, so the user can tell "坏了" from "没说话". */
       (void)lvgl_ui_channel_send_ex(
           "语音识别不可用：请检查网络和语音识别配置。", 0xff5252);
 #endif
