@@ -136,6 +136,8 @@ typedef void (*remote_scroll_fn)(int dir, void *ctx); /* 0=older, 1=newer */
 typedef void (*remote_action_fn)(void *ctx);          /* model-next / new-session */
 typedef int  (*remote_wake_fn)(void *ctx);            /* 1 when it ate the press as a wake */
 typedef int  (*remote_dismiss_fn)(void *ctx);         /* 1 when it ate the press as a page dismiss */
+/* back: leave the transcript and return to the product's home screen.  It
+ * carries no channel semantics -- nothing in remote_ctrl changes state. */
 
 struct remote_input_ops_s
 {
@@ -149,7 +151,9 @@ struct remote_input_ops_s
    * context (idle keys scroll, approval keys decide) without reading session
    * state itself.  `dismiss` and `wake` are "consume or pass" gates the
    * adapter must try BEFORE the keymap: a notice page (5 s) or the standby
-   * clock owns the press and swallows it. */
+   * clock owns the press and swallows it.  `back` is the product's own
+   * "return home" intent (the keymap binds it to the S2+S3 combo from the
+   * idle map); remote_ctrl only forwards it to the UI. */
   int (*attach)(remote_decide_fn decide,
                 remote_pending_fn pending,
                 remote_scroll_fn scroll,
@@ -157,6 +161,7 @@ struct remote_input_ops_s
                 remote_action_fn session_new,
                 remote_dismiss_fn dismiss,
                 remote_wake_fn wake,
+                remote_action_fn back,
                 void *ctx);
   void (*detach)(void);
 };

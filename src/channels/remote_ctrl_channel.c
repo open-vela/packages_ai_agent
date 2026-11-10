@@ -688,6 +688,23 @@ static int remote_ctrl_dismiss_from_input(void *ctx)
 #endif
 }
 
+/* Back intent: leave the chat transcript and go home to the pet screen.  The
+ * chat screen owns the foreground until something asks it to leave, so
+ * without this the only way back is waiting out the standby timer.  set_page
+ * is the same entry point the `set_page 0` console command uses, which keeps
+ * CP (direct) and AP (RPMSG shim) builds on one path. */
+static void remote_ctrl_back_from_input(void *ctx)
+{
+    (void)ctx;
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    if (lvgl_ui_channel_set_page(0) != 0) {
+        printf("[key] back: pet page unavailable\n");
+    }
+#else
+    printf("[key] back (no UI)\n");
+#endif
+}
+
 int remote_ctrl_register_input(const struct remote_input_ops_s *ops)
 {
     if (ops == NULL || ops->attach == NULL) {
@@ -701,6 +718,7 @@ int remote_ctrl_register_input(const struct remote_input_ops_s *ops)
                        remote_ctrl_session_new_from_input,
                        remote_ctrl_dismiss_from_input,
                        remote_ctrl_wake_from_input,
+                       remote_ctrl_back_from_input,
                        NULL);
 }
 

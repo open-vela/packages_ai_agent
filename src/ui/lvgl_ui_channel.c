@@ -29,6 +29,7 @@
 #include "infra/network_manager.h"  /* network_is_connected — gate TTS */
 #include "agent_compat.h"
 #include "agent_config.h"
+#include "remote/remote_link.h"      /* REMOTE_TOOL_MAX / REMOTE_HINT_MAX */
 #include "voice/voice_channel.h"
 
 #include <errno.h>
@@ -1944,9 +1945,12 @@ static void chat_view_trim_history(void)
 
 #define LVGL_UI_SCROLL_STEP 120   /* px per short-press scroll tick */
 
+/* Sized to the wire contract in remote/remote_link.h (REMOTE_TOOL_MAX /
+ * REMOTE_HINT_MAX) so an approval that arrives over the link is shown in full
+ * instead of being cut twice: once by the RPMSG shim and again here. */
 typedef struct {
-    char tool[32];
-    char hint[128];
+    char tool[REMOTE_TOOL_MAX + 1];
+    char hint[REMOTE_HINT_MAX + 1];
 } async_approval_t;
 
 typedef struct {
@@ -1975,7 +1979,9 @@ static void approval_screen_build(void)
 
     bool round_panel = (disp_w == 240 && disp_h == 296);
     int32_t round_d = round_panel ? 224 : ((disp_w < disp_h) ? disp_w : disp_h);
-    int32_t card_w = (round_d * 82) / 100;   /* 82% of the face width */
+    /* 90% of the panel width on the 240x296 rectangle (was 90% of the Ø224
+     * inscribed circle = 201 px, which left a 20 px black frame each side). */
+    int32_t card_w = round_panel ? (disp_w * 90) / 100 : (round_d * 90) / 100;
     if (card_w < 160) card_w = 160;
 
     s_state.approval_screen = lv_obj_create(NULL);
@@ -1985,17 +1991,23 @@ static void approval_screen_build(void)
     }
     lv_obj_set_style_bg_color(s_state.approval_screen, lv_color_hex(UI_PAL_BG), 0);
     lv_obj_set_style_bg_opa(s_state.approval_screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_font(s_state.approval_screen, &lv_font_misans_16_cjk, 0);
+    lv_obj_set_style_text_font(s_state.approval_screen, &lv_font_misans_12_cjk, 0);
 
     /* White card centered on the panel (the round face is concentric with
      * the full panel, so lv_obj_center lands it on the face center). */
     lv_obj_t* card = lv_obj_create(s_state.approval_screen);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    /* Scrollable on purpose: max_height below caps the card, so a very long
+     * hint must be reachable by scrolling instead of being clipped. */
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(card, card_w);
     lv_obj_set_height(card, LV_SIZE_CONTENT);
     lv_obj_center(card);
     lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    /* Same bounded-card rule as the notice page: the hint can be up to
+     * REMOTE_HINT_MAX bytes, so cap the card inside the panel and let the
+     * hint scroll instead of pushing the button row off screen. */
+    lv_obj_set_style_max_height(card, disp_h - 12, 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(UI_PAL_CARD), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(UI_PAL_LINE), 0);
@@ -2024,7 +2036,16 @@ static void approval_screen_build(void)
     s_state.approval_hint = lv_label_create(card);
     lv_label_set_text(s_state.approval_hint, "");
     lv_label_set_long_mode(s_state.approval_hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_state.approval_hint, card_w - 2 * 14);
+    /* Card inner width: card_w minus pad_all(10) on both sides minus the 1 px
+     * border.  The old width ignored the border and overflowed by 2 px. */
+    lv_obj_set_width(s_state.approval_hint, card_w - 2 * 10 - 2);
+    /* Height is content-derived.  It used to carry flex_grow(1) +
+     * min_height(0) inside a LV_SIZE_CONTENT card: LVGL cannot resolve a
+     * growing child against an auto-sized main axis, so the label collapsed
+     * to zero height and the command/path was invisible on the panel (the
+     * tool name above it rendered fine).  Sizing from the wrapped text keeps
+     * it visible; the card's max_height still bounds the worst case. */
+    lv_obj_set_height(s_state.approval_hint, LV_SIZE_CONTENT);
     lv_obj_set_style_text_color(s_state.approval_hint, lv_color_hex(UI_PAL_MUTED), 0);
 
     /* Button row: two capsules mapping the two non-PTT keys to their approval
