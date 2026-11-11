@@ -33,11 +33,19 @@
  * UI方案.md §2.5 ("PTT=按下录音→松手触发 ASR；可挂 S1").  Button index,
  * long-press threshold, and devpath are Kconfig-tunable.
  *
- * The blocking voice_channel_stop_with_text() runs in this dedicated thread
- * (not the LVGL/agent thread), so the ASR finalize (~300-800ms TLS + stream)
- * never stalls rendering or the agent loop.  A local busy flag serializes
- * sessions: a second press during processing is ignored, mirroring the
- * on-screen ptt_btn_event_cb's is_processing guard.
+ * Two threads, on purpose:
+ *   - the watcher below owns /dev/btn0 and does NOTHING but read edges and
+ *     flip flags.  It must never block: everything it does is also the only
+ *     path that can observe the next press.
+ *   - a worker does the slow half of a release (voice_channel_stop_with_text
+ *     finalizes the ASR stream — seconds — and voice_channel_dispatch
+ *     publishes to the bridge).  Both used to run on the watcher, so for the
+ *     whole ASR window a press produced no event at all: the button read as
+ *     dead rather than busy (BNI: "second voice round never happens").
+ *
+ * A busy flag still serializes sessions — one utterance at a time — but a
+ * press that lands while busy is now logged and shown as a toast instead of
+ * being dropped without a trace, and the worker's exit always clears it.
  *
  * Only compiled under CONFIG_AI_AGENT_PTT, which depends on a UI channel
  * (LVGL_UI or UI_RPMSG) so the lvgl_ui_channel_* symbols resolve.
@@ -52,6 +60,7 @@
 #include <stdio.h>
 #include <poll.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <sys/ioctl.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -67,6 +76,15 @@
 #define PTT_HAVE_UI 1
 #else
 #define PTT_HAVE_UI 0
+#endif
+
+/* The toast only exists where LVGL is drawn locally (路 A/AP).  Under
+ * UI_RPMSG the CP renders and there is no AP-side toast to call. */
+#if defined(CONFIG_AI_AGENT_LVGL_UI)
+#include "ui/lvgl_toast.h"
+#define PTT_HAVE_TOAST 1
+#else
+#define PTT_HAVE_TOAST 0
 #endif
 
 #define TAG "ptt_button"
@@ -97,6 +115,18 @@ static bool g_ptt_recording = false;   /* between press and release */
 static bool g_ptt_busy = false;        /* processing a release (stop+ASR) */
 static pthread_mutex_t g_ptt_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Watcher → worker handoff.  A counting sem keeps one post per release, and
+ * the worker (unlike the watcher) is allowed to block for as long as the ASR
+ * finalize and the bridge publish take. */
+static sem_t g_release_sem;
+static bool g_release_worker = false;
+
+/* The worker runs the same code the watcher used to; give it room for the
+ * ASR text buffer plus the voice stack's own frames. */
+#ifndef PTT_WORKER_STACK
+#  define PTT_WORKER_STACK 6144
+#endif
+
 static inline int ptt_button_bit(void)
 {
   return (int)((btn_buttonset_t)1 << CONFIG_AI_AGENT_PTT_BUTTON_IDX);
@@ -109,8 +139,20 @@ static void ptt_on_press(void)
   pthread_mutex_lock(&g_ptt_lock);
   if (g_ptt_busy || g_ptt_recording)
     {
+      bool busy = g_ptt_busy;
+
       pthread_mutex_unlock(&g_ptt_lock);
-      return;  /* ignore re-press during an active session */
+
+      /* Not silent any more: a dropped press used to leave no trace at all,
+       * which is indistinguishable from a dead button. */
+      syslog(LOG_WARNING, "[%s] press ignored: %s\n", TAG,
+             busy ? "previous utterance still processing"
+                  : "already recording");
+#if PTT_HAVE_TOAST
+      (void)lvgl_toast_show_async("语音", "上一轮还在处理，请稍候再说",
+                                  0xffa31f, 2500);
+#endif
+      return;  /* one utterance at a time */
     }
   g_ptt_recording = true;
   pthread_mutex_unlock(&g_ptt_lock);
@@ -133,10 +175,6 @@ static void ptt_on_press(void)
 
 static void ptt_on_release(void)
 {
-  char asr_text[CONFIG_AI_AGENT_PTT_ASR_CAP];
-  int ret;
-  bool asr_failed = false;
-
   pthread_mutex_lock(&g_ptt_lock);
   if (!g_ptt_recording)
     {
@@ -153,7 +191,18 @@ static void ptt_on_release(void)
 #endif
   syslog(LOG_INFO, "[%s] PTT release → ASR\n", TAG);
 
-  /* Blocks until ASR finalizes the stream.  Fine here — dedicated thread. */
+  /* Hand the slow half to the worker and go straight back to the button.
+   * Doing it here would blind the watcher for the whole ASR round. */
+  sem_post(&g_release_sem);
+}
+
+/* Worker side of a release: finalize ASR, echo the utterance, dispatch. */
+static void ptt_process_release(void)
+{
+  char asr_text[CONFIG_AI_AGENT_PTT_ASR_CAP];
+  int ret;
+  bool asr_failed = false;
+
   asr_text[0] = '\0';
   ret = voice_channel_stop_with_text(asr_text, sizeof(asr_text));
 
@@ -223,6 +272,33 @@ done:
   if (asr_failed)
     (void)lvgl_ui_channel_set_pet_error("语音识别不可用\n请检查网络和凭据");
 #endif
+}
+
+/* One post per release; the loop keeps the last-idle-clear invariant even if
+ * a stop path returns early (its `done:` label is the only clear point). */
+static void* ptt_release_thread(void* arg)
+{
+  (void)arg;
+
+  for (;;)
+    {
+      if (sem_wait(&g_release_sem) != 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+          syslog(LOG_ERR, "[%s] release worker sem_wait: %d\n", TAG, errno);
+          break;
+        }
+
+      syslog(LOG_INFO, "[%s] processing release\n", TAG);
+      ptt_process_release();
+      syslog(LOG_INFO, "[%s] release done, ready for the next utterance\n",
+             TAG);
+    }
+
+  return NULL;
 }
 
 static void* ptt_button_thread(void* arg)
@@ -339,6 +415,38 @@ int ptt_button_start(void)
   if (g_ptt_running)
     {
       return 0;
+    }
+
+  if (!g_release_worker)
+    {
+      ret = sem_init(&g_release_sem, 0, 0);
+      if (ret != 0)
+        {
+          syslog(LOG_ERR, "[%s] sem_init: %d\n", TAG, errno);
+          return -errno;
+        }
+
+      ret = pthread_attr_init(&attr);
+      if (ret != 0)
+        {
+          syslog(LOG_ERR, "[%s] attr_init: %d\n", TAG, ret);
+          return -ret;
+        }
+      sp.sched_priority = CONFIG_AI_AGENT_PTT_PRIORITY;
+      (void)pthread_attr_setschedpolicy(&attr, SCHED_RR);
+      (void)pthread_attr_setschedparam(&attr, &sp);
+      (void)pthread_attr_setstacksize(&attr, PTT_WORKER_STACK);
+
+      ret = pthread_create(&tid, &attr, ptt_release_thread, NULL);
+      (void)pthread_attr_destroy(&attr);
+      if (ret != 0)
+        {
+          syslog(LOG_ERR, "[%s] release worker create: %d\n", TAG, ret);
+          return -ret;
+        }
+
+      pthread_detach(tid);
+      g_release_worker = true;
     }
 
   ret = pthread_attr_init(&attr);
