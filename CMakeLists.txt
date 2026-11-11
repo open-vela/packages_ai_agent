@@ -259,6 +259,14 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_INCDIRS ${ALSA_DIRECT_INC})
   endif()
 
+  # BK7258 AP: the Wi-Fi STA lives on the CP core, so `set_wifi` /
+  # `wifi_reconnect` reach it through the cross-core control plane in
+  # chips/bk7258/wlan_ctrl (wlan_ctrl_client.c is already compiled into the
+  # arch library; only the header path is needed here).
+  if(CONFIG_BK7258_COMPONENT_AP)
+    list(APPEND AGENT_INCDIRS ${CMAKE_SOURCE_DIR}/../vendor/beken/chips/bk7258/wlan_ctrl)
+  endif()
+
   nuttx_add_application(
     NAME
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_PROGNAME}

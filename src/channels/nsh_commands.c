@@ -47,6 +47,13 @@
 #include "tools/tool_registry.h"
 #include "tools/tool_web_search.h"
 #include "agent_compat.h"
+
+/* BK7258 AP: the Wi-Fi STA lives on the CP core, so re-associating from the
+ * agent means asking the cross-core control plane (chips/bk7258/wlan_ctrl). */
+#if defined(CONFIG_BK7258_COMPONENT_AP)
+#include "wlan_ctrl.h"
+#define AI_AGENT_WIFI_CTRL 1
+#endif
 #include "agent_config.h"
 
 #if AGENT_SKILL_SYNC_ENABLED
@@ -118,15 +125,15 @@ static void cmd_help(void)
         "  heap_info            - Show memory usage\n"
         "  set_proxy <host> <port> - Set HTTP proxy\n"
         "  clear_proxy          - Remove proxy config\n"
-        "  set_wifi <ssid> <pw> - Connect to WiFi (real hardware; saved for reboot)\n"
-        "  wifi_reconnect       - Re-join WiFi using saved credentials\n"
+        "  set_wifi <ssid> <pw> - Connect to WiFi and save credentials (survives reconnects)\n"
+        "  wifi_reconnect       - Re-join WiFi using saved credentials, no reflash\n"
         "  set_search_key <key> - Set SerpAPI (Google) key\n"
         "  set_exa_key <key>    - Set Exa AI search key\n"
         "  set_tavily_key <key> - Set Tavily search key\n"
         "  set_news_key <key>   - Set NewsAPI key\n"
         "  set_tavily_key <key> - Set Tavily AI search key\n"
         "  config_show          - Show current configuration\n"
-        "  sync_time            - Show clock, ensure network time sync (SNTP)\n"
+        "  sync_time            - Force an SNTP sync now, then show the clock\n"
         "  config_reset         - Clear all runtime config\n"
         "  ask <text>           - Chat with AI Agent\n"
         "  heartbeat_trigger    - Manually trigger heartbeat check\n"
@@ -385,30 +392,96 @@ static void cmd_clear_proxy(void)
     printf("Proxy cleared. Restart to apply.\n");
 }
 
+/* 等 CP 核那边把关联/DHCP 走完(dhcp 不在 AP 上跑),最多 secs 秒。 */
+static void wifi_wait_link(int secs)
+{
+    int i;
+
+    for (i = 0; i < secs && !network_is_connected(); i++) {
+        sleep(1);
+    }
+
+    printf("link   %s (%s)\n",
+        network_is_connected() ? "up" : "down", network_get_ip());
+}
+
+/* 保存 Wi-Fi 凭据并立即连接。
+ * 板上 AP 没有 netdev,STA 在 CP 核,所以走 chips/bk7258/wlan_ctrl 的跨核
+ * 控制面——和 nsh-ap> 的 `wapi connect` 是同一条路,但这里在 agent 里直接
+ * 调,不用退回 NSH。凭据同时存进配置库:掉线后 `wifi_reconnect` 靠它自救,
+ * 不重烧、不重启(AP 的 /data 是 tmpfs,重启会丢)。 */
 static void cmd_set_wifi(int argc, char** argv)
 {
+#if defined(AI_AGENT_WIFI_CTRL)
+    int ret;
+#else
+    int err;
+#endif
+
     if (argc < 3) {
         printf("Usage: set_wifi <ssid> <password>\n");
         return;
     }
+
     printf("Connecting to '%s' ...\n", argv[1]);
-    int err = network_wifi_connect(NULL, argv[1], argv[2]);
-    if (err == OK)
-        printf("WiFi connected: %s\n", network_get_ip());
-    else
+
+#if defined(AI_AGENT_WIFI_CTRL)
+    claw_config_set(AGENT_CFG_KEY_WIFI_SSID, argv[1]);
+    claw_config_set(AGENT_CFG_KEY_WIFI_PASS, argv[2]);
+
+    ret = wifi_ctrl_connect(argv[1], argv[2]);
+    if (ret < 0) {
+        printf("Wi-Fi connect request failed (%d); try `wapi scan`\n", ret);
+        return;
+    }
+#else
+    err = network_wifi_connect(NULL, argv[1], argv[2]);
+    if (err != OK) {
         printf("WiFi failed. Check SSID/password or run net_status.\n");
+        return;
+    }
+#endif
+
+    wifi_wait_link(20);
 }
 
+/* 用保存的凭据重新关联:掉网后一条命令恢复,不需要重烧或重启。 */
 static void cmd_wifi_reconnect(void)
 {
-    printf("Reconnecting WiFi ...\n");
+#if defined(AI_AGENT_WIFI_CTRL)
+    char ssid[WLAN_CTRL_SSID_LEN] = { 0 };
+    char pass[WLAN_CTRL_PASS_LEN] = { 0 };
+    int ret;
+
+    if (claw_config_get(AGENT_CFG_KEY_WIFI_SSID, ssid, sizeof(ssid)) != OK
+        || ssid[0] == '\0') {
+        printf("No saved credentials. Use: set_wifi <ssid> <pass>\n");
+        return;
+    }
+
+    (void)claw_config_get(AGENT_CFG_KEY_WIFI_PASS, pass, sizeof(pass));
+
+    printf("Reconnecting to '%s' ...\n", ssid);
+    (void)wifi_ctrl_disconnect();
+    sleep(1);
+
+    ret = wifi_ctrl_connect(ssid, pass);
+    if (ret < 0) {
+        printf("Wi-Fi reconnect failed (%d); check the AP is in range\n", ret);
+        return;
+    }
+
+    wifi_wait_link(20);
+#else
     int err = network_wifi_reconnect();
+
     if (err == OK)
         printf("Reconnected: %s\n", network_get_ip());
     else if (err == ERROR)
         printf("No saved credentials. Use: set_wifi <ssid> <pass>\n");
     else
         printf("WiFi reconnect failed.\n");
+#endif
 }
 
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
