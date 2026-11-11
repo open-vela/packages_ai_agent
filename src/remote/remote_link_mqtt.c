@@ -66,6 +66,11 @@ struct remote_mqtt_s {
  * makes that safe rather than racy. */
 #define REMOTE_MQTT_STOP_WAIT_S 2
 
+/* How long remote_link_mqtt_run() waits for a previous loop to release the
+ * transport before refusing to start. Long enough to cover a stalled send
+ * draining, short enough that a reconfigure still feels immediate. */
+#define REMOTE_MQTT_START_WAIT_S 20
+
 /* One remote session per device, so a single static instance avoids ~9 KiB of
  * heap churn across reconnects. Because the instance is shared, only one loop
  * may own it at a time — see g_loop_active. */
@@ -77,6 +82,27 @@ static volatile bool g_running;
 static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_state_cond = PTHREAD_COND_INITIALIZER;
 static bool g_loop_active;
+
+/* The socket the running loop is using, so stop() can shut it down instead of
+ * waiting for a send that may never return. Guarded by g_state_lock. */
+static int g_active_fd = -1;
+
+static void track_fd(int fd)
+{
+    pthread_mutex_lock(&g_state_lock);
+    g_active_fd = fd;
+    pthread_mutex_unlock(&g_state_lock);
+}
+
+static void untrack_fd_and_close(int fd)
+{
+    pthread_mutex_lock(&g_state_lock);
+    if (g_active_fd == fd) {
+        g_active_fd = -1;
+    }
+    pthread_mutex_unlock(&g_state_lock);
+    close(fd);
+}
 
 static void release_loop(void)
 {
@@ -281,15 +307,28 @@ int remote_link_mqtt_run(const struct remote_mqtt_config_s* config,
 
     /* Claim the shared transport before anything writes to it. copy_config()
      * targets g_mqtt, so without this even a rejected start would scribble on
-     * the config of a loop that is still running. */
+     * the config of a loop that is still running. A previous loop can still be
+     * on its way out (it was told to stop, or a stalled send just timed out),
+     * so wait for it instead of refusing: refusing left the device unable to
+     * reconnect at all until it was power-cycled. */
     pthread_mutex_lock(&g_state_lock);
-    if (g_loop_active) {
-        pthread_mutex_unlock(&g_state_lock);
-        syslog(LOG_WARNING,
-            "[%s] a transport loop is still active, not starting another\n", TAG);
-        return ERROR;
+    while (g_loop_active) {
+        struct timespec deadline;
+
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += REMOTE_MQTT_START_WAIT_S;
+        if (pthread_cond_timedwait(&g_state_cond, &g_state_lock, &deadline) == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_state_lock);
+            syslog(LOG_WARNING,
+                "[%s] a transport loop is still active, not starting another\n", TAG);
+            return ERROR;
+        }
     }
     g_loop_active = true;
+    /* Set while the claim is held: a stop() that lands between the wait and
+     * this assignment would otherwise be overwritten and the loop would run on
+     * after being told to stop. */
+    g_running = true;
     pthread_mutex_unlock(&g_state_lock);
 
     if (!copy_config(config, transport)) {
@@ -308,7 +347,6 @@ int remote_link_mqtt_run(const struct remote_mqtt_config_s* config,
     transport->session = session;
     transport->transport.ops = &g_transport_ops;
     transport->transport.context = transport;
-    g_running = true;
 
     while (g_running) {
         int fd = connect_socket(transport->host, transport->port);
@@ -320,11 +358,15 @@ int remote_link_mqtt_run(const struct remote_mqtt_config_s* config,
             continue;
         }
 
+        /* Publish the socket the moment it is live: stop() has to be able to
+         * break a send that is stuck on a peer that vanished. */
+        track_fd(fd);
+
         /* Every reconnect is a new session: fresh nonce, fresh handshake, and
          * Offline until a matching snapshot arrives. This is why the transport
          * does not use mqtt_init_reconnect — the boundary has to be visible. */
         if (!make_nonce(nonce, sizeof(nonce))) {
-            close(fd);
+            untrack_fd_and_close(fd);
             sleep(REMOTE_MQTT_RETRY_DELAY_S);
             continue;
         }
@@ -343,7 +385,7 @@ int remote_link_mqtt_run(const struct remote_mqtt_config_s* config,
                 != MQTT_OK
             || mqtt_subscribe(&transport->mqtt, transport->to_device, 0) != MQTT_OK) {
             syslog(LOG_WARNING, "[%s] MQTT connect or subscribe failed\n", TAG);
-            close(fd);
+            untrack_fd_and_close(fd);
             sleep(REMOTE_MQTT_RETRY_DELAY_S);
             continue;
         }
@@ -355,7 +397,7 @@ int remote_link_mqtt_run(const struct remote_mqtt_config_s* config,
         if (!remote_session_send_hello(session)) {
             syslog(LOG_WARNING, "[%s] hello publish failed\n", TAG);
             remote_session_set_active_transport(session, NULL);
-            close(fd);
+            untrack_fd_and_close(fd);
             sleep(REMOTE_MQTT_RETRY_DELAY_S);
             continue;
         }
@@ -373,7 +415,7 @@ int remote_link_mqtt_run(const struct remote_mqtt_config_s* config,
         syslog(LOG_INFO, "[%s] disconnected\n", TAG);
         remote_session_link_down(session);
         remote_session_set_active_transport(session, NULL);
-        close(fd);
+        untrack_fd_and_close(fd);
 
         if (g_running) {
             sleep(REMOTE_MQTT_RETRY_DELAY_S);
@@ -397,6 +439,14 @@ void remote_link_mqtt_stop(void)
     if (!g_loop_active) {
         pthread_mutex_unlock(&g_state_lock);
         return;
+    }
+
+    /* The loop only looks at g_running between synchronisation calls, and a
+     * send stalled on a peer that stopped ACKing never reaches the next one.
+     * Shutting the socket down turns that stall into an immediate socket
+     * error, so the loop can unwind and release the transport. */
+    if (g_active_fd >= 0) {
+        shutdown(g_active_fd, SHUT_RDWR);
     }
 
     clock_gettime(CLOCK_REALTIME, &deadline);
