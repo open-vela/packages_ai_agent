@@ -21,9 +21,13 @@
  * each source keeping its own next-due timestamp.  Polling is a sync
  * mcp_client_execute() call on this thread (never on agent_loop).
  *
- * Dedup: Gerrit change numbers are numeric and ~monotonic → store the max
- * seen, only report id > last_max.  Jira keys are "PROJ-123" (non-numeric)
- * → store a last-seen key + a small in-memory LRU of reported keys.
+ * Dedup: Gerrit polls with a last-updated window (-age:) and keeps a small
+ * in-memory LRU of the change numbers it reported, so what gets notified is
+ * "updated since the previous poll" rather than "id larger than everything
+ * seen".  The id-cursor version could never report a new patch set on an
+ * existing change — the normal upload path — and replayed the whole
+ * open-change backlog after a re-flash.  Jira keys are "PROJ-123"
+ * (non-numeric) → store a last-seen key + a small in-memory LRU.
  *
  * Cursor persistence: config_store (claw_config_get/set).  Cursor is
  * updated in memory first, then pushed to outbound, then persisted — so
@@ -71,6 +75,36 @@ static notify_src_cfg_t s_cfg[NOTIFY_SRC_COUNT];
 #define JIRA_LRU_SIZE 64
 static char s_jira_lru[JIRA_LRU_SIZE][24];
 static int s_jira_lru_n = 0;
+
+/* Gerrit in-memory LRU of recently reported change numbers (not persisted).
+ * The poll query is already bounded to "updated in the last few minutes";
+ * the LRU only keeps the overlapping windows of consecutive polls from
+ * reporting the same change twice. */
+#define GERRIT_LRU_SIZE 64
+static long s_gerrit_lru[GERRIT_LRU_SIZE];
+static int s_gerrit_lru_n = 0;
+
+static bool gerrit_lru_seen(long id)
+{
+    for (int i = 0; i < s_gerrit_lru_n; i++) {
+        if (s_gerrit_lru[i] == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gerrit_lru_add(long id)
+{
+    if (s_gerrit_lru_n < GERRIT_LRU_SIZE) {
+        s_gerrit_lru[s_gerrit_lru_n++] = id;
+    } else {
+        /* ring: drop the oldest */
+        memmove(s_gerrit_lru, s_gerrit_lru + 1,
+                sizeof(s_gerrit_lru[0]) * (GERRIT_LRU_SIZE - 1));
+        s_gerrit_lru[GERRIT_LRU_SIZE - 1] = id;
+    }
+}
 
 /* Thread state */
 static volatile bool s_running = false;
@@ -129,9 +163,14 @@ static void notify_load_cfg(void)
                  sizeof(g->server_name), "gerrit");
     cfg_load_str(NOTIFY_SRC_GERRIT, "tool", g->tool_query,
                  sizeof(g->tool_query), "gerrit.query_changes");
+    /* Only the user's own changes.  The plain `status:open` query reported
+     * every open change in the project — a poll could surface a dozen
+     * unrelated subjects that kept replacing each other on the notice page.
+     * `owner:` covers what we push, `reviewer:` covers review requests. */
     cfg_load_str(NOTIFY_SRC_GERRIT, "query_args", g->query_args,
                  sizeof(g->query_args),
-                 "{\"query\":\"status:open\",\"limit\":50}");
+                 "{\"query\":\"status:open (owner:zhangyi101@xiaomi.com OR "
+                 "reviewer:zhangyi101@xiaomi.com)\",\"limit\":50}");
     g->interval_sec = cfg_load_int(NOTIFY_SRC_GERRIT, "interval_sec",
                                    AGENT_NOTIFY_INTERVAL_SEC);
     cfg_load_str(NOTIFY_SRC_GERRIT, "last_cursor", g->last_cursor,
@@ -161,8 +200,14 @@ static void notify_load_cfg(void)
          * limit=10 keeps one poll at ~16KB of HTTP body / ~7.3KB of payload
          * (measured) — inside MCP_RESP_BUF_SIZE (64KB) and
          * AGENT_NOTIFY_JSON_BUF_SIZE (16KB) respectively. */
+        /* …and only the user's own issues.  Without the assignee/reporter/
+         * watcher filter every updated issue in every project the token can
+         * see matched, so the notice page reported strangers' tickets. */
         snprintf(j->query_args, sizeof(j->query_args),
-                 "{\"jql\":\"updated >= -1h ORDER BY updated DESC\","
+                 "{\"jql\":\"(assignee = \\\"zhangyi101@xiaomi.com\\\" OR "
+                 "reporter = \\\"zhangyi101@xiaomi.com\\\" OR "
+                 "watcher = \\\"zhangyi101@xiaomi.com\\\") AND "
+                 "updated >= -1h ORDER BY updated DESC\","
                  "\"fields\":\"summary,status,priority,assignee\",\"limit\":10}");
     }
     j->interval_sec = cfg_load_int(NOTIFY_SRC_JIRA, "interval_sec",
@@ -222,9 +267,8 @@ static void push_notify(notify_source_t src, const char *key,
     }
 
     /* Notification page, not a toast: the round panel is too small for a top
-     * banner (the body was clipped).  The page holds a length-scaled window
-     * (10s floor, up to 30s for long summaries; see notice_duration_ms in
-     * lvgl_ui_channel.c), any user key exits early, and the approval page
+     * banner (the body was clipped).  The page holds a fixed 5 s window
+     * (LVGL_UI_NOTICE_MS), any user key exits early, and the approval page
      * outranks it. */
     lvgl_ui_channel_show_notice(title, body, color);
 
@@ -249,9 +293,9 @@ static void push_notify(notify_source_t src, const char *key,
 
 /* Text fallback: the onedev gateway's query_changes returns a plain text
  * summary whose lines look like "- 10365285: subject text".  Scan one
- * buffer line by line and notify for ids above the cursor.  The cursor
- * (last_max) advances to the newest id notified so the same change is
- * not re-reported on the next poll. */
+ * buffer line by line and notify for ids the LRU has not reported yet;
+ * the query's -age: window is what makes a line "new" (a new patch set on
+ * an existing change shows up with its old, smaller number). */
 static void gerrit_scan_text(const char *text, notify_source_t src,
                              long *last_max, int *n_new)
 {
@@ -266,7 +310,7 @@ static void gerrit_scan_text(const char *text, notify_source_t src,
             char *end = NULL;
             long id = strtol(p + 2, &end, 10);
             if (end && end != p + 2 && *end == ':' && end[1] == ' '
-                && id > 0 && id > *last_max) {
+                && id > 0 && !gerrit_lru_seen(id)) {
                 const char *subj = end + 2;
                 size_t slen = len - (size_t)(subj - p);
                 char key[24];
@@ -276,13 +320,16 @@ static void gerrit_scan_text(const char *text, notify_source_t src,
                 snprintf(summary, sizeof(summary), "%.*s",
                          (int)(slen < sizeof(summary) - 1
                                ? slen : sizeof(summary) - 1), subj);
-                /* Cap toasts per poll; last_max still advances so the
-                 * skipped backlog is not re-reported next time. */
+                /* Mark seen even when the per-poll cap skips the push, so
+                 * a burst cannot turn into a flood on later polls. */
+                gerrit_lru_add(id);
                 if (*n_new < AGENT_NOTIFY_MAX_NEW) {
                     push_notify(src, key, summary);
                     (*n_new)++;
                 }
-                *last_max = id;
+                if (id > *last_max) {
+                    *last_max = id;
+                }
             }
         }
         p = eol ? eol + 1 : NULL;
@@ -324,7 +371,7 @@ static int gerrit_dedup(const char *json, notify_source_t src, int *n_new_out)
                 n_struct++;
 
                 long id = (long)num->valuedouble;
-                if (id <= last_max) continue;  /* already seen */
+                if (id <= 0 || gerrit_lru_seen(id)) continue;
 
                 cJSON *subj = cJSON_GetObjectItem(item, "subject");
                 if (!subj) subj = cJSON_GetObjectItem(item, "summary");
@@ -333,14 +380,17 @@ static int gerrit_dedup(const char *json, notify_source_t src, int *n_new_out)
 
                 char key[24];
                 snprintf(key, sizeof(key), "%ld", id);
-                /* Cap toasts per poll; last_max still advances so the
-                 * skipped backlog is not re-reported next time. */
+                /* Mark seen even when the per-poll cap skips the push, so
+                 * a burst cannot turn into a flood on later polls. */
+                gerrit_lru_add(id);
                 if (n_new < AGENT_NOTIFY_MAX_NEW) {
                     push_notify(src, key, summary);
                     n_new++;
                 }
 
-                last_max = id;  /* id > last_max guaranteed above */
+                if (id > last_max) {
+                    last_max = id;  /* status display only */
+                }
             }
         }
 
@@ -435,6 +485,57 @@ static int jira_dedup(const char *json, notify_source_t src, int *n_new_out)
     return 0;
 }
 
+/* ── Gerrit poll query: configured query + last-updated window ─── */
+
+#define GERRIT_DEFAULT_QUERY \
+    "status:open (owner:zhangyi101@xiaomi.com OR " \
+    "reviewer:zhangyi101@xiaomi.com)"
+
+/* Append `-age:<N>min` to the configured query so the server returns only
+ * changes whose last update falls inside the window; that is what makes a
+ * new patch set on an existing change a notification event.  `-age:` takes
+ * a relative age evaluated by Gerrit itself, so the device clock and this
+ * image's missing locale TZ cannot skew the window.  Twice the poll
+ * interval (+1 min) tolerates a slow or skipped poll without dropping an
+ * update; the id LRU absorbs the overlap. */
+static void gerrit_poll_args(char *out, size_t out_sz)
+{
+    notify_src_cfg_t *c = &s_cfg[NOTIFY_SRC_GERRIT];
+    int interval = c->interval_sec > 0 ? c->interval_sec
+                                       : AGENT_NOTIFY_INTERVAL_SEC;
+    int mins = (interval * 2 + 59) / 60 + 1;
+    char qbuf[224];
+
+    cJSON *args = cJSON_Parse(c->query_args);
+    if (args == NULL) {
+        args = cJSON_CreateObject();
+    }
+    if (args == NULL) {
+        out[0] = '\0';
+        return;
+    }
+
+    cJSON *q = cJSON_GetObjectItem(args, "query");
+    const char *base = (q && cJSON_IsString(q)) ? q->valuestring
+                                                : GERRIT_DEFAULT_QUERY;
+    snprintf(qbuf, sizeof(qbuf), "%s -age:%dmin", base, mins);
+
+    cJSON_DeleteItemFromObject(args, "query");
+    cJSON_AddStringToObject(args, "query", qbuf);
+    if (cJSON_GetObjectItem(args, "limit") == NULL) {
+        cJSON_AddNumberToObject(args, "limit", 50);
+    }
+
+    char *j = cJSON_PrintUnformatted(args);
+    if (j != NULL) {
+        strlcpy(out, j, out_sz);
+        free(j);
+    } else {
+        out[0] = '\0';
+    }
+    cJSON_Delete(args);
+}
+
 /* ── Poll one source ──────────────────────────────────────────── */
 
 static void poll_one_source(notify_source_t src)
@@ -451,9 +552,21 @@ static void poll_one_source(notify_source_t src)
     }
     buf[0] = '\0';
 
-    syslog(LOG_INFO, "[%s] polling %s (%s)\n", TAG, c->server_name, c->tool_query);
+    /* Gerrit polls through a freshly built time-windowed query; every other
+     * source uses its configured args verbatim. */
+    char gerrit_args[320];
+    const char *args = c->query_args;
+    if (src == NOTIFY_SRC_GERRIT) {
+        gerrit_poll_args(gerrit_args, sizeof(gerrit_args));
+        if (gerrit_args[0] != '\0') {
+            args = gerrit_args;
+        }
+    }
 
-    int rc = mcp_client_execute(c->tool_query, c->query_args,
+    syslog(LOG_INFO, "[%s] polling %s (%s)\n", TAG, c->server_name, c->tool_query);
+    syslog(LOG_INFO, "[%s] %s args: %s\n", TAG, c->server_name, args);
+
+    int rc = mcp_client_execute(c->tool_query, args,
                                 buf, AGENT_NOTIFY_JSON_BUF_SIZE);
     if (rc != OK && strstr(buf, "not discovered")) {
         /* Self-heal: if the boot-time discover failed (network race or a
@@ -464,7 +577,7 @@ static void poll_one_source(notify_source_t src)
                TAG, c->server_name);
         mcp_client_discover();
         buf[0] = '\0';
-        rc = mcp_client_execute(c->tool_query, c->query_args,
+        rc = mcp_client_execute(c->tool_query, args,
                                 buf, AGENT_NOTIFY_JSON_BUF_SIZE);
     }
     if (rc != OK) {
