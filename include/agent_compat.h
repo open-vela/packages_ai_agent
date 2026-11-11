@@ -92,6 +92,8 @@ static inline int agent_task_create(void* (*func)(void*), const char* name,
     int r = pthread_create(&tid, &attr, _agent_task_shim, ta);
     pthread_attr_destroy(&attr);
     if (r != 0) {
+        syslog(LOG_ERR, "[compat] task_create '%s' failed: %d "
+            "(stack=%d prio=%d)\n", name, r, stack_size, prio);
         free(ta);
         return ERROR;
     }

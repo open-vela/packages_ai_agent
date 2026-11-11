@@ -15,6 +15,7 @@
  */
 
 #include "channels/cmd_llm.h"
+#include "channels/llm_path.h"
 #include "infra/config_store.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
@@ -141,12 +142,9 @@ void cmd_set_llm(int argc, char** argv)
             path = "/v1/chat/completions";
         }
 
-        /* Append /chat/completions if path is just /v1 */
+        /* Append /chat/completions if path stops at a version segment */
         static char full_path[256];
-        if (strcmp(path, "/v1") == 0 || strcmp(path, "/v1/") == 0) {
-            snprintf(full_path, sizeof(full_path), "/v1/chat/completions");
-            path = full_path;
-        }
+        path = llm_complete_path(path, full_path, sizeof(full_path));
 
         if (argc >= 3)
             model = argv[2];

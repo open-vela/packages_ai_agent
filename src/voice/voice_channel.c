@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -375,7 +376,8 @@ static void* recording_thread(void* arg)
     (void)arg;
     unsigned char chunk[AGENT_ASR_CHUNK_SIZE];
     int need_fallback = 0;
-    // int dump_fd = -1;
+    int dump_fd = open("/data/cap_dump.pcm",
+        O_WRONLY | O_CREAT | O_TRUNC, 0644);
     size_t total_bytes_read = 0;
     size_t total_bytes_sent = 0;
     int chunk_count = 0;
@@ -451,26 +453,31 @@ static void* recording_thread(void* arg)
         chunk_count++;
 
         /* Dump raw PCM to file */
-        // if (dump_fd >= 0) {
-        //     write(dump_fd, chunk, (size_t)n);
-        // }
+        if (dump_fd >= 0) {
+            write(dump_fd, chunk, (size_t)n);
+        }
 
-        /* Log audio level for first few chunks and periodically
-         * to diagnose silence vs actual speech from QEMU mic. */
-        if (chunk_count <= 3 || chunk_count % 50 == 0) {
+        /* Log audio level for the first few chunks and every 10th after
+         * that: the periodic lines are what tell "user was speaking here"
+         * apart from "PTT ran but the mic heard nothing".  dc is the block
+         * mean, which exposes an analog offset riding on the signal. */
+        if (chunk_count <= 3 || chunk_count % 10 == 0) {
             int16_t* samples = (int16_t*)chunk;
             int sample_count = n / 2;
             int32_t peak = 0;
+            int64_t sum = 0;
 
             for (int i = 0; i < sample_count; i++) {
                 int32_t v = samples[i] < 0 ? -samples[i] : samples[i];
                 if (v > peak) {
                     peak = v;
                 }
+                sum += samples[i];
             }
             syslog(LOG_INFO,
-                "[%s] chunk#%d: %d bytes, peak=%ld\n",
-                TAG, chunk_count, n, (long)peak);
+                "[%s] chunk#%d: %d bytes, peak=%ld dc=%ld\n",
+                TAG, chunk_count, n, (long)peak,
+                (long)(sample_count ? sum / sample_count : 0));
         }
 
 #ifdef CONFIG_AI_AGENT_AUDIO_PREPROCESS
@@ -486,10 +493,10 @@ static void* recording_thread(void* arg)
 #endif
 
     /* Store stream handle for voice_channel_stop to finish */
-    // if (dump_fd >= 0) {
-    //     close(dump_fd);
-    //     syslog(LOG_INFO, "[%s] PCM dump saved to /data/cap_dump.pcm\n", TAG);
-    // }
+    if (dump_fd >= 0) {
+        close(dump_fd);
+        syslog(LOG_INFO, "[%s] PCM dump saved to /data/cap_dump.pcm\n", TAG);
+    }
 
     pthread_mutex_lock(&s_voice.lock);
     s_voice.asr_stream = stream;
@@ -511,6 +518,52 @@ static void* recording_thread(void* arg)
 
 #define ASR_THREAD_STACK (24 * 1024)
 
+static voice_text_sink_t s_text_sink;
+static void* s_text_sink_ctx;
+
+int voice_channel_register_sink(voice_text_sink_t fn, void* ctx)
+{
+    pthread_mutex_lock(&s_voice.lock);
+    s_text_sink = fn;
+    s_text_sink_ctx = ctx;
+    pthread_mutex_unlock(&s_voice.lock);
+    return 0;
+}
+
+void voice_channel_dispatch(const char* text)
+{
+    voice_text_sink_t sink;
+    void* ctx;
+
+    if (!text || text[0] == '\0') {
+        return;
+    }
+
+    pthread_mutex_lock(&s_voice.lock);
+    sink = s_text_sink;
+    ctx = s_text_sink_ctx;
+    pthread_mutex_unlock(&s_voice.lock);
+
+    if (sink) {
+        sink(text, ctx);
+        return;
+    }
+
+    /* No consumer registered: the on-device agent over the chat bus. */
+
+    {
+        agent_msg_t msg;
+
+        memset(&msg, 0, sizeof(msg));
+        strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
+        strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
+        msg.content = strdup(text);
+        if (msg.content) {
+            message_bus_push_inbound(&msg);
+        }
+    }
+}
+
 static void* asr_and_dispatch(void* arg)
 {
     unsigned char* pcm = (unsigned char*)arg;
@@ -531,17 +584,7 @@ static void* asr_and_dispatch(void* arg)
         syslog(LOG_INFO, "[%s] ASR result: %s\n", TAG, text);
         printf("ASR: %s\n", text);
 
-        agent_msg_t msg;
-
-        memset(&msg, 0, sizeof(msg));
-        strncpy(msg.channel, AGENT_CHAN_VOICE,
-            sizeof(msg.channel) - 1);
-        strncpy(msg.chat_id, "voice",
-            sizeof(msg.chat_id) - 1);
-        msg.content = strdup(text);
-        if (msg.content) {
-            message_bus_push_inbound(&msg);
-        }
+        voice_channel_dispatch(text);
     } else {
         syslog(LOG_WARNING, "[%s] ASR failed or empty: %d\n",
             TAG, ret);
@@ -555,7 +598,19 @@ static void* asr_and_dispatch(void* arg)
 
 static struct timespec s_tts_start;
 static int s_tts_first_chunk;
+static int s_tts_chunks;
+static long s_tts_last_chunk_ms;
+static size_t s_tts_bytes;
 static struct timespec s_asr_done_ts;
+
+static long tts_ms_since_start(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - s_tts_start.tv_sec) * 1000
+        + (now.tv_nsec - s_tts_start.tv_nsec) / 1000000;
+}
 
 static void tts_stream_cb(const unsigned char* pcm_data,
     size_t pcm_len, int is_last, void* user_data)
@@ -568,16 +623,47 @@ static void tts_stream_cb(const unsigned char* pcm_data,
     }
 
     if (pcm_data && pcm_len > 0 && pb) {
+        long recv_ms = tts_ms_since_start();
+
         if (!s_tts_first_chunk) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long ms = (now.tv_sec - s_tts_start.tv_sec) * 1000
-                + (now.tv_nsec - s_tts_start.tv_nsec) / 1000000;
             syslog(LOG_INFO, "[%s] TTS first chunk: %ldms\n",
-                TAG, ms);
+                TAG, recv_ms);
             s_tts_first_chunk = 1;
         }
-        audio_playback_write(pb, pcm_data, pcm_len);
+        /* A dropped chunk is 0.7-0.8s of audio and used to disappear without
+         * a trace, which is indistinguishable from the speaker cutting out.
+         * The write duration tells the two apart: a write that blocks means
+         * the DMA queue is behind (audio still playing); one that returns at
+         * once means the queue ran dry and the card may already be silent. */
+        struct timespec w0, w1;
+
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        int wr = audio_playback_write(pb, pcm_data, pcm_len);
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+
+        long write_ms = (w1.tv_sec - w0.tv_sec) * 1000
+            + (w1.tv_nsec - w0.tv_nsec) / 1000000;
+
+        s_tts_chunks++;
+        s_tts_bytes += pcm_len;
+
+        /* The byte rate tells network starvation (few KB/s) apart from a
+         * playback-side stall: an utterance only plays smoothly while this
+         * stays at or above the PCM rate (32KB/s at 16k/16bit). */
+        syslog(LOG_INFO,
+            "[%s] tts chunk %d: +%ldms (gap %ldms) len=%zu write=%ldms "
+            "total=%zu (%ldB/s)\n",
+            TAG, s_tts_chunks, recv_ms,
+            s_tts_chunks > 1 ? recv_ms - s_tts_last_chunk_ms : 0,
+            pcm_len, write_ms, s_tts_bytes,
+            (long)(recv_ms > 0 ? (1000 * s_tts_bytes) / (long)recv_ms : 0));
+
+        if (wr < 0) {
+            syslog(LOG_ERR, "[%s] playback write failed: %d (chunk %zu bytes)\n",
+                TAG, wr, pcm_len);
+        }
+
+        s_tts_last_chunk_ms = recv_ms;
     }
 
     (void)is_last;
@@ -733,6 +819,7 @@ int voice_channel_start(void)
     sem_wait(&s_voice.rec_ready);
 
     if (audio_capture_start(s_voice.cap) < 0) {
+        syslog(LOG_ERR, "[%s] capture start failed\n", TAG);
         pthread_mutex_lock(&s_voice.lock);
         s_voice.state = VOICE_IDLE;
         if (s_voice.asr_stream) {
@@ -909,6 +996,13 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
                 TAG, text);
             strncpy(text_out, text, text_cap - 1);
             text_out[text_cap - 1] = '\0';
+        } else if (ret != 0) {
+            /* Propagate the failure: otherwise the PTT path reports an
+             * empty result and the screen shows nothing at all when the
+             * network or the ASR credentials are missing. */
+            syslog(LOG_WARNING, "[%s] stream ASR failed: %d\n",
+                TAG, ret);
+            return ret;
         }
         return 0;
     }
@@ -938,6 +1032,7 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     } else if (ret != 0) {
         syslog(LOG_WARNING, "[%s] batch ASR failed: %d\n",
             TAG, ret);
+        return ret;
     }
 
     return 0;
@@ -989,6 +1084,166 @@ static void tts_strip_markdown(char* s)
     *w = '\0';
 }
 
+/* ── TTS sentence segmentation ─────────────────────────────── */
+
+/* Long replies sent as one TTS request sound monotonous (no inter-sentence
+ * pause) and, past ~4s of audio, hit the streaming response buffer cap and
+ * truncate the tail.  Splitting into sentence-sized segments fixes both: each
+ * segment is a short, natural utterance and its own synth request, all written
+ * to the one open playback handle in order.
+ *
+ * Segment ceiling: 180 UTF-8 bytes ≈ 60 CJK chars ≈ 12s of speech at the
+ * ~4 chars/s rate, comfortably under the 512KB stream cap. */
+/* Largest slice of text sent as one synth request.  Each slice is a separate
+ * HTTPS request, and whatever the keep-alive pool can reuse still costs one
+ * round trip plus the engine's first-chunk latency; on a weak Wi-Fi link that
+ * is audible as a hole between sentences.  600 UTF-8 bytes (~200 hanzi) is
+ * well inside the engine's per-request limit and cuts the number of requests
+ * on a long reply by 3x compared with the old 180. */
+#define TTS_SEGMENT_MAX 600
+
+/* UTF-8 byte length of a sentence terminator at p (0 = not a terminator):
+ * ASCII \n ! ?, or full-width 。！？； (3 bytes each). */
+static int tts_terminator_len(const char *p)
+{
+  unsigned char c = (unsigned char)p[0];
+
+  if (c == '\n' || c == '!' || c == '?') {
+    return 1;
+  }
+  /* 。 U+3002 (E3 80 82) */
+  if (c == 0xE3 && (unsigned char)p[1] == 0x80
+      && (unsigned char)p[2] == 0x82) {
+    return 3;
+  }
+  /* ！ U+FF01 / ？ U+FF1F / ； U+FF1B (EF BC 81 / 9F / 9B) */
+  if (c == 0xEF && (unsigned char)p[1] == 0xBC
+      && ((unsigned char)p[2] == 0x81 || (unsigned char)p[2] == 0x9F
+          || (unsigned char)p[2] == 0x9B)) {
+    return 3;
+  }
+  return 0;
+}
+
+/* Return the start of the segment that follows `s`: just past the first
+ * sentence terminator (trailing whitespace skipped), or — when none appears
+ * within TTS_SEGMENT_MAX bytes — a forced split rounded down to a UTF-8
+ * character boundary so a multi-byte char is never cut in half. */
+static char *tts_next_segment(char *s)
+{
+  char *p = s;
+  size_t run = 0;
+
+  while (*p) {
+    int tlen = tts_terminator_len(p);
+
+    if (tlen) {
+      p += tlen;  /* keep the terminator with the current sentence */
+      while (*p == '\n' || *p == ' ' || *p == '\t') {
+        p++;
+      }
+      return p;
+    }
+
+    p++;
+    run++;
+    if (run >= TTS_SEGMENT_MAX) {
+      /* Continuation bytes are 0x80..0xBF; back up to the leading byte. */
+      while (p > s && ((unsigned char)p[0] & 0xC0) == 0x80) {
+        p--;
+      }
+      return p;
+    }
+  }
+  return p;  /* end of string */
+}
+
+/* ── Attention beep (prompt tone) ───────────────────────── */
+
+#define BEEP_SINE_TABLE 256
+
+/* One full sine period, 16-bit signed, amplitude 8000 (≈ -12 dBFS). */
+static const int16_t beep_sine[BEEP_SINE_TABLE] = {
+    0, 196, 393, 589, 784, 979, 1174, 1368, 1561, 1753, 1944, 2134, 2322, 2509, 2695, 2879,
+    3061, 3242, 3420, 3597, 3771, 3943, 4113, 4280, 4445, 4606, 4766, 4922, 5075, 5225, 5372, 5516,
+    5657, 5794, 5928, 6058, 6184, 6307, 6426, 6541, 6652, 6759, 6862, 6961, 7055, 7146, 7232, 7314,
+    7391, 7464, 7532, 7596, 7656, 7710, 7760, 7806, 7846, 7882, 7913, 7940, 7961, 7978, 7990, 7998,
+    8000, 7998, 7990, 7978, 7961, 7940, 7913, 7882, 7846, 7806, 7760, 7710, 7656, 7596, 7532, 7464,
+    7391, 7314, 7232, 7146, 7055, 6961, 6862, 6759, 6652, 6541, 6426, 6307, 6184, 6058, 5928, 5794,
+    5657, 5516, 5372, 5225, 5075, 4922, 4766, 4606, 4445, 4280, 4113, 3943, 3771, 3597, 3420, 3242,
+    3061, 2879, 2695, 2509, 2322, 2134, 1944, 1753, 1561, 1368, 1174, 979, 784, 589, 393, 196,
+    0, -196, -393, -589, -784, -979, -1174, -1368, -1561, -1753, -1944, -2134, -2322, -2509, -2695, -2879,
+    -3061, -3242, -3420, -3597, -3771, -3943, -4113, -4280, -4445, -4606, -4766, -4922, -5075, -5225, -5372, -5516,
+    -5657, -5794, -5928, -6058, -6184, -6307, -6426, -6541, -6652, -6759, -6862, -6961, -7055, -7146, -7232, -7314,
+    -7391, -7464, -7532, -7596, -7656, -7710, -7760, -7806, -7846, -7882, -7913, -7940, -7961, -7978, -7990, -7998,
+    -8000, -7998, -7990, -7978, -7961, -7940, -7913, -7882, -7846, -7806, -7760, -7710, -7656, -7596, -7532, -7464,
+    -7391, -7314, -7232, -7146, -7055, -6961, -6862, -6759, -6652, -6541, -6426, -6307, -6184, -6058, -5928, -5794,
+    -5657, -5516, -5372, -5225, -5075, -4922, -4766, -4606, -4445, -4280, -4113, -3943, -3771, -3597, -3420, -3242,
+    -3061, -2879, -2695, -2509, -2322, -2134, -1944, -1753, -1561, -1368, -1174, -979, -784, -589, -393, -196,
+};
+
+/* Play a short sine-wave beep as an attention cue. Fades in/out ~15ms to
+ * avoid clicks. Safe to call before TTS to signal an incoming reply while
+ * the (slower) network synthesis is still in flight. */
+int voice_channel_beep(unsigned int freq_hz, unsigned int duration_ms)
+{
+    if (freq_hz < 100 || freq_hz > 8000) {
+        freq_hz = 1000;
+    }
+    if (duration_ms == 0 || duration_ms > 5000) {
+        duration_ms = 200;
+    }
+
+    const unsigned int rate = AGENT_VOICE_SAMPLE_RATE;
+    const unsigned int n = (unsigned int)((uint64_t)rate * duration_ms / 1000);
+
+    int16_t* buf = malloc((size_t)n * sizeof(int16_t));
+    if (!buf) {
+        return -ENOMEM;
+    }
+
+    /* Fixed-point phase accumulator (16.16) into the 256-entry table. */
+    uint32_t phase = 0;
+    uint32_t inc = (uint32_t)((uint64_t)freq_hz * BEEP_SINE_TABLE * 65536 / rate);
+
+    /* ~15ms linear fade-in/out to avoid a click at onset/release. */
+    unsigned int fade = rate * 15 / 1000;
+    if (fade == 0) {
+        fade = 1;
+    }
+
+    for (unsigned int i = 0; i < n; i++) {
+        int32_t s = beep_sine[(phase >> 16) & (BEEP_SINE_TABLE - 1)];
+
+        int32_t gain = 256;
+        if (i < fade) {
+            gain = (int32_t)i * 256 / fade;
+        } else if (i >= n - fade) {
+            gain = (int32_t)(n - 1 - i) * 256 / fade;
+        }
+
+        buf[i] = (int16_t)(s * gain / 256);
+        phase += inc;
+    }
+
+    audio_playback_t* pb = audio_playback_open(
+        AGENT_AUDIO_PLAYBACK_DEV, rate,
+        AGENT_VOICE_CHANNELS, AGENT_VOICE_BITS);
+    if (!pb) {
+        free(buf);
+        return -EIO;
+    }
+
+    int ret = audio_playback_write(pb, buf, (size_t)n * sizeof(int16_t));
+    if (ret < 0) {
+        syslog(LOG_WARNING, "[%s] beep write failed: %d\n", TAG, ret);
+    }
+    audio_playback_close(pb);
+    free(buf);
+
+    return (ret < 0) ? ret : 0;
+}
+
 int voice_channel_speak(const char* text)
 {
     if (!text || text[0] == '\0') {
@@ -1020,6 +1275,16 @@ int voice_channel_speak(const char* text)
     }
     pthread_mutex_unlock(&s_voice.lock);
 
+    /* Without credentials the network synth can only fail.  Bail out before
+     * touching the audio hardware (beep + playback open/close): that path
+     * stalls the caller for seconds and churns the audio driver for nothing. */
+    if (!voice_tts_is_ready()) {
+        syslog(LOG_WARNING,
+            "[%s] speak: TTS not configured, skipped\n", TAG);
+        pthread_mutex_unlock(&s_voice.speak_lock);
+        return -ENOENT;
+    }
+
     /* Work on a mutable copy so we can strip markdown in-place */
     size_t text_len = strlen(text);
     char* clean = malloc(text_len + 1);
@@ -1044,6 +1309,9 @@ int voice_channel_speak(const char* text)
 
     clock_gettime(CLOCK_MONOTONIC, &s_tts_start);
     s_tts_first_chunk = 0;
+    s_tts_chunks = 0;
+    s_tts_last_chunk_ms = 0;
+    s_tts_bytes = 0;
 
     if (s_asr_done_ts.tv_sec > 0) {
         long llm_ms = (s_tts_start.tv_sec - s_asr_done_ts.tv_sec) * 1000
@@ -1051,10 +1319,16 @@ int voice_channel_speak(const char* text)
         syslog(LOG_INFO, "[%s] LLM latency: %ldms\n", TAG, llm_ms);
     }
 
-    /* Try streaming TTS first (callback per chunk) */
+    /* Play a short attention beep before the (slower) network synthesis so
+     * a notification is audible immediately. Non-fatal on failure. */
+    voice_channel_beep(1000, 200);
+
+    /* Try streaming TTS first (callback per chunk).
+     * NOTE: playback must match the REST v3 synth sample rate
+     * (AGENT_VOICE_SAMPLE_RATE = 16kHz), not the old WS v1 24kHz. */
     audio_playback_t* pb = audio_playback_open(
         AGENT_AUDIO_PLAYBACK_DEV,
-        AGENT_TTS_WS_SAMPLE_RATE,
+        AGENT_VOICE_SAMPLE_RATE,
         AGENT_VOICE_CHANNELS,
         AGENT_VOICE_BITS);
 
@@ -1071,9 +1345,34 @@ int voice_channel_speak(const char* text)
     s_voice.tts_pb = pb;
     pthread_mutex_unlock(&s_voice.lock);
 
-    /* Use streaming TTS: each chunk writes to playback file */
-    int ret = voice_tts_speak_stream(clean,
-        tts_stream_cb, pb);
+    /* Synthesize the reply sentence-by-sentence: a long text sent as one
+     * request both truncates at the streaming buffer cap and reads as one
+     * monotonous run.  Each segment is its own synth request written, in
+     * order, to the one open playback handle — sentence terminators stay with
+     * their segment, giving the engine a natural pause at each boundary. */
+    int ret = 0;
+    char* seg = clean;
+
+    while (*seg && ret == 0 && !s_voice.tts_abort) {
+        char* next = tts_next_segment(seg);
+        char saved = *next;
+
+        if (next == seg) {
+            break;  /* defensive: no forward progress */
+        }
+
+        *next = '\0';
+        if (seg[0] != '\0') {
+            /* Segment boundaries are where a new TLS request (and, without a
+             * pooled connection, a handshake) starts; logging the split point
+             * makes an audible inter-sentence gap attributable. */
+            syslog(LOG_INFO, "[%s] TTS segment start +%ldms: \"%.*s\"\n",
+                TAG, tts_ms_since_start(), 40, seg);
+            ret = voice_tts_speak_stream(seg, tts_stream_cb, pb);
+        }
+        *next = saved;
+        seg = next;
+    }
 
     struct timespec tts_net;
     clock_gettime(CLOCK_MONOTONIC, &tts_net);

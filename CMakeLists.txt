@@ -33,6 +33,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/infra/vela_tls.c
     src/infra/config_store.c
     src/infra/network_manager.c
+    src/infra/time_sync.c
     src/infra/cron_service.c
     src/infra/heartbeat.c
     src/channels/nsh_commands.c
@@ -100,6 +101,54 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
 
   if(CONFIG_AI_AGENT_LVGL_UI)
     list(APPEND AGENT_SRCS src/ui/lvgl_ui_channel.c)
+    list(APPEND AGENT_SRCS src/ui/lvgl_toast.c)
+    # Pre-rasterized MiSans 16 CJK font (lv_font_conv, 3755 GB2312-1 chars).
+    # App-owned like xiaozhi_gui's font_awesome_*.c: LV_FONT_DECLARE in code,
+    # no patching of apps_graphics_lvgl. The file header carries the exact
+    # regeneration command.
+    list(APPEND AGENT_SRCS src/ui/lv_font_misans_12_cjk.c)
+  endif()
+
+  # M7 差异化页 (pure-LVGL 退路): round-screen pet status ring home screen.
+  # Compiles on the qemu single-core (LVGL_UI) and on the CP (UI_CP) alike.
+  if(CONFIG_AI_AGENT_PET_STATUS)
+    list(APPEND AGENT_SRCS src/ui/pet_status_view.c)
+  endif()
+
+  # M7 待机界面: dim digital clock standby screen (standby_view.c), faded in by
+  # lvgl_ui_channel.c after 60s of no activity.  AP-local only.
+  if(CONFIG_AI_AGENT_STANDBY_UI)
+    list(APPEND AGENT_SRCS src/ui/standby_view.c)
+  endif()
+
+  # 路 B (dual-core BK7258): the AP runs the agent but has no LCD/LVGL/FPU.
+  # Instead of building bubbles locally, a thin shim (ui_rpmsg_client.c)
+  # implements the SAME lvgl_ui_channel_* / lvgl_toast_* API as RPMsg
+  # messages to the CP core, where ui_rpmsg_server.c renders them.  Call
+  # sites are guarded with
+  #   #if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+  # so agent_main.c / nsh_commands.c / remote_ctrl_channel.c /
+  # notify_service.c compile unchanged on both cores.
+  if(CONFIG_AI_AGENT_UI_RPMSG)
+    list(APPEND AGENT_SRCS src/ui/ui_rpmsg_client.c)
+  endif()
+
+  # Physical S1 hold-to-talk button (M5 PTT).  AP-only: the buttons + voice
+  # pipeline + UI shim all live on the AP core, so no reverse RPMsg.  Calls
+  # voice_channel_start/stop_with_text + lvgl_ui_channel_set_ptt/send_user.
+  if(CONFIG_AI_AGENT_PTT)
+    list(APPEND AGENT_SRCS src/voice/ptt_button.c)
+  endif()
+
+  # S2/S3 context keys now live in the board's button input layer
+  # (board/bk7258-devkit/src/bk7258_buttons_input.c), which registers as a
+  # remote_ctrl input adapter: short press scrolls the transcript when idle
+  # or approves/denies a pending permission, long press cycles the model /
+  # opens a fresh session.  The retired key_manager.c owned this before the
+  # fusion with the colleague's layer.
+
+  if(CONFIG_AI_AGENT_NOTIFY_SERVICE)
+    list(APPEND AGENT_SRCS src/infra/notify_service.c)
   endif()
 
   if(CONFIG_AI_AGENT_CAMERA)
@@ -120,6 +169,17 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       src/tools/mcp_tool_registry.c
       src/tools/mcp_builtin_tools.c
       src/tools/mcp_client.c
+    )
+  endif()
+
+  if(CONFIG_AI_AGENT_REMOTE_CTRL)
+    list(APPEND AGENT_SRCS
+      src/remote/remote_link.c
+      src/remote/remote_codec.c
+      src/remote/remote_session.c
+      src/remote/remote_link_mqtt.c
+      src/channels/remote_ctrl_channel.c
+      src/tools/tool_remote_agent.c
     )
   endif()
 
@@ -199,6 +259,14 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     list(APPEND AGENT_INCDIRS ${ALSA_DIRECT_INC})
   endif()
 
+  # BK7258 AP: the Wi-Fi STA lives on the CP core, so `set_wifi` /
+  # `wifi_reconnect` reach it through the cross-core control plane in
+  # chips/bk7258/wlan_ctrl (wlan_ctrl_client.c is already compiled into the
+  # arch library; only the header path is needed here).
+  if(CONFIG_BK7258_COMPONENT_AP)
+    list(APPEND AGENT_INCDIRS ${CMAKE_SOURCE_DIR}/../vendor/beken/chips/bk7258/wlan_ctrl)
+  endif()
+
   nuttx_add_application(
     NAME
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_PROGNAME}
@@ -222,6 +290,60 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     COMMAND ${CMAKE_COMMAND} -E touch
       ${CMAKE_CURRENT_SOURCE_DIR}/src/agent_main.c
     COMMENT "Refreshing AI Agent build timestamp"
+  )
+
+endif()
+
+################################################################################
+# CP-side UI renderer (路 B). Independent of EXAMPLES_AI_AGENT_VELA so the
+# CP core can render the chat UI without agent_main/llm/voice/TLS. Builds
+# only the LVGL chat-view assets; voice_channel_* + message_bus are stubbed
+# (src/ui_cp/cp_stubs.c). The AP->CP UI RPMsg server will be added here next.
+################################################################################
+if(CONFIG_EXAMPLES_AI_AGENT_UI_CP)
+
+  # NOTE: lv_font_misans_12_cjk.c is NOT listed here. The canonical font
+  # lives in the LVGL tree (apps/graphics/lvgl/.../font/) and is compiled into
+  # liblvgl.a when CONFIG_LV_FONT_MISANS_16_CJK=y (set in the CP defconfig;
+  # the symbol name there still carries the 16 px spelling).
+  # We only LV_FONT_DECLARE + reference &lv_font_misans_12_cjk from
+  # lvgl_ui_channel.c; the symbol is provided by the LVGL lib at link time,
+  # the same way the built-in Montserrat fonts are consumed.
+  set(AI_AGENT_UI_CP_SRCS
+    src/ui_cp/cp_ui_main.c
+    src/ui_cp/cp_stubs.c
+    src/ui_cp/ui_rpmsg_server.c
+    src/ui/lvgl_ui_channel.c
+    src/ui/lvgl_toast.c
+  )
+
+  # M7 差异化页 (pure-LVGL 退路): pet status ring home screen on the CP.
+  if(CONFIG_AI_AGENT_PET_STATUS)
+    list(APPEND AI_AGENT_UI_CP_SRCS src/ui/pet_status_view.c)
+  endif()
+
+  # The shared UI sources (lvgl_ui_channel.c / lvgl_toast.c / agent_config.h)
+  # gate their real implementations behind CONFIG_AI_AGENT_LVGL_UI.  On the AP
+  # that symbol comes from the VELA Kconfig; the CP app does not build the full
+  # agent so we define it here instead, making the shared UI subset compile the
+  # SAME real code on both cores (stubs in cp_stubs.c cover the voice/bus calls
+  # that only exist on AP).
+  nuttx_add_application(
+    NAME
+      ${CONFIG_EXAMPLES_AI_AGENT_UI_CP_PROGNAME}
+    SRCS
+      ${AI_AGENT_UI_CP_SRCS}
+    INCLUDE_DIRECTORIES
+      include
+      src
+    DEFINITIONS
+      CONFIG_AI_AGENT_LVGL_UI
+    DEPENDS
+      lvgl
+    STACKSIZE
+      ${CONFIG_EXAMPLES_AI_AGENT_UI_CP_STACKSIZE}
+    PRIORITY
+      ${CONFIG_EXAMPLES_AI_AGENT_UI_CP_PRIORITY}
   )
 
 endif()

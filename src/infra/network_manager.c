@@ -18,6 +18,9 @@
 #include "agent_compat.h"
 
 #include <arpa/inet.h>
+#ifdef CONFIG_NETDB_DNSCLIENT
+#  include <nuttx/net/dns.h>
+#endif
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <string.h>
@@ -29,6 +32,7 @@
 static const char* TAG = "netmgr";
 
 static char s_ip_str[INET_ADDRSTRLEN] = "0.0.0.0";
+static char s_last_ip_str[INET_ADDRSTRLEN] = "";
 
 bool network_is_connected(void)
 {
@@ -52,8 +56,16 @@ bool network_is_connected(void)
                 continue;
 
             inet_ntop(AF_INET, &sin->sin_addr, s_ip_str, sizeof(s_ip_str));
-            syslog(LOG_INFO, "[%s] Found iface %s addr %s\n", TAG,
-                ifa->ifa_name ? ifa->ifa_name : "?", s_ip_str);
+            /* Log only when the address changes; the poll thread calls
+             * this every few seconds and per-poll INFO spam floods the
+             * serial console (and has triggered the known serial.c
+             * assert on large stdout writes on at least one target). */
+            if (strncmp(s_ip_str, s_last_ip_str, sizeof(s_ip_str)) != 0)
+              {
+                strlcpy(s_last_ip_str, s_ip_str, sizeof(s_last_ip_str));
+                syslog(LOG_INFO, "[%s] Found iface %s addr %s\n", TAG,
+                    ifa->ifa_name ? ifa->ifa_name : "?", s_ip_str);
+              }
             freeifaddrs(ifa_list);
             return true;
         }
@@ -267,9 +279,19 @@ static bool check_interfaces(void)
         /* Also update the shared s_ip_str for network_get_ip() */
         inet_ntop(AF_INET, &sin->sin_addr, s_ip_str, sizeof(s_ip_str));
 
-        syslog(LOG_DEBUG, "[%s] Found iface %s addr %s\n", TAG,
-            ifa->ifa_name ? ifa->ifa_name : "?",
-            g_net_status.ip_addr);
+        /* Same guard as network_is_connected(): this runs from the iface
+         * poll thread every interval, so an unconditional log prints the
+         * same address for as long as the board is up.  Announce a change,
+         * not a heartbeat.
+         */
+
+        if (strncmp(s_ip_str, s_last_ip_str, sizeof(s_ip_str)) != 0)
+          {
+            strlcpy(s_last_ip_str, s_ip_str, sizeof(s_last_ip_str));
+            syslog(LOG_INFO, "[%s] Found iface %s addr %s\n", TAG,
+                ifa->ifa_name ? ifa->ifa_name : "?",
+                g_net_status.ip_addr);
+          }
 
         found = true;
         break;
@@ -567,7 +589,6 @@ int network_reconnect(void)
 
 int network_set_dns(const char* primary, const char* secondary)
 {
-    FILE* fp = NULL;
     int ret = ERROR;
 
     if (!primary || primary[0] == '\0') {
@@ -575,19 +596,43 @@ int network_set_dns(const char* primary, const char* secondary)
         return -EINVAL;
     }
 
-    fp = fopen("/tmp/resolv.conf", "w");
-    if (!fp) {
-        syslog(LOG_ERR, "[%s] Cannot open /tmp/resolv.conf: %d\n",
-            TAG, errno);
-        return -errno;
-    }
+#ifdef CONFIG_NETDB_DNSCLIENT
+    /* Register with the resolver directly; on flat NuttX there is no
+     * /etc/resolv.conf reader, and no /tmp to write one into. */
+    {
+        struct in_addr addr;
 
-    fprintf(fp, "nameserver %s\n", primary);
-    if (secondary && secondary[0] != '\0') {
-        fprintf(fp, "nameserver %s\n", secondary);
-    }
+        if (inet_pton(AF_INET, primary, &addr) == 1) {
+            dns_add_nameserver((FAR const struct sockaddr_in *)&addr,
+                sizeof(struct sockaddr_in));
+        } else {
+            syslog(LOG_ERR, "[%s] set_dns: bad primary '%s'\n", TAG, primary);
+        }
 
-    fclose(fp);
+        if (secondary && secondary[0] != '\0' &&
+            inet_pton(AF_INET, secondary, &addr) == 1) {
+            dns_add_nameserver((FAR const struct sockaddr_in *)&addr,
+                sizeof(struct sockaddr_in));
+        }
+    }
+#else
+    /* Hosts with a real /etc: write the file. */
+    {
+        FILE* fp = fopen("/tmp/resolv.conf", "w");
+        if (!fp) {
+            syslog(LOG_ERR, "[%s] Cannot open /tmp/resolv.conf: %d\n",
+                TAG, errno);
+            return -errno;
+        }
+
+        fprintf(fp, "nameserver %s\n", primary);
+        if (secondary && secondary[0] != '\0') {
+            fprintf(fp, "nameserver %s\n", secondary);
+        }
+
+        fclose(fp);
+    }
+#endif
 
     /* Persist to config_store */
     claw_config_set("net.dns_primary", primary);

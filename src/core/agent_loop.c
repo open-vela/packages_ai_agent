@@ -28,6 +28,7 @@
 #include "core/context_builder.h"
 #include "core/message_bus.h"
 #include "core/session_mgr.h"
+#include "infra/network_manager.h"
 #include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
@@ -45,6 +46,10 @@
 #include <sys/time.h>
 
 #include "cJSON.h"
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+#include "ui/lvgl_ui_channel.h"
+#endif
 
 static const char* TAG = "agent";
 
@@ -198,6 +203,14 @@ static void add_tool_result_messages(cJSON* messages,
 {
     int n = resp->call_count;
 
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* The LLM asked for tools, so the turn has left THINKING and is now
+     * executing them (pet_status_view.h: 3, orange fill).  A permission
+     * prompt raised inside a tool overrides this with WAITING (4) and
+     * restores whatever we set here once it clears. */
+    (void)lvgl_ui_channel_set_pet_state(3);
+#endif
+
     if (n == 1) {
         const llm_tool_call_t* call = &resp->calls[0];
 
@@ -218,6 +231,11 @@ static void add_tool_result_messages(cJSON* messages,
         cJSON_AddStringToObject(result_msg, "tool_call_id", call->id);
         cJSON_AddStringToObject(result_msg, "content", tool_output);
         cJSON_AddItemToArray(messages, result_msg);
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        /* Back to THINKING while the LLM digests the tool result. */
+        (void)lvgl_ui_channel_set_pet_state(2);
+#endif
         return;
     }
 
@@ -307,6 +325,11 @@ static void add_tool_result_messages(cJSON* messages,
             free(tasks[i].output);
         }
     }
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* Back to THINKING while the LLM digests the tool results. */
+    (void)lvgl_ui_channel_set_pet_state(2);
+#endif
 }
 
 /* ── Fast path counters ─────────────────────────────────── */
@@ -354,6 +377,30 @@ static const nl_intent_t s_intents[] = {
     { NULL,         NULL,               NULL,  0    },
 };
 
+/* Pet-view state helpers for the NL fast path.  Unlike the ReAct path
+ * (add_tool_result_messages()), the fast path runs its tool synchronously
+ * before returning, so it has no THINKING phase: mark EXECUTING right before
+ * the tool call and let nl_fast_path_done() drop back to IDLE. */
+static inline void nl_fast_path_pet_state(int state)
+{
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    (void)lvgl_ui_channel_set_pet_state(state);
+#else
+    (void)state;
+#endif
+}
+
+static inline void nl_fast_path_done(void)
+{
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* A tool that raised an approval prompt leaves the approval page owning
+     * WAITING; only clear to IDLE when nothing is pending. */
+    if (!lvgl_ui_channel_approval_pending()) {
+        (void)lvgl_ui_channel_set_pet_state(0);
+    }
+#endif
+}
+
 static char* handle_nl_fast_path(const char* text)
 {
     /* Table-driven: scan intents, first match wins */
@@ -361,6 +408,7 @@ static char* handle_nl_fast_path(const char* text)
         if (contains_any(text, s_intents[i].keywords)) {
             char* reply = calloc(1, s_intents[i].output_size);
             if (reply) {
+                nl_fast_path_pet_state(3);
                 tool_registry_execute(s_intents[i].tool_name,
                     s_intents[i].tool_args, reply,
                     s_intents[i].output_size);
@@ -408,8 +456,10 @@ static char* handle_nl_fast_path(const char* text)
         snprintf(input, sizeof(input),
             "{\"location\":\"%s\"}", safe_city);
         char* reply = calloc(1, 4096);
-        if (reply)
+        if (reply) {
+            nl_fast_path_pet_state(3);
             tool_registry_execute("get_weather", input, reply, 4096);
+        }
         if (reply) {
             s_fast_path_count++;
             syslog(LOG_INFO,
@@ -438,6 +488,7 @@ static char* handle_nl_fast_path(const char* text)
                 "{\"keyword\":\"%.*s\"}", klen, kw);
             char search_result[4096];
             memset(search_result, 0, sizeof(search_result));
+            nl_fast_path_pet_state(3);
             tool_registry_execute("music_search", input, search_result, sizeof(search_result));
 
             /* Auto-play first result if search succeeded */
@@ -863,7 +914,7 @@ static void dispatch_response(const agent_msg_t* msg,
             sizeof(out.channel) - 1);
         strncpy(out.chat_id, msg->chat_id,
             sizeof(out.chat_id) - 1);
-        out.content = strdup("Sorry, I encountered an error.");
+        out.content = strdup("请求失败：请检查网络或模型配置。");
         if (out.content) {
             if (message_bus_push_outbound(&out) != OK) {
                 free(out.content);
@@ -1401,6 +1452,83 @@ static void inject_session_context(char* sys_prompt, size_t size,
         channel, chat_id);
 }
 
+/* ── Prerequisite gate for the LLM leg ───────────────────── */
+
+/* User-facing reason why the LLM cannot run, or NULL when it can.
+ * The text is shown as a chat card, so it says what is missing and
+ * which command fixes it. */
+static const char* llm_blocked_reason(const char** short_text)
+{
+    llm_backend_t backend;
+
+    if (short_text) {
+        *short_text = NULL;
+    }
+
+    if (!network_is_connected()) {
+        if (short_text) {
+            /* Pet screen caption: 2 lines, must fit the 240px round LCD. */
+            *short_text = "未联网\n请先连接 Wi-Fi";
+        }
+        return "未联网：请先连接 Wi-Fi，设置好网络后再试。";
+    }
+
+    if (llm_router_get_backend(0, &backend) != 0
+        || backend.model[0] == '\0') {
+        if (short_text) {
+            *short_text = "模型未配置\n请用 set_llm 配置";
+        }
+        return "模型未配置：请先用 set_llm 配置模型。";
+    }
+
+    return NULL;
+}
+
+/* Answer a message that cannot reach the LLM.  Voice replies normally go
+ * through TTS, which needs the very network/credentials found missing, so
+ * the text is delivered on the UI channel instead (the bubble appears on
+ * the round screen and TTS is attempted only once).  The pet goes to ERROR
+ * (red + shake) so the failure is still visible after the chat screen
+ * yields back to the pet; ERROR has no auto-return timer. */
+static void reply_llm_unavailable(const agent_msg_t* msg, const char* text,
+                                  const char* short_text)
+{
+    agent_msg_t out = { 0 };
+    const char* channel = msg->channel;
+    const char* chat_id = msg->chat_id;
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    if (strcmp(msg->channel, AGENT_CHAN_VOICE) == 0) {
+        channel = AGENT_CHAN_LVGL_UI;
+        chat_id = "lvgl_ui";
+    }
+#endif
+
+    strncpy(out.channel, channel, sizeof(out.channel) - 1);
+    strncpy(out.chat_id, chat_id, sizeof(out.chat_id) - 1);
+    out.content = strdup(text);
+    if (out.content && message_bus_push_outbound(&out) != OK) {
+        free(out.content);
+    }
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* Only local input should paint the on-device pet red; a remote
+     * channel (feishu/ws/mqtt) failing says nothing about this screen. */
+    if (strcmp(msg->channel, "cli") == 0
+        || strcmp(msg->channel, AGENT_CHAN_VOICE) == 0
+        || strcmp(msg->channel, AGENT_CHAN_LVGL_UI) == 0) {
+        /* Carry the concrete reason onto the pet screen too: the chat card
+         * yields back to the pet after 8s, and a bare "出错了" there leaves
+         * the user guessing whether Wi-Fi or the model is the problem. */
+        if (short_text && short_text[0] != '\0') {
+            (void)lvgl_ui_channel_set_pet_error(short_text);
+        } else {
+            (void)lvgl_ui_channel_set_pet_state(5);
+        }
+    }
+#endif
+}
+
 /* ── Main agent loop task ─────────────────────────────────── */
 
 static void* agent_loop_task(void* arg)
@@ -1510,6 +1638,10 @@ static void* agent_loop_task(void* arg)
         /* NL fast path — after injection check, before LLM */
         if (!reply) {
             reply = handle_nl_fast_path(msg.content);
+            if (reply) {
+                /* Tool already ran synchronously; the turn ends here. */
+                nl_fast_path_done();
+            }
         }
 
         if (reply) {
@@ -1523,6 +1655,23 @@ static void* agent_loop_task(void* arg)
                 free(reply);
             }
             free(msg.content);
+            continue;
+        }
+
+        /* Prerequisites for the LLM leg.  Without this, a device that is
+         * offline or has no model configured either blocks on network
+         * timeouts or answers with a bare English error, leaving the user
+         * with no idea what is wrong.  Say it on the chat screen instead. */
+        const char* blocked_short = NULL;
+        const char* blocked = llm_blocked_reason(&blocked_short);
+        if (blocked) {
+            syslog(LOG_WARNING,
+                "[%s] LLM unavailable for %s:%s: %s\n",
+                TAG, msg.channel, msg.chat_id, blocked);
+            reply_llm_unavailable(&msg, blocked, blocked_short);
+            free(msg.content);
+            free(msg.image_b64);
+            msg.image_b64 = NULL;
             continue;
         }
 
@@ -1545,6 +1694,14 @@ static void* agent_loop_task(void* arg)
 
         char* final_text = NULL;
 
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        /* Entering the LLM path (vision or ReAct) — drive the pet to THINKING
+         * (blue, spin).  Fills the gap after voice_channel_dispatch returns
+         * and the PTT mirror drops to IDLE: without this the pet shows
+         * idle-green while the LLM is still working.  pet_status_view.h: 2. */
+        (void)lvgl_ui_channel_set_pet_state(2);
+#endif
+
         /* Vision path */
         final_text = handle_vision_message(&msg);
         if (final_text) {
@@ -1558,6 +1715,13 @@ static void* agent_loop_task(void* arg)
         }
 
         dispatch_response(&msg, final_text);
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        /* LLM/reply phase done — back to IDLE.  A downstream TTS speak
+         * failure will later drive ERROR, which the RPMsg FIFO delivers
+         * after this IDLE so red+shake wins.  pet_status_view.h: 0. */
+        (void)lvgl_ui_channel_set_pet_state(0);
+#endif
 
         /* Free image_b64 if not already freed by vision path */
         free(msg.image_b64);
@@ -1587,12 +1751,23 @@ int agent_loop_init(void)
 
 int agent_loop_start(void)
 {
+    /* The loop is started at boot (so offline input is still answered)
+     * and again when the network comes up; keep the second call a no-op
+     * instead of spawning a competing consumer on the inbound queue. */
+    static bool started = false;
+
+    if (started) {
+        return OK;
+    }
+
     int ret = agent_task_create(agent_loop_task, "agent_loop",
         AGENT_AI_AGENT_STACK, NULL, AGENT_AI_AGENT_PRIO);
 
     if (ret != OK) {
         syslog(LOG_ERR,
             "[%s] Failed to create agent_loop task\n", TAG);
+    } else {
+        started = true;
     }
     return ret;
 }

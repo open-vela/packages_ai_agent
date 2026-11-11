@@ -28,13 +28,18 @@
 #include "infra/config_store.h"
 #include "infra/cron_service.h"
 #include "infra/heartbeat.h"
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+#include "infra/notify_service.h"
+#endif
 #include "llm/llm_proxy.h"
 #ifdef CONFIG_AI_AGENT_MCP
 #include "tools/mcp_client.h"
+#include "cJSON.h"
 #endif
 #include "core/memory_store.h"
 #include "core/session_mgr.h"
 #include "infra/network_manager.h"
+#include "infra/time_sync.h"
 #include "infra/http_proxy.h"
 #include "infra/vela_tls.h"
 #include "tools/tool_get_time.h"
@@ -42,14 +47,28 @@
 #include "tools/tool_registry.h"
 #include "tools/tool_web_search.h"
 #include "agent_compat.h"
+
+/* BK7258 AP: the Wi-Fi STA lives on the CP core, so re-associating from the
+ * agent means asking the cross-core control plane (chips/bk7258/wlan_ctrl). */
+#if defined(CONFIG_BK7258_COMPONENT_AP)
+#include "wlan_ctrl.h"
+#define AI_AGENT_WIFI_CTRL 1
+#endif
 #include "agent_config.h"
 
 #if AGENT_SKILL_SYNC_ENABLED
 #include "tools/skill_sync.h"
 #endif
 
-#ifdef CONFIG_AI_AGENT_LVGL_UI
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
 #include "ui/lvgl_ui_channel.h"
+#endif
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+#include "ui/pet_status_view.h"
+#endif
+
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+#include "channels/remote_ctrl_channel.h"
 #endif
 
 #ifdef CONFIG_AI_AGENT_TEST
@@ -106,14 +125,15 @@ static void cmd_help(void)
         "  heap_info            - Show memory usage\n"
         "  set_proxy <host> <port> - Set HTTP proxy\n"
         "  clear_proxy          - Remove proxy config\n"
-        "  set_wifi <ssid> <pw> - Connect to WiFi (real hardware; saved for reboot)\n"
-        "  wifi_reconnect       - Re-join WiFi using saved credentials\n"
+        "  set_wifi <ssid> <pw> - Connect to WiFi and save credentials (survives reconnects)\n"
+        "  wifi_reconnect       - Re-join WiFi using saved credentials, no reflash\n"
         "  set_search_key <key> - Set SerpAPI (Google) key\n"
         "  set_exa_key <key>    - Set Exa AI search key\n"
         "  set_tavily_key <key> - Set Tavily search key\n"
         "  set_news_key <key>   - Set NewsAPI key\n"
         "  set_tavily_key <key> - Set Tavily AI search key\n"
         "  config_show          - Show current configuration\n"
+        "  sync_time            - Force an SNTP sync now, then show the clock\n"
         "  config_reset         - Clear all runtime config\n"
         "  ask <text>           - Chat with AI Agent\n"
         "  heartbeat_trigger    - Manually trigger heartbeat check\n"
@@ -124,16 +144,40 @@ static void cmd_help(void)
         "  node_start          - Connect to OpenClaw Gateway as Node\n"
         "  node_stop           - Disconnect from OpenClaw Gateway\n"
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        "  set_remote <host:port> [device_id] - Set PC bridge for remote agent\n"
+        "  set_remote_auth <user> <pass> - Set bridge broker credentials\n"
+        /* One 'r' prefix for the whole family: these are typed at a console, and
+         * a set where one name is short and the rest are long is worse than
+         * either convention on its own. set_remote* keep their names because
+         * they follow the repo-wide set_<thing> pattern for configuration. */
+        "  rask <text>          - Send one instruction to the remote agent\n"
+        "  rstat                - Remote agent state, model, billing, approval\n"
+        "  rreply               - Print the remote agent's full reply\n"
+        "  rmodel [n|name]      - List remote agent models, or switch to one\n"
+        "  rmode [normal|reads|trust] - Show or switch the approval mode\n"
+        "  rnew                 - Open a fresh session\n"
+        "  ruse [n]             - List sessions, or switch to generation n\n"
+        "  rusage               - Refresh remote session billing\n"
+        "  ronce                - Approve the pending request (human only)\n"
+        "  rdeny                - Deny the pending request (human only)\n"
+#endif
+#if defined(CONFIG_AI_AGENT_REMOTE_CTRL) && (defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG))
+        "  rpending <tool> [hint] - Simulate a pending approval (debug; S2/S3 decide)\n"
+#endif
         "  restart              - Restart the device\n"
         "  quit                 - Exit agent\n"
         "  set_mqtt <broker> [client_id] - Set MQTT broker (host:port)\n"
         "  set_volc_key <api_key>       - Set Doubao voice API key\n"
         "  set_volc_asr <id> <tok> <cluster> - Set ASR credentials\n"
         "  set_volc_speaker <id>  - Set TTS voice (e.g. zh_female_cancan)\n"
+        "  set_volc_voice <speed> [volume] [pitch] - Tune TTS rate/volume/pitch (1.0=default)\n"
         "  voice_start            - Start voice channel\n"
         "  voice_stop             - Stop voice channel\n"
         "  voice_test_tts <text> [out.pcm] - Test TTS synthesis\n"
         "  voice_test_asr <file>  - Test ASR recognition\n"
+        "  voice_test_beep [freq] [ms] - Test beep tone (default 1000Hz 200ms)\n"
+        "  voice_test_speak <text> - Test speak end-to-end (beep + TTS + playback)\n"
         "  set_voice_tts <name>   - Switch TTS backend\n"
         "  set_voice_asr <name>   - Switch ASR backend\n"
         "  set_weixin_token <tok> - Set WeChat bot token\n"
@@ -156,8 +200,19 @@ static void cmd_help(void)
         "  mcp_status            - Show MCP client status\n"
         "  mcp_tools             - List remote MCP tools\n"
 #endif
-#ifdef CONFIG_AI_AGENT_LVGL_UI
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+        "  notify_start          - Start Gerrit/Jira background polling\n"
+        "  notify_status         - Show notify service status (cursor/new)\n"
+        "  notify_stop           - Stop background polling\n"
+        "  notify_inject <g|j> <key> <text> - Pop the test notice page (gerrit/jira)\n"
+#endif
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
         "  show_chat            - Show chat UI on screen\n"
+        "  set_pet <0-5>        - Drive pet to a state (debug; 0=idle 1=listen 2=think 3=exec 4=wait 5=err)\n"
+        "  set_page <0>         - Back to the pet home screen (also wakes standby)\n"
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+        "  set_ptype [0-3]      - Show/set the fixed pet species (0=cat 1=frog 2=dog 3=pig)\n"
+#endif
 #endif
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
         "  net_diag [ping|http] <target>  Network diagnostics\n"
@@ -234,9 +289,17 @@ static void cmd_net_diag(int argc, char** argv)
     }
 
     if (strcmp(argv[1], "ping") == 0 && argc >= 3) {
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "ping -c 3 %s", argv[2]);
-        system(cmd);
+        /* NuttX does not provide libc system() unless CONFIG_SYSTEM_SYSTEM
+         * is enabled; call the ping builtin's entry directly instead of
+         * shelling out, so this diagnostic links without that dependency. */
+#ifdef CONFIG_SYSTEM_PING
+        extern int ping_main(int argc, FAR char *argv[]);
+        FAR char *pargs[] = {"ping", "-c", "3", argv[2], NULL};
+        ping_main(4, pargs);
+#else
+        printf("ping builtin off (CONFIG_SYSTEM_PING); run at NSH: ping -c 3 %s\n",
+               argv[2]);
+#endif
     } else if (strcmp(argv[1], "http") == 0 && argc >= 3) {
         printf("HTTP HEAD %s ...\n", argv[2]);
         /* Simple connectivity test using existing TLS layer */
@@ -270,13 +333,13 @@ static void cmd_memory_read(void)
     free(buf);
 }
 
-static void cmd_memory_write(int argc, char** argv)
+static void cmd_memory_write(const char* text)
 {
-    if (argc < 2) {
+    if (text == NULL || text[0] == '\0') {
         printf("Usage: memory_write <content>\n");
         return;
     }
-    memory_write_long_term(argv[1]);
+    memory_write_long_term(text);
     printf("MEMORY.md updated.\n");
 }
 
@@ -329,30 +392,96 @@ static void cmd_clear_proxy(void)
     printf("Proxy cleared. Restart to apply.\n");
 }
 
+/* 等 CP 核那边把关联/DHCP 走完(dhcp 不在 AP 上跑),最多 secs 秒。 */
+static void wifi_wait_link(int secs)
+{
+    int i;
+
+    for (i = 0; i < secs && !network_is_connected(); i++) {
+        sleep(1);
+    }
+
+    printf("link   %s (%s)\n",
+        network_is_connected() ? "up" : "down", network_get_ip());
+}
+
+/* 保存 Wi-Fi 凭据并立即连接。
+ * 板上 AP 没有 netdev,STA 在 CP 核,所以走 chips/bk7258/wlan_ctrl 的跨核
+ * 控制面——和 nsh-ap> 的 `wapi connect` 是同一条路,但这里在 agent 里直接
+ * 调,不用退回 NSH。凭据同时存进配置库:掉线后 `wifi_reconnect` 靠它自救,
+ * 不重烧、不重启(AP 的 /data 是 tmpfs,重启会丢)。 */
 static void cmd_set_wifi(int argc, char** argv)
 {
+#if defined(AI_AGENT_WIFI_CTRL)
+    int ret;
+#else
+    int err;
+#endif
+
     if (argc < 3) {
         printf("Usage: set_wifi <ssid> <password>\n");
         return;
     }
+
     printf("Connecting to '%s' ...\n", argv[1]);
-    int err = network_wifi_connect(NULL, argv[1], argv[2]);
-    if (err == OK)
-        printf("WiFi connected: %s\n", network_get_ip());
-    else
+
+#if defined(AI_AGENT_WIFI_CTRL)
+    claw_config_set(AGENT_CFG_KEY_WIFI_SSID, argv[1]);
+    claw_config_set(AGENT_CFG_KEY_WIFI_PASS, argv[2]);
+
+    ret = wifi_ctrl_connect(argv[1], argv[2]);
+    if (ret < 0) {
+        printf("Wi-Fi connect request failed (%d); try `wapi scan`\n", ret);
+        return;
+    }
+#else
+    err = network_wifi_connect(NULL, argv[1], argv[2]);
+    if (err != OK) {
         printf("WiFi failed. Check SSID/password or run net_status.\n");
+        return;
+    }
+#endif
+
+    wifi_wait_link(20);
 }
 
+/* 用保存的凭据重新关联:掉网后一条命令恢复,不需要重烧或重启。 */
 static void cmd_wifi_reconnect(void)
 {
-    printf("Reconnecting WiFi ...\n");
+#if defined(AI_AGENT_WIFI_CTRL)
+    char ssid[WLAN_CTRL_SSID_LEN] = { 0 };
+    char pass[WLAN_CTRL_PASS_LEN] = { 0 };
+    int ret;
+
+    if (claw_config_get(AGENT_CFG_KEY_WIFI_SSID, ssid, sizeof(ssid)) != OK
+        || ssid[0] == '\0') {
+        printf("No saved credentials. Use: set_wifi <ssid> <pass>\n");
+        return;
+    }
+
+    (void)claw_config_get(AGENT_CFG_KEY_WIFI_PASS, pass, sizeof(pass));
+
+    printf("Reconnecting to '%s' ...\n", ssid);
+    (void)wifi_ctrl_disconnect();
+    sleep(1);
+
+    ret = wifi_ctrl_connect(ssid, pass);
+    if (ret < 0) {
+        printf("Wi-Fi reconnect failed (%d); check the AP is in range\n", ret);
+        return;
+    }
+
+    wifi_wait_link(20);
+#else
     int err = network_wifi_reconnect();
+
     if (err == OK)
         printf("Reconnected: %s\n", network_get_ip());
     else if (err == ERROR)
         printf("No saved credentials. Use: set_wifi <ssid> <pass>\n");
     else
         printf("WiFi reconnect failed.\n");
+#endif
 }
 
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
@@ -440,6 +569,42 @@ static void cmd_set_news_key(int argc, char** argv)
     printf("NewsAPI key saved.\n");
 }
 
+/* 打印系统时钟,并确保网络时间(SNTP)守护在跑。
+ * 板上 localtime_r() 退化成 gmtime_r(),本地时间用 UTC+8 显式换算。
+ * 先强制同步一次再打印:守护线程的周期是 30 分钟,时钟跑偏时干等着看
+ * 读数没有意义——要的是「同步完纠没纠回来」。 */
+static void cmd_sync_time(void)
+{
+    char utc_s[32];
+    char cst_s[32];
+    char err[128] = { 0 };
+    struct tm tm;
+    int rc;
+
+    (void)time_sync_start();
+
+    rc = time_sync_now(err, sizeof(err));
+
+    time_t now = time(NULL);
+    gmtime_r(&now, &tm);
+    strftime(utc_s, sizeof(utc_s), "%Y-%m-%d %H:%M:%S", &tm);
+
+    time_t local = now + AGENT_TZ_OFFSET_SEC;
+    gmtime_r(&local, &tm);
+    strftime(cst_s, sizeof(cst_s), "%Y-%m-%d %H:%M:%S", &tm);
+
+    printf("clock  UTC %s | CST %s (epoch %lld)\n",
+        utc_s, cst_s, (long long)now);
+    printf("link   %s (%s)\n",
+        network_is_connected() ? "up" : "down", network_get_ip());
+
+    if (rc == 0) {
+        printf("sntp   synced now (then re-syncs every 30 min)\n");
+    } else {
+        printf("sntp   sync failed: %s\n", err[0] ? err : "unknown");
+    }
+}
+
 static void cmd_config_show(void)
 {
     char val[128] = { 0 };
@@ -480,10 +645,19 @@ static void cmd_config_show(void)
     SHOW_CFG("GW Port", AGENT_CFG_KEY_GATEWAY_PORT, false);
     SHOW_CFG("GW Token", AGENT_CFG_KEY_GATEWAY_TOKEN, true);
     SHOW_CFG("MQTT Broker", AGENT_CFG_KEY_MQTT_BROKER, false);
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+    SHOW_CFG("Remote Broker", AGENT_CFG_KEY_REMOTE_BROKER, false);
+    SHOW_CFG("Remote Device", AGENT_CFG_KEY_REMOTE_DEVICE_ID, false);
+    SHOW_CFG("Remote User", AGENT_CFG_KEY_REMOTE_USERNAME, false);
+    SHOW_CFG("Remote Pass", AGENT_CFG_KEY_REMOTE_PASSWORD, true);
+#endif
     SHOW_CFG("Volc AppKey", AGENT_CFG_KEY_VOLC_APPKEY, true);
     SHOW_CFG("Volc Token", AGENT_CFG_KEY_VOLC_TOKEN, true);
     SHOW_CFG("Volc API Key", AGENT_CFG_KEY_VOLC_API_KEY, true);
     SHOW_CFG("Volc Speaker", AGENT_CFG_KEY_VOLC_SPEAKER, false);
+    SHOW_CFG("Volc Speed", AGENT_CFG_KEY_VOLC_SPEED, false);
+    SHOW_CFG("Volc Volume", AGENT_CFG_KEY_VOLC_VOLUME, false);
+    SHOW_CFG("Volc Pitch", AGENT_CFG_KEY_VOLC_PITCH, false);
 
 #undef SHOW_CFG
 
@@ -571,29 +745,26 @@ static void cmd_heartbeat_trigger(void)
     }
 }
 
-static void cmd_ask(int argc, char** argv)
+static void cmd_ask(const char* text)
 {
-    if (argc < 2) {
+    if (text == NULL || text[0] == '\0') {
         printf("Usage: ask <message>\n");
         return;
-    }
-
-    /* Concatenate all arguments as the message */
-    char content[256] = { 0 };
-    for (int i = 1; i < argc; i++) {
-        strncat(content, argv[i], sizeof(content) - strlen(content) - 1);
-        if (i < argc - 1)
-            strncat(content, " ", sizeof(content) - strlen(content) - 1);
     }
 
     agent_msg_t msg = { 0 };
     strncpy(msg.channel, "cli", sizeof(msg.channel) - 1);
     strncpy(msg.chat_id, "console", sizeof(msg.chat_id) - 1);
-    msg.content = strdup(content);
+    msg.content = strdup(text);
     if (msg.content)
         message_bus_push_inbound(&msg);
-    printf("Sent to agent: %s\n", content);
-    syslog(LOG_INFO, "[agent] ask: %s\n", content);
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* Echo the typed text as a right-aligned user bubble, matching the
+     * PTT path, so the screen shows both halves of the exchange. */
+    (void)lvgl_ui_channel_send_user(text);
+#endif
+    printf("Sent to agent: %s\n", text);
+    syslog(LOG_INFO, "[agent] ask: %s\n", text);
 }
 
 static void cmd_cron_start(void)
@@ -664,6 +835,18 @@ static void cmd_quit(void)
     agent_request_shutdown();
 }
 
+#if defined(CONFIG_AI_AGENT_REMOTE_CTRL) && (defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG))
+/* rpending <tool> [hint] — debug-only: simulate a pending remote approval so the
+ * S2/S3 short-press approve/deny flow can be exercised on-device without a PC
+ * bridge. Shows the approval page and arms the next S2/S3 press as a decision. */
+static void cmd_remote_pending(int argc, char** argv)
+{
+    const char* tool = (argc >= 2) ? argv[1] : "remote-tool";
+    const char* hint = (argc >= 3) ? argv[2] : "需要你的确认";
+    remote_ctrl_channel_debug_pending(tool, hint);
+}
+#endif
+
 static void cmd_launch_app(int argc, char** argv)
 {
     if (argc < 2) {
@@ -696,18 +879,44 @@ static void cmd_exit_app(void)
 #ifdef CONFIG_AI_AGENT_MCP
 static void cmd_mcp_add(int argc, char** argv)
 {
+    /* Two forms:
+     *   mcp_add <name> <url> [token]                          (generic / Gerrit)
+     *   mcp_add <name> <url> <jira_url> <username> <pat>      (Jira MCP)
+     * The Jira form is selected when the URL targets acc.pt.miui.com; the
+     * Jira MCP (mcp-atlassian) authenticates via three X-Atlassian-* headers
+     * instead of a single bearer token. */
+    bool is_jira = (argc >= 3) && (strstr(argv[2], "acc.pt.miui.com") != NULL);
+
     if (argc < 3) {
-        printf("Usage: mcp_add <name> <url> [token]\n"
-               "  name:  server name (e.g. amap)\n"
-               "  url:   MCP endpoint (e.g. http://host:port/mcp)\n"
-               "  token: optional bearer token\n");
+        printf("Usage:\n"
+               "  mcp_add <name> <url> [token]\n"
+               "  mcp_add <name> <url> <jira_url> <username> <pat>   (Jira)\n"
+               "    name:     server name (e.g. gerrit, jira)\n"
+               "    url:      MCP endpoint\n"
+               "    token:    optional bearer token (generic / onedev gateway)\n"
+               "    jira_url: Jira base URL (e.g. https://jira-phone.mioffice.cn)\n"
+               "    username: Jira username (email prefix)\n"
+               "    pat:      Jira personal access token\n");
         return;
     }
 
-    const char* token = (argc >= 4) ? argv[3] : NULL;
-    int ret = mcp_client_add_server(argv[1], argv[2], token);
+    int ret;
+    if (is_jira) {
+        if (argc < 6) {
+            printf("Jira MCP needs: mcp_add <name> <url> <jira_url> <username> <pat>\n");
+            return;
+        }
+        ret = mcp_client_add_server(argv[1], argv[2], NULL,
+            argv[3], argv[4], argv[5]);
+    } else {
+        const char* token = (argc >= 4) ? argv[3] : NULL;
+        ret = mcp_client_add_server(argv[1], argv[2], token,
+            NULL, NULL, NULL);
+    }
     if (ret == OK) {
         printf("Added MCP server: %s → %s\n", argv[1], argv[2]);
+        /* Persist so the server is auto-restored after reboot. */
+        mcp_client_persist_save();
     } else {
         printf("Failed to add MCP server\n");
     }
@@ -725,6 +934,8 @@ static void cmd_mcp_remove(int argc, char** argv)
     int ret = mcp_client_remove_server(argv[1]);
     if (ret == OK) {
         printf("Removed MCP server: %s\n", argv[1]);
+        /* Update persisted list so a removed server doesn't reappear. */
+        mcp_client_persist_save();
     } else {
         printf("Server not found: %s\n", argv[1]);
     }
@@ -763,14 +974,106 @@ static void cmd_mcp_status(void)
 static void cmd_mcp_tools(void)
 {
     char* json = mcp_client_get_tools_json();
+    if (!json) {
+        printf("No remote tools (run mcp_discover first)\n");
+        return;
+    }
+
+    /* One tool per line: the array is thousands of bytes of JSON and a
+     * single printf gets cut off by the serial console mid-object, which
+     * is exactly where the tool names live.
+     */
+
+    cJSON* arr = cJSON_Parse(json);
+    if (!arr || !cJSON_IsArray(arr)) {
+        printf("%s\n", json);
+        free(json);
+        return;
+    }
+
+    cJSON* t = NULL;
+    int n = 0;
+    cJSON_ArrayForEach(t, arr)
+    {
+        cJSON* name = cJSON_GetObjectItem(t, "name");
+        cJSON* desc = cJSON_GetObjectItem(t, "description");
+        const char* d = (desc && cJSON_IsString(desc)) ? desc->valuestring : "";
+        printf("%2d  %-40s  %.60s\n", ++n,
+            (name && cJSON_IsString(name)) ? name->valuestring : "?",
+            d);
+    }
+
+    printf("(%d tools)\n", n);
+    cJSON_Delete(arr);
+    free(json);
+}
+#endif /* CONFIG_AI_AGENT_MCP */
+
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+/* ── notify_start / status / stop / inject ──────────────────── */
+
+static void cmd_notify_start(void)
+{
+    if (notify_service_start() == OK) {
+        printf("Notify service started (polling Gerrit/Jira).\n");
+    } else {
+        printf("Notify service already running or failed to start.\n");
+    }
+}
+
+static void cmd_notify_status(void)
+{
+    char* json = notify_service_status_json();
     if (json) {
         printf("%s\n", json);
         free(json);
     } else {
-        printf("No remote tools (run mcp_discover first)\n");
+        printf("No notify service data\n");
     }
 }
-#endif /* CONFIG_AI_AGENT_MCP */
+
+static void cmd_notify_stop(void)
+{
+    notify_service_stop();
+    printf("Notify service stopped.\n");
+}
+
+static void cmd_notify_inject(int argc, char** argv)
+{
+    /* notify_inject <gerrit|jira> <key> <summary...>
+     * Bypasses polling — pops a toast immediately.  Used to verify the
+     * toast widget + outbound path without a live MCP server. */
+    if (argc < 4) {
+        printf("Usage: notify_inject <gerrit|jira> <key> <summary...>\n"
+               "  e.g. notify_inject gerrit 9688768 \"CI failed: audio.c build error\"\n");
+        return;
+    }
+
+    notify_source_t src;
+    if (strcmp(argv[1], "gerrit") == 0) {
+        src = NOTIFY_SRC_GERRIT;
+    } else if (strcmp(argv[1], "jira") == 0) {
+        src = NOTIFY_SRC_JIRA;
+    } else {
+        printf("Source must be 'gerrit' or 'jira'\n");
+        return;
+    }
+
+    /* Rejoin argv[3..] as the summary text. */
+    char summary[192];
+    summary[0] = '\0';
+    for (int i = 3; i < argc; i++) {
+        if (i > 3) strlcat(summary, " ", sizeof(summary));
+        strlcat(summary, argv[i], sizeof(summary));
+    }
+
+    if (notify_service_inject(src, argv[2], summary) == OK) {
+        printf("Injected %s notification: %s\n", argv[1], argv[2]);
+    } else {
+        printf("Inject failed (bad source/key?)\n");
+    }
+}
+#endif /* CONFIG_AI_AGENT_NOTIFY_SERVICE */
 
 /* ── install_skill: install a skill from URL ──────────────── */
 
@@ -902,6 +1205,39 @@ static void* cli_thread(void* arg)
             continue;
         }
 
+        /* syslog and this fgets() share one console, so a log line can land
+         * in the read buffer and get dispatched as a command (board:
+         * "Unknown command: [agent]").  Every logger here tags its lines
+         * "[something]", so anything that opens with '[' is noise, not a
+         * typed command -- drop it and re-prompt.
+         */
+
+        {
+            const char* q = line;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '[') {
+                pthread_mutex_lock(&g_stdout_lock);
+                printf("vela> ");
+                fflush(stdout);
+                pthread_mutex_unlock(&g_stdout_lock);
+                continue;
+            }
+        }
+
+        /* Free-text commands (ask/rask/memory_write/voice_test_speak) read
+         * the untokensed remainder of the line, captured first because
+         * tokenise() splits the buffer in place and caps at MAX_ARGS words —
+         * without this, everything past the 7th word of a prompt was
+         * silently dropped. */
+        char rest[LINE_LEN];
+        {
+            const char* p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            p += strcspn(p, " \t");
+            while (*p == ' ' || *p == '\t') p++;
+            snprintf(rest, sizeof(rest), "%s", p);
+        }
+
         int argc = tokenise(line, argv, MAX_ARGS);
         if (argc == 0) {
             pthread_mutex_lock(&g_stdout_lock);
@@ -932,7 +1268,7 @@ static void* cli_thread(void* arg)
         else if (strcmp(cmd, "memory_read") == 0)
             cmd_memory_read();
         else if (strcmp(cmd, "memory_write") == 0)
-            cmd_memory_write(argc, argv);
+            cmd_memory_write(rest);
         else if (strcmp(cmd, "session_list") == 0)
             cmd_session_list();
         else if (strcmp(cmd, "session_clear") == 0)
@@ -969,12 +1305,14 @@ static void* cli_thread(void* arg)
             cmd_set_tavily_key(argc, argv);
         else if (strcmp(cmd, "config_show") == 0)
             cmd_config_show();
+        else if (strcmp(cmd, "sync_time") == 0)
+            cmd_sync_time();
         else if (strcmp(cmd, "config_reset") == 0)
             cmd_config_reset();
         else if (strcmp(cmd, "heartbeat_trigger") == 0)
             cmd_heartbeat_trigger();
         else if (strcmp(cmd, "ask") == 0)
-            cmd_ask(argc, argv);
+            cmd_ask(rest);
         else if (strcmp(cmd, "cron_start") == 0)
             cmd_cron_start();
 #ifdef CONFIG_AI_AGENT_NODE
@@ -987,6 +1325,39 @@ static void* cli_thread(void* arg)
         else if (strcmp(cmd, "node_stop") == 0)
             cmd_node_stop();
 #endif
+#ifdef CONFIG_AI_AGENT_REMOTE_CTRL
+        else if (strcmp(cmd, "set_remote") == 0)
+            cmd_set_remote(argc, argv);
+        else if (strcmp(cmd, "set_remote_auth") == 0)
+            cmd_set_remote_auth(argc, argv);
+        /* One spelling each, all 'r'-prefixed (see the help block for why).
+         * A second name for the same action would only be one more thing to
+         * remember and one more place to fall out of date. */
+        else if (strcmp(cmd, "rask") == 0)
+            cmd_remote_ask(rest);
+        else if (strcmp(cmd, "rstat") == 0)
+            cmd_remote_status();
+        else if (strcmp(cmd, "rreply") == 0)
+            cmd_remote_output();
+        else if (strcmp(cmd, "rmodel") == 0)
+            cmd_remote_model(argc, argv);
+        else if (strcmp(cmd, "rmode") == 0)
+            cmd_remote_mode(argc, argv);
+        else if (strcmp(cmd, "rnew") == 0)
+            cmd_remote_new();
+        else if (strcmp(cmd, "ruse") == 0)
+            cmd_remote_use(argc, argv);
+        else if (strcmp(cmd, "rusage") == 0)
+            cmd_remote_usage();
+        else if (strcmp(cmd, "ronce") == 0)
+            cmd_remote_once();
+        else if (strcmp(cmd, "rdeny") == 0)
+            cmd_remote_deny();
+#endif
+#if defined(CONFIG_AI_AGENT_REMOTE_CTRL) && (defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG))
+        else if (strcmp(cmd, "rpending") == 0)
+            cmd_remote_pending(argc, argv);
+#endif
         else if (strcmp(cmd, "quit") == 0) {
             cmd_quit();
             break;
@@ -998,6 +1369,8 @@ static void* cli_thread(void* arg)
             cmd_set_volc_asr(argc, argv);
         else if (strcmp(cmd, "set_volc_speaker") == 0)
             cmd_set_volc_speaker(argc, argv);
+        else if (strcmp(cmd, "set_volc_voice") == 0)
+            cmd_set_volc_voice(argc, argv);
         else if (strcmp(cmd, "voice_start") == 0)
             cmd_voice_start();
         else if (strcmp(cmd, "voice_stop") == 0)
@@ -1006,6 +1379,10 @@ static void* cli_thread(void* arg)
             cmd_voice_test_tts(argc, argv);
         else if (strcmp(cmd, "voice_test_asr") == 0)
             cmd_voice_test_asr(argc, argv);
+        else if (strcmp(cmd, "voice_test_beep") == 0)
+            cmd_voice_test_beep(argc, argv);
+        else if (strcmp(cmd, "voice_test_speak") == 0)
+            cmd_voice_test_speak(rest);
         else if (strcmp(cmd, "set_voice_tts") == 0)
             cmd_set_voice_tts(argc, argv);
         else if (strcmp(cmd, "set_voice_asr") == 0)
@@ -1036,9 +1413,45 @@ static void* cli_thread(void* arg)
         else if (strcmp(cmd, "mcp_tools") == 0)
             cmd_mcp_tools();
 #endif
-#ifdef CONFIG_AI_AGENT_LVGL_UI
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+        else if (strcmp(cmd, "notify_start") == 0)
+            cmd_notify_start();
+        else if (strcmp(cmd, "notify_status") == 0)
+            cmd_notify_status();
+        else if (strcmp(cmd, "notify_stop") == 0)
+            cmd_notify_stop();
+        else if (strcmp(cmd, "notify_inject") == 0)
+            cmd_notify_inject(argc, argv);
+#endif
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
         else if (strcmp(cmd, "show_chat") == 0)
             lvgl_ui_channel_show();
+        /* Debug: manually drive the pet status ring to a state (0..5) so each
+         * anim callback (breathe/spin/fill/blink/shake) can be verified without
+         * a network/LLM round-trip. pet_status_view.h: enum pet_state. */
+        else if (strcmp(cmd, "set_pet") == 0 && argc >= 2)
+            lvgl_ui_channel_set_pet_state(atoi(argv[1]));
+        /* Debug: bring the pet status ring home screen back to the foreground
+         * (page 0 only; the former particle page 1 was removed). */
+        else if (strcmp(cmd, "set_page") == 0 && argc >= 2)
+        {
+            if (lvgl_ui_channel_set_page(atoi(argv[1])) != 0)
+                printf("set_page: only page 0 (pet home) exists\n");
+        }
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+        /* Debug: print or set the ONE pet species this flash runs with
+         * (pet_status_view.h: enum pet_type).  The species is fixed at boot —
+         * randomly picked on the first boot after a flash and persisted in
+         * config — so it must not change when the user moves between pages.
+         * Setting it here persists the new value for the next boot. */
+        else if (strcmp(cmd, "set_ptype") == 0)
+        {
+            if (argc >= 2)
+                pet_status_view_set_type(atoi(argv[1]));
+            printf("pet type: %d (0=cat 1=frog 2=dog 3=pig; fixed per flash)\n",
+                   pet_status_view_get_type());
+        }
+#endif
 #endif
 #ifdef CONFIG_AI_AGENT_TEST
         else if (strcmp(cmd, "claw_test") == 0)

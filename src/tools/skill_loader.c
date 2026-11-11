@@ -195,6 +195,29 @@ static const char *TAG = "skills";
     "- Add: get_current_time, then edit_file/write_file to append: - [ ] [YYYY-MM-DD] desc\n" \
     "- Complete: edit_file to change - [ ] to - [x]\n"
 
+#define BUILTIN_VELA_BUILD \
+    "# Vela Build\n\n" \
+    "Compile vela firmware on the PC via the 'pc' MCP server, and report progress and result.\n\n" \
+    "## When to use\n" \
+    "When user asks to:\n" \
+    "- compile/build the vela firmware\n" \
+    "- check build progress or result\n" \
+    "- clean full rebuild\n\n" \
+    "## How to use\n" \
+    "1. mcp_status - check a server named 'pc' is connected. If missing (first use only, persisted):\n" \
+    "   run_shell \"mcp_add pc http://10.0.2.2:8760/mcp\" then run_shell \"mcp_discover\"\n" \
+    "2. pc.vela_build {\"target\": \"goldfish-arm64-v8a-ap\", \"clean\": false} - starts the build on the PC and returns immediately. Do NOT wait for the build in this call (a single HTTP request times out at 120 s).\n" \
+    "3. pc.vela_build_status {\"wait\": 60} - the wait holds the call up to 60 s while the build runs; repeat until terminal:\n" \
+    "   - state running: call vela_build_status {\"wait\": 60} again, never poll in a tight loop\n" \
+    "   - state success: report artifact (vela_ap.bin + size) and elapsed time\n" \
+    "   - state failed: report the error lines from log_tail (only failures include it)\n\n" \
+    "## Limits\n" \
+    "- Only one build at a time on the PC\n" \
+    "- Build output stays on the PC under out/openvela_vela_<target>/\n\n" \
+    "## Example\n" \
+    "User: 帮我编译一下固件\n" \
+    "-> mcp_status -> pc.vela_build -> pc.vela_build_status {\"wait\": 60} (repeat) -> 编译成功：vela_ap.bin 12.3 MB，耗时 35 秒\n"
+
 /* Built-in skill registry */
 typedef struct {
     const char *filename;   /* e.g. "weather" */
@@ -212,6 +235,7 @@ static const builtin_skill_t s_builtins[] = {
     { "news-digest",    BUILTIN_NEWS_DIGEST    },
     { "feishu-test",    BUILTIN_FEISHU_TEST    },
     { "task-manager",   BUILTIN_TASK_MANAGER   },
+    { "vela-build",     BUILTIN_VELA_BUILD     },
 };
 
 #define NUM_BUILTINS (sizeof(s_builtins) / sizeof(s_builtins[0]))

@@ -36,8 +36,8 @@ Call them by their full prefixed name just like built-in tools.
 - `mcp_remove <name>` — disconnect and remove a server
 
 ## Limits
-- Maximum 8 servers, 64 total tools across all servers
-- Servers and tools are NOT persisted across restarts. Re-add servers after reboot.
+- Server/tool capacity is set by Kconfig: `AI_AGENT_MCP_MAX_SERVERS` (default 4) and `AI_AGENT_MCP_MAX_TOOLS` (default 16, boards can raise it — goldfish uses 64)
+- Servers added with `mcp_add` ARE persisted in the config store and survive reboots; discovered tools refresh at startup/`mcp_discover`
 
 ## Troubleshooting
 - HTTP 401/403: Check bearer token is valid and not expired

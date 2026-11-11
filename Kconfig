@@ -102,6 +102,60 @@ config AI_AGENT_LVGL_UI
 		Provides a chat-bubble interface on a round watch screen
 		with PTT (Push-to-Talk) voice input.
 
+config AI_AGENT_UI_RPMSG
+	bool "Drive the CP-side UI over RPMsg (路 B dual-core)"
+	default n
+	depends on RPTUN
+	---help---
+		On dual-core BK7258 (路 B): the AP runs the agent (LLM/voice/
+		TLS) but has no LCD/LVGL/FPU.  This compiles a thin shim
+		(ui_rpmsg_client.c) that implements the lvgl_ui_channel_* +
+		lvgl_toast_* API as RPMsg messages to the CP core, which owns
+		the LCD and renders the bubbles/toasts (ui_rpmsg_server.c).
+		The agent's call sites are unchanged (same guard as
+		AI_AGENT_LVGL_UI).  TTS still runs locally on AP via
+		voice_channel_speak(); only the bubble render crosses the link.
+
+config AI_AGENT_PTT
+	bool "Physical Push-to-Talk button (hold-to-talk)"
+	default n
+	depends on INPUT_BUTTONS
+	depends on AI_AGENT_LVGL_UI || AI_AGENT_UI_RPMSG
+	---help---
+		Compile the AP-side physical PTT button thread (ptt_button.c).
+		Opens /dev/btn0 and watches the configured button (S1 by default)
+		for press/release edges: press → voice_channel_start() +
+		set_ptt(RECORDING); release → set_ptt(PROCESSING) +
+		voice_channel_stop_with_text() + send_user() echo +
+		voice_channel_dispatch() → agent → LLM → reply + set_ptt(IDLE).
+		Hold-to-talk semantics (UI方案.md §2.5).  No reverse RPMsg —
+		the buttons, voice pipeline, and UI shim are all on the AP core.
+
+config AI_AGENT_PTT_BUTTON_IDX
+	int "PTT button index (0=S1/KEY1, 1=S2/KEY2, 2=S3/KEY3)"
+	default 0
+	depends on AI_AGENT_PTT
+
+config AI_AGENT_PTT_DEVPATH
+	string "PTT button device path"
+	default "/dev/btn0"
+	depends on AI_AGENT_PTT
+
+config AI_AGENT_PTT_STACKSIZE
+	int "PTT button thread stack size"
+	default 4096
+	depends on AI_AGENT_PTT
+
+config AI_AGENT_PTT_PRIORITY
+	int "PTT button thread priority"
+	default 100
+	depends on AI_AGENT_PTT
+
+config AI_AGENT_PTT_ASR_CAP
+	int "ASR text buffer capacity (bytes)"
+	default 512
+	depends on AI_AGENT_PTT
+
 config AI_AGENT_FEISHU
 	bool "Enable Feishu bot channel"
 	default y
@@ -139,15 +193,21 @@ config AI_AGENT_AUDIO_PREPROCESS
 config AI_AGENT_AUDIO_CAPTURE_GAIN
 	int "Audio capture gain multiplier"
 	default 6
-	range 1 16
+	range 1 256
 	---help---
 		Gain multiplier applied to captured audio samples.
-		When board configures multiple DMIC channels but only
-		one has a physical microphone, the mono downmix dilutes
-		the signal. Set gain to compensate:
-		- 1 = No gain (single-channel or balanced multi-mic)
-		- 6 = Compensate for 6-channel DMIC with 1 active mic
-		- Higher values for more amplification (may clip)
+		Two use cases:
+		- Multi-mic downmix: when the board configures several DMIC
+		  channels but only one has a physical mic, the mono downmix
+		  dilutes the signal (e.g. 6 = compensate 6-channel DMIC with
+		  1 active mic).
+		- QEMU/goldfish: the host mic level depends on which
+		  PulseAudio source the virtio-snd capture binds to.  A
+		  Bluetooth HFP headset source is already 16kHz mono s16le at
+		  normal mic level, so no gain is needed (1 = passthrough).
+		  Only raise this if a specific host source is measurably too
+		  quiet.
+		- 1 = No gain; higher values amplify more (may clip; saturated).
 
 config AI_AGENT_AUDIO_ALSA_DIRECT
 	bool "Use direct ALSA capture backend"
@@ -161,6 +221,19 @@ config AI_AGENT_AUDIO_ALSA_DIRECT
 		boards; the agent then uses the media framework recorder,
 		which works everywhere. When enabled, the agent still falls
 		back to media_recorder at runtime if ALSA capture fails.
+
+config AI_AGENT_AUDIO_NUTTX_DIRECT
+	bool "Use direct NuttX audio backend (pcm0c capture + pcm0p playback)"
+	default n
+	depends on AUDIO
+	---help---
+		Fallback audio backend for boards that have NuttX audio
+		lower-halves but no media server (e.g. BK7258 /dev/audio/pcm0c
+		and /dev/audio/pcm0p): capture via open/ioctl/read and playback
+		via open/ioctl/enqueue. The media_recorder / media_player
+		backends are always tried first; this path is only taken when
+		they are unavailable, so leave it off on boards that run the
+		media framework (e.g. qemu goldfish).
 
 config AI_AGENT_CAMERA
 	bool "Enable camera capture tool"
@@ -188,6 +261,30 @@ config AI_AGENT_MCP
 		Enable the Model Context Protocol bridge for remote
 		tool servers. Costs ~10KB RAM (registry + client state).
 		Disable to save memory if only using builtin tools.
+
+config AI_AGENT_REMOTE_CTRL
+	bool "Enable remote agent control channel"
+	default n
+	depends on NETUTILS_MQTTC && NETUTILS_CJSON
+	---help---
+		Let this device drive a remote ACP agent (mimocode or
+		kiro-cli) running on a PC, over a bridge that speaks MQTT
+		to the device. Adds the remote_agent_prompt and
+		remote_agent_status tools, the set_remote* config commands
+		and the r* console commands (rask, rstat, rreply, rusage,
+		ronce, rdeny).
+
+		Costs ~22KB RAM (12KB thread + 2x4.6KB MQTT buffers +
+		session state). Needs its own MQTT client, separate from
+		the AI_AGENT_MQTT chat channel, because each reconnect must
+		mint a new session nonce and redo the handshake.
+
+		Permission decisions for the remote agent are reachable only
+		from the NSH commands, never as an LLM-callable tool.
+
+		Broker address and credentials are supplied at runtime
+		through the config store (remote_broker, remote_username,
+		remote_password) and are never compiled in.
 
 config AI_AGENT_TEST
 	bool "Enable integration test commands"
@@ -260,7 +357,7 @@ config AI_AGENT_MCP_MAX_SERVERS
 	int "Max MCP remote servers"
 	default 4
 	range 1 8
-	depends on AGENT_MCP
+	depends on AI_AGENT_MCP
 	---help---
 		Maximum number of remote MCP servers. Each server slot
 		uses ~456 bytes BSS. Reduce on memory-constrained boards.
@@ -269,7 +366,7 @@ config AI_AGENT_MCP_MAX_TOOLS
 	int "Max MCP remote tools"
 	default 16
 	range 4 64
-	depends on AGENT_MCP
+	depends on AI_AGENT_MCP
 	---help---
 		Maximum cached remote tools across all MCP servers.
 		Each tool slot uses ~452 bytes BSS. Reduce on
@@ -283,6 +380,75 @@ config AI_AGENT_TLS_CONN_POOL_SIZE
 		Number of persistent TLS connections kept alive for
 		reuse. Each slot uses ~12KB BSS (TLS context + raw
 		buffer). Set to 1 on memory-constrained boards.
+
+config AI_AGENT_WS_SERVER
+	bool "WebSocket server channel"
+	default y
+	depends on EXAMPLES_AI_AGENT_VELA
+	---help---
+		Run the local WebSocket server (port 8080 style console).
+		Disable on small-RAM targets: the accept thread needs its
+		own TLS-sized stack and pushes the heap over the edge
+		after the agent loop's buffers are allocated.  Boards that
+		reach their LLM over MQTT or Feishu do not need it.
+
+config AI_AGENT_TOOLS_WEARABLE
+	bool "Wearable sensor tools (battery/wear/screen/heartrate/steps/vibrate)"
+	default y
+	depends on EXAMPLES_AI_AGENT_VELA
+	---help---
+		Register the wearable sensor tool group.  Disable on boards
+		without the corresponding sensors; each registered tool
+		costs heap in the registry and the tools JSON.
+
+config AI_AGENT_TOOLS_MEDIA
+	bool "Music control tools"
+	default y
+	depends on EXAMPLES_AI_AGENT_VELA
+	---help---
+		Register the music playback tool group.  Disable on boards
+		without a media player.
+
+config AI_AGENT_TOOLS_QUICKAPP
+	bool "QuickApp launch tools"
+	default y
+	depends on EXAMPLES_AI_AGENT_VELA
+	---help---
+		Register quickapp launch/exit tools.  Disable on boards
+		without the quickapp runtime.
+
+config AI_AGENT_NOTIFY_SERVICE
+	bool "Enable Gerrit/Jira notify polling → LVGL toast"
+	default n
+	depends on AI_AGENT_LVGL_UI || AI_AGENT_UI_RPMSG
+	depends on AI_AGENT_MCP
+	---help---
+		Background polling service that periodically queries
+		connected Gerrit/Jira MCP servers for new changes,
+		deduplicates against a persisted cursor, and pops a
+		top-of-screen LVGL toast for each new item (does NOT
+		enter chat history). Requires LVGL UI + MCP client.
+
+config AI_AGENT_NOTIFY_INTERVAL_SEC
+	int "Notify polling interval (seconds)"
+	default 60
+	range 30 3600
+	depends on AI_AGENT_NOTIFY_SERVICE
+	---help---
+		Base polling interval in seconds. Each source (gerrit/
+		jira) keeps its own next-due timestamp staggered off
+		this base. Too low hammers internal MCP gateways; too
+		-high misses fresh CI failures. 60 is a sane default.
+
+config AI_AGENT_NOTIFY_LLM_SUMMARY
+	bool "Summarize new items via LLM (off = template text)"
+	default n
+	depends on AI_AGENT_NOTIFY_SERVICE
+	---help---
+		If on, new Gerrit/Jira items are pushed as a prompt to
+		agent_loop so the LLM summarizes them before showing the
+		toast. Costs tokens + ~2-5s latency per batch. Off (default)
+		uses a fast snprintf template ("Gerrit #N: subject").
 
 config AI_AGENT_BLE_GATT
 	bool "Enable BLE GATT data channel"
@@ -308,5 +474,69 @@ config AI_AGENT_REST_API
 		Enable HTTP REST API endpoints accessible via WebSocket
 		server for remote configuration, skill management, and
 		log retrieval from Android companion App.
+
+endif
+
+#----------------------------------------------------------------------------
+# CP-side UI renderer (路 B). Independent of EXAMPLES_AI_AGENT_VELA so the
+# CP core can render the chat UI without pulling agent_main/llm/voice/TLS.
+#----------------------------------------------------------------------------
+config EXAMPLES_AI_AGENT_UI_CP
+	bool "AI Agent UI (CP-side render only)"
+	default n
+	depends on GRAPHICS_LVGL
+	---help---
+	  CP-core UI renderer: builds only the LVGL chat-view assets
+	  (lvgl_ui_channel + lvgl_toast + MiSans CJK font) into a
+	  standalone NSH builtin, without agent_main/llm/voice/TLS.
+	  voice_channel_* and message_bus are stubbed on this side (CP
+	  only renders; TTS/ASR live on AP). Launch from CP NSH; the
+	  AP->CP UI RPMsg endpoint will be wired in a follow-up slice.
+
+# Defined at top-level (NOT inside `if EXAMPLES_AI_AGENT_VELA`) so it is
+# selectable on the CP core, which builds under EXAMPLES_AI_AGENT_UI_CP
+# without EXAMPLES_AI_AGENT_VELA.  On qemu/AP it is reachable via
+# AI_AGENT_LVGL_UI / AI_AGENT_UI_RPMSG (which do sit inside the VELA
+# block); the ap defconfig leaves it off because the AP has no LVGL.
+config AI_AGENT_PET_STATUS
+	bool "Pet status ring home screen (M7 差异化页, pure-LVGL 退路)"
+	default n
+	depends on AI_AGENT_LVGL_UI || AI_AGENT_UI_RPMSG || EXAMPLES_AI_AGENT_UI_CP
+	---help---
+	  Build pet_status_view.c: a round-screen "pet" home screen that mirrors
+	  the agent's lifecycle state (idle/listening/thinking/executing/waiting/
+	  error) via color + animation, as a 待机首屏.  Pure LVGL (the Rust/mirui
+	  退路 from UI方案.md §2.4 when the no_std runtime is unavailable).
+	  On dual-core (路 B) the CP renders it and the AP drives state over
+	  RPMsg (UI_RPMSG_SET_PET_STATE); lvgl_ui_channel also mirrors PTT
+	  state onto the pet and yields the foreground to the pet after chat
+	  idle, so the pet "lives" during PTT without extra AP wiring.
+
+config AI_AGENT_STANDBY_UI
+	bool "Standby dim digital clock (M7 待机界面)"
+	default n
+	depends on AI_AGENT_LVGL_UI || AI_AGENT_UI_RPMSG || EXAMPLES_AI_AGENT_UI_CP
+	---help---
+	  Build standby_view.c: a minimal dim digital clock (large HH:MM in
+	  Montserrat 24 + date in MiSans 16 CJK + a "待机中" hint) that
+	  lvgl_ui_channel.c fades in after 60s with no real activity (no chat
+	  bubble, PTT, pet-state change, page switch, approval or scroll) and the
+	  agent idle.  Any such activity wakes it and restores the previous
+	  screen.  Runs on the same core that owns the local LVGL UI (AP on the
+	  BK7258, or qemu single-core).
+
+if EXAMPLES_AI_AGENT_UI_CP
+
+config EXAMPLES_AI_AGENT_UI_CP_PROGNAME
+	string "Program name"
+	default "ai_agent_ui"
+
+config EXAMPLES_AI_AGENT_UI_CP_PRIORITY
+	int "UI task priority"
+	default 100
+
+config EXAMPLES_AI_AGENT_UI_CP_STACKSIZE
+	int "UI task stack size"
+	default 32768
 
 endif

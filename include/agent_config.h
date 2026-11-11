@@ -102,7 +102,10 @@
 #define AGENT_FEISHU_MAX_MSG_LEN 4000 /* Feishu text message limit */
 
 /* ── Agent Loop ─────────────────────────────────────────────── */
-#define AGENT_AI_AGENT_STACK (32 * 1024)
+#define AGENT_AI_AGENT_STACK (32 * 1024) /* was 64K: ENOMEM on small-RAM
+                                  * targets whose heap fragments after boot
+                                  * (biggest free block < 64K observed with
+                                  * 179K total free on a BK7258 AP) */
 #define AGENT_AI_AGENT_PRIO 60
 #define AGENT_AI_AGENT_CORE 0
 #define AGENT_AI_AGENT_MAX_HISTORY 10
@@ -126,6 +129,11 @@
 
 /* ── Timezone (POSIX TZ format) ────────────────────────────── */
 #define AGENT_TIMEZONE "CST-8"
+
+/* 板上 AP 构建没有 CONFIG_LIBC_LOCALTIME 时,libc 的 localtime_r() 退化成
+ * gmtime_r(),TZ 不起作用。需要本地时间显示的代码(localtime_r 调用处)显式
+ * 加这个偏移,和 tool_get_time 的做法一致。 */
+#define AGENT_TZ_OFFSET_SEC (8 * 3600)
 
 /* ── LLM ────────────────────────────────────────────────────── */
 #define AGENT_LLM_DEFAULT_MODEL ""
@@ -161,7 +169,7 @@
 /* ── Message Bus ────────────────────────────────────────────── */
 #define AGENT_BUS_QUEUE_LEN 16
 #define AGENT_BUS_PUSH_TIMEOUT_MS 5000
-#define AGENT_OUTBOUND_STACK (16 * 1024)
+#define AGENT_OUTBOUND_STACK (24 * 1024) /* was 48K, same fragmentation ceiling */
 #define AGENT_OUTBOUND_PRIO 50
 #define AGENT_OUTBOUND_CORE 0
 
@@ -228,7 +236,7 @@
 #define AGENT_WS_CLIENT_STACK (12 * 1024)
 
 /* ── Serial CLI ─────────────────────────────────────────────── */
-#define AGENT_CLI_STACK (16 * 1024)
+#define AGENT_CLI_STACK (24 * 1024) /* was 48K, same fragmentation ceiling */
 #define AGENT_CLI_PRIO 30
 #define AGENT_CLI_CORE 0
 
@@ -299,6 +307,19 @@
 #ifdef CONFIG_AI_AGENT_LVGL_UI
 #define AGENT_CHAN_LVGL_UI "lvgl_ui"
 #endif
+#ifdef CONFIG_AI_AGENT_UI_RPMSG
+/* 路 B: AP drives the CP-side UI over RPMsg.  Same channel name so the
+ * agent's routing logic is identical to the local-LVGL path; the only
+ * difference is the link-time implementation of lvgl_ui_channel_*. */
+#ifndef AGENT_CHAN_LVGL_UI
+#define AGENT_CHAN_LVGL_UI "lvgl_ui"
+#endif
+#endif
+
+/* ── Notify Service (Gerrit/Jira background polling → toast popup) ── */
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+#define AGENT_CHAN_LVGL_NOTIFY "lvgl_notify"
+#endif
 
 /* ── WeChat Channel ─────────────────────────────────────────── */
 #define AGENT_WEIXIN_STACK (12 * 1024)
@@ -306,8 +327,33 @@
 
 /* ── LVGL UI Channel ───────────────────────────────────────── */
 #ifdef CONFIG_AI_AGENT_LVGL_UI
-#define AGENT_LVGL_UI_STACK (16 * 1024)
+#define AGENT_LVGL_UI_STACK (64 * 1024)
 #define AGENT_LVGL_UI_PRIO 45
+#endif
+
+/* ── Notify Service (Gerrit/Jira polling → LVGL toast) ────── */
+#ifdef CONFIG_AI_AGENT_NOTIFY_SERVICE
+/* The poll runs mcp_client_execute → vela_tls HTTPS handshake on this
+ * thread's stack; 8KB overflowed into the heap on the first successful
+ * Gerrit poll (recursive assert).  Agent loop does the same TLS work on
+ * a 64KB stack — 32KB leaves headroom for handshake + cJSON parsing. */
+#define AGENT_NOTIFY_STACK (32 * 1024)
+#define AGENT_NOTIFY_PRIO 35            /* below agent_loop (60) + outbound (50) */
+#ifndef CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC
+#define CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC 60
+#endif
+#define AGENT_NOTIFY_INTERVAL_SEC CONFIG_AI_AGENT_NOTIFY_INTERVAL_SEC
+/* JSON buffer for one poll response.  mcp_client_execute() copies the
+ * tools/call payload into this buffer with strncpy, so a payload larger
+ * than the buffer is silently truncated and the dedup parser then sees
+ * broken JSON.  Measured: jira_search payload is ~0.7KB per issue plus
+ * wrapper — 7.2KB at limit=10 (the default below), 40KB at limit=50.
+ * 16KB covers the default with headroom for long summaries; the old 8KB
+ * sat right at the limit=10 boundary and could not hold limit=50 at all. */
+#define AGENT_NOTIFY_JSON_BUF_SIZE 16384
+#define AGENT_NOTIFY_MAX_NEW 16          /* cap new records per poll */
+#define AGENT_NOTIFY_GERRIT_COLOR 0x2196f3 /* blue */
+#define AGENT_NOTIFY_JIRA_COLOR   0xff9800 /* orange (== LVGL_UI_CARD_COLOR_JIRA) */
 #endif
 
 /* ── MQTT Channel ───────────────────────────────────────────── */
@@ -327,25 +373,45 @@
 #define AGENT_CFG_KEY_MQTT_USERNAME "mqtt_username"
 #define AGENT_CFG_KEY_MQTT_PASSWORD "mqtt_password"
 
+/* ── Remote-control channel (drives a remote ACP agent) ─────── */
+#define AGENT_REMOTE_CTRL_STACK (12 * 1024)
+#define AGENT_REMOTE_CTRL_PRIO 45
+
+/* Default budget for one remote turn. A turn held up by a permission request
+ * cannot finish until a human answers on this device, so the tool reports what
+ * it has rather than waiting indefinitely. */
+#define AGENT_REMOTE_CTRL_TURN_TIMEOUT_MS 120000
+
+/* Credentials are read from the config store, never from a command line. */
+#define AGENT_CFG_KEY_REMOTE_BROKER "remote_broker"
+#define AGENT_CFG_KEY_REMOTE_DEVICE_ID "remote_device_id"
+#define AGENT_CFG_KEY_REMOTE_USERNAME "remote_username"
+#define AGENT_CFG_KEY_REMOTE_PASSWORD "remote_password"
+#define AGENT_CFG_KEY_REMOTE_TOPIC_PREFIX "remote_topic_prefix"
+
 /* ── Voice Channel (Doubao ASR/TTS) ─────────────────────────── */
 #define AGENT_CHAN_VOICE "voice"
 
-#define AGENT_VOICE_STACK (16 * 1024)
+#define AGENT_VOICE_STACK (48 * 1024)
 #define AGENT_VOICE_PRIO 50
 
-/* Doubao TTS V3 API endpoint (HTTP Chunked, x-api-key auth) */
+/* Doubao TTS V3 API endpoint (HTTP Chunked, x-api-key auth).
+ * Resource id must match the speaker model generation (account grants
+ * seed-tts-2.0 only): *_uranus_bigtts / saturn_* -> seed-tts-2.0,
+ * *_mars_bigtts / *_moon_bigtts / ICL_* -> seed-tts-1.0. */
 #define AGENT_DOUBAO_TTS_HOST "openspeech.bytedance.com"
 #define AGENT_DOUBAO_TTS_PORT "443"
 #define AGENT_DOUBAO_TTS_V3_PATH "/api/v3/tts/unidirectional"
-#define AGENT_DOUBAO_TTS_RESOURCE "volc.service_type.10029"
+#define AGENT_DOUBAO_TTS_RESOURCE "seed-tts-2.0"
 
-/* Doubao streaming ASR WebSocket API (V2) */
+/* Doubao streaming ASR WebSocket API (V3 bigmodel, API-key auth).
+ * Auth: X-Api-Key header (from set_volc_key). Resource id fixed per app. */
 #define AGENT_DOUBAO_ASR_HOST "openspeech.bytedance.com"
 #define AGENT_DOUBAO_ASR_PORT "443"
-#define AGENT_DOUBAO_ASR_WS_PATH "/api/v2/asr"
+#define AGENT_DOUBAO_ASR_WS_PATH "/api/v3/sauc/bigmodel_async"
 
-/* Default ASR cluster (streaming, common Chinese) */
-#define AGENT_DOUBAO_ASR_CLUSTER "volcengine_streaming_common"
+/* Default ASR resource (豆包流式语音识别大模型 2.0 小时版) */
+#define AGENT_DOUBAO_ASR_RESOURCE "volc.seedasr.sauc.duration"
 
 /* Audio device paths (platform-specific) */
 #ifndef AGENT_AUDIO_CAPTURE_DEV
@@ -379,10 +445,36 @@
 #define AGENT_CFG_KEY_VOLC_SPEAKER "volc_speaker"
 #define AGENT_CFG_KEY_VOLC_CLUSTER "volc_cluster"
 #define AGENT_CFG_KEY_VOLC_ASR_CLUSTER "volc_asr_cluster"
+/* TTS 音质旋钮(seed-tts-2.0 audio_params 标准字段)。用 set_volc_voice 调整;
+ * 值取字符串便于 config store 存取,合成时再 atof。默认 1.0 = 引擎默认。 */
+#define AGENT_CFG_KEY_VOLC_SPEED   "volc_speed"
+#define AGENT_CFG_KEY_VOLC_VOLUME  "volc_volume"
+#define AGENT_CFG_KEY_VOLC_PITCH   "volc_pitch"
 
-/* Default TTS speaker and cluster */
-#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
+/* Default TTS speaker and cluster (seed-tts-2.0 voice: *_uranus_bigtts) */
+/* seed-tts-2.0 该账号实测可用的 20 个音色见 set_volc_speaker(2026-11-10 逐个
+ * 拉样音确认)。用户先选 vv(反馈"刺耳/不喜欢")→ sophie(更沉温和、齿音少)
+ * → 最终 2026-11-10 敲定 zh_male_liufei(低沉男声,基频 ~118Hz)。备选女声:
+ * gaolengyujie / shuangkuaisisi / xiaohe / cancan。 */
+#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_liufei_uranus_bigtts"
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
+/* TTS 音质默认值(浮点比例语义,1.0 = 引擎原速/原音量)。
+ *
+ * 注意:实际 TTS 走 v3(/api/v3/tts/unidirectional, seed-tts-2.0),请求体里
+ * 只认整数 speech_rate / loudness_rate(-50..100),由这里的 speed/volume 换算
+ * 而来(见 volc_tts.c 的 tts_ratio_to_rate)。v1 的 speed_ratio/volume_ratio
+ * 浮点字段在 v3 上会被静默忽略。
+ *
+ * 音色对齐参考样音(/tmp/tts_voices2/*.wav,按引擎默认 speech_rate=0 /
+ * loudness_rate=0 生成)。早先默认 speed 0.5(半速,整句时长翻倍、听感与
+ * 样音"对不上"),2026-11-10 改回 speed/volume/pitch 全 1.0 对齐样音。
+ * pitch 在 v3 seed-tts-2.0 上无对应字段(pitch_ratio 照发被静默忽略),想改
+ * 音色只能换 AGENT_VOICE_DEFAULT_SPEAKER。
+ * /data 是 tmpfs,set_volc_voice 只在本次开机有效,故默认值落在代码里。 */
+#define AGENT_VOICE_DEFAULT_RATIO  "1.0"   /* 引擎默认,也是"省略该字段"的哨兵 */
+#define AGENT_VOICE_DEFAULT_SPEED  "1.0"   /* 2026-11-10 用户改回 1 倍速 */
+#define AGENT_VOICE_DEFAULT_VOLUME "1.0"   /* 对齐样音:引擎原音量 */
+#define AGENT_VOICE_DEFAULT_PITCH  "1.0"   /* v3 忽略,对齐样音 */
 
 /* WebSocket TTS output sample rate (big-model voices output 24kHz) */
 #define AGENT_TTS_WS_SAMPLE_RATE 24000

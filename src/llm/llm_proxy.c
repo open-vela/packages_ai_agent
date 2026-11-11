@@ -356,7 +356,17 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
         memcpy(provider, model, plen);
     }
 
+    /* "Connection: close" disables vela_tls connection pooling for LLM calls.
+     * The pool reuses idle TLS sockets, but some LLM gateways (e.g.
+     * api.xiaomimimo.com) leave the socket half-open after responding: the
+     * next pooled "Reusing connection" write succeeds yet the read then blocks
+     * for the whole socket timeout, hanging the agent mid-tool-loop. With
+     * Connection: close the server tears down after each response, the TLS
+     * layer sees keep=false, and pool_release drops the slot — every call does
+     * a fresh handshake (~100ms), negligible next to multi-second LLM latency,
+     * but eliminates the stall. */
     vela_header_t hdrs[] = { { "Authorization", auth_header },
+        { "Connection", "close" },
         { provider[0] ? "X-Model-Provider-Id" : NULL,
             provider[0] ? provider : NULL },
         { NULL, NULL } };
@@ -444,7 +454,10 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
         return ERROR;
     }
 
-    char tmp[4096];
+    /* 1 KB read chunk instead of 4 KB: llm_http_direct already has a 1 KB
+     * header buffer on its stack, and the whole LLM call runs on the 32 KB
+     * agent-loop thread.  Smaller chunks keep peak stack headroom. */
+    char tmp[1024];
     while (1) {
         int n = proxy_conn_read(conn, tmp, sizeof(tmp), 120000);
         if (n <= 0)

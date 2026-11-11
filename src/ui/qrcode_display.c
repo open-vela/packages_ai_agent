@@ -23,6 +23,7 @@ static const char *TAG = "qr_display";
 
 #if defined(CONFIG_LV_USE_QRCODE) && defined(CONFIG_GRAPHICS_LVGL)
 #include <lvgl/lvgl.h>
+#include "ui/lvgl_ui_channel.h"  /* lvgl_ui_lock — cross-thread LVGL entry */
 
 #define QR_DISPLAY_TIMEOUT_MS 120000 /* auto-close after 2 min */
 #define QR_SIZE_PX            180  /* fixed size for watch screens */
@@ -143,13 +144,19 @@ int claw_show_qrcode(const char *url)
 
     strlcpy(s_qr_url, url, sizeof(s_qr_url));
 
+    /* Called from the command channel thread: creating a timer mutates
+     * LVGL's global timer list, which the LVGL loop thread is walking. */
+    lvgl_ui_lock();
     lv_timer_t *t = lv_timer_create(qr_show_timer_cb, 0, NULL);
+    if (t) {
+        lv_timer_set_repeat_count(t, 1);
+        lv_timer_set_auto_delete(t, true);
+    }
+    lvgl_ui_unlock();
     if (!t) {
         syslog(LOG_ERR, "[%s] failed to create show timer\n", TAG);
         return ERROR;
     }
-    lv_timer_set_repeat_count(t, 1);
-    lv_timer_set_auto_delete(t, true);
 
     return OK;
 }

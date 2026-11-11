@@ -21,8 +21,10 @@
 #include "voice/voice_asr.h"
 #include "voice/voice_channel.h"
 #include "voice/voice_tts.h"
+#include "voice/volc_tts.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void cmd_set_volc_key(int argc, char** argv)
@@ -58,6 +60,34 @@ void cmd_set_volc_asr(int argc, char** argv)
         argv[1], argv[3]);
 }
 
+void cmd_set_volc_voice(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_volc_voice <speed> [volume] [pitch]\n");
+        printf("  值 1.0 = 引擎默认;范围约 0.5~2.0。\n");
+        printf("  出厂默认: speed=0.5(语速偏快→-50%%) volume=1.3(响度偏小→+30%%)"
+               " pitch=0.8(v3 无此字段,不生效)\n");
+        printf("  例: set_volc_voice 0.5 1.3 0.8  (恢复出厂默认)\n");
+        return;
+    }
+    claw_config_set(AGENT_CFG_KEY_VOLC_SPEED, argv[1]);
+    printf("TTS speed=%s\n", argv[1]);
+    if (argc > 2 && argv[2][0] != '\0') {
+        claw_config_set(AGENT_CFG_KEY_VOLC_VOLUME, argv[2]);
+        printf("TTS volume=%s\n", argv[2]);
+    }
+    if (argc > 3 && argv[3][0] != '\0') {
+        claw_config_set(AGENT_CFG_KEY_VOLC_PITCH, argv[3]);
+        printf("TTS pitch=%s\n", argv[3]);
+    }
+
+    /* The backend caches the knobs at registration; apply them now so the
+     * next speak uses the new values (config lives on tmpfs and would be
+     * lost on reboot, so waiting for one is not an option). */
+    volc_tts_reload_ratios();
+    printf("Applied (see [volc_tts] ratios reloaded log for effective values)\n");
+}
+
 void cmd_voice_start(void)
 {
     voice_channel_start();
@@ -89,6 +119,35 @@ void cmd_voice_test_asr(int argc, char** argv)
         return;
     }
     voice_channel_test_asr(argv[1]);
+}
+
+void cmd_voice_test_beep(int argc, char** argv)
+{
+    unsigned int freq = 1000;
+    unsigned int ms = 200;
+
+    if (argc >= 2) {
+        freq = (unsigned int)strtoul(argv[1], NULL, 10);
+    }
+    if (argc >= 3) {
+        ms = (unsigned int)strtoul(argv[2], NULL, 10);
+    }
+
+    printf("Beep: %uHz for %ums ...\n", freq, ms);
+    int ret = voice_channel_beep(freq, ms);
+    printf("Beep done: %d\n", ret);
+}
+
+void cmd_voice_test_speak(const char* text)
+{
+    if (text == NULL || text[0] == '\0') {
+        printf("Usage: voice_test_speak <text>\n");
+        return;
+    }
+
+    printf("Speak: \"%s\" ...\n", text);
+    int ret = voice_channel_speak(text);
+    printf("Speak done: %d\n", ret);
 }
 
 void cmd_set_voice_tts(int argc, char** argv)

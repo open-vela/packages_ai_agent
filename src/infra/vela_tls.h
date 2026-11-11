@@ -72,6 +72,49 @@ int vela_https_request(
     size_t           *out_body_len  /* optional: actual body bytes written, or NULL */
 );
 
+/* Largest single body line the streaming reader will assemble.  Server-sent
+ * payloads are newline-delimited JSON; measured on the Volcengine v3 TTS
+ * endpoint, a line runs up to ~74KB of base64 (55KB of PCM) when a segment is
+ * synthesized slowly, so 96KB leaves headroom.  A longer line is dropped
+ * rather than aborting the transfer. */
+#define VELA_TLS_STREAM_LINE_MAX (96 * 1024)
+
+/**
+ * Callback for vela_https_request_stream().  Called once per complete
+ * '\n'-terminated line of the response body (terminators stripped).
+ * Return non-zero to abort the transfer.
+ */
+typedef int (*vela_stream_line_cb)(const char *line, size_t len, void *user);
+
+/**
+ * Perform an HTTPS request and hand the response body to `cb` line by line
+ * as it arrives, instead of buffering the whole body.
+ *
+ * The body is de-chunked incrementally, so the total size is bounded only by
+ * the peer — this is what lets long streaming responses (TTS audio, SSE) work
+ * on a device where a whole-body buffer would not fit in RAM.
+ *
+ * @return HTTP status code on success (>= 100), negative VELA_TLS_ERR_* on
+ *         failure, VELA_TLS_ERR_READ if the callback aborted.
+ *
+ * The connection is returned to the keep-alive pool when the body was read to
+ * its framing end (final chunk / full Content-Length) and the peer did not ask
+ * for `Connection: close`; otherwise it is closed.  Callers that stream
+ * several requests in a row to the same host (TTS segments) therefore only pay
+ * one TLS handshake.
+ */
+int vela_https_request_stream(
+    const char       *host,
+    const char       *port,
+    const char       *method,
+    const char       *path,
+    const vela_header_t *headers,
+    const char       *body,
+    size_t            body_len,
+    vela_stream_line_cb cb,
+    void             *user
+);
+
 /**
  * Convenience wrapper for GET with no extra headers or body.
  */
