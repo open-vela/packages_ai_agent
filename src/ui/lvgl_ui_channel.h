@@ -127,6 +127,12 @@ int lvgl_ui_channel_clear_approval(void);
  * 工具返回值覆盖。返回 1 pending，0 无。 */
 int lvgl_ui_channel_approval_pending(void);
 
+/* 审批页此刻是否真的显示在屏上。approval_pending() 在调用 clear 时就同步
+ * 归零，即使那条异步清屏丢了也不会反映出来；按键层需要的是"屏上还有没有
+ * 审批页"，用它来判断键表能否停留在 approval。任意线程可读（单字节状态）。
+ * UI_RPMSG 下审批页在 CP 侧，AP 无从得知，恒返回 0。 */
+int lvgl_ui_channel_approval_visible(void);
+
 /* ── 通知页（Gerrit / Jira 通知）───────────────────────────────
  *
  * 圆屏太小，屏顶 toast 会把正文裁掉，所以通知改成和审批页同构的整屏
@@ -141,8 +147,10 @@ int lvgl_ui_channel_approval_pending(void);
  * 线程安全：任意线程可调用，内部经 lv_async_call 调度到 LVGL 线程。
  */
 
-/* 通知页停留时长（毫秒）。5s 时用户反馈「来不及看清」，提到 10s。 */
-#define LVGL_UI_NOTICE_MS 15000
+/* 通知页停留时长（毫秒）。历史上 5s→10s→15s（用户反馈「来不及看清」），
+ * 11-10 按验收口径「通知页 5 s 自退」改回固定 5s：任何按键都能提前关，
+ * 想看长标题就按键留住/重看，不再靠拖长自动消失。 */
+#define LVGL_UI_NOTICE_MS 5000
 
 /* 显示一条通知。title/body 为 UTF-8，bar_color 是卡片左侧色条颜色
  * （0 = 用状态蓝）。返回 0 成功，负值错误。 */

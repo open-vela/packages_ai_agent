@@ -198,6 +198,14 @@ static void on_session_event(void* context, enum remote_event_e event,
                 *nl = '\0';
             lvgl_toast_show_async("远程编码", body, 0x4caf50, 4000);
         }
+
+        /* Backstop: a finished turn cannot still owe an approval.  The state
+         * event normally clears the page the moment link.has_prompt drops, but
+         * that clear is an lv_async_call whose failure nobody checks, and a
+         * dropped one leaves the approval screen up for good -- with the key
+         * map already back on idle, so the buttons look dead.  Re-issue the
+         * clear when the transcript proves the turn is over. */
+        lvgl_ui_channel_clear_approval();
 #endif
         break;
 
@@ -384,6 +392,27 @@ static void voice_sink_to_remote(const char* text, void* ctx)
 
     if (remote_ctrl_channel_submit(text, reply, sizeof(reply)) != OK) {
         syslog(LOG_ERR, "[%s] voice submit: %s\n", TAG, reply);
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        /* The utterance was heard and transcribed but never left the device.
+         * A log line alone reads on the bench as "the button stopped
+         * working"; the usual cause is a turn that is still running, so say
+         * what to do instead of leaving the screen idle. */
+        {
+            const char* hint = "语音未发送";
+
+            if (strstr(reply, "already running") != NULL) {
+                hint = "上一轮还在跑，请等结束后再说";
+            } else if (strstr(reply, "permission decision") != NULL) {
+                hint = "先按 S2/S3 处理审批，再说";
+            } else if (strstr(reply, "offline") != NULL) {
+                hint = "远控离线，检查网络或桥";
+            } else if (strstr(reply, "not running") != NULL) {
+                hint = "PC 侧编码代理未运行";
+            }
+
+            lvgl_toast_show_async("语音", hint, 0xffa31f, 3000);
+        }
+#endif
     }
 }
 
@@ -562,7 +591,22 @@ static int remote_ctrl_pending_from_input(void *ctx)
     if (remote_ctrl_channel_status(&st) != OK)
         return 0;
 
-    return st.has_prompt ? 1 : 0;
+    if (st.has_prompt)
+        return 1;
+
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+    /* The page can outlive the prompt by a moment (the decision was accepted
+     * and the next request has not arrived yet), or permanently when an async
+     * clear was dropped.  Keeping the approval key map while the page is up
+     * means S2/S3 still reach decide(): the press either answers the next
+     * request or is reported and dismisses the stale page.  Letting the keys
+     * fall back to idle here made the page look dead -- S2/S3 scrolled a
+     * transcript nobody could see. */
+    if (lvgl_ui_channel_approval_visible())
+        return 1;
+#endif
+
+    return 0;
 }
 
 static void remote_ctrl_decide_from_input(enum remote_decision_e decision,
@@ -592,6 +636,13 @@ static void remote_ctrl_decide_from_input(enum remote_decision_e decision,
     if (remote_ctrl_channel_decide(decision) != OK) {
         printf("No approvable request is pending (or one was already "
                "answered).\n");
+#if defined(CONFIG_AI_AGENT_LVGL_UI) || defined(CONFIG_AI_AGENT_UI_RPMSG)
+        /* The press landed on a page whose prompt is gone.  Dismiss it and
+         * say so: an unanswered press that only writes to a serial console
+         * reads on the device as "the button is dead". */
+        lvgl_ui_channel_clear_approval();
+        lvgl_toast_show_async("审批", "审批已结束", 0xffa31f, 2000);
+#endif
         return;
     }
 

@@ -40,13 +40,13 @@ extern "C" {
 #define REMOTE_EPOCH_MAX 48
 #define REMOTE_PROMPT_ID_MAX 40
 /* Approval prompt display limits.  The tool title is what the bridge takes from
- * the ACP toolCall.title (a path or a short verb phrase), and the hint is the
- * summarized tool input (command / file path / query).  40 + 160 bytes is what
- * a 240x296 round panel can show in its approval card without truncating the
- * information a person needs to approve or deny.  Keep in sync with
+ * the permission kind (mapped to a short Chinese label) and the hint is the
+ * summarized tool input (command / file path / query).  240 bytes fits a whole
+ * shell command line; the card caps its height and scrolls, so a longer hint is
+ * reachable instead of clipped.  Keep in sync with
  * tools/acp-bridge/src/bridge.js (TOOL_TITLE_MAX_BYTES / HINT_MAX_BYTES). */
 #define REMOTE_TOOL_MAX 40
-#define REMOTE_HINT_MAX 160
+#define REMOTE_HINT_MAX 240
 #define REMOTE_SUMMARY_MAX 128
 #define REMOTE_BILLING_UNIT_MAX 16
 #define REMOTE_REQUEST_ID_MAX 40

@@ -347,7 +347,9 @@ typedef struct {
      * for a top toast (the body was clipped), so a notice gets its own screen,
      * held for LVGL_UI_NOTICE_MS and exiting on any user key.  It yields to the
      * approval page: while an approval is pending, notices are stashed here and
-     * the newest one is shown when the approval clears (later replaces older). */
+     * the newest one is shown when the approval clears (later replaces older).
+     * Deliberately NOT dropped: the user wants it replayed after the approval
+     * is answered, not lost. */
     lv_obj_t* notice_screen;
     lv_obj_t* notice_title;
     lv_obj_t* notice_body;
@@ -360,6 +362,7 @@ typedef struct {
     char notice_pending_title[64];
     char notice_pending_body[512];
     lv_color_t notice_pending_color;
+    lv_color_t notice_last_color; /* bar colour of the notice on screen */
 
     /* Chat history */
     chat_history_t history;
@@ -668,6 +671,7 @@ static void notice_screen_build(void);
 static void notice_hide(const char* why);
 static void notice_show_locked(const char* title, const char* body,
                                lv_color_t bar_color);
+static void notice_stash_visible(void);
 static void notice_maybe_show_pending(void);
 
 /* ── Ring buffer ──────────────────────────────────────────────── */
@@ -2118,8 +2122,12 @@ static void set_approval_async_cb(void* data)
         lv_obj_clear_flag(s_state.approval_tool, LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* Approval outranks a notice: if a notice page is up, drop it first so the
-     * page saved below is the underlying pet/chat screen, not the notice.
+    /* Approval outranks a notice, but only for as long as the prompt is open:
+     * a notice that is already on screen is stashed first and re-shown when
+     * the approval clears.  Dropping it would lose a Gerrit/Jira event the user
+     * never got to read; without the stash the page just flashed
+     * notice -> approval and the notice never came back.
+     *
      * Carry the "we came from the clock" memory over so the clock can come back
      * once the approval is resolved. */
     if (s_state.notice_visible) {
@@ -2127,6 +2135,7 @@ static void set_approval_async_cb(void* data)
         if (s_state.notice_was_standby) s_state.approval_was_standby = true;
         s_state.notice_was_standby = false;
 #endif
+        notice_stash_visible();
         notice_hide("dismissed (approval page up)");
     }
 
@@ -2139,9 +2148,15 @@ static void set_approval_async_cb(void* data)
     }
 #endif
 
-    /* Save the page we were on (pet/chat) so clear can restore it. */
+    /* Save the page we were on (pet/chat) so clear can restore it.  If a
+     * previous clear was dropped, the active screen can already BE the
+     * approval page; saving it would make every later clear "restore" the
+     * approval page and strand the user on it, so store NULL instead and let
+     * clear fall back to a known page. */
     if (!s_state.approval_visible) {
-        s_state.approval_prev_screen = lv_screen_active();
+        lv_obj_t* active = lv_screen_active();
+        s_state.approval_prev_screen =
+            (active == s_state.approval_screen) ? NULL : active;
         lv_screen_load_anim(s_state.approval_screen, LV_SCR_LOAD_ANIM_FADE_IN,
                             SCREEN_FADE_MS, 0, false);
         s_state.approval_visible = true;
@@ -2166,7 +2181,8 @@ static void clear_approval_async_cb(void* data)
     s_state.approval_was_standby = false;
     if (back_to_clock && !standby_view_is_visible())
       {
-        if (s_state.approval_prev_screen)
+        if (s_state.approval_prev_screen &&
+            s_state.approval_prev_screen != s_state.approval_screen)
             lv_screen_load(s_state.approval_prev_screen);
         standby_view_show_now();
         s_state.approval_visible = false;
@@ -2176,10 +2192,27 @@ static void clear_approval_async_cb(void* data)
       }
 #endif
 
-    if (s_state.approval_prev_screen) {
-        lv_screen_load_anim(s_state.approval_prev_screen,
-                            LV_SCR_LOAD_ANIM_FADE_IN,
-                            SCREEN_FADE_MS, 0, false);
+    {
+        /* Never "restore" the approval page itself: that happens when a set
+         * arrived after a dropped clear and saved the page as prev.  Fall
+         * back to the chat transcript or the pet home instead of stranding
+         * the user on a page whose prompt is long gone. */
+        lv_obj_t* prev = s_state.approval_prev_screen;
+
+        if (prev == s_state.approval_screen) {
+            prev = NULL;
+        }
+        if (prev != NULL) {
+            lv_screen_load_anim(prev, LV_SCR_LOAD_ANIM_FADE_IN,
+                                SCREEN_FADE_MS, 0, false);
+        } else if (s_state.screen_visible && s_state.screen != NULL) {
+            lv_screen_load_anim(s_state.screen, LV_SCR_LOAD_ANIM_FADE_IN,
+                                SCREEN_FADE_MS, 0, false);
+        } else {
+#ifdef CONFIG_AI_AGENT_PET_STATUS
+            pet_status_view_show();
+#endif
+        }
     }
     s_state.approval_visible = false;
     s_state.approval_prev_screen = NULL;
@@ -2198,8 +2231,9 @@ static void clear_approval_async_cb(void* data)
  *
  * Precedence: approval > notice > chat/pet.  A notice that arrives while an
  * approval is pending is remembered (newest wins) and shown once the approval
- * clears.  A notice that arrives while the standby clock is up is dropped:
- * waking the screen is the user's call, not the notifier's.
+ * clears -- never discarded, because the event it reports is news the user
+ * still needs after answering.  A notice that arrives while the standby clock
+ * is up wakes the page and hands the screen back to the clock when it closes.
  */
 
 typedef struct {
@@ -2359,19 +2393,17 @@ static void notice_timeout_cb(lv_timer_t* t)
     notice_maybe_show_pending();
 }
 
-/* Hold time scales with how much there is to read: a fixed window makes a
- * one-line Gerrit change linger long past the point of usefulness while a long
- * Jira summary gets yanked away mid-sentence.  ~60ms per UTF-8 byte ≈ 180ms per
- * CJK char (a slow skim), floored at LVGL_UI_NOTICE_MS (15 s — 10 s was measured
- * as too short to read a summary) and capped at 45 s.  Any key closes it early,
- * so the long tail costs nothing when the user already read it. */
+/* Fixed hold time.  It used to scale with the text (~60ms per byte, floored at
+ * 15 s, capped at 45 s) so a long Jira summary would not be yanked mid-sentence.
+ * The acceptance criterion for the notification page is a flat "5 s 自退" with
+ * any key dismissing it early, so the window is now exactly LVGL_UI_NOTICE_MS
+ * and reading more is the user's call (press a key, or the item comes back on
+ * the next poll).  Kept as a function so both notice paths share one value. */
 static uint32_t notice_duration_ms(const char* title, const char* body)
 {
-    size_t n = (title ? strlen(title) : 0) + (body ? strlen(body) : 0);
-    uint32_t ms = 5000 + (uint32_t)(n * 60);
-    if (ms < LVGL_UI_NOTICE_MS) ms = LVGL_UI_NOTICE_MS;
-    if (ms > 45000) ms = 45000;
-    return ms;
+    (void)title;
+    (void)body;
+    return LVGL_UI_NOTICE_MS;
 }
 
 /* Must run on the LVGL thread. */
@@ -2398,6 +2430,7 @@ static void notice_show_locked(const char* title, const char* body,
     if (s_state.notice_title) lv_label_set_text(s_state.notice_title, title ? title : "");
     if (s_state.notice_body)  lv_label_set_text(s_state.notice_body, body ? body : "");
     if (s_state.notice_bar)   lv_obj_set_style_border_color(s_state.notice_bar, bar_color, 0);
+    s_state.notice_last_color = bar_color;   /* remembered for a preempted-notice replay */
 
     if (!s_state.notice_visible) {
         s_state.notice_prev_screen = lv_screen_active();
@@ -2417,6 +2450,29 @@ static void notice_show_locked(const char* title, const char* body,
 
     syslog(LOG_INFO, "[%s] show: %s | %s\n", NOTICE_TAG,
            title ? title : "", body ? body : "");
+}
+
+/* Move the notice currently on screen into the stash so the approval page that
+ * is about to take over does not swallow it.  Newest wins — the same rule
+ * notice_show_async_cb() uses for notices that arrive while an approval is
+ * already up.  Must run on the LVGL thread, before notice_hide(). */
+static void notice_stash_visible(void)
+{
+    if (!s_state.notice_visible || !s_state.notice_title || !s_state.notice_body) {
+        return;
+    }
+
+    const char* title = lv_label_get_text(s_state.notice_title);
+    const char* body = lv_label_get_text(s_state.notice_body);
+
+    strlcpy(s_state.notice_pending_title, title ? title : "",
+            sizeof(s_state.notice_pending_title));
+    strlcpy(s_state.notice_pending_body, body ? body : "",
+            sizeof(s_state.notice_pending_body));
+    s_state.notice_pending_color = s_state.notice_last_color;
+    s_state.notice_pending = true;
+    syslog(LOG_INFO, "[%s] stashed for re-show (approval page up): %s\n",
+           NOTICE_TAG, s_state.notice_pending_title);
 }
 
 static void notice_maybe_show_pending(void)
@@ -2580,6 +2636,14 @@ int lvgl_ui_channel_clear_approval(void)
 int lvgl_ui_channel_approval_pending(void)
 {
     return s_approval_pet_saved;
+}
+
+int lvgl_ui_channel_approval_visible(void)
+{
+    /* approval_pending() is the request latch and clears even when the async
+     * clear is dropped; this one answers "is the page actually on screen",
+     * which is what the key map needs to stay on S2=通过 / S3=拒绝. */
+    return s_state.approval_visible ? 1 : 0;
 }
 
 int lvgl_ui_channel_scroll(int dir)

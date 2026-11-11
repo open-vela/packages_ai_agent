@@ -457,6 +457,14 @@ int lvgl_ui_channel_clear_approval(void)
   return ret;
 }
 
+/* The approval page lives on the CP display in this build, so the AP side
+ * cannot know whether it is still up; report "not visible" and let callers
+ * keep their previous behaviour. */
+int lvgl_ui_channel_approval_visible(void)
+{
+  return 0;
+}
+
 /* Notification page shim.  In this build the screen is owned by the other
  * core, so this side has no page state to track: keep the existing RPMsg toast
  * opcode (it renders on the CP) instead of inventing a second notice opcode.
