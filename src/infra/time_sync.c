@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,6 +71,9 @@ static const char* s_servers[] = {
 
 static volatile bool s_synced;
 static char s_last_err[128] = "not attempted";
+
+/* Serialises the daemon's periodic sync against an on-demand one. */
+static pthread_mutex_t s_sync_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool s_started;
 
 static uint32_t be32(const unsigned char* p)
@@ -182,12 +186,18 @@ static void* time_sync_task(void* arg)
     (void)arg;
 
     while (1) {
+        bool ok;
+
         if (!network_is_connected()) {
             sleep(5);
             continue;
         }
 
-        if (sntp_sync_once()) {
+        pthread_mutex_lock(&s_sync_lock);
+        ok = sntp_sync_once();
+        pthread_mutex_unlock(&s_sync_lock);
+
+        if (ok) {
             s_synced = true;
             sleep(SNTP_RESYNC_SEC);
         } else {
@@ -198,6 +208,31 @@ static void* time_sync_task(void* arg)
     }
 
     return NULL;
+}
+
+int time_sync_now(char* err, size_t err_len)
+{
+    bool ok;
+
+    if (!network_is_connected()) {
+        if (err != NULL && err_len > 0) {
+            snprintf(err, err_len, "network is down");
+        }
+        return -1;
+    }
+
+    /* One request at a time: the daemon may be awake at the same moment, and
+     * two settimeofday() racing would make the printed result meaningless. */
+    pthread_mutex_lock(&s_sync_lock);
+    ok = sntp_sync_once();
+    if (ok) {
+        s_synced = true;
+    } else if (err != NULL && err_len > 0) {
+        snprintf(err, err_len, "%s", s_last_err);
+    }
+    pthread_mutex_unlock(&s_sync_lock);
+
+    return ok ? 0 : -1;
 }
 
 bool time_sync_has_synced(void)

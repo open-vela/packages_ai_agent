@@ -570,12 +570,20 @@ static void cmd_set_news_key(int argc, char** argv)
 }
 
 /* 打印系统时钟,并确保网络时间(SNTP)守护在跑。
- * 板上 localtime_r() 退化成 gmtime_r(),本地时间用 UTC+8 显式换算。 */
+ * 板上 localtime_r() 退化成 gmtime_r(),本地时间用 UTC+8 显式换算。
+ * 先强制同步一次再打印:守护线程的周期是 30 分钟,时钟跑偏时干等着看
+ * 读数没有意义——要的是「同步完纠没纠回来」。 */
 static void cmd_sync_time(void)
 {
     char utc_s[32];
     char cst_s[32];
+    char err[128] = { 0 };
     struct tm tm;
+    int rc;
+
+    (void)time_sync_start();
+
+    rc = time_sync_now(err, sizeof(err));
 
     time_t now = time(NULL);
     gmtime_r(&now, &tm);
@@ -590,13 +598,10 @@ static void cmd_sync_time(void)
     printf("link   %s (%s)\n",
         network_is_connected() ? "up" : "down", network_get_ip());
 
-    (void)time_sync_start();
-
-    if (time_sync_has_synced()) {
-        printf("sntp   synced (re-syncs every 30 min)\n");
+    if (rc == 0) {
+        printf("sntp   synced now (then re-syncs every 30 min)\n");
     } else {
-        printf("sntp   no sync yet — last error: %s\n",
-            time_sync_last_error());
+        printf("sntp   sync failed: %s\n", err[0] ? err : "unknown");
     }
 }
 

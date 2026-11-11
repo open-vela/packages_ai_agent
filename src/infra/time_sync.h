@@ -17,6 +17,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /**
  * time_sync.h — 网络时间同步(SNTP)守护
@@ -38,3 +39,14 @@ bool time_sync_has_synced(void);
 
 /** 最近一次失败原因(人类可读,如 "resolve … failed"/"recv … errno")。 */
 const char* time_sync_last_error(void);
+
+/**
+ * 立即同步一次,不等 30 分钟的重同步周期。
+ *
+ * 守护线程只在周期到点或失败重试时才发 SNTP 请求,所以时钟跑偏之后
+ * `sync_time` 只能干看着——它以前只打印、不触发。这条给 CLI 用:同步
+ * 完再看打印出来的时钟才知道纠没纠回来。
+ *
+ * @return 0 成功获得服务器时间并 settimeofday;负值失败,原因写进 err。
+ */
+int time_sync_now(char* err, size_t err_len);
